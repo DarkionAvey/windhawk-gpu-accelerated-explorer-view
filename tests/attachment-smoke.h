@@ -574,7 +574,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         userMode(mode); FinishColumnTransition(*state);
         Check(state->rowHeight96[false]==pinchedList && state->rowHeight96[true]==gridHeight &&
             fabsf(state->fontPx-Scale96(state->gridView ? std::min(gridHeight,96) : pinchedList,DpiOf(overlay))*
-                g_fontPercent.load()/100.f)<1.f &&
+                (state->gridView ? g_gridFontPercent.load() : g_fontPercent.load())/100.f)<1.f &&
             fabsf(state->textFormat->GetFontSize()-state->fontPx)<.001f &&
             state->tabPresentations[state->activeTabHost].zoomHeight96==state->rowHeight96 &&
             !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),

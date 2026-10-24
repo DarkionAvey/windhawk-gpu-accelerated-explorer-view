@@ -65,10 +65,10 @@ static void TestMirroredWindowCoordinates(const std::wstring& directory) {
         Check(state->viewToggleNeighbor==nativeButton,"RTL status switch searched the wrong edge");
         auto button=screenRect(state->viewToggle), neighbor=screenRect(nativeButton);
         Check(button.right-button.left==40 && button.bottom-button.top==32 && button.top==neighbor.top &&
-            (rtl ? button.left>neighbor.right : button.right<neighbor.left),
+            (rtl ? button.left>=neighbor.right : button.right<=neighbor.left),
             "RTL status switch double-mirrored its parent placement or mismatched native button size");
         Check(!(GetWindowLongPtrW(state->viewToggle,GWL_EXSTYLE)&WS_EX_LAYOUTRTL),"status switch retained mirrored GDI coordinates");
-        // Also cover the fallback used for virtualized (non-HWND) status buttons.
+        // Also cover the fallback when a mod hides the native controls.
         ShowWindow(nativeButton,SW_HIDE); RefreshViewToggleForFrame(frame);
         button=screenRect(state->viewToggle); const auto frameBounds=screenRect(frame);
         Check(rtl ? button.right<frameBounds.left+450 : button.left>frameBounds.left+450,

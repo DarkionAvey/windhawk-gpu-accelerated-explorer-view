@@ -170,7 +170,9 @@ static void TestGridFilenameSelection(ViewState& state) {
     const auto flags=state.selectedFlags;
     const int selected=state.selected,hovered=state.hovered;
     const auto search=std::move(state.typeSearch); state.typeSearch.clear();
-    state.entries[0].name=L"Install macOS 27 release Beta"; state.entries[0].path=L"grid-label-fixture:0";
+    // Stay long enough to wrap at the smaller grid font default. A wrapping
+    // layout can legitimately contain one line when its entire label fits.
+    state.entries[0].name=L"Install macOS 27 release Beta - Developer Preview"; state.entries[0].path=L"grid-label-fixture:0";
     state.entries[1].name=L"Short"; state.entries[1].path=L"grid-label-fixture:1";
     state.selectedFlags.assign(state.total,0); state.selectedFlags[0]=1;
     state.selected=0; state.hovered=-1;
@@ -182,12 +184,15 @@ static void TestGridFilenameSelection(ViewState& state) {
     if (!(shape.count && (geometry.wrapped ? shape.count>=2 : shape.count==1) &&
         bounds.top>=geometry.text.top-padding && bounds.bottom<=geometry.text.bottom+padding))
         std::cerr << "LABEL mode=" << state.cachedNativeMode << " rtl=" << state.rtlLayout <<
-            " lines=" << shape.count << " font=" << state.fontPx << " row=" << state.rowPx <<
+            " lines=" << shape.count << " font=" << state.fontPx << " format=" << state.textFormat->GetFontSize() << " row=" << state.rowPx <<
             " text=" << geometry.text.left << ',' << geometry.text.top << ',' << geometry.text.right << ',' << geometry.text.bottom <<
             " bounds=" << bounds.left << ',' << bounds.top << ',' << bounds.right << ',' << bounds.bottom << '\n';
     Check(shape.count && (geometry.wrapped ? shape.count>=2 : shape.count==1) &&
         bounds.top>=geometry.text.top-padding && bounds.bottom<=geometry.text.bottom+padding,
         "filename-only grid bounds included icon or failed to follow wrapped lines");
+    SelectionShape shortShape;
+    SelectionRect(state,1,0,state.rowPx,0,0,ListEndX(state),DocumentRowLeft(state,1),0,&shortShape);
+    Check(shortShape.count==1,"short grid filename acquired artificial line wrapping");
     const auto& cached=state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(state.entries[0].name);
     const auto* layout=cached.text.Get();
     SelectionShape translated;
@@ -316,6 +321,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         state.selectedFlags.assign(state.total, 0);
         state.entries[0].name=L"Flower panorama.bmp"; state.entries[0].path=picture;
         UpdateRefreshRate(state);
+        UpdateMetrics(state);
         Check(EnsureTarget(state), "grid GPU target");
         auto savedSwap = std::move(state.swapChain);
         auto savedBitmap = std::move(state.backbuffer);
@@ -329,6 +335,8 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             state.nativeIconSize = size;
             state.scrollNow = state.scrollTarget = 0.f;
             UpdateMetrics(state);
+            Check(MakeTextFormats(state,true) && state.textFormat->GetFontSize()==state.fontPx,
+                "grid fixture font format does not match its layout metrics");
             Check(state.itemsPerRow >= 2 && state.rowPx > size &&
                 DocumentRowTop(state, 1) == 0.f && DocumentRowLeft(state, 1) > 0.f &&
                 DocumentRowTop(state, state.itemsPerRow) == state.rowPx,
@@ -672,13 +680,14 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
             const auto item=LayoutItem(state,LayoutRowVisual(state,0,1.f));
             const auto bar=LayoutDriveBar(state,0,item);
-            Check(state.itemsPerRow==2 && !item.wrapped && item.text.left>=item.icon.right &&
+            const int columns=state.itemsPerRow;
+            Check(columns>=2 && columns<state.total && !item.wrapped && item.text.left>=item.icon.right &&
                 item.usage.top>=item.text.bottom && item.capacity.top>=item.usage.bottom &&
                 item.capacity.bottom<item.cell.bottom && item.capacity.right<=item.cell.right &&
                 bar.visible && bar.labelRight==item.text.right,
                 "drive tiles lost their shared two-line horizontal layout");
             Check(RowAtDocument(state,0,state.itemWidth*1.5f)==1 &&
-                DocumentRowTop(state,2)==state.rowPx && KeyboardNavigationTarget(state,VK_DOWN)==2,
+                DocumentRowTop(state,columns)==state.rowPx && KeyboardNavigationTarget(state,VK_DOWN)==columns,
                 "drive tiles diverged from grid hit testing, packing or keyboard movement");
             const auto pending=LayoutItem(state,LayoutRowVisual(state,1,1.f));
             Check(!LayoutDriveBar(state,1,pending).visible &&

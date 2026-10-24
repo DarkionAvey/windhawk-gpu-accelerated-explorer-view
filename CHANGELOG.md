@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.9.226
+
+- Keep asynchronous status-button discovery retryable when its submission or
+  completion queue is briefly contended; coalesce an owner-thread continuation
+  instead of leaving a completed measurement unused.
+- Bound chrome discovery when a native content viewport is zero-sized or
+  partially initialized, so it cannot descend into the directory's UIA tree.
+- Add deterministic queue-contention and partial-viewport regressions. Repeat
+  the read-only production probe against the desktop's actual visible controls:
+  two 41×41 buttons, zero native gap, and a matching non-overlapping placement.
+
+`build.bat -SourceFile 0.9.226.cpp` passes repository checks, Windhawk DLL
+linking, all 33 option contracts, complete C++/offscreen graphics/input and
+21 real DLL-unload cycles. Contention and partial-viewport checks pass in the
+full gate; callback stacks remain below 8 KiB (maximum 1,960 bytes).
+latest.cpp matches the tested archive; all 29 earlier archives remain unchanged.
+See the [status geometry investigation](docs/status-toggle-0.9.225.md).
+
+## 0.9.225
+
+- Change the Grid text size default to 42%; preserve the separate List/Details
+  default and existing saved font preferences.
+- Measure status-bar buttons exposed through HWNDs or virtual accessibility
+  controls. Copy the nearest button's dimensions and vertical position and the
+  actual peer gap, including zero-gap native buttons, with RTL/mirrored mapping.
+- Query optional accessibility chrome on the existing tab-owned Columns lane;
+  publish plain geometry snapshots with generation/lifetime guards. Cache
+  unchanged geometry and invalidate it on frame/layout/DPI/theme/control changes.
+- Use DPI-aware physical coordinates for accessibility proxies, and retain a
+  bounded fallback for hidden/unavailable controls or pending discovery. Add
+  source/bounds diagnostics under the existing Performance logging option.
+- Cover non-HWND controls using real private toolbar accessibility, resized/
+  superseded requests, hidden/restored buttons, DPI/RTL/spacing, and actual
+  native HWND/mirrored attachment checks. The live production-code probe finds
+  the desktop's real virtual controls; it does not exercise the fallback.
+
+`build.bat -SourceFile 0.9.225.cpp` passed all repository, DLL-link, 33-option,
+C++/offscreen graphics/input and 21 real DLL-unload checks before publication.
+See the [measurement and implementation notes](docs/status-toggle-0.9.225.md).
+
+## 0.9.224
+
+- Separate List/Details and grid text-size percentages. List/Details keeps
+  its existing saved setting and 52% default; grid captions and drive tiles
+  have an independent setting defaulting to 32%. Both retain the 20–80% range.
+- Select the percentage in shared metrics so zoom, layout switching, DPI and
+  independent presentation use the current view's setting. Preserve the grid
+  caption cap at very large image sizes.
+- Extend option contracts and layout/DirectWrite consumers to cover separate
+  percentages, repeated List/Details/icon/small-icon switches and large grid
+  zoom at 96/144/192 DPI. Update native view-switch font checks for both values.
+- Initialize graphics fixtures with matching metrics/formats, cover short and
+  wrapped labels, and check drive-tile navigation against responsive packing.
+  Isolate the This PC refresh fixture's keyboard modifiers and verify both
+  Alt+F5 rejection and unmodified F5 refresh on the private test thread.
+
+Focused option, graphics and drive-refresh suites pass, as does
+`build.bat -SourceFile 0.9.224.cpp`: repository checks, Windhawk DLL link, all
+33 option contracts, full C++/offscreen graphics/input and 21 real DLL-unload
+cycles. Callback stacks remain below 8 KiB (maximum 1,960 bytes). The tested
+release is published as latest.cpp and its identical 0.9.224 archive; all
+27 earlier archives are unchanged. These checks do not measure live Explorer's
+displayed frame rate. Detailed local logs are in `tests/options-0.9.224.log`,
+`tests/graphics-0.9.224.log`, `tests/drive-refresh-0.9.224.log` and
+`tests/build-0.9.224.log`; the failed fixture runs are also retained.
+
 ## 0.9.223
 
 - Fix the intermittent offscreen group regression: wait for the current

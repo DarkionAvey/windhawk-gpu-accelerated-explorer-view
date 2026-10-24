@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.223
+// @version         0.9.226
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -29,7 +29,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 ## Use
 1. Install [Windhawk](https://windhawk.net/).
 2. Click the "Create a new mod" button.
-3. Paste the contents of [`latest.cpp`](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/blob/main/latest.cpp).
+3. Paste the contents of [`latest.cpp`](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/latest.cpp).
 4. Compile and enable it.
 5. Customize options.
 
@@ -52,8 +52,11 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
       $name: Row height
       $description: Higher = taller file rows; lower = more files on screen.
     - fontSizePercent: 52
-      $name: Text size (% of row height)
-      $description: Higher = larger labels; lower = smaller labels. Ctrl+wheel also changes size.
+      $name: List text size (% of row height)
+      $description: Text size in List and Details views. Ctrl+wheel also changes size.
+    - gridFontSizePercent: 42
+      $name: Grid text size (% of row height)
+      $description: Text size in icon grids and drive tiles. Ctrl+wheel also changes size.
     - fontFamily: ""
       $name: Font family
       $description: Enter an installed font name. Leave blank to use Explorer's font.
@@ -480,7 +483,8 @@ constexpr unsigned kColumnWiggleWindowDoubleClickIntervals = 4;
 
 std::atomic<bool> g_unloading{false};
 std::atomic<int> g_row96{32};
-std::atomic<int> g_fontPercent{52};
+std::atomic<int> g_fontPercent{52}; // List/Details; keep the existing settings key.
+std::atomic<int> g_gridFontPercent{42};
 std::atomic<bool> g_autoRefitColumns{true};
 // The settings callback may run on a different thread from Explorer's view.
 // Text formats take a snapshot only when they are created, never per frame.
@@ -1313,6 +1317,30 @@ struct ColumnCatalogJob {
     ColumnChoices known; // Only value snapshots; never an apartment-owned IColumnManager.
 };
 
+struct StatusButtonQuery {
+    HWND frame=nullptr;
+    RECT client{},band{}; // Physical screen pixels, never DPI-scaled estimates.
+    int dpi=96;
+    bool rtl=false;
+};
+bool SameStatusButtonQuery(const StatusButtonQuery& a,const StatusButtonQuery& b) {
+    return a.frame==b.frame && a.dpi==b.dpi && a.rtl==b.rtl &&
+        EqualRect(&a.client,&b.client) && EqualRect(&a.band,&b.band);
+}
+struct StatusButtonSnapshot {
+    StatusButtonQuery query;
+    unsigned long long token=0;
+    struct Button {RECT bounds{}; HWND hwnd=nullptr;};
+    std::vector<Button> buttons;
+    std::vector<HWND> roots;
+    HWND providerHost=nullptr;
+    HRESULT result=S_OK;
+    bool accessible=false;
+    unsigned scanned=0,offscreen=0;
+    struct Observation {RECT bounds; CONTROLTYPEID type; BOOL offscreen;};
+    std::vector<Observation> observations; // Populated only for performance diagnostics.
+};
+
 struct DirectoryResult {
     std::shared_ptr<FolderChangeStamp> changeStamp;
     unsigned long long changeRevision = 0, observerId = 0;
@@ -1674,12 +1702,14 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::atomic<unsigned long long> iconGeneration{0};
     std::atomic<unsigned long long> nativeRowsGeneration{0};
     std::atomic<unsigned long long> columnCatalogGeneration{0};
+    std::atomic<unsigned long long> statusButtonGeneration{0};
     bool registered = false; // Protected by the lifetime regulator's mutex.
     SRWLOCK directoryLock = SRWLOCK_INIT;
     std::deque<DirectoryJob> directoryJobs, layoutJobs, capacityJobs;
     std::deque<DetailJob> detailJobs;
     std::deque<NativeRowsJob> nativeRowsJobs;
     std::deque<ColumnCatalogJob> columnCatalogJobs;
+    std::optional<StatusButtonSnapshot> statusButtonJob,statusButtonResult;
     std::deque<DirectoryWatchJob> watchJobs;
     std::deque<DirectoryResult> directoryResults;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
@@ -1714,6 +1744,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
         nativeRowsGeneration.store(0, std::memory_order_release);
         selectionGeneration.store(0, std::memory_order_release);
         columnCatalogGeneration.store(0, std::memory_order_release);
+        statusButtonGeneration.store(0, std::memory_order_release);
         for (const Worker* worker : Workers())
             if (worker->wake) SetEvent(worker->wake);
         // Best effort for a blocked synchronous filesystem enumeration. Shell
@@ -2186,6 +2217,10 @@ struct ViewState {
     int viewToggleIconPx = 0;
     COLORREF viewToggleIconColor = CLR_INVALID;
     HWND viewToggleNeighbor = nullptr;
+    StatusButtonSnapshot viewToggleGeometry;
+    StatusButtonQuery viewToggleQuery;
+    unsigned long long viewToggleGeometryToken=0;
+    bool viewToggleGeometryPending=false;
     bool viewToggleNeighborSearched = false, viewToggleBufferedPaint = false;
     int viewToggleDpi = 0;
     bool viewToggleLayoutQueued = false;
@@ -2204,6 +2239,8 @@ struct ViewState {
         if (viewToggleBufferedPaint) BufferedPaintUnInit();
         viewToggleTooltip = viewToggle = nullptr;
         viewToggleNeighbor = nullptr;
+        viewToggleGeometry={}; viewToggleQuery={};
+        viewToggleGeometryToken=0; viewToggleGeometryPending=false;
         viewToggleNeighborSearched = viewToggleBufferedPaint = false;
         viewToggleIcons[0] = viewToggleIcons[1] = nullptr;
         viewToggleIconPx = 0;
@@ -4939,6 +4976,7 @@ bool RefreshNativePalette(ViewState& state) {
 void LoadSettings() {
     g_row96.store(std::clamp(Wh_GetIntSetting(L"Appearance.rowHeight"), 24, 96));
     g_fontPercent.store(std::clamp(Wh_GetIntSetting(L"Appearance.fontSizePercent"), 20, 80));
+    g_gridFontPercent.store(std::clamp(Wh_GetIntSetting(L"Appearance.gridFontSizePercent"), 20, 80));
     auto fontSetting = WindhawkUtils::StringSetting::make(L"Appearance.fontFamily");
     std::wstring fontFamily = fontSetting.get();
     const size_t first = fontFamily.find_first_not_of(L" \t\r\n");
@@ -6634,6 +6672,133 @@ void RequestNativeRows(ViewState& state) {
     UnregisterAnimationWhenIdle(state);
 }
 
+StatusButtonQuery CaptureStatusButtonQuery(HWND frame,HWND native,bool rtl,int dpi) {
+    StatusButtonQuery query; query.frame=frame; query.rtl=rtl; query.dpi=dpi;
+    GetClientRect(frame,&query.client);
+    MapWindowPoints(frame,HWND_DESKTOP,reinterpret_cast<POINT*>(&query.client),2);
+    query.band=query.client;
+    RECT content{}; HWND host=FolderContentHost(native);
+    const bool bounds=GetWindowRect(host ? host : native,&content)!=FALSE;
+    const LONG footer=query.client.bottom-content.bottom;
+    const bool settled=bounds && content.right>content.left && content.bottom>content.top &&
+        footer>0 && footer<=(query.client.bottom-query.client.top)/3;
+    // A zero/partial native viewport must not turn a chrome query into a
+    // directory-tree traversal. The estimate bounds discovery only; real
+    // controls still supply every dimension and spacing value for placement.
+    query.band.top=settled ? std::max(content.bottom,query.client.top) :
+        std::max(query.client.top,query.client.bottom-Scale96(48,dpi));
+    return query;
+}
+
+bool StatusButtonInside(const StatusButtonQuery& query,const RECT& rect) {
+    return rect.right>rect.left && rect.bottom>rect.top &&
+        rect.left>=query.client.left && rect.right<=query.client.right &&
+        rect.top>=query.band.top && rect.bottom<=query.band.bottom &&
+        (query.rtl ? rect.right<=query.client.left+(query.client.right-query.client.left)/2 :
+            rect.left>=query.client.left+(query.client.right-query.client.left)/2);
+}
+
+StatusButtonSnapshot DiscoverStatusButtonWindows(const StatusButtonQuery& query) {
+    StatusButtonSnapshot found; found.query=query;
+    EnumChildWindows(query.frame,[](HWND child,LPARAM context)->BOOL {
+        auto& found=*reinterpret_cast<StatusButtonSnapshot*>(context);
+        if(!IsWindowVisible(child) || GetPropW(child,kViewToggleOwnerProperty)) return TRUE;
+        wchar_t cls[80]{}; RECT rect{};
+        if(!GetClassNameW(child,cls,ARRAYSIZE(cls)) || !GetWindowRect(child,&rect)) return TRUE;
+        if(!_wcsicmp(cls,L"Button") && StatusButtonInside(found.query,rect) && found.buttons.size()<16)
+            found.buttons.push_back({rect,child});
+        if((!_wcsicmp(cls,L"DirectUIHWND") || !_wcsicmp(cls,STATUSCLASSNAMEW) ||
+            !_wcsicmp(cls,TOOLBARCLASSNAMEW)) && rect.bottom>found.query.band.top &&
+            rect.top<found.query.band.bottom && found.roots.size()<8)
+            found.roots.push_back(child);
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+// Optional native chrome discovery shares the tab's existing Columns lane.
+// Never walk directory descendants, marshal UI objects to the owner, or wait
+// for an accessibility provider from input/paint/resize callbacks.
+template<class Current>
+void ReadVirtualStatusButtons(StatusButtonSnapshot& found,ComPtr<IUIAutomation>& automation,Current current) {
+    // Legacy accessibility proxies can virtualize rectangles on a DPI-unaware
+    // worker even when the target Explorer window uses physical coordinates.
+    struct PhysicalCoordinates {
+        DPI_AWARENESS_CONTEXT previous=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        ~PhysicalCoordinates() {SetThreadDpiAwarenessContext(previous);}
+    } physical;
+    found.accessible=true;
+    if(!automation) found.result=CoCreateInstance(CLSID_CUIAutomation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation));
+    if(!automation || !current()) return;
+    ComPtr<IUIAutomationCondition> all;
+    ComPtr<IUIAutomationCacheRequest> cache;
+    if(FAILED(found.result=automation->CreateTrueCondition(&all)) ||
+        FAILED(found.result=automation->CreateCacheRequest(&cache))) return;
+    cache->put_TreeScope(TreeScope_Element);
+    for(PROPERTYID property:{UIA_ControlTypePropertyId,UIA_BoundingRectanglePropertyId,UIA_IsOffscreenPropertyId})
+        cache->AddProperty(property);
+    for(HWND host:found.roots) {
+        if(!current() || !IsWindowVisible(host)) continue;
+        if(!found.providerHost) found.providerHost=host;
+        ComPtr<IUIAutomationElement> root;
+        if(FAILED(found.result=automation->ElementFromHandle(host,&root))) continue;
+        struct Node {ComPtr<IUIAutomationElement> element; unsigned depth;};
+        std::vector<Node> queue; queue.push_back({root,0});
+        for(size_t next=0;next<queue.size() && found.scanned<64 && current();++next) {
+            const auto node=queue[next];
+            ComPtr<IUIAutomationElementArray> children;
+            if(FAILED(found.result=node.element->FindAllBuildCache(TreeScope_Children,all.Get(),cache.Get(),&children))) continue;
+            int count=0; children->get_Length(&count);
+            for(int i=0;i<count && found.scanned<64 && current();++i,++found.scanned) {
+                ComPtr<IUIAutomationElement> child; RECT rect{}; CONTROLTYPEID type=0; BOOL offscreen=TRUE;
+                if(FAILED(children->GetElement(i,&child)) || FAILED(child->get_CachedBoundingRectangle(&rect)) ||
+                    FAILED(child->get_CachedControlType(&type)) || FAILED(child->get_CachedIsOffscreen(&offscreen))) continue;
+                if(g_perf.load(std::memory_order_relaxed)) found.observations.push_back({rect,type,offscreen});
+                if(offscreen) {++found.offscreen; continue;}
+                if((type==UIA_ButtonControlTypeId || type==UIA_RadioButtonControlTypeId ||
+                    type==UIA_CheckBoxControlTypeId || type==UIA_MenuItemControlTypeId || type==UIA_SplitButtonControlTypeId) &&
+                    StatusButtonInside(found.query,rect) && found.buttons.size()<16) {
+                    found.buttons.push_back({rect,nullptr}); found.providerHost=host;
+                } else if(node.depth<3 && rect.top>=found.query.band.top && rect.bottom<=found.query.band.bottom &&
+                    rect.right>rect.left && rect.bottom>rect.top &&
+                    (type==UIA_GroupControlTypeId || type==UIA_PaneControlTypeId || type==UIA_StatusBarControlTypeId ||
+                     type==UIA_ToolBarControlTypeId)) queue.push_back({std::move(child),node.depth+1});
+            }
+        }
+        if(!found.buttons.empty()) break;
+    }
+}
+
+bool StatusTogglePlacement(const StatusButtonSnapshot& snapshot,RECT& placed,HWND& neighbor,int& gap) {
+    std::vector<StatusButtonSnapshot::Button> buttons;
+    for(const auto& button:snapshot.buttons) if(StatusButtonInside(snapshot.query,button.bounds) &&
+        (!button.hwnd || IsWindowVisible(button.hwnd))) buttons.push_back(button);
+    if(buttons.empty()) return false;
+    std::sort(buttons.begin(),buttons.end(),[](const auto& a,const auto& b) {return a.bounds.left<b.bounds.left;});
+    const bool rtl=snapshot.query.rtl;
+    const auto& anchor=rtl ? buttons.back() : buttons.front();
+    const RECT rect=anchor.bounds;
+    const int width=rect.right-rect.left,height=rect.bottom-rect.top;
+    gap=0;
+    // Match the real peer-to-peer spacing, including zero-gap native controls.
+    if(buttons.size()>1) {
+        const auto& peer=buttons[rtl ? buttons.size()-2 : 1].bounds;
+        if(peer.bottom>rect.top && peer.top<rect.bottom)
+            gap=std::max(0L,rtl ? rect.left-peer.right : peer.left-rect.right);
+    }
+    placed=rect;
+    placed.left=rtl ? rect.right+gap : rect.left-gap-width; placed.right=placed.left+width;
+    if(placed.left<snapshot.query.client.left || placed.right>snapshot.query.client.right) {
+        // A very narrow host may lack room beside the native cluster. Keep
+        // its controls usable by placing the same-sized switch above them.
+        placed.left=rect.left; placed.right=rect.right;
+        placed.bottom=rect.top-gap; placed.top=placed.bottom-height;
+        if(placed.top<snapshot.query.client.top) return false;
+    }
+    neighbor=anchor.hwnd;
+    return true;
+}
+
 DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     auto& lane = *static_cast<TabBackground::Worker*>(context);
     auto& work = *lane.owner;
@@ -6645,6 +6810,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     const bool watchLane = lane.lane == TabBackground::Lane::Watch;
     const bool columnsLane = lane.lane == TabBackground::Lane::Columns;
     WorkerComApartment apartment;
+    ComPtr<IUIAutomation> statusAutomation;
     auto& typeNames = lane.typeNames;
     auto& observedAssociationEpoch = lane.associationEpoch;
     std::shared_ptr<FolderChangeStamp> observedFolder;
@@ -6679,6 +6845,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         DetailJob detail;
         DirectoryWatchJob watch;
         ColumnCatalogJob catalog;
+        std::optional<StatusButtonSnapshot> statusButtons;
         bool haveCatalog = false;
         bool haveDirectory = false, haveDetail = false, haveWatch = false;
         TabBackground::RetiredPayload retired;
@@ -6692,6 +6859,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 directory = std::move(work.layoutJobs.back());
                 work.layoutJobs.pop_back();
                 haveDirectory = true;
+            } else if (columnsLane && work.statusButtonJob) {
+                statusButtons=std::move(work.statusButtonJob); work.statusButtonJob.reset();
             } else if (columnsLane && !work.columnCatalogJobs.empty()) {
                 catalog = std::move(work.columnCatalogJobs.back());
                 work.columnCatalogJobs.pop_back();
@@ -6723,6 +6892,24 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 lane.scheduled.store(false, std::memory_order_release);
                 break;
             }
+        }
+        if(statusButtons) {
+            const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
+                work.statusButtonGeneration.load(std::memory_order_acquire)==statusButtons->token;};
+            if(current()) ReadVirtualStatusButtons(*statusButtons,statusAutomation,current);
+            if(current() && g_perf.load(std::memory_order_relaxed)) {
+                Wh_Log(L"[GPU status] measure token=%llu buttons=%zu scanned=%u offscreen=%u result=0x%08X",
+                    statusButtons->token,statusButtons->buttons.size(),statusButtons->scanned,statusButtons->offscreen,statusButtons->result);
+                for(const auto& sample:statusButtons->observations)
+                    Wh_Log(L"[GPU status] control type=%d offscreen=%d bounds=%ld,%ld,%ld,%ld",
+                        sample.type,sample.offscreen,sample.bounds.left,sample.bounds.top,sample.bounds.right,sample.bounds.bottom);
+            }
+            if(current()) {
+                {ExclusiveSrwLock lock(work.directoryLock);
+                    if(current()) work.statusButtonResult=std::move(statusButtons);}
+                PostMessageW(work.hwnd,kMsgViewToggleLayout,WPARAM(work.notificationLifetime),0);
+            }
+            continue;
         }
         PipelineScope pipeline(work,L"worker.job",static_cast<unsigned>(lane.lane),
             haveCatalog ? catalog.token : haveWatch ? watch.token : haveDetail ? detail.token : directory.token);
@@ -9188,7 +9375,8 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // Grid zoom grows the image independently of its caption. Bound font
     // metrics before integer DPI conversion, even at very large image scales.
     const int baseRow = Scale96(state.gridView ? std::min(height96, 96) : height96, dpi);
-    const int font = std::max(7, MulDiv(baseRow, g_fontPercent.load(), 100));
+    const int fontPercent = state.gridView ? g_gridFontPercent.load() : g_fontPercent.load();
+    const int font = std::max(7, MulDiv(baseRow, fontPercent, 100));
     // Display size is independent of the bounded Shell image request tiers.
     // Keep this arithmetic floating point: MulDiv/int casts would overflow
     // well before the tab's zoom preference reaches its storage limit.
@@ -20403,7 +20591,7 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     if (msg == WM_EXITSIZEMOVE)
         for (HWND overlay : FrameOverlays(hwnd))
             if (auto state=State(overlay)) QueueColumnFit(*state);
-    if (msg == WM_SIZE || msg == WM_DPICHANGED || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE)
+    if (msg == WM_SIZE || msg == WM_WINDOWPOSCHANGED || msg == WM_DPICHANGED || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE)
         RefreshViewToggleForFrame(hwnd, true);
     if (msg == WM_ACTIVATE || msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
         for (HWND overlay : FrameOverlays(hwnd)) QueueInputFocusUpdate(overlay);
@@ -23697,7 +23885,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetActive(hwnd, !s->visible);
         return 0;
     case kMsgViewToggleLayout:
-        if (s) {
+        if (s && (!wParam || wParam==WPARAM(s->lifetimeToken))) {
             s->viewToggleLayoutQueued = false;
             RefreshViewToggleForFrame(s->frameHwnd);
         }
@@ -24146,15 +24334,29 @@ void SuppressAppearingNativeSurface(HWND changed, DWORD event) {
 void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed,
                                 LONG objectId, LONG childId, DWORD, DWORD) {
     WindowCallbackGuard callback;
-    if (!changed || objectId!=OBJID_WINDOW || childId!=0 ||
-        (event!=EVENT_OBJECT_CREATE && event!=EVENT_OBJECT_SHOW && event!=EVENT_OBJECT_PARENTCHANGE) ||
-        g_unloading.load(std::memory_order_relaxed)) return;
+    if (!changed || g_unloading.load(std::memory_order_relaxed)) return;
     const HWND frame=GetAncestor(changed,GA_ROOT);
     AcquireSRWLockShared(&g_shellHookLock);
     const auto hook=g_shellViewHooks.find(frame);
     const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
     ReleaseSRWLockShared(&g_shellHookLock);
-    if (owns) SuppressAppearingNativeSurface(changed,event);
+    if(!owns) return;
+    if(!GetPropW(changed,kViewToggleOwnerProperty) &&
+        (event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_HIDE || event==EVENT_OBJECT_DESTROY ||
+         (event==EVENT_OBJECT_LOCATIONCHANGE && objectId==OBJID_WINDOW))) {
+        for(HWND overlay:FrameOverlays(frame)) if(auto state=State(overlay)) {
+            const bool known=changed==state->viewToggleGeometry.providerHost ||
+                std::any_of(state->viewToggleGeometry.buttons.begin(),state->viewToggleGeometry.buttons.end(),
+                    [&](const auto& button) {return button.hwnd==changed;});
+            wchar_t cls[80]{};
+            const bool statusWindow=objectId==OBJID_WINDOW && GetClassNameW(changed,cls,ARRAYSIZE(cls)) &&
+                (!_wcsicmp(cls,L"Button") || !_wcsicmp(cls,STATUSCLASSNAMEW) || !_wcsicmp(cls,TOOLBARCLASSNAMEW));
+            if(known || statusWindow) {RefreshViewToggleForFrame(frame,true); break;}
+        }
+    }
+    if(objectId==OBJID_WINDOW && !childId &&
+        (event==EVENT_OBJECT_CREATE || event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_PARENTCHANGE))
+        SuppressAppearingNativeSurface(changed,event);
 }
 
 // View creation/show notifications cover messages Explorer sends directly to
@@ -27003,17 +27205,74 @@ LRESULT CALLBACK ViewToggleSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 // A frame child is available independently of XAML focus, template creation,
 // symbols and CommandBar overflow. Each overlay owns its own switch lifetime;
 // frame selection only chooses which tab's child is presented.
+void RetryStatusButtonGeometry(ViewState& state) {
+    if(!state.viewToggleLayoutQueued && !g_unloading.load(std::memory_order_relaxed))
+        state.viewToggleLayoutQueued=PostMessageW(state.hwnd,kMsgViewToggleLayout,WPARAM(state.lifetimeToken),0)!=FALSE;
+}
+
+void ConsumeStatusButtonGeometry(ViewState& state) {
+    auto& work=*state.background;
+    std::optional<StatusButtonSnapshot> result;
+    {ExclusiveSrwLock lock(work.directoryLock,true);
+        if(!lock) {
+            if(state.viewToggleGeometryPending) RetryStatusButtonGeometry(state);
+            return;
+        }
+        result=std::exchange(work.statusButtonResult,{});}
+    if(result && result->token==state.viewToggleGeometryToken &&
+        SameStatusButtonQuery(result->query,state.viewToggleQuery)) {
+        state.viewToggleGeometry=std::move(*result); state.viewToggleGeometryPending=false;
+    }
+}
+
+void RequestStatusButtonGeometry(ViewState& state,const StatusButtonQuery& query) {
+    auto& work=*state.background;
+    bool nativeChanged=false;
+    for(const auto& button:state.viewToggleGeometry.buttons) if(button.hwnd) {
+        RECT current{};
+        nativeChanged |= !IsWindowVisible(button.hwnd) || !GetWindowRect(button.hwnd,&current) ||
+            !EqualRect(&current,&button.bounds);
+    }
+    if(state.viewToggleNeighborSearched && !nativeChanged && SameStatusButtonQuery(query,state.viewToggleQuery)) return;
+    auto found=DiscoverStatusButtonWindows(query);
+    found.token=g_nextToken.fetch_add(1);
+    state.viewToggleQuery=query; state.viewToggleGeometryToken=found.token;
+    state.viewToggleNeighborSearched=true;
+    work.statusButtonGeneration.store(found.token,std::memory_order_release);
+    if(!found.buttons.empty() || found.roots.empty()) {
+        state.viewToggleGeometry=std::move(found); state.viewToggleGeometryPending=false;
+        return;
+    }
+    const HWND hwnd=state.hwnd;
+    if(!StartTabWorker(state.background,work.columns,DirectoryWorkerProc,THREAD_PRIORITY_BELOW_NORMAL)) {
+        state.viewToggleNeighborSearched=false; return;
+    }
+    if(!IsWindow(hwnd) || State(hwnd)!=&state) return;
+    {ExclusiveSrwLock lock(work.directoryLock,true);
+        if(!lock) {state.viewToggleNeighborSearched=false; RetryStatusButtonGeometry(state); return;}
+        work.statusButtonJob=std::move(found);}
+    state.viewToggleGeometryPending=true;
+    SetEvent(work.columns.wake);
+}
+
 void RefreshViewToggleForFrame(HWND frame, bool deferred) {
     if (g_unloading.load(std::memory_order_relaxed) || !IsWindow(frame)) return;
     if (deferred) {
-        if (auto state = State(OverlayUnder(frame)); state && !state->viewToggleLayoutQueued)
-            state->viewToggleLayoutQueued = PostMessageW(state->hwnd, kMsgViewToggleLayout, 0, 0) != FALSE;
+        // A frame-level chrome change also invalidates hidden tabs' snapshots;
+        // only the active tab queues provider work, and others refresh on return.
+        for(HWND overlay:FrameOverlays(frame))
+            if(auto state=State(overlay)) state->viewToggleNeighborSearched=false;
+        if (auto state = State(OverlayUnder(frame))) {
+            if(!state->viewToggleLayoutQueued)
+                state->viewToggleLayoutQueued = PostMessageW(state->hwnd, kMsgViewToggleLayout, 0, 0) != FALSE;
+        }
         return;
     }
     const HWND active = ActiveExplorerTab(frame);
     for (HWND overlay : FrameOverlays(frame)) {
         auto state = State(overlay);
         if (!state || GetWindowThreadProcessId(overlay, nullptr) != GetCurrentThreadId()) continue;
+        ConsumeStatusButtonGeometry(*state);
         const bool show = state->activeTabHost == active && state->inScope &&
             state->detailsViewActive && !IsIconic(frame) && IsWindowVisible(frame);
         if (!show) {
@@ -27167,50 +27426,32 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred) {
         // Leave the native status-bar view buttons at the trailing edge. If a
         // build hides its status bar, the same switch stays inside the lower
         // viewport edge; no list/header extent or animation is changed.
-        const int reserve = std::min(Scale96(68, dpi), std::max(margin, (clientWidth - width) / 3));
+        const int reserve = std::min(Scale96(72, dpi), std::max(margin, (clientWidth - width) / 3));
         int x = trailingAtLowX ? reserve : std::max(margin, clientWidth - width - reserve);
         int y = std::max(0, clientHeight - height - (footer ? std::max(0, (footer - height) / 2) : margin));
-        // Use a real status view button's size/position when the build exposes
-        // one as an HWND. Only the first layout searches; paint/input never
-        // walks the tree. Virtualized status buttons use the 32-DIP fallback.
-        if (!state->viewToggleNeighborSearched) {
-            state->viewToggleNeighborSearched = true;
-            struct Search { HWND frame, found; RECT client, bounds; int extent; bool rtl; } search{
-                frame, nullptr, client, {}, Scale96(48, dpi), trailingAtLowX};
-            EnumChildWindows(frame, [](HWND child, LPARAM param) -> BOOL {
-                auto& search = *reinterpret_cast<Search*>(param);
-                wchar_t name[32]{}; GetClassNameW(child, name, ARRAYSIZE(name));
-                if (_wcsicmp(name, L"Button") || GetPropW(child, kViewToggleOwnerProperty) || !IsWindowVisible(child)) return TRUE;
-                RECT rect{}; if (!GetWindowRect(child, &rect)) return TRUE;
-                MapWindowPoints(HWND_DESKTOP, search.frame, reinterpret_cast<POINT*>(&rect), 2);
-                const int w = rect.right - rect.left, h = rect.bottom - rect.top;
-                if (w < 16 || h < 16 || w > search.extent || h > search.extent ||
-                    rect.top < search.client.bottom - search.extent || rect.bottom > search.client.bottom ||
-                    rect.left < 0 || rect.right > search.client.right ||
-                    (search.rtl ? rect.right > search.client.right / 2 : rect.left < search.client.right / 2)) return TRUE;
-                if (!search.found || (search.rtl ? rect.right > search.bounds.right : rect.left < search.bounds.left)) {
-                    search.found = child; search.bounds = rect;
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&search));
-            state->viewToggleNeighbor = search.found;
-        }
-        RECT neighbor{};
-        if (IsWindowVisible(state->viewToggleNeighbor) && GetWindowRect(state->viewToggleNeighbor, &neighbor)) {
-            MapWindowPoints(HWND_DESKTOP, frame, reinterpret_cast<POINT*>(&neighbor), 2);
-            if (neighbor.left >= 0 && neighbor.top >= 0 && neighbor.right <= clientWidth && neighbor.bottom <= clientHeight) {
-                width = neighbor.right - neighbor.left; height = neighbor.bottom - neighbor.top;
-                x = trailingAtLowX ? neighbor.right + margin : neighbor.left - width - margin;
-                x = std::clamp(x, 0, std::max(0, clientWidth - width)); y = neighbor.top;
-            }
+        const auto query=CaptureStatusButtonQuery(frame,state->nativeHwnd,state->rtlLayout,dpi);
+        RequestStatusButtonGeometry(*state,query);
+        RECT measured{}; int gap=0;
+        state->viewToggleNeighbor=nullptr;
+        const bool fromNative=SameStatusButtonQuery(state->viewToggleGeometry.query,query) &&
+            StatusTogglePlacement(state->viewToggleGeometry,measured,state->viewToggleNeighbor,gap);
+        if(fromNative) {
+            MapWindowPoints(HWND_DESKTOP,frame,reinterpret_cast<POINT*>(&measured),2);
+            x=measured.left; y=measured.top; width=measured.right-measured.left; height=measured.bottom-measured.top;
         }
         RECT previous{}; GetWindowRect(state->viewToggle, &previous);
         MapWindowPoints(HWND_DESKTOP, frame, reinterpret_cast<POINT*>(&previous), 2);
         if (!IsWindowVisible(state->viewToggle) || GetWindow(frame, GW_CHILD) != state->viewToggle ||
             previous.left != x || previous.top != y || previous.right - previous.left != width ||
             previous.bottom - previous.top != height)
+        {
             SetWindowPos(state->viewToggle, HWND_TOP, x, y, width, height,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            if(g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU status] layout source=%s root=%p neighbor=%p x=%d y=%d w=%d h=%d gap=%d pending=%d",
+                    fromNative ? (state->viewToggleGeometry.accessible ? L"accessibility" : L"HWND") : L"fallback",
+                    state->viewToggleGeometry.providerHost,state->viewToggleNeighbor,x,y,width,height,gap,state->viewToggleGeometryPending);
+        }
     }
 }
 

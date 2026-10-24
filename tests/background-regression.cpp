@@ -1643,6 +1643,7 @@ static void TestPreviewInput() {
 #include "column-bridge-smoke.h"
 #include "column-minimum-smoke.h"
 #include "namespace-mutations-smoke.h"
+#include "status-button-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1678,6 +1679,10 @@ int wmain(int argc,wchar_t** argv) {
             TestNativeStartupPipeline(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--office-locks")==0) {
             TestOfficeLockFiltering(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--status-buttons")==0) {
+            TestStatusButtonLayout();
+        } else if (argc>1 && wcscmp(argv[1],L"--drive-refresh")==0) {
+            TestDriveSpaceRefresh();
         } else if (argc>1 && wcscmp(argv[1],L"--column-minimum")==0) {
             TestColumnMinimumWidths();
         } else if (argc>1 && wcscmp(argv[1],L"--column-bridge")==0) {
@@ -1740,6 +1745,7 @@ int wmain(int argc,wchar_t** argv) {
             TestAttachedLifecycle(fixture.wstring());
             TestUiFeedbackAudit(fixture.wstring());
         } else {
+        TestStatusButtonLayout();
         TestUserOptions();
         TestClippingPreflight();
         TestResizeAutoRefit();
