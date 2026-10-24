@@ -16,7 +16,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 ## Use
 1. Install [Windhawk](https://windhawk.net/).
 2. Click the "Create a new mod" button.
-3. Paste the contents of [`latest.cpp`](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/blob/main/latest.cpp).
+3. Paste the contents of [`latest.cpp`](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/latest.cpp).
 4. Compile and enable it.
 5. Customize options.
 
