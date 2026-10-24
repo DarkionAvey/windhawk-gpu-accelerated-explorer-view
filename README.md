@@ -21,4 +21,11 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 5. Customize options.
 
 
-
+## Features
+- **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
+- **Custom Fonts** — Personalize the appearance with your preferred fonts.
+- **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
+- **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
+- **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
+- **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
+- **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
