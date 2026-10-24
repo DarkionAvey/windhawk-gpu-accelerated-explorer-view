@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.223
+
+- Fix the intermittent offscreen group regression: wait for the current
+  renderer intent's explicit completion instead of treating a nearly-final
+  document height as proof that animation has finished. Retain the final
+  native/input geometry assertion.
+- Share group advancement and raw-progress completion between presentation
+  and input. Acknowledge the renderer's actual geometry sample so delayed paint
+  or receipt delivery cannot advance input geometry ahead of the image.
+- Add deterministic collapse/expansion boundary, delayed receipt and reversed
+  intent checks for LTR/RTL Details/grid, alongside the offscreen GPU test.
+
+See the [failure investigation and validation](docs/group-animation-completion-0.9.223.md).
+The focused presentation regression and `build.bat -SourceFile 0.9.223.cpp`
+pass: repository checks, Windhawk DLL linking, all 32 option contracts, the
+complete C++/offscreen graphics/input suite and 21 real DLL unload cycles.
+Critical callback stacks remain below 8 KiB (maximum 1,960 bytes). The build
+published 0.9.223; latest.cpp matches its archive, and all 26 older archives
+remain unchanged. No live Explorer frame-rate claim is made.
+
 ## 0.9.222
 
 - Commit namespace membership through the same snapshot preparation, identity

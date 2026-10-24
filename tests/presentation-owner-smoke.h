@@ -79,6 +79,7 @@ struct Tab {
         if(!done) std::cout<<"PRESENTATION timeout expected="<<state.presentationSequence<<" receipt="<<bool(result)
             <<" seq="<<(result ? result->sequence : 0)<<" ready="<<(result && result->ready)
             <<" accepted="<<(result && result->accepted)<<" rows="<<(result && result->rows)
+            <<" groups="<<(result && result->groups)
             <<" columns="<<(result && result->columns)<<" scene="<<(result && result->scenePublished)
             <<" standby="<<(result && result->standby)<<" frames="<<(result ? result->frames : 0)
             <<" stop="<<state.background->stopping.load()<<std::endl;
@@ -118,6 +119,57 @@ void Mutation(Tab& tab,bool insert) {
     else StartRowTransition(s,std::move(rows),total,row,s.scrollNow);
     Check(s.rowTransitionActive,"presentation mutation did not start shared motion");
 }
+
+void GroupAnimationClock(bool rtl,bool grid) {
+    Tab bridge(L"group input clock",80,rtl,grid,true);
+    Tab renderer(L"group rendering clock",80,rtl,grid,true);
+    auto& input=bridge.state; auto& output=renderer.state;
+    auto lane=std::make_shared<PresentationLane>(); lane->lifetime=input.lifetimeToken;
+    lane->hwnd=input.hwnd; input.presenter=lane;
+    // Fixed clock samples reproduce the last subpixel frames and arbitrarily
+    // delayed paint/receipt delivery without depending on sleeps or GPU speed.
+    input.qpcFrequency=output.qpcFrequency=1000000.;
+    output.graphicsPaintSerial=output.lastAcceptedPaint=1;
+    output.token=input.token; output.directoryToken=input.directoryToken;
+    const float expanded=DocumentHeight(input);
+    const float body=input.rowPx*ItemLineCount(input,input.sections.back().end-input.sections.back().first)+GroupHeadingHeight(input);
+    for(bool collapse:{true,false}) {
+        auto& group=input.sections.back();
+        group.collapsed=collapse; group.from=group.fraction; group.to=collapse ? 0.f : 1.f;
+        group.started.QuadPart=1000000; input.groupAnimating=true;
+        PublishGroupIntents(input);
+        const auto before=group.fraction;
+        // A receipt from the previous intent must not finish a reversed gesture.
+        if(!collapse) {
+            PublishPresentationReceipt(output,lane); ConsumePresentation(input);
+            Check(input.groupAnimating && group.started.QuadPart && group.fraction==before,
+                "stale group receipt completed a newer intent");
+        }
+        output.sections=input.sections; output.groupAnimating=true;
+        output.presentationGroupIntents=input.presentationGroupIntents;
+        const float target=expanded-(collapse ? body : 0.f);
+        for(double progress:{.975,.999,1.,4.}) {
+            LARGE_INTEGER sample{};
+            sample.QuadPart=1000000+LONGLONG(kUiTransitionDurationMs*1000*progress);
+            AdvanceGroupAnimation(output,sample); LayoutGroupSections(output);
+            PublishPresentationReceipt(output,lane);
+            const auto receipt=bridge.Receipt();
+            Check(receipt && receipt->accepted && receipt->groups==(progress<1.),
+                "group completion used rounded easing instead of elapsed duration");
+            if(progress==.975) Check(fabsf(receipt->documentHeight-target)<.02f && receipt->groups,
+                "near-terminal frame did not reproduce the old height-only wait race");
+            ConsumePresentation(input);
+            Check(input.groupAnimating==output.groupAnimating &&
+                input.sections.back().started.QuadPart==output.sections.back().started.QuadPart &&
+                input.sections.back().fraction==output.sections.back().fraction &&
+                DocumentHeight(input)==DocumentHeight(output),
+                "delayed group receipt changed the rendered input geometry");
+            if(progress>=1.) Check(!input.groupAnimating && DocumentHeight(input)==target,
+                "completed group receipt lost final native/input geometry");
+        }
+    }
+    input.presenter.reset();
+}
 }
 
 static void TestPresentationOwners() {
@@ -126,6 +178,7 @@ static void TestPresentationOwners() {
     const auto before=g_gpuDevices.load();
     const bool smooth=g_smooth.exchange(true),automatic=g_autoRefitColumns.exchange(false);
     g_frameStopping=false;
+    for(bool rtl:{false,true}) for(bool grid:{false,true}) PresentationFixture::GroupAnimationClock(rtl,grid);
     {
         Check(!g_frameThread && !g_frameEvent,"frame-stop fixture requires an idle scheduler");
         g_frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
@@ -267,7 +320,9 @@ static void TestPresentationOwners() {
             s.selected=-1;
             const float expected=DocumentHeight(s)-s.rowPx*ItemLineCount(s,section.end-section.first)-GroupHeadingHeight(s);
             ToggleGroupSection(s,index); SubmitPresentation(s);
-            tab.Await([&](const auto& r) {return r.accepted && fabsf(r.documentHeight-expected)<.02f;});
+            const auto sequence=s.presentationSequence;
+            tab.Await([&](const auto& r) {return r.accepted && r.sequence==sequence &&
+                r.groupIntents==s.presentationGroupIntents && !r.groups && fabsf(r.documentHeight-expected)<.02f;});
             ConsumePresentation(s);
             Check(!s.groupAnimating && fabsf(DocumentHeight(s)-expected)<.02f,"offscreen group animation lost native/input geometry");
         }

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.222
+// @version         0.9.223
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -11,21 +11,37 @@
 
 // ==WindhawkModReadme==
 /*
+![Showcase GIF](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/assets/showcase.gif)
+
+
 # GPU-accelerated `explorer.exe` list and grid views
 
 A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations and modern look.
 
-- Phenocopies explorer: Details list and icons grid, including thumbnails, sorting and grouping.
+- Replicates explorer views using hardware accelerated graphics: Details list and icons grid, including thumbnails, sorting and grouping.
 - Animated interactions: grouping, sorting, selecting/cutting/copying files, and many more.
 - Smooth scrolling, touchpad gestures and inertia scrolling.
-- RTL langauge support.
+- RTL language support.
 - Button to switch back to native explorer view (or use **Ctrl+Alt+F9** shortcut).
 - Prioritizes responsiveness and animations over efficiency.
+- Less likely to break in future Windows updates since it does not modify the default views of explorer but recreates them
 
 ## Use
+1. Install [Windhawk](https://windhawk.net/).
+2. Click the "Create a new mod" button.
+3. Paste the contents of [`latest.cpp`](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/blob/main/latest.cpp).
+4. Compile and enable it.
+5. Customize options.
 
-Install [Windhawk](https://windhawk.net/), create a new mod in its editor,
-and replace the source with `latest.cpp`. Compile and enable it.
+
+## Features
+- **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
+- **Custom Fonts** — Personalize the appearance with your preferred fonts.
+- **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
+- **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
+- **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
+- **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
+- **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
 */
 // ==/WindhawkModReadme==
 
@@ -2407,6 +2423,7 @@ struct ViewState {
     std::shared_ptr<const GroupIntents> presentationGroupIntents;
     std::vector<int> rowGroup; // O(1) row-to-section lookup
     bool groupAnimating = false;
+    LARGE_INTEGER groupFrameQpc{}; // Geometry sample shared with the input owner.
     int hotSection = -1;
     bool sortInitialized = false; // Header sort chosen for this folder.
     bool trackNativeSort = false; // Only follow Shell changes after a GPU header click.
@@ -3002,7 +3019,7 @@ struct PresentationReceipt {
     DWORD thread=0;
     HRESULT failure=S_OK; int failureStage=0;
     bool ready=false,accepted=false,failed=false,rows=false,columns=false,standby=false,standbyPending=false,zoom=false,control=false;
-    bool scrolling=false,horizontalMoving=false,columnPending=false,zebra=false,opacity=false,content=false;
+    bool scrolling=false,horizontalMoving=false,columnPending=false,zebra=false,opacity=false,content=false,groups=false;
     LARGE_INTEGER rowOrigin{},columnOrigin{},scrollOrigin{},horizontalOrigin{},zoomOrigin{},zebraOrigin{};
     float rowProgress=0.f,scroll=0.f,horizontal=0.f;
     float rowHeight=0.f,headerHeight=0.f,fontSize=0.f,iconSize=0.f,itemWidth=0.f,zebraExtent=0.f,zebraFrom=0.f,zebraTo=0.f;
@@ -3011,7 +3028,7 @@ struct PresentationReceipt {
     unsigned long long clipboardSequence=0,observerAcknowledged=0,styleRevision=0;
     std::vector<ExplorerColumn> columnPoses;
     std::shared_ptr<const ViewState::GroupIntents> groupIntents;
-    LARGE_INTEGER at{};
+    LARGE_INTEGER groupFrame{};
     size_t glyphBytes=0,imageBytes=0,overrides=0,modelRows=0;
     struct Sample {int index; unsigned long long identity,name; bool selected; RowVisual visual;};
     std::vector<Sample> samples;
@@ -3398,6 +3415,28 @@ float UiTransitionProgress(const ViewState& state, LARGE_INTEGER started,
         (1000. / state.qpcFrequency);
     return std::clamp(static_cast<float>(elapsedMs /
         static_cast<double>(std::max<ULONGLONG>(1, durationMs))), 0.f, 1.f);
+}
+
+bool AdvanceGroupAnimation(ViewState& state, LARGE_INTEGER sampled = {}) {
+    if (!state.groupAnimating) return false;
+    if (!sampled.QuadPart) QueryPerformanceCounter(&sampled);
+    state.groupFrameQpc = sampled;
+    state.groupAnimating = false;
+    for (auto& group : state.sections) {
+        if (!group.started.QuadPart) continue;
+        const float progress = UiTransitionProgress(state, group.started,
+            kUiTransitionDurationMs, sampled);
+        // Easing can round to 1 before the duration actually ends. Both owners
+        // settle on raw progress and use the same geometry sample.
+        if (progress >= 1.f) {
+            group.fraction = group.to;
+            group.started = {};
+        } else {
+            group.fraction = group.from + (group.to-group.from)*EaseOutCubic(progress);
+            state.groupAnimating = true;
+        }
+    }
+    return true;
 }
 
 RowVisual LayoutRowVisual(const ViewState& state, int index, float progress);
@@ -20861,21 +20900,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
     AdvanceScroll(state);
     AdvanceHorizontalTrack(state);
     AdvanceColumnTransition(state);
-    const bool groupsMoving = state.groupAnimating;
-    if (groupsMoving) {
-        state.groupAnimating = false;
-        for (auto& group : state.sections) {
-            if (!group.started.QuadPart) continue;
-            const float t = EaseOutCubic(UiTransitionProgress(state,
-                group.started));
-            group.fraction = group.from + (group.to-group.from)*t;
-            if (t >= 1.f) {
-                group.fraction = group.to;
-                group.started.QuadPart = 0;
-            } else {
-                state.groupAnimating = true;
-            }
-        }
+    if (AdvanceGroupAnimation(state)) {
         LayoutGroupSections(state);
         ClampScroll(state);
         // Collapsing groups can remove the vertical scrollbar.
@@ -21272,7 +21297,8 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->zebraFrom=state.zebraExtentFrom; receipt->zebraTo=state.zebraExtentTo;
     receipt->clipboardSequence=state.clipboardSequence; receipt->opacity=state.itemOpacityAnimating;
     receipt->observerAcknowledged=state.presentationObserverAcknowledged; receipt->styleRevision=state.presentationStyleRevision;
-    receipt->groupIntents=state.presentationGroupIntents; QueryPerformanceCounter(&receipt->at);
+    receipt->groupIntents=state.presentationGroupIntents;
+    receipt->groups=state.groupAnimating; receipt->groupFrame=state.groupFrameQpc;
     receipt->glyphBytes=GlyphCacheBytes(state); receipt->imageBytes=state.iconCacheBytes;
     receipt->overrides=state.presentationItems.size(); receipt->modelRows=state.presentationEntries ? state.presentationEntries->size() : 0;
     if(lane->diagnostics.load(std::memory_order_relaxed)) for(int i:VisibleItemRows(state,0.f)) {
@@ -21518,15 +21544,8 @@ void ConsumePresentation(ViewState& state) {
         if(state.textFormat && state.textFormat->GetFontSize()!=state.fontPx) MakeTextFormats(state,true);
         if(!state.zoomAnimating && state.zoomLayoutTransition) StopRowTransition(state);
     }
-    if(state.groupAnimating && state.presentationGroupIntents==receipt->groupIntents) {
-        state.groupAnimating=false;
-        for(auto& group:state.sections) if(group.started.QuadPart) {
-            const float t=UiTransitionProgress(state,group.started,kUiTransitionDurationMs,receipt->at);
-            group.fraction=group.from+(group.to-group.from)*EaseOutCubic(t);
-            if(t>=1.f) group.started={}; else state.groupAnimating=true;
-            geometry=true;
-        }
-    }
+    if(state.presentationGroupIntents==receipt->groupIntents && receipt->groupFrame.QuadPart)
+        geometry |= AdvanceGroupAnimation(state,receipt->groupFrame);
     if(geometry) {LayoutGroupSections(state); ClampScroll(state); RepositionRenameEdit(state);}
     if(state.zebraExtentAnimating && state.zebraExtentFrom==receipt->zebraFrom && state.zebraExtentTo==receipt->zebraTo) {
         state.zebraExtentStartedQpc=receipt->zebraOrigin; state.zebraExtentPresented=receipt->zebraExtent;
