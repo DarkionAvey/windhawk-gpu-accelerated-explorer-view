@@ -7,6 +7,8 @@
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -ldcomp -ld3d11 -ldxgi -ld2d1 -ldwrite -lshell32 -lole32 -loleaut32 -luuid -lshlwapi -luser32 -lgdi32 -lwindowscodecs -ldwmapi -luxtheme -lpropsys -lcomctl32 -lruntimeobject
+// @github          https://github.com/DarkionAvey
+// @license         GPL-2.0
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
