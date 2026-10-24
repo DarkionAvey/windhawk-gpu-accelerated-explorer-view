@@ -12,7 +12,7 @@ static void TestRowComposition(HWND frame) {
             s.hwnd=CreateWindowExW(0,L"STATIC",L"private row compositor",WS_CHILD,
                 0,0,800,480,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
             Check(s.hwnd!=nullptr,"row compositor window");
-            s.frameHwnd=frame; s.nativeHwnd=s.activeTabHost=s.hwnd; s.background->hwnd=s.hwnd;
+            s.frameHwnd=s.activeTabHost=frame; s.nativeHwnd=s.hwnd; s.background->hwnd=s.hwnd;
             FocusFixture::Session focus(frame,s.hwnd);
             s.visible=s.inScope=s.loaded=s.detailsViewActive=true; s.rtlLayout=rtl;
             s.firstContentSubmittedAt=1; s.featureInitializationStep=kOverlayFeatureSteps;

@@ -133,8 +133,10 @@ function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
     $archive = Join-Path $RepositoryRoot 'previous-versions'
     New-Item -ItemType Directory -Path $archive -Force | Out-Null
     $staged = Join-Path $RepositoryRoot ('latest.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $stagedExport = Join-Path $RepositoryRoot ('latest.export.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         Copy-Item -LiteralPath $SourcePath -Destination $staged
+        Copy-Item -LiteralPath $staged -Destination $stagedExport
         $sources = @(Get-VersionSources $RepositoryRoot)
         $legacy = Join-Path $RepositoryRoot 'mod.cpp'
         if (Test-Path -LiteralPath $legacy) { $sources += Get-Item -LiteralPath $legacy }
@@ -153,7 +155,14 @@ function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
         } else {
             Move-Item -LiteralPath $staged -Destination $latest
         }
+        $export = Join-Path $RepositoryRoot 'gpu-accelerated-explorer-view.wh.cpp'
+        if (Test-Path -LiteralPath $export) {
+            [IO.File]::Replace($stagedExport, $export, [NullString]::Value)
+        } else {
+            Move-Item -LiteralPath $stagedExport -Destination $export
+        }
     } finally {
         if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged }
+        if (Test-Path -LiteralPath $stagedExport) { Remove-Item -LiteralPath $stagedExport }
     }
 }

@@ -30,4 +30,4 @@ if ((Get-SourceHash $source) -ne $sourceHash -or
     throw 'Source or README changed during testing; run the build again before publishing'
 }
 Publish-ModRelease $root $source
-Write-Output "PASS: release finalized at $(Join-Path $root 'latest.cpp'); numbered sources preserved in previous-versions."
+Write-Output "PASS: release finalized at $(Join-Path $root 'latest.cpp') and gpu-accelerated-explorer-view.wh.cpp; numbered sources preserved in previous-versions."

@@ -88,8 +88,13 @@ public:
             items.data(), out);
     }
     HRESULT STDMETHODCALLTYPE GetFocusedItem(int* index) override { *index = focused ? 17 : -1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetSelectedItem(int start,int* index) override {
+        if (start<0 || size_t(start)>=selected.size()) {*index=-1; return S_FALSE;}
+        *index=start; return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE Item(int index, PITEMID_CHILD* out) override {
-        *out = index == 17 && focused ? ILClone(focused.get()) : nullptr;
+        *out = index == 17 && focused ? ILClone(focused.get()) :
+            index>=0 && size_t(index)<selected.size() ? ILClone(selected[size_t(index)].get()) : nullptr;
         return *out ? S_OK : E_FAIL;
     }
 };
@@ -99,6 +104,9 @@ public:
 #include "selection-recovery-smoke.h"
 
 static void TestSelectionGestures(ViewState& state, SelectionFolderView& native) {
+    // Plain clicks must stay plain even if a nested Shell pump refreshes the
+    // thread keyboard snapshot from live desktop modifier state.
+    ModifierFixture::Session modifiers;
     BYTE saved[256]{}, plain[256]{};
     Check(GetKeyboardState(saved) && SetKeyboardState(plain), "repeat click keyboard setup");
     const bool smooth = g_smooth.exchange(true);
@@ -456,7 +464,14 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
                   "event-driven large-selection identity verification was skipped");
             if (!entireDirectory) {
                 // A valid identity survives different cached size/time data.
-                const Entry& changed = state.confirmedNativeSelection->entries.front();
+                const auto& selectedEntries = state.confirmedNativeSelection->entries;
+                const auto changedFile = std::find_if(selectedEntries.begin(), selectedEntries.end(),
+                    // Prepared selections carry identities, not file-kind
+                    // metadata. Inspect only this private filesystem fixture.
+                    [](const Entry& entry) { return std::filesystem::is_regular_file(entry.path); });
+                Check(changedFile != selectedEntries.end(), "metadata mutation needs a selected regular file");
+                const auto changedIndex = static_cast<size_t>(changedFile - selectedEntries.begin());
+                const Entry& changed = *changedFile;
                 HANDLE file = CreateFileW(changed.path.c_str(), GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -469,7 +484,10 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
                 PITEMID_CHILD refreshed = nullptr;
                 Check(SUCCEEDED(EntryChildPidl(state, changed, &refreshed)) && refreshed,
                       "refreshed fixture identity");
-                native->selected.front().reset(refreshed);
+                const auto selectedFile = std::find_if(native->selected.begin(), native->selected.end(),
+                    [&](const OwnedPidl& item) { return ILIsEqual(item.get(), expectedIds.children[changedIndex]) != FALSE; });
+                Check(selectedFile != native->selected.end(), "metadata mutation lost its selected native PIDL");
+                selectedFile->reset(refreshed);
                 Check(VerifyNativeSelection(state, expectedIds), "cached metadata differences broke identity verification");
             }
             OwnedPidl correct = std::move(native->selected.front());

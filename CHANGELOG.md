@@ -1,5 +1,222 @@
 # Changelog
 
+## 0.9.237
+
+- Remove the arbitrary 512px request/decode ceiling. Image demand follows
+  physical icon size, zoom destination, visible viewport, available memory and
+  the current rendering device's bitmap limit.
+- Use dynamic resolution tiers and cheaper nearby previews, reuse adequate
+  cached imagery, and keep the displayed fallback until its replacement is ready.
+- Bound per-tab reservations and WIC pixel bytes. Sample available RAM on existing
+  image workers and reject stale large requests after memory pressure changes.
+- Cancel obsolete queued/in-flight requests without terminating providers.
+  Avoid repeated larger extractions only after multiple requests confirm that
+  the provider cannot supply more detail; shared Shell image-list fallbacks
+  remain limited to their available 256px artwork.
+
+See the [adaptive image policy and validation](docs/adaptive-images-0.9.237.md).
+Validation: the full release build, repository regressions, linked Windhawk DLL,
+C++/graphics/input and DLL-unload suites passed. Automated DPI/5K viewport
+models exercise requests through 6144px; real Shell-factory/WIC/GPU transfer
+checks exceed 512px. Live Explorer behavior on a physical 5K display remains
+separate. Published source/export/archive hashes match; 40 prior archives are
+unchanged.
+
+## 0.9.236
+
+- Replace the Logging section and six separate diagnostic switches with one
+  top-level **Enable logging** option. It enables every existing diagnostic
+  category together and defaults to off.
+- Bound Shell column counts and labels, validate selected-PIDL enumeration
+  batches, reject ambiguous navigation paths and cap incremental search input.
+- Ignore non-finite scroll input, reject invalid scrollbar geometry, validate
+  pixel strides/buffer sizes and keep successful image decode status accurate.
+- Cancel failed, stale and disallowed drag/drop targets. Detach old drag state
+  before outgoing callbacks so reentrant activity retains its own session.
+
+See the [unexpected-input audit and fault checks](docs/unexpected-input-audit-0.9.236.md).
+`build.bat -SourceFile 0.9.236.cpp` passes repository/export checks, real Windhawk
+DLL linking, all 31 option contracts, the complete C++/offscreen graphics/input
+suite, six fault groups (including 2,000 mixed scrollbar cases), and real DLL
+unload/process-exit checks. Each fault group detects a failure in unchanged
+0.9.235. The final full run also verifies non-owned enumeration slots are never
+freed. Both published sources match the tested archive; all 39 earlier archives
+remain unchanged. Live Explorer behavior has not been manually verified.
+
+## 0.9.235
+
+- Preserve the selected item's canonical path while Explorer catches up with a
+  completed rename. Names refresh continues to remap selection by path; an empty
+  intermediate native selection can no longer erase that pending identity.
+- Verify both native selection and focused identity before completing the
+  existing asynchronous restore. Boundary arrow keys retain outstanding
+  verification; selecting a different item still supersedes it.
+- Add optional **Logging > Selection identity diagnostics** with timestamped GPU
+  and live native selection identities around rename, refresh, recovery and
+  keyboard input. Diagnostics are disabled by default.
+
+See the [selection identity investigation](docs/selection-identity-0.9.235.md).
+`build.bat -SourceFile 0.9.235.cpp` passes repository/export checks, Windhawk
+DLL linking, all 36 option contracts, the complete C++/offscreen graphics/input
+suite and real DLL-unload/process-exit checks. The new delayed-readiness test
+fails against unchanged 0.9.234 and passes after this correction, including
+formatted GPU/native trace assertions. Both published sources match the tested
+archive; all 38 earlier archives remain unchanged. Live Explorer behavior has
+not been manually verified.
+
+## 0.9.234
+
+- Unify the editor-to-list focus transition across creation and rename routes.
+  Preserve the selected file and keyboard caret while editing, reconcile Shell's
+  selected identity before returning focus, and invalidate older selection imports.
+- Keep renamed paths searchable before directory refresh with a sparse index
+  update, carried with history and retired on the tab's existing background lane.
+- Share list-focus ownership/fallback rules while respecting address/search
+  controls, modal dialogs, foreground windows and the active tab.
+
+See the [focus ownership investigation](docs/focus-ownership-0.9.234.md).
+`build.bat -SourceFile 0.9.234.cpp` passes repository/export checks, Windhawk
+DLL linking, all 35 option contracts, the complete C++/offscreen graphics/input
+suite and real DLL-unload/process-exit checks. Focused rename and selection
+suites pass; the old 0.9.233 source reproduces the new ownership regression.
+Both published sources match the tested archive; all 37 earlier archives remain
+unchanged. Live Explorer behavior has not been manually verified.
+
+## 0.9.233
+
+- Close the rename field and submit its replacement label before calling Shell,
+  rather than waiting for a directory notification. Keep the pending name through
+  reentrant directory deliveries; restore the actual name if Shell rejects it.
+- Hand off hidden native inline editors from keyboard, toolbar and Shell New
+  commands to the same visible GPU editor, preserving file identity, text and
+  caret. Native editor focus no longer cancels a pending New command.
+- Repair editor visibility and sibling order even when its rectangle is unchanged.
+
+See the [rename handoff investigation and checks](docs/rename-handoff-0.9.233.md).
+`build.bat -SourceFile 0.9.233.cpp` passes repository/export checks, Windhawk
+DLL linking, all 35 option contracts, the complete C++/offscreen graphics/input
+suite and real DLL-unload/process-exit checks. The focused rename suite also
+passes. Both published sources match the tested archive; all 36 earlier
+archives remain unchanged. Live Explorer appearance was not manually verified.
+
+## 0.9.232
+
+- Address the seven-point LLM report against current functions: stop history
+  snapshots owning directory watches; suppress repeated discovery for resolved
+  unsupported tabs; invoke selected files' native default command and working
+  directory; correct frame subscription ownership and unload admission/draining;
+  remove accelerator interpretation of unrelated window data; reject NaN Shell
+  sort values; and explicitly release a process-exit-safe worker registry.
+- Retain asynchronous watch teardown and names validation. History without a
+  live watch revalidates before rows appear; metadata remains reusable after
+  fresh names match. Native same-tab folder navigation is preserved.
+
+See the [seven-point decisions and validation](docs/llm-report-0.9.232.md).
+`build.bat -SourceFile 0.9.232.cpp` passes repository/export checks, Windhawk
+DLL linking, all 35 option contracts, the complete C++/offscreen graphics/input
+suite, real DLL-unload checks and the new blocked-callback process-exit check.
+The report and watch-release checks, selected-group default activation and
+namespace-aware history/navigation checks pass. Both published sources match
+the tested archive; all 35 earlier archives remain unchanged.
+
+## 0.9.231
+
+- Add **Show native view toggle button**, enabled by default under Scrolling
+  and navigation. It applies to existing and newly opened tabs; Ctrl+Alt+F9
+  continues switching views while the button is hidden.
+- Show the shortcut on a second line in both native/GPU switch tooltips.
+
+`build.bat -SourceFile 0.9.231.cpp` passes repository/export checks, Windhawk
+DLL linking, all 35 option contracts, the complete C++/offscreen graphics/input
+suite and real DLL-unload checks. Attachment checks cover live setting changes,
+fresh tabs with the button disabled, both multiline hints, and Ctrl+Alt+F9 in
+both directions with the button hidden, without changing focus or activation.
+The focused navigation suite also passes. Both published sources match the
+tested archive; all 34 earlier archives remain unchanged. These are private
+offscreen checks; live Explorer appearance was not manually verified.
+
+## 0.9.230
+
+- Remove the sharper grayscale text option. Previously saved `sharp` selections
+  fall back to Windows default; smooth grayscale and aliased text remain available.
+- Repaint the switch button's complete status-chrome surface on every paint.
+  Remove transparent sibling ordering and destination-pixel copying, which could
+  retain old hover/glyph pixels when Explorer's frame did not paint its backdrop.
+- Reset hover on captured moves outside, capture loss, cancellation and tab
+  visibility changes. Explicitly invalidate newly shown/repositioned switches.
+
+See the [toggle repaint investigation](docs/toggle-repaint-0.9.230.md).
+`build.bat -SourceFile 0.9.230.cpp` passes repository/export checks, Windhawk
+DLL linking, all 34 option contracts, the complete C++/offscreen graphics/input
+suite and actual DLL-unload checks. The new repaint and native-button state
+checks pass in light/dark palettes. Both published sources match the tested
+archive; all 33 earlier archives remain unchanged. An initial intermittent
+sorting assertion and its successful reruns are recorded in the investigation.
+Live Explorer appearance was not manually verified.
+
+## 0.9.229
+
+- Preserve transparent Explorer backgrounds and use native per-monitor
+  DirectWrite tuning for text. Add Windows default, smooth grayscale, sharper
+  grayscale and aliased choices, with consistent direct/cached/animated sources
+  and lazy raster invalidation on rendering, monitor and system-font changes.
+- Snap rendering primitives in physical device space, including translated
+  row/column sources. Keep continuous layout/input/animation geometry and avoid
+  a second bilinear filter on composited text/icon surfaces.
+- Request correctly sized List/Details icons at high DPI and zoom. Snap image
+  edges, preserve exact unscaled texels and use high-quality scaled icon filtering.
+- Remove the switch button's synthetic idle background; reconstruct its actual
+  parent backdrop and retain hover/press/focus feedback and composited icon alpha.
+- Skip invisible fills, text, strokes and icons through shared draw guards,
+  before shaping, cache lookups and optional image work. Transparent clearing
+  operations still execute because they remove old pixels.
+
+See the [rendering quality investigation](docs/render-quality-0.9.229.md).
+`build.bat -SourceFile 0.9.229.cpp` passes repository/export checks, Windhawk
+DLL linking, all 34 option contracts, the complete C++/offscreen graphics/input
+suite and real DLL-unload checks, including 21 API-hook cycles. Pixel readback
+also passes with the desktop's existing MacType injection overriding native text
+choices. Both published sources match the tested archive; all 32 earlier archives
+remain unchanged. Live Explorer appearance/frame rates were not measured.
+
+## 0.9.228
+
+- Export `gpu-accelerated-explorer-view.wh.cpp` alongside `latest.cpp` after
+  the release gate; both files contain the identical tested source.
+- Allocate dispatch scan state only for relevant Explorer frames. Reclaim
+  exited threads' maps/handles on the existing lifetime regulator, preserving
+  live-thread caches and trivial TLS pointers through DLL unload.
+- Coordinate frame-thread startup, stop admission and handle teardown with
+  the frame lock. Pass immutable wake handles to the frame and tab observers.
+- Give the overlay a mod-specific class name and module instance. Reject
+  class conflicts instead of reusing or replacing another registration.
+- Add export/failure-guard, worker-race, thread-churn and real DLL class-ownership
+  checks. See the [lifetime investigation](docs/lifetime-and-export-0.9.228.md).
+
+`build.bat -SourceFile 0.9.228.cpp` passes repository/export guards, Windhawk
+DLL linking, all 33 option contracts, complete C++/offscreen graphics/input and
+real DLL-unload suites, including the new lifetime/class checks and 21 API-hook
+unload cycles. Both published source files match the tested archive byte for
+byte; all 31 earlier archives remain unchanged. Live Explorer frame rates were
+not measured.
+
+## 0.9.227
+
+- Replace the rename editor's manual window-procedure installation/restoration
+  with `SetWindowSubclass`, `DefSubclassProc` and `RemoveWindowSubclass`.
+  Store the tab state in subclass reference data instead of EDIT user data.
+- Preserve native EDIT destruction before releasing the session/font. Detach
+  the callback and select a stock font if the editor survives overlay disposal.
+- Cover LTR/RTL text, undo, caret, Enter/Escape epochs, external destruction,
+  nested retirement and native messages after actual DLL unmapping.
+
+See the [rename subclass investigation](docs/rename-subclass-0.9.227.md).
+`build.bat -SourceFile 0.9.227.cpp` passes repository checks, Windhawk DLL
+linking, all 33 option contracts, the full C++/offscreen graphics/input suite,
+21 API-hook DLL-unload cycles and the retained-editor unload check. The
+published latest.cpp matches its tested archive; all 30 earlier archives are
+unchanged. These checks do not measure live Explorer's displayed frame rate.
+
 ## 0.9.226
 
 - Keep asynchronous status-button discovery retryable when its submission or

@@ -12,6 +12,8 @@ public:
     DWORD owner=GetCurrentThreadId();
     unsigned snapshots=0;
     bool available=false;
+    UINT reportedCount=0;
+    bool unterminatedLabel=false;
     std::vector<PROPERTYKEY> keys{PKEY_FileName,PKEY_DateModified,PKEY_ItemTypeText,PKEY_Size,PKEY_Author,PKEY_DateCreated};
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         *out=nullptr; if(iid!=IID_IUnknown && iid!=IID_IColumnManager) return E_NOINTERFACE;
@@ -22,7 +24,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetColumnCount(CM_ENUM_FLAGS,UINT* out) override {
         Check(GetCurrentThreadId()==owner,"bridge column count crossed the native STA");
         if(!available) {*out=0; return E_PENDING;}
-        *out=UINT(keys.size()); return S_OK;
+        *out=reportedCount ? reportedCount : UINT(keys.size()); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetColumns(CM_ENUM_FLAGS,PROPERTYKEY* out,UINT count) override {
         Check(GetCurrentThreadId()==owner && count==keys.size(),"bridge column snapshot boundary");
@@ -32,7 +34,9 @@ public:
         Check(GetCurrentThreadId()==owner,"bridge column descriptor crossed the native STA");
         const wchar_t* label=SameKey(key,PKEY_FileName) ? L"Name" : SameKey(key,PKEY_DateModified) ? L"Date modified" :
             SameKey(key,PKEY_ItemTypeText) ? L"Type" : SameKey(key,PKEY_Size) ? L"Size" : SameKey(key,PKEY_Author) ? L"Authors" : L"Date created";
-        wcscpy_s(out->wszName,label); out->uWidth=out->uDefaultWidth=240; return S_OK;
+        if(unterminatedLabel) std::fill(std::begin(out->wszName),std::end(out->wszName),L'Q');
+        else wcscpy_s(out->wszName,label);
+        out->uWidth=out->uDefaultWidth=240; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetColumnInfo(REFPROPERTYKEY,const CM_COLUMNINFO*) override {return E_NOTIMPL;}
     HRESULT STDMETHODCALLTYPE SetColumns(const PROPERTYKEY*,UINT) override {return E_NOTIMPL;}

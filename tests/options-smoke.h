@@ -126,21 +126,18 @@ static void TestUserOptions() {
         {L"Appearance.showEmptyRows",false,&g_emptyRows},
         {L"Hover.animateHover",true,&g_animateHover},
         {L"Navigation.smoothScrolling",true,&g_smooth},
+        {L"Navigation.showNativeViewToggleButton",true,&g_showNativeViewToggleButton},
         {L"Navigation.touchpadDirectManipulation",true,&g_touchpadDirectManipulation},
         {L"Navigation.touchpadSwipeNavigation",false,&g_touchpadSwipeNavigation},
         {L"Navigation.showScrollbar",true,&g_scrollbar},
         {L"Navigation.instantScrollbarScrub",false,&g_instantScrub},
         {L"Columns.autoRefitColumns",true,&g_autoRefitColumns},
-        {L"Logging.perfLogging",false,&g_perf},
-        {L"Logging.frameTimeLogging",false,&g_frameTimeLogging},
-        {L"Logging.pipelineTracing",false,&g_pipelineTracing},
-        {L"Logging.uiTransitionLogging",false,&g_uiTransitionLogging},
-        {L"Logging.gpuMemoryLogging",false,&g_gpuMemoryLogging},
+        {L"enableLogging",false,&g_perf},
     };
     std::map<std::wstring,std::wstring> expected;
     for(const auto& option:integers) expected[option.key]=std::to_wstring(option.initial);
     for(const auto& option:booleans) expected[option.key]=option.initial ? L"true" : L"false";
-    expected.insert({{L"Appearance.fontFamily",L""},{L"Appearance.middleEllipsis",L"gridOnly"},
+    expected.insert({{L"Appearance.fontFamily",L""},{L"Appearance.textAntialiasing",L"system"},{L"Appearance.middleEllipsis",L"gridOnly"},
         {L"Selection.filenameOnlySelection",L"gridOnly"},{L"Selection.selectionColor",L"accent"},
         {L"Columns.folderPlacement",L"foldersBottom"}});
     std::map<std::wstring,std::wstring> schema;
@@ -148,13 +145,17 @@ static void TestUserOptions() {
     Check(source.is_open(),"selected settings source unavailable");
     bool settings=false; std::wstring line,group;
     const std::wregex category(LR"(^- ([A-Za-z][A-Za-z0-9]*):\s*$)"),
-        option(LR"(^    - ([A-Za-z][A-Za-z0-9]*): (.*?)\s*$)");
+        option(LR"(^    - ([A-Za-z][A-Za-z0-9]*): (.*?)\s*$)"),
+        rootOption(LR"(^- ([A-Za-z][A-Za-z0-9]*): (.*?)\s*$)");
     while(std::getline(source,line)) {
         if(line.find(L"// ==WindhawkModSettings==")!=std::wstring::npos) {settings=true; continue;}
         if(line.find(L"// ==/WindhawkModSettings==")!=std::wstring::npos) break;
         if(!settings) continue;
         std::wsmatch match;
-        if(std::regex_match(line,match,category)) group=match[1];
+        if(std::regex_match(line,match,rootOption)) {
+            Check(schema.emplace(match[1].str(),match[2].str()).second,"duplicate root user option");
+            group.clear();
+        } else if(std::regex_match(line,match,category)) group=match[1];
         else if(std::regex_match(line,match,option)) {
             std::wstring value=match[2];
             if(value.size()>=2 && value.front()==L'"' && value.back()==L'"') value=value.substr(1,value.size()-2);
@@ -166,8 +167,12 @@ static void TestUserOptions() {
     std::vector<std::function<void()>> restore;
     for(const auto& option:integers) {auto before=option.setting->load(); restore.push_back([=] {*option.setting=before;});}
     for(const auto& option:booleans) {auto before=option.setting->load(); restore.push_back([=] {*option.setting=before;});}
+    std::atomic<bool>* diagnostics[]={&g_selectionLogging,&g_frameTimeLogging,
+        &g_pipelineTracing,&g_uiTransitionLogging,&g_gpuMemoryLogging};
+    for(auto* setting:diagnostics) {const bool before=setting->load(); restore.push_back([=] {*setting=before;});}
     const auto family=ConfiguredFontFamily(); const auto placement=g_folderPlacement.load();
     const auto middle=g_middleEllipsis.load(),filename=g_filenameOnly.load();
+    const auto antialiasing=g_textAntialiasing.load();
     const auto rgb=g_selectionRgb.load(); const auto wheel=g_wheelLines.load();
     const bool accent=g_dynamicAccent.load();
     struct Restore {
@@ -176,6 +181,7 @@ static void TestUserOptions() {
     } guard{restore,[&] {
         AcquireSRWLockExclusive(&g_fontFamilyLock); g_fontFamily=family; ReleaseSRWLockExclusive(&g_fontFamilyLock);
         g_folderPlacement=placement; g_middleEllipsis=middle; g_filenameOnly=filename;
+        g_textAntialiasing=antialiasing; ++g_textRenderingRevision;
         g_selectionRgb=rgb; g_dynamicAccent=accent; g_wheelLines=wheel;
     }};
     SettingsFixture::reads.clear(); SettingsFixture::values=&values; LoadSettings();
@@ -183,9 +189,18 @@ static void TestUserOptions() {
     for(const auto& [key,value]:schema) Check(SettingsFixture::reads[key]==1,"option read more than once or through the wrong key");
     for(const auto& option:integers) Check(option.setting->load()==option.initial,"integer default binding");
     for(const auto& option:booleans) Check(option.setting->load()==option.initial,"boolean default binding");
+    for(auto* setting:diagnostics) Check(!setting->load(),"unified logging default left a diagnostic enabled");
     Check(ConfiguredFontFamily().empty() && g_dynamicAccent && g_middleEllipsis==ViewOption::GridOnly &&
         g_filenameOnly==ViewOption::GridOnly && g_folderPlacement==FolderPlacement::AlwaysBottom,"string default binding");
     const auto set=[&](const wchar_t* key,const std::wstring& value) {values[key]=value; LoadSettings();};
+    for(const auto& [value,mode]:std::initializer_list<std::pair<const wchar_t*,TextAntialiasing>>{
+        {L"system",TextAntialiasing::System},{L"smooth",TextAntialiasing::Smooth},
+        {L"sharp",TextAntialiasing::System},{L"aliased",TextAntialiasing::Aliased},
+        {L"SMOOTH",TextAntialiasing::Smooth},{L"unknown",TextAntialiasing::System}}) {
+        set(L"Appearance.textAntialiasing",value);
+        Check(g_textAntialiasing==mode,"text antialiasing choice/fallback binding");
+    }
+    values[L"Appearance.textAntialiasing"]=L"system"; LoadSettings();
     for(const auto& option:integers) {
         for(int value:{-6000,option.minimum,(option.minimum+option.maximum)/2,option.maximum,7000}) {
             set(option.key,std::to_wstring(value));
@@ -197,6 +212,8 @@ static void TestUserOptions() {
         for(int value:{0,1,0,-3}) {
             set(option.key,std::to_wstring(value));
             Check(option.setting->load()==(value!=0),"boolean setting cannot be toggled in both directions");
+            if(std::wstring_view(option.key)==L"enableLogging")
+                for(auto* setting:diagnostics) Check(setting->load()==(value!=0),"unified logging did not toggle every diagnostic");
         }
         values[option.key]=schema.at(option.key);
     }

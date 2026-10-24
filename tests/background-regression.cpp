@@ -14,7 +14,12 @@
 #include "audit-fixture.h"
 #include "locale-fixture.h"
 #include "settings-fixture.h"
+#include "selection-log-fixture.h"
 #include GPU_OVERLAY_SOURCE
+#undef Wh_Log
+#undef CoCreateInstance
+#undef SetWinEventHook
+#undef MessageBoxW
 #undef Wh_GetIntSetting
 #undef Wh_GetStringSetting
 #undef Wh_FreeStringSetting
@@ -22,6 +27,7 @@
 #undef CreateThread
 #undef DCompositionCreateDevice
 #undef GetQueueStatus
+#undef GetKeyState
 #undef GetFocus
 #undef GetForegroundWindow
 #undef IsWindowVisible
@@ -468,6 +474,9 @@ static void PrimeSnapshotWatch(ViewState& state, const std::wstring& directory) 
     state.validatedFolderStamp->change = FindFirstChangeNotificationW(directory.c_str(), FALSE,
         FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
     Check(state.validatedFolderStamp->change != INVALID_HANDLE_VALUE, "private snapshot watch");
+    state.directoryWatch=std::make_unique<FolderWatch>();
+    state.directoryWatch->stamp=state.validatedFolderStamp;
+    state.directoryWatch->change=state.validatedFolderStamp->change;
     state.validatedFolderRevision = 0;
 }
 
@@ -1144,7 +1153,7 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
         state->hwnd = CreateWindowExW(0, L"STATIC", L"hidden-gpu", WS_CHILD,
             0, 0, 400, 400, frame, nullptr, GetModuleHandleW(nullptr), nullptr);
         state->nativeHwnd = state->hwnd;
-        state->frameHwnd = frame;
+        state->frameHwnd = state->activeTabHost = frame;
         state->fontPx = 16;
         state->rowPx = 34;
     }
@@ -1370,7 +1379,7 @@ static void TestNativeStartupPipeline(const std::wstring& directory) {
 }
 
 static void TestRenameSizing() {
-    for (bool rtl : {false, true}) {
+    for (bool rtl : {false, true}) for (bool externalDestroy : {false, true}) {
         ViewState state;
         HWND frame = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"rename-frame",
             WS_POPUP | WS_VISIBLE, -32000, -32000, 640, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1395,9 +1404,10 @@ static void TestRenameSizing() {
         Check(r.editor != nullptr, "rename native EDIT");
         r.index = 0; r.path = entry.path; r.folder = state.folderPath;
         r.tab = state.activeTabHost; r.native = state.nativeHwnd; r.frameRect = initial;
-        SetWindowLongPtrW(r.editor, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
-        r.originalProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(r.editor, GWLP_WNDPROC,
-            reinterpret_cast<LONG_PTR>(RenameEditProc)));
+        // Subclass reference data must not depend on the control's USERDATA.
+        SetWindowLongPtrW(r.editor, GWLP_USERDATA, 0x227);
+        Check(SetWindowSubclass(r.editor, RenameEditProc, reinterpret_cast<UINT_PTR>(RenameEditProc),
+            reinterpret_cast<DWORD_PTR>(&state)), "rename editor subclass");
         SendMessageW(r.editor, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), FALSE);
         RepositionRenameEdit(state);
         SetWindowPos(r.editor, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -1433,11 +1443,27 @@ static void TestRenameSizing() {
         state.columns[0].end = NameTextOrigin(state) - ListStartX(state) + state.horizontalScroll + 50.f;
         RepositionRenameEdit(state);
         Check(width() <= 41, "rename minimum width escaped a narrow Name column");
-        CancelRename(state);
-        Check(!r.editor, "rename sizing session leaked its editor");
+        for (WPARAM key : {VK_RETURN, VK_ESCAPE}) {
+            const auto epoch = r.epoch;
+            SendMessageW(r.editor, WM_KEYDOWN, key, 0);
+            SendMessageW(r.editor, WM_CHAR, key, 0);
+            MSG decision{};
+            Check(PeekMessageW(&decision, state.hwnd, kMsgRenameDecision, kMsgRenameDecision, PM_REMOVE) &&
+                decision.wParam == (key == VK_RETURN ? 1u : 0u) &&
+                decision.lParam == static_cast<LPARAM>(epoch), "rename key decision lost its session epoch");
+            Check(!PeekMessageW(&decision, state.hwnd, kMsgRenameDecision, kMsgRenameDecision, PM_REMOVE),
+                "rename character generated a duplicate decision");
+        }
+        Check(GetWindowLongPtrW(r.editor, GWLP_USERDATA) == 0x227, "rename subclass overwrote control USERDATA");
+        const HWND editor = r.editor;
+        const auto epoch = r.epoch;
+        if (externalDestroy) Check(DestroyWindow(editor), "external rename destruction");
+        else CancelRename(state);
+        Check(!r.editor && !IsWindow(editor) && !r.parentSubclassInstalled && r.epoch > epoch,
+            "rename destruction leaked its editor, parent subclass or session epoch");
         DestroyWindow(state.hwnd); DestroyWindow(frame);
     }
-    std::cout << "PASS: native rename EDIT grows/shrinks from live text, stops at the column, preserves caret and handles undo/Unicode in LTR/RTL\n";
+    std::cout << "PASS: rename subclass preserves native text/undo/caret, Enter/Escape epochs, USERDATA and cancellation/external destruction in LTR/RTL\n";
 }
 
 static void TestEscapeClipboard() {
@@ -1644,6 +1670,13 @@ static void TestPreviewInput() {
 #include "column-minimum-smoke.h"
 #include "namespace-mutations-smoke.h"
 #include "status-button-smoke.h"
+#include "lifetime-race-smoke.h"
+#include "render-quality-smoke.h"
+#include "llm-report-smoke.h"
+#include "rename-handoff-smoke.h"
+#include "rename-reorder-smoke.h"
+#include "unexpected-input-smoke.h"
+#include "adaptive-image-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1674,7 +1707,17 @@ int wmain(int argc,wchar_t** argv) {
             CloseHandle(file);
         }
         const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--namespace-mutations")==0) {
+        if (argc>1 && wcscmp(argv[1],L"--adaptive-images")==0) {
+            TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
+        } else if (argc>1 && wcscmp(argv[1],L"--unexpected-inputs")==0) {
+            TestUnexpectedInputs(fixture.wstring(),argc>2 ? argv[2] : L"all");
+        } else if (argc>1 && wcscmp(argv[1],L"--llm-report")==0) {
+            TestLlmReport(); TestFilesystemMutationDelivery(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--render-quality")==0) {
+            TestRenderQuality(); TestToggleRepaint();
+        } else if (argc>1 && wcscmp(argv[1],L"--lifetime")==0) {
+            TestLifetimeRaces(); TestDispatchStateRetirement();
+        } else if (argc>1 && wcscmp(argv[1],L"--namespace-mutations")==0) {
             TestNamespaceItemMutations(fixture.wstring());
             TestNativeStartupPipeline(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--office-locks")==0) {
@@ -1736,6 +1779,11 @@ int wmain(int argc,wchar_t** argv) {
                 WS_POPUP|WS_VISIBLE,-32000,-32000,800,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
             Check(frame!=nullptr,"row compositor frame");
             TestRowComposition<ViewState>(frame); DestroyWindow(frame); g_writeFactory.Reset();
+        } else if (argc>1 && wcscmp(argv[1],L"--rename")==0) {
+            TestRenameSizing();
+            TestRenameHandoff(fixture.wstring());
+            TestEditorSelectionOwnership(fixture.wstring());
+            TestRenameReorderReadiness(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {
             TestNativeSuppression();
             TestGraphicsIsolation(fixture.wstring());
@@ -1745,6 +1793,8 @@ int wmain(int argc,wchar_t** argv) {
             TestAttachedLifecycle(fixture.wstring());
             TestUiFeedbackAudit(fixture.wstring());
         } else {
+        TestLlmReport(); TestRenderQuality(); TestToggleRepaint();
+        TestLifetimeRaces(); TestDispatchStateRetirement();
         TestStatusButtonLayout();
         TestUserOptions();
         TestClippingPreflight();
@@ -1763,6 +1813,7 @@ int wmain(int argc,wchar_t** argv) {
         TestSnapshotSelectionRestoration(fixture.wstring());
         ProfileExecutableIcons();
         TestIconQueueIsolation();
+        TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
         TestFrameBudgets();
         TestPipelineTrace();
         TestPropertyPoolIsolation(fixture.wstring());
@@ -1782,6 +1833,10 @@ int wmain(int argc,wchar_t** argv) {
         TestTimingReadiness(fixture.wstring());
         TestMirroredWindowCoordinates(fixture.wstring());
         TestRenameSizing();
+        TestRenameHandoff(fixture.wstring());
+        TestEditorSelectionOwnership(fixture.wstring());
+        TestRenameReorderReadiness(fixture.wstring());
+        TestUnexpectedInputs(fixture.wstring());
         TestEscapeClipboard();
         TestPreviewInput();
         TestNativeStartupPipeline(fixture.wstring());
@@ -1795,7 +1850,7 @@ int wmain(int argc,wchar_t** argv) {
         Check(g_shellViewHooks.empty(), "frame lifecycle/creation hooks outlived their overlays");
         ShutDownFrames();
         ShutDownBackgroundWorkers();
-        Check(g_backgroundLifetimes.empty() && !g_backgroundReaper && !g_backgroundReaperWake,
+        Check(!g_backgroundLifetimes && !g_backgroundReaper && !g_backgroundReaperWake,
               "background shutdown leaked lifetime registry/handles");
         Check(std::filesystem::weakly_canonical(fixture).parent_path() ==
               std::filesystem::weakly_canonical(std::filesystem::path(temporary)),

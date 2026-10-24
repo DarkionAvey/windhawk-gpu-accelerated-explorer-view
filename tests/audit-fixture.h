@@ -49,3 +49,27 @@ inline HRESULT WINAPI FramePulse() {
 #define CreateThread AuditFixture::Thread
 #define DCompositionCreateDevice AuditFixture::Composition
 #define DwmFlush AuditFixture::FramePulse
+// Only explicitly enabled private discovery/failure scenarios are substituted.
+#include <exdisp.h>
+namespace ReportApiFixture {
+inline thread_local bool countShellWindows=false, failEvents=false;
+inline thread_local unsigned shellWindowsCalls=0;
+inline thread_local bool suppressRenameError=false;
+inline thread_local unsigned renameErrors=0;
+inline int WINAPI Message(HWND window,LPCWSTR text,LPCWSTR title,UINT flags) {
+    if (suppressRenameError && !wcscmp(title,L"Rename")) {++renameErrors; return IDOK;}
+    return ::MessageBoxW(window,text,title,flags);
+}
+inline HRESULT WINAPI Create(REFCLSID cls,IUnknown* outer,DWORD flags,REFIID iid,void** result) {
+    if (countShellWindows && cls==CLSID_ShellWindows) {++shellWindowsCalls; *result=nullptr; return E_FAIL;}
+    return ::CoCreateInstance(cls,outer,flags,iid,result);
+}
+inline HWINEVENTHOOK WINAPI Event(DWORD first,DWORD last,HMODULE module,WINEVENTPROC callback,
+        DWORD process,DWORD thread,DWORD flags) {
+    if (failEvents) return nullptr;
+    return ::SetWinEventHook(first,last,module,callback,process,thread,flags);
+}
+}
+#define CoCreateInstance ReportApiFixture::Create
+#define SetWinEventHook ReportApiFixture::Event
+#define MessageBoxW ReportApiFixture::Message

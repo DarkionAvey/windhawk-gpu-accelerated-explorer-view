@@ -5,7 +5,7 @@ static void TestResizeText(HWND frame) {
         state.hwnd=CreateWindowExW(0,L"STATIC",L"resize text",WS_CHILD,0,0,1000,600,
             frame,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(state.hwnd!=nullptr,"resize text window");
-        state.frameHwnd=frame; state.nativeHwnd=state.hwnd;
+        state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
         state.visible=state.inScope=state.detailsViewActive=state.loaded=state.columnsView=true;
         state.rtlLayout=rtl; state.firstContentSubmittedAt=GetTickCount64(); state.deferColumnProviders=false;
         UpdateMetrics(state);

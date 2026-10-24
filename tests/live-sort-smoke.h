@@ -25,7 +25,7 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     state.hwnd=CreateWindowExW(0,L"STATIC",L"live-sort",WS_CHILD,
         0,0,640,360,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
     Check(state.hwnd!=nullptr,"live sort window");
-    state.frameHwnd=frame; state.nativeHwnd=state.activeTabHost=state.hwnd;
+    state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
     state.background->hwnd=state.hwnd; state.folderPath=directory;
     state.visible=state.inScope=true;
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
@@ -218,7 +218,7 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     ViewState volumes;
     volumes.hwnd=CreateWindowExW(0,L"STATIC",L"live-capacity-sort",WS_CHILD,
         0,0,640,360,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
-    volumes.frameHwnd=frame; volumes.nativeHwnd=volumes.activeTabHost=volumes.hwnd;
+    volumes.frameHwnd=volumes.activeTabHost=frame; volumes.nativeHwnd=volumes.hwnd;
     volumes.thisPcGpu=volumes.visible=volumes.inScope=volumes.nativeRowsComplete=true;
     volumes.nativeRowsNeedCapture=false; volumes.folderPath=kThisPcLocation;
     volumes.sort.key=PKEY_FreeSpace; volumes.sort.kind=SortKind::ShellProperty;

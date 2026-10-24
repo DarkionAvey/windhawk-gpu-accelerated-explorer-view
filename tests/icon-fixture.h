@@ -6,6 +6,8 @@
 #include <atomic>
 #include <string>
 #include <string_view>
+#include <algorithm>
+#include <cstring>
 #include <propvarutil.h>
 #include <propkey.h>
 
@@ -49,6 +51,44 @@ struct Session {
 #define GetDriveTypeW CapacityFixture::DriveType
 #define GetDiskFreeSpaceExW CapacityFixture::Space
 
+namespace AdaptiveImageFixture {
+inline std::atomic<bool> enabled{false};
+inline std::atomic<UINT> sourceLimit{UINT_MAX},maximumRequest{0};
+inline std::atomic<unsigned> requests{0},blocked{0};
+inline HANDLE gate=nullptr;
+class Factory final : public IShellItemImageFactory {
+    std::atomic<ULONG> refs{1};
+    bool slow;
+public:
+    explicit Factory(bool wait) : slow(wait) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+        if(!out) return E_POINTER; *out=nullptr;
+        if(iid!=IID_IUnknown && iid!=IID_IShellItemImageFactory) return E_NOINTERFACE;
+        *out=static_cast<IShellItemImageFactory*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {return ++refs;}
+    ULONG STDMETHODCALLTYPE Release() override {const auto n=--refs; if(!n) delete this; return n;}
+    HRESULT STDMETHODCALLTYPE GetImage(SIZE size,SIIGBF,HBITMAP* out) override {
+        if(!out) return E_POINTER; *out=nullptr;
+        if(size.cx<=0 || size.cy<=0) return E_INVALIDARG;
+        ++requests; UINT before=maximumRequest.load();
+        while(before<UINT(size.cx) && !maximumRequest.compare_exchange_weak(before,UINT(size.cx))) {}
+        if(slow) {++blocked; WaitForSingleObject(gate,INFINITE); --blocked;}
+        const UINT side=std::min({UINT(size.cx),sourceLimit.load(),2048u});
+        BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth=LONG(side); info.bmiHeader.biHeight=-LONG(std::max(1u,side/2));
+        info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32; info.bmiHeader.biCompression=BI_RGB;
+        void* bits=nullptr; *out=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+        if(!*out || !bits) return E_OUTOFMEMORY;
+        memset(bits,255,size_t(side)*std::max(1u,side/2)*4); return S_OK;
+    }
+};
+struct Session {
+    Session() {gate=CreateEventW(nullptr,TRUE,FALSE,nullptr); sourceLimit=UINT_MAX; requests=blocked=maximumRequest=0; enabled=true;}
+    ~Session() {enabled=false; if(gate) SetEvent(gate);}
+};
+}
+
 namespace IconFixture {
 inline HANDLE gate = nullptr;
 inline std::atomic<unsigned> blocked{0};
@@ -80,6 +120,10 @@ struct Session {
     ~Session() { enabled = false; if (gate) SetEvent(gate); }
 };
 inline HRESULT WINAPI CreateItem(PCWSTR path, IBindCtx* context, REFIID iid, void** output) {
+    if(AdaptiveImageFixture::enabled && path && std::wstring_view(path).starts_with(L"wh-adaptive-image:")) {
+        auto* factory=new AdaptiveImageFixture::Factory(std::wstring_view(path).find(L"slow")!=std::wstring_view::npos);
+        const HRESULT hr=factory->QueryInterface(iid,output); factory->Release(); return hr;
+    }
     if (enabled.load() && path && std::wstring_view(path).starts_with(L"wh-icon-test:")) {
         *output = nullptr;
         return E_INVALIDARG;
@@ -93,11 +137,20 @@ inline HRESULT WINAPI CreateItem(PCWSTR path, IBindCtx* context, REFIID iid, voi
 // Delays only explicit synthetic property paths. Real stores and all COM,
 // dispatch, generation checks and result delivery remain the production path.
 namespace PropertyFixture {
+inline thread_local const PROPVARIANT* sortVariant=nullptr;
 inline HANDLE gate = nullptr;
 inline std::atomic<unsigned> blocked{0};
 inline std::atomic<bool> enabled{false};
 inline HRESULT WINAPI Store(PCWSTR path, IBindCtx* context, GETPROPERTYSTOREFLAGS flags,
                             REFIID iid, void** output) {
+    if (sortVariant && path && std::wstring_view(path)==L"wh-property-test:nan") {
+        IPropertyStore* store=nullptr;
+        HRESULT hr=PSCreateMemoryPropertyStore(IID_PPV_ARGS(&store));
+        if (FAILED(hr)) return hr;
+        hr=store->SetValue(PKEY_Rating,*sortVariant);
+        if (SUCCEEDED(hr)) hr=store->QueryInterface(iid,output);
+        store->Release(); return hr;
+    }
     if (CapacityFixture::Matches(path)) return CapacityFixture::Store(iid,output);
     if (enabled.load() && path && std::wstring_view(path).starts_with(L"wh-property-test:")) {
         if (std::wstring_view(path).find(L"slow") != std::wstring_view::npos) {

@@ -15,3 +15,21 @@ struct Session {
 };
 }
 #define GetQueueStatus FrameInputFixture::QueueStatus
+
+// Explicit test modifiers must survive nested Shell/window message pumps.
+// SetKeyboardState changes the thread's live queue snapshot, which subsequent
+// messages can replace. Substitute only production calls in a scoped fixture.
+namespace ModifierFixture {
+inline thread_local BYTE* active=nullptr;
+inline SHORT WINAPI Key(int key) {
+    if(!active || key<0 || key>=256) return ::GetKeyState(key);
+    return SHORT((active[key]&0x80 ? 0x8000 : 0) | (active[key]&1));
+}
+struct Session {
+    BYTE keys[256]{};
+    BYTE* previous=active;
+    Session() {active=keys;}
+    ~Session() {active=previous;}
+};
+}
+#define GetKeyState ModifierFixture::Key

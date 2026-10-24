@@ -56,7 +56,7 @@ static void TestColumnViewTransition(HWND frame) {
         state.hwnd = CreateWindowExW(0, L"STATIC", L"view-mode-transition", WS_CHILD,
             0, 0, 640, 400, frame, nullptr, GetModuleHandleW(nullptr), nullptr);
         Check(state.hwnd != nullptr, "view mode fixture window");
-        state.frameHwnd = frame; state.nativeHwnd = state.activeTabHost = state.hwnd;
+        state.frameHwnd = state.activeTabHost = frame; state.nativeHwnd = state.hwnd;
         state.background->hwnd = state.hwnd;
         state.visible = state.inScope = state.loaded = state.columnsView = true;
         state.rtlLayout = rtl;
@@ -278,8 +278,8 @@ static void TestColumnEntrance(HWND frame) {
         state.hwnd = CreateWindowExW(0, L"STATIC", L"column-entrance", WS_CHILD,
             0, 0, 640, 400, frame, nullptr, GetModuleHandleW(nullptr), nullptr);
         Check(state.hwnd != nullptr, "column fixture window");
-        state.nativeHwnd = state.activeTabHost = state.hwnd;
-        state.frameHwnd = frame;
+        state.nativeHwnd = state.hwnd;
+        state.frameHwnd = state.activeTabHost = frame;
         state.background->hwnd = state.hwnd;
         state.visible = state.inScope = state.loaded = state.columnsView = true;
         state.rtlLayout = rtl;

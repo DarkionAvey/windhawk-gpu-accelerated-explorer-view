@@ -72,19 +72,13 @@ static void TestDriveSpaceRefresh() {
     CapacityFixture::freeBytes=125;
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     {
-        // Private thread state only. A user's Alt key (or a preceding message
-        // pump's modifier snapshot) must not turn synthetic F5 into Alt+F5.
-        struct KeyboardState {
-            BYTE saved[256]{};
-            KeyboardState() {Check(GetKeyboardState(saved),"capacity refresh keyboard snapshot");}
-            ~KeyboardState() {SetKeyboardState(saved);}
-        } keys;
-        BYTE modifiers[256]{}; modifiers[VK_MENU]=0x80;
-        Check(SetKeyboardState(modifiers),"capacity refresh modified-key fixture");
+        // Scoped simulated input remains stable through nested message pumps
+        // and never depends on or changes the user's keyboard state.
+        ModifierFixture::Session modifiers;
+        modifiers.keys[VK_MENU]=0x80;
         OverlayProc(state.hwnd,WM_KEYDOWN,VK_F5,0);
         Check(state.propertyEpoch==propertyEpoch,"Alt+F5 unexpectedly forced a volume refresh");
-        modifiers[VK_MENU]=0;
-        Check(SetKeyboardState(modifiers),"capacity refresh unmodified-key fixture");
+        modifiers.keys[VK_MENU]=0;
         OverlayProc(state.hwnd,WM_KEYDOWN,VK_F5,0);
     }
     Check(state.propertyEpoch!=propertyEpoch,"This PC F5 did not invalidate provider values");

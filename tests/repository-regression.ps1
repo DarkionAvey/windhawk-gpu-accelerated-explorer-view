@@ -37,19 +37,23 @@ try {
     Write-Utf8 $readme $text
     Publish-ModRelease $fixture $new
     $latest = Join-Path $fixture 'latest.cpp'
+    $export = Join-Path $fixture 'gpu-accelerated-explorer-view.wh.cpp'
     $archive = Join-Path $fixture 'previous-versions'
     Assert ((Get-SourceHash $latest) -eq $newHash) 'latest differs from the tested source'
+    Assert ((Get-SourceHash $export) -eq $newHash) 'Windhawk export differs from the tested source'
     Assert ((Get-SourceHash (Join-Path $archive '0.9.9.cpp')) -eq $oldHash) 'historical bytes changed'
     Assert ((Get-SourceHash (Join-Path $archive '0.9.10.cpp')) -eq $newHash) 'archive differs from latest'
     Assert (@(Get-VersionSources $fixture).Count -eq 0) 'numbered sources remain at root'
     Copy-Item -LiteralPath (Join-Path $archive '0.9.10.cpp') -Destination $new
     Publish-ModRelease $fixture $new
     Assert ((Get-SourceHash $latest) -eq $newHash) 'identical archive retry failed'
+    Assert ((Get-SourceHash $export) -eq $newHash) 'identical archive retry changed the Windhawk export'
     Write-Utf8 $old ($original + 'conflict')
     Copy-Item -LiteralPath (Join-Path $archive '0.9.10.cpp') -Destination $new
     Reject { Publish-ModRelease $fixture $new } 'conflicting history was overwritten'
     Assert ((Test-Path -LiteralPath $new) -and (Test-Path -LiteralPath $old)) 'archive conflict moved working files'
     Assert ((Get-SourceHash $latest) -eq $newHash) 'archive conflict changed latest'
+    Assert ((Get-SourceHash $export) -eq $newHash) 'archive conflict changed the Windhawk export'
     Remove-Item -LiteralPath $old, $new
     Copy-Item -LiteralPath (Join-Path $archive '0.9.9.cpp') -Destination $old
     Reject { Publish-ModRelease $fixture $old } 'older release replaced latest'
@@ -78,15 +82,18 @@ try {
         Set-Location -LiteralPath $temporary
         Reject { & $build -WindhawkDirectory $fakeWindhawk } 'failed regression published a release'
         Assert ((Get-SourceHash $latest) -eq $newHash) 'failed tests changed latest'
+        Assert ((Get-SourceHash $export) -eq $newHash) 'failed tests changed the Windhawk export'
         Assert (Test-Path -LiteralPath $next) 'failed tests discarded the working source'
         Assert (!(Test-Path -LiteralPath (Join-Path $archive '0.9.11.cpp'))) 'failed tests archived the candidate'
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); [IO.File]::AppendAllText($SourceFile, "changed during testing")'
         Reject { & $build -WindhawkDirectory $fakeWindhawk } 'source changed during testing was published'
+        Assert ((Get-SourceHash $export) -eq $newHash) 'source-change guard published the Windhawk export'
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory)'
         & $build -WindhawkDirectory $fakeWindhawk
         Assert ((Get-ModVersion $latest) -eq [version]'0.9.11') 'successful run did not finalize'
         Assert ((Get-SourceHash $latest) -eq
             (Get-SourceHash (Join-Path $archive '0.9.11.cpp'))) 'final published/archive copies differ'
+        Assert ((Get-SourceHash $export) -eq (Get-SourceHash $latest)) 'final Windhawk export differs from latest'
     } finally { Set-Location -LiteralPath $outside.Path }
     $previousWindhawk = $env:WINDHAWK_HOME
     try {

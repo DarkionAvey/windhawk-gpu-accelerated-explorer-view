@@ -8,7 +8,7 @@ static void TestColumnFitComposition(HWND frame) {
         state.hwnd=CreateWindowExW(0,L"STATIC",L"column-fit-composition",WS_CHILD,
             0,0,800,480,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(state.hwnd!=nullptr,"fit composition window");
-        state.frameHwnd=frame; state.nativeHwnd=state.activeTabHost=state.hwnd;
+        state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
         state.background->hwnd=state.hwnd;
         state.visible=state.inScope=state.loaded=state.columnsView=state.detailsViewActive=true;
         state.rtlLayout=rtl; state.total=40; state.entries.resize(40); state.selectedFlags.assign(40,0);

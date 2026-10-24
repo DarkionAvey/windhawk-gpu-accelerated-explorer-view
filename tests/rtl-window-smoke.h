@@ -1,6 +1,9 @@
 // Exercise real USER mirroring, rather than setting rtlLayout on LTR HWNDs.
 // All windows remain off screen; focus/cursor APIs use the private fixtures.
 static void TestMirroredWindowCoordinates(const std::wstring& directory) {
+    // These messages model plain Escape/arrows. Nested Shell pumps can replace
+    // the thread's keyboard snapshot; never inherit desktop modifier state.
+    ModifierFixture::Session modifiers;
     Check(SUCCEEDED(OleInitialize(nullptr)),"RTL window STA");
     const auto previousFactory=g_writeFactory;
     Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),

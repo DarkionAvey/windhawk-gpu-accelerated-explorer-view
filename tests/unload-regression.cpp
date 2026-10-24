@@ -42,6 +42,11 @@ static HMODULE Load(const wchar_t* path) {
 }
 
 int wmain(int argc,wchar_t** argv) {
+    if(argc==3 && wcscmp(argv[2],L"--process-exit")==0) {
+        HMODULE module=Load(argv[1]);
+        if(!Export<BOOL(*)()>(module,"BlockedPoolAtProcessExit")()) return 3;
+        ExitProcess(0); // Loader teardown, deliberately without Wh_ModUninit.
+    }
     if(argc!=2) return 2;
     entered=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     released=CreateEventW(nullptr,TRUE,FALSE,nullptr);
@@ -49,6 +54,31 @@ int wmain(int argc,wchar_t** argv) {
     exitWorker=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     unloaded=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     try {
+        {
+            wchar_t executable[MAX_PATH]{}; Check(GetModuleFileNameW(nullptr,executable,MAX_PATH)!=0,"exit fixture executable");
+            std::wstring command=L"\""+std::wstring(executable)+L"\" \""+argv[1]+L"\" --process-exit";
+            STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION process{};
+            Check(CreateProcessW(executable,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process),
+                "process-exit child creation");
+            const DWORD wait=WaitForSingleObject(process.hProcess,10000);
+            DWORD code=1;
+            if(wait==WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess,&code);
+            else {TerminateProcess(process.hProcess,1); WaitForSingleObject(process.hProcess,5000);}
+            CloseHandle(process.hThread); CloseHandle(process.hProcess);
+            Check(wait==WAIT_OBJECT_0 && code==0,"loader teardown joined an abandoned pool callback at process exit");
+            std::cout<<"PASS: graceful process exit with a blocked pool callback and registry-only worker ownership, without explicit mod cleanup\n";
+        }
+        {
+            HMODULE module=Load(argv[1]);
+            HWND frame=Export<HWND(*)()>(module,"RetainedFrameAfterHookUpgrade")();
+            Check(frame!=nullptr,"upgraded hook owner retained its frame subclass");
+            Export<void(*)()>(module,"Before")(); unload();
+            Check(FreeLibrary(module),"retained frame DLL release");
+            MEMORY_BASIC_INFORMATION memory{};
+            Check(VirtualQuery(module,&memory,sizeof(memory)) && memory.AllocationBase!=module,"frame test DLL remained mapped");
+            SendMessageW(frame,WM_NULL,0,0); Check(DestroyWindow(frame),"retained frame after DLL unmapping");
+            std::cout<<"PASS: frame messages/destruction after upgraded-hook owner release and verified DLL unmapping\n";
+        }
         {
             HMODULE nested=Load(argv[1]);
             Export<void(*)(int,FARPROC)>(nested,"Prepare")(0,reinterpret_cast<FARPROC>(RecursiveDispatch));
@@ -97,6 +127,24 @@ int wmain(int argc,wchar_t** argv) {
         }
         std::cout<<"PASS: all seven API hooks drain after removal, 21 real DLL unloads before callback-thread exit, no delayed TLS destructor\n";
         {
+            HMODULE rename=Load(argv[1]);
+            HWND editor=Export<HWND(*)()>(rename,"RetainedRenameEditor")();
+            Check(editor!=nullptr,"retained rename editor kept its subclass or freed font");
+            HWND frame=GetParent(editor);
+            Export<void(*)()>(rename,"Before")(); unload();
+            Check(FreeLibrary(rename)!=FALSE,"rename DLL release");
+            MEMORY_BASIC_INFORMATION memory{};
+            Check(VirtualQuery(rename,&memory,sizeof(memory)) && memory.AllocationBase!=rename,
+                "rename test DLL remained mapped");
+            // These messages and NCDESTROY run after verified DLL unmapping.
+            Check(SetWindowTextW(editor,L"after unload"),"detached EDIT lost its native procedure");
+            wchar_t text[32]{};
+            Check(GetWindowTextW(editor,text,32)==12 && wcscmp(text,L"after unload")==0,
+                "detached EDIT cannot process native text messages");
+            Check(DestroyWindow(frame)!=FALSE && !IsWindow(editor),"detached EDIT destruction after unload");
+            std::cout<<"PASS: surviving rename EDIT has no mod subclass, uses a stock font and handles text/destruction after verified DLL unmapping\n";
+        }
+        {
             HMODULE barrier=Load(argv[1]);
             Check(Export<BOOL(*)()>(barrier,"NativeBarrierRetirement")(),"native creation barrier did not suppress/retire with its owning overlay");
             Export<void(*)()>(barrier,"Before")();
@@ -112,8 +160,8 @@ int wmain(int argc,wchar_t** argv) {
             std::cout<<"PASS: actual disable restores host visibility and nonempty native list geometry after zero-size echoes, before verified DLL unmapping\n";
         }
         HMODULE module=Load(argv[1]);
-        Check(Export<BOOL(*)()>(module,"FailedInitialization")(),"failed initialization retained a stale class/factory/event");
-        std::cout<<"PASS: failed hook initialization repairs stale class ownership and unwinds its class, event and factory\n";
+        Check(Export<BOOL(*)()>(module,"FailedInitialization")(),"module-owned class conflict or initialization unwind failed");
+        std::cout<<"PASS: module-owned overlay class rejects conflicts, coexists with the EXE class and unwinds with its event/factory after failed hooks\n";
         Check(Export<BOOL(*)()>(module,"NestedRetirement")(),"nested destruction freed live overlay state/resources");
         std::cout<<"PASS: foreign threads cannot borrow ViewState; reentrant destruction detaches immediately and retires state/resources after the outer callback\n";
         IUnknown* sink=Export<IUnknown*(*)()>(module,"RetainSink")();

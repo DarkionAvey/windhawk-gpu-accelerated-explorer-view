@@ -157,17 +157,15 @@ static void TestFilesystemMutationDelivery(const std::wstring& fixture) {
     Check(Eventually(settled) && state.total == 2 && state.directoryToken != inFlight,
         "names completion did not release the coalesced follow-up scan");
 
-    // Match cut/paste away: the active watch moves on, while its snapshot
-    // retains the original kernel handle. Returning must reject old names.
+    // History retains only a weak stamp. Once the watch lane moves on, cached
+    // folders release their handles and returns require fresh names.
     CacheDepartingFolder(state);
     auto retained = state.folderCache.folders.at(directory).changeStamp;
-    Check(retained && retained->change != INVALID_HANDLE_VALUE, "snapshot lost its change handle");
     CloseDirectoryWatch(state);
+    Check(Eventually([&]{return retained.expired();}),"cached history kept a directory watch alive after navigation");
     const auto moved = JoinPath(fixture, L"mutation-moved.txt");
     Check(MoveFileW(first.c_str(), moved.c_str()) && DeleteFileW(second.c_str()),
         "private move/delete away from cached folder");
-    Check(WaitForSingleObject(retained->change, 10000) == WAIT_OBJECT_0,
-        "cached snapshot did not observe changes while its worker moved on");
     state.loaded = false;
     Check(!RestoreCachedFolder(state) && state.entries.empty() && !state.loaded,
         "changed cached folder flashed stale names");

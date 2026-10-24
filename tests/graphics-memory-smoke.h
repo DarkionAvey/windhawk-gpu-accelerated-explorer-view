@@ -30,7 +30,7 @@ static void TestGraphicsMemoryProbe() {
         state->hwnd=CreateWindowExW(0,L"STATIC",L"private memory surface",WS_CHILD,
             0,0,3840,2160,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(state->hwnd!=nullptr,"memory probe child");
-        state->frameHwnd=frame; state->nativeHwnd=state->hwnd;
+        state->frameHwnd=state->activeTabHost=frame; state->nativeHwnd=state->hwnd;
         state->fontPx=16; state->rowPx=32; state->loaded=true;
         Check(EnsureTarget(*state),"memory probe target");
         if(!adapter) {

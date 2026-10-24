@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.227
+// @version         0.9.230
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -28,22 +28,18 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - Prioritizes responsiveness and animations over efficiency.
 - Less likely to break in future Windows updates since it does not modify the default views of explorer but recreates them
 
-## Use
-1. Install [Windhawk](https://windhawk.net/).
-2. Click the "Create a new mod" button.
-3. Paste the contents of [`latest.cpp`](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/latest.cpp).
-4. Compile and enable it.
-5. Customize options.
-
-
 ## Features
 - **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
+- **Text Antialiasing** — Use Windows monitor tuning, smooth grayscale, or no antialiasing while preserving transparent backgrounds.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
 - **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
+
+## Report bugs
+Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues).
 */
 // ==/WindhawkModReadme==
 
@@ -62,6 +58,13 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
     - fontFamily: ""
       $name: Font family
       $description: Enter an installed font name. Leave blank to use Explorer's font.
+    - textAntialiasing: system
+      $name: Text antialiasing
+      $description: Preserves transparent backgrounds. Windows uses native monitor tuning. Font customization tools can override these choices.
+      $options:
+        - system: Windows default
+        - smooth: Smooth grayscale
+        - aliased: No antialiasing
     - secondaryTextOpacity: 45
       $name: Date, type and size text opacity (%)
       $description: Higher = brighter text; lower = fainter text.
@@ -204,6 +207,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 #include <dcomp.h>
 #include <directmanipulation.h>
 #include <dwrite.h>
+#include <dwrite_3.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <roapi.h>
@@ -249,7 +253,20 @@ namespace {
 // arrays must live on the heap, even when used only in a rare branch.
 struct ShellPathStorage { wchar_t value[32768]{}; };
 
-constexpr wchar_t kOverlayClass[] = L"WindhawkWindowsGpuOverlayTest";
+constexpr wchar_t kOverlayClass[] = L"" WH_MOD_ID L"-overlay";
+HINSTANCE OverlayModuleInstance() {
+    HMODULE module=nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(kOverlayClass),&module);
+    return module;
+}
+HRESULT CreatePixelAlignedVisual(IDCompositionDevice* device,IDCompositionVisual** visual) {
+    const HRESULT hr=device->CreateVisual(visual);
+    if(FAILED(hr)) return hr;
+    // Curves and input retain continuous geometry. Moving already-rasterized
+    // pixels must not bilinearly blur text/icons a second time in DWM.
+    return (*visual)->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+}
 constexpr wchar_t kOverlayProperty[] = L"WindhawkExplorerGpuOverlayOwnsShellView";
 constexpr wchar_t kViewToggleOwnerProperty[] = L"WindhawkExplorerGpuViewToggleOwner";
 constexpr wchar_t kSuppressedHostProperty[] = L"WindhawkGpuSuppressedFolderHost";
@@ -524,6 +541,9 @@ std::atomic<unsigned long long> g_shellAssociationEpoch{1};
 std::atomic<bool> g_scrollbar{true};
 std::atomic<bool> g_instantScrub{false};
 std::atomic<int> g_secondaryOpacity{45};
+enum class TextAntialiasing { System, Smooth, Aliased };
+std::atomic<TextAntialiasing> g_textAntialiasing{TextAntialiasing::System};
+std::atomic<unsigned long long> g_textRenderingRevision{1};
 std::atomic<bool> g_dimDotFiles{true};
 std::atomic<int> g_edgeMargin96{10};
 std::atomic<bool> g_perf{false};
@@ -759,6 +779,7 @@ struct SelectionShape {
 struct TextLayoutCache {
     struct Raster {
         ComPtr<ID2D1Bitmap1> bitmap;
+        unsigned long long rendering = 0;
         float width = 0.f, height = 0.f;
         unsigned long long used = 0;
         size_t bytes = 0;
@@ -1047,13 +1068,14 @@ std::atomic<unsigned long long> g_compositionStarted{0}, g_compositionCompleted{
 bool PresentationFramesActive();
 void SignalPresentationFrames();
 
-DWORD WINAPI CompositionFrameProc(LPVOID) {
+DWORD WINAPI CompositionFrameProc(LPVOID context) {
+    const HANDLE wake=static_cast<HANDLE>(context);
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
     unsigned long long sequence=0;
     // The inner cadence wait can consume shutdown's auto-reset signal. Test
     // the stop condition before returning to an infinite outer wait as well.
     for (;!g_frameStopping.load(std::memory_order_acquire);) {
-        if (WaitForSingleObject(g_frameEvent, INFINITE) != WAIT_OBJECT_0 ||
+        if (WaitForSingleObject(wake, INFINITE) != WAIT_OBJECT_0 ||
             g_frameStopping.load(std::memory_order_acquire)) break;
         while (!g_frameStopping.load(std::memory_order_acquire)) {
             AcquireSRWLockShared(&g_frameLock);
@@ -1087,7 +1109,7 @@ DWORD WINAPI CompositionFrameProc(LPVOID) {
             SignalPresentationFrames();
             // DwmFlush may return immediately if composition is suspended.
             // This short wait prevents an unbounded busy-spin in that case.
-            WaitForSingleObject(g_frameEvent, 1);
+            WaitForSingleObject(wake, 1);
         }
     }
     return 0;
@@ -1097,13 +1119,17 @@ void RegisterAnimationWindow(HWND hwnd) {
     if (!hwnd || IsIconic(GetAncestor(hwnd, GA_ROOT)) ||
         g_frameStopping.load(std::memory_order_relaxed)) return;
     AcquireSRWLockExclusive(&g_frameLock);
+    if (g_frameStopping.load(std::memory_order_acquire)) {
+        ReleaseSRWLockExclusive(&g_frameLock);
+        return;
+    }
     bool found = false;
     for (const auto& t : g_activeFrames) if (t.hwnd == hwnd) found = true;
     if (!found) g_activeFrames.push_back({hwnd, false});
     if (g_frameEvent && !g_frameThread)
-        g_frameThread = CreateThread(nullptr, 0, CompositionFrameProc, nullptr, 0, nullptr);
-    ReleaseSRWLockExclusive(&g_frameLock);
+        g_frameThread = CreateThread(nullptr, 0, CompositionFrameProc, g_frameEvent, 0, nullptr);
     if (g_frameEvent) SetEvent(g_frameEvent);
+    ReleaseSRWLockExclusive(&g_frameLock);
 }
 
 void UnregisterAnimationWindow(HWND hwnd) {
@@ -1120,14 +1146,16 @@ void AcknowledgeAnimationFrame(HWND hwnd) {
 }
 
 void ShutDownFrames() {
-    g_frameStopping.store(true, std::memory_order_release);
-    if (g_frameEvent) SetEvent(g_frameEvent);
-    if (g_frameThread) {
-        WaitForSingleObject(g_frameThread, INFINITE);
-        CloseHandle(g_frameThread);
-        g_frameThread = nullptr;
-    }
     AcquireSRWLockExclusive(&g_frameLock);
+    g_frameStopping.store(true, std::memory_order_release);
+    const HANDLE thread=g_frameThread;
+    if (g_frameEvent) SetEvent(g_frameEvent);
+    ReleaseSRWLockExclusive(&g_frameLock);
+    // Startup is now closed. Never hold the registry lock while joining its worker.
+    if (thread) WaitForSingleObject(thread, INFINITE);
+    AcquireSRWLockExclusive(&g_frameLock);
+    if (thread) CloseHandle(thread);
+    g_frameThread = nullptr;
     if (g_frameEvent) { CloseHandle(g_frameEvent); g_frameEvent = nullptr; }
     g_activeFrames.clear();
     ReleaseSRWLockExclusive(&g_frameLock);
@@ -1855,6 +1883,7 @@ std::mutex g_backgroundLifetimeMutex;
 std::vector<std::shared_ptr<TabBackground>> g_backgroundLifetimes;
 HANDLE g_backgroundReaperWake = nullptr, g_backgroundReaper = nullptr;
 bool g_backgroundShutdown = false; // Protected by g_backgroundLifetimeMutex.
+bool ReapDispatchThreadStates();
 
 DWORD WINAPI BackgroundReaperProc(LPVOID) {
     DWORD delay = INFINITE;
@@ -1876,7 +1905,8 @@ DWORD WINAPI BackgroundReaperProc(LPVOID) {
         // Potentially enormous discarded snapshots are destroyed here, outside
         // the registry lock and outside every overlay's input/paint thread.
         finished.clear();
-        delay = pending ? 50 : INFINITE;
+        const bool dispatchPending=ReapDispatchThreadStates();
+        delay = pending ? 50 : dispatchPending ? 1000 : INFINITE;
     }
     return 0;
 }
@@ -1894,9 +1924,8 @@ DWORD WINAPI TabWorkerEntry(LPVOID context) {
     return 0;
 }
 
-bool RegisterTabBackgroundLocked(const std::shared_ptr<TabBackground>& work) {
-    if (g_backgroundShutdown || g_unloading.load(std::memory_order_acquire) ||
-        work->stopping.load(std::memory_order_acquire)) return false;
+bool EnsureBackgroundRegulatorLocked() {
+    if (g_backgroundShutdown || g_unloading.load(std::memory_order_acquire)) return false;
     if (!g_backgroundReaper) {
         g_backgroundReaperWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (g_backgroundReaperWake)
@@ -1907,6 +1936,11 @@ bool RegisterTabBackgroundLocked(const std::shared_ptr<TabBackground>& work) {
             return false;
         }
     }
+    return true;
+}
+
+bool RegisterTabBackgroundLocked(const std::shared_ptr<TabBackground>& work) {
+    if (work->stopping.load(std::memory_order_acquire) || !EnsureBackgroundRegulatorLocked()) return false;
     if (!work->registered) {
         g_backgroundLifetimes.push_back(work);
         work->registered = true;
@@ -2726,7 +2760,6 @@ struct ViewState {
     struct RenameSession {
         HWND editor = nullptr;
         HFONT font = nullptr;
-        WNDPROC originalProc = nullptr;
         int index = -1;
         std::wstring path, folder;
         HWND tab = nullptr, native = nullptr;
@@ -2962,6 +2995,11 @@ struct ViewState {
     ComPtr<ID2D1DeviceContext> target;
     ComPtr<ID2D1DeviceContext> textRasterTarget;
     ComPtr<ID2D1SolidColorBrush> textRasterBrush;
+    ComPtr<IDWriteRenderingParams> textRenderingParams;
+    HMONITOR textRenderingMonitor = nullptr;
+    unsigned long long textRenderingRevision = 0, textRenderingSerial = 0;
+    TextAntialiasing textAntialiasing = TextAntialiasing::System;
+    D2D1_TEXT_ANTIALIAS_MODE textAntialiasMode = D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
     unsigned long long textRasterTick = 0;
     LONGLONG textRasterBuildTicks = 0;
     bool textRasterPainting = false, textRasterPending = false, textRasterUnavailable = false;
@@ -4991,6 +5029,10 @@ void LoadSettings() {
     AcquireSRWLockExclusive(&g_fontFamilyLock);
     g_fontFamily.swap(fontFamily);
     ReleaseSRWLockExclusive(&g_fontFamilyLock);
+    const auto textSetting=WindhawkUtils::StringSetting::make(L"Appearance.textAntialiasing");
+    const auto textMode=_wcsicmp(textSetting.get(),L"smooth")==0 ? TextAntialiasing::Smooth :
+        _wcsicmp(textSetting.get(),L"aliased")==0 ? TextAntialiasing::Aliased : TextAntialiasing::System;
+    if(g_textAntialiasing.exchange(textMode)!=textMode) ++g_textRenderingRevision;
     g_zebra.store(Wh_GetIntSetting(L"Appearance.zebraStripes") != 0);
     g_emptyRows.store(Wh_GetIntSetting(L"Appearance.showEmptyRows") != 0);
     g_zebraOpacity.store(std::clamp(Wh_GetIntSetting(L"Appearance.zebraOpacity"), 0, 100));
@@ -5522,7 +5564,7 @@ std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& looku
         useAttrs = false;
     }
     const bool listThumbnail = !associationOnly && !state.gridView && UsesThumbnails(state,e);
-    const UINT size = state.gridView || listThumbnail ? IconRequestSize(state) : 32;
+    const UINT size = IconRequestSize(state);
     // Separate small per-file thumbnails from existing 32px per-file icons.
     // Larger tiers can reuse the identical decorated grid image unchanged.
     if (size > 32 || listThumbnail) key = L"@" + std::to_wstring(size) + L"|" + key;
@@ -12404,7 +12446,7 @@ bool EnsureTarget(ViewState& state) {
                                             state.compTarget.GetAddressOf());
     if (FAILED(hr)) goto failed;
     state.graphicsFailureStage=5;
-    hr = state.composition->CreateVisual(state.visual.GetAddressOf());
+    hr = CreatePixelAlignedVisual(state.composition.Get(),state.visual.GetAddressOf());
     if (FAILED(hr)) goto failed;
     hr = state.visual->SetContent(state.swapChain.Get());
     if (FAILED(hr)) goto failed;
@@ -12446,18 +12488,112 @@ failed:
     return false;
 }
 
+bool VisibleOpacity(float opacity) { return std::isfinite(opacity) && opacity>0.f; }
+
+// All drawing coordinates are physical pixels at the contexts' 96-DPI default.
+// Account for the active source-plane translation (and any axis-aligned scale)
+// before rounding, then map back so the input/animation model stays continuous.
+D2D1_POINT_2F SnapDrawPoint(ID2D1RenderTarget* target,D2D1_POINT_2F point,float phase=0.f) {
+    D2D1_MATRIX_3X2_F m{}; target->GetTransform(&m);
+    float dx=96,dy=96; target->GetDpi(&dx,&dy);
+    if(fabsf(m._12)>.00001f || fabsf(m._21)>.00001f || fabsf(m._11)<.00001f || fabsf(m._22)<.00001f)
+        return point; // Intentional rotated icon animation is not an axis-aligned edge.
+    const float sx=m._11*dx/96.f,sy=m._22*dy/96.f,tx=m._31*dx/96.f,ty=m._32*dy/96.f;
+    return D2D1::Point2F((roundf(point.x*sx+tx-phase)+phase-tx)/sx,
+        (roundf(point.y*sy+ty-phase)+phase-ty)/sy);
+}
+D2D1_RECT_F SnapDrawRect(ID2D1RenderTarget* target,D2D1_RECT_F rect) {
+    const auto a=SnapDrawPoint(target,D2D1::Point2F(rect.left,rect.top));
+    const auto b=SnapDrawPoint(target,D2D1::Point2F(rect.right,rect.bottom));
+    return D2D1::RectF(a.x,a.y,b.x,b.y);
+}
+void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColorBrush* brush,float width=1.f) {
+    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
+    width=std::max(1.f,roundf(width));
+    const float phase=(static_cast<int>(width)&1) ? .5f : 0.f;
+    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawLine(SnapDrawPoint(state.target.Get(),a,phase),
+        SnapDrawPoint(state.target.Get(),b,phase),brush,width);
+}
+void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBrush* brush,float width=1.f) {
+    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
+    rect.rect=SnapDrawRect(state.target.Get(),rect.rect);
+    width=std::max(1.f,roundf(width));
+    const float inset=width*.5f;
+    rect.rect.left+=inset; rect.rect.top+=inset; rect.rect.right-=inset; rect.rect.bottom-=inset;
+    if(rect.rect.right<=rect.rect.left || rect.rect.bottom<=rect.rect.top) return;
+    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawRoundedRectangle(rect,brush,width);
+}
+D2D1_ELLIPSE SnapDrawEllipse(ID2D1RenderTarget* target,D2D1_ELLIPSE ellipse) {
+    const auto rect=SnapDrawRect(target,D2D1::RectF(ellipse.point.x-ellipse.radiusX,ellipse.point.y-ellipse.radiusY,
+        ellipse.point.x+ellipse.radiusX,ellipse.point.y+ellipse.radiusY));
+    return D2D1::Ellipse(D2D1::Point2F((rect.left+rect.right)*.5f,(rect.top+rect.bottom)*.5f),
+        (rect.right-rect.left)*.5f,(rect.bottom-rect.top)*.5f);
+}
+void FillEllipsePrimitive(ViewState& state,D2D1_ELLIPSE ellipse,ID2D1SolidColorBrush* brush) {
+    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
+    static_cast<ID2D1RenderTarget*>(state.target.Get())->FillEllipse(SnapDrawEllipse(state.target.Get(),ellipse),brush);
+}
+void StrokeEllipse(ViewState& state,D2D1_ELLIPSE ellipse,ID2D1SolidColorBrush* brush,float width=1.f) {
+    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
+    ellipse=SnapDrawEllipse(state.target.Get(),ellipse); width=std::max(1.f,roundf(width));
+    ellipse.radiusX=std::max(0.f,ellipse.radiusX-width*.5f); ellipse.radiusY=std::max(0.f,ellipse.radiusY-width*.5f);
+    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawEllipse(ellipse,brush,width);
+}
+
+void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
+    const auto revision=g_textRenderingRevision.load(std::memory_order_relaxed);
+    const auto mode=g_textAntialiasing.load(std::memory_order_relaxed);
+    const HMONITOR monitor=checkMonitor || !state.textRenderingSerial ?
+        MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST) : state.textRenderingMonitor;
+    if(state.textRenderingSerial && state.textRenderingRevision==revision &&
+        state.textAntialiasing==mode && state.textRenderingMonitor==monitor) return;
+    ComPtr<IDWriteRenderingParams> native;
+    if(g_writeFactory && FAILED(g_writeFactory->CreateMonitorRenderingParams(monitor,&native)))
+        g_writeFactory->CreateRenderingParams(&native);
+    state.textRenderingParams=native;
+    BOOL smoothing=TRUE;
+    SystemParametersInfoW(SPI_GETFONTSMOOTHING,0,&smoothing,0);
+    state.textAntialiasMode=mode==TextAntialiasing::Aliased || (mode==TextAntialiasing::System && !smoothing) ?
+        D2D1_TEXT_ANTIALIAS_MODE_ALIASED : mode==TextAntialiasing::System ?
+        D2D1_TEXT_ANTIALIAS_MODE_DEFAULT : D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+    if(native && mode!=TextAntialiasing::System) {
+        const auto rendering=mode==TextAntialiasing::Smooth ? DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED :
+            DWRITE_RENDERING_MODE1_ALIASED;
+        const auto fitting=mode==TextAntialiasing::Smooth ? DWRITE_GRID_FIT_MODE_DISABLED : DWRITE_GRID_FIT_MODE_ENABLED;
+        ComPtr<IDWriteFactory3> factory;
+        ComPtr<IDWriteRenderingParams1> params1;
+        ComPtr<IDWriteRenderingParams3> custom;
+        native.As(&params1);
+        if(SUCCEEDED(g_writeFactory.As(&factory)) && SUCCEEDED(factory->CreateCustomRenderingParams(
+                native->GetGamma(),native->GetEnhancedContrast(),
+                params1 ? params1->GetGrayscaleEnhancedContrast() : native->GetEnhancedContrast(),
+                native->GetClearTypeLevel(),native->GetPixelGeometry(),rendering,fitting,&custom)))
+            custom.As(&state.textRenderingParams);
+    }
+    state.textRenderingMonitor=monitor; state.textRenderingRevision=revision; state.textAntialiasing=mode;
+    state.textRasterUnavailable=false; // A user/monitor change licenses a fresh native rendering attempt.
+    ++state.textRenderingSerial; // Old raster variants retire lazily through the existing LRU.
+}
+void ConfigureTextTarget(ViewState& state,ID2D1RenderTarget* target) {
+    target->SetTextRenderingParams(state.textRenderingParams.Get());
+    target->SetTextAntialiasMode(state.textAntialiasMode);
+}
+
 void Fill(ViewState& state, float l, float t, float r, float b,
           unsigned hex, float a=1.f, float radius=0) {
+    if(!VisibleOpacity(a) || r<=l || b<=t) return;
     if (state.rtlLayout) {
         const float newLeft = state.paintWidth - r;
         r = state.paintWidth - l;
         l = newLeft;
     }
-    state.brush->SetColor(Packed(hex, a));
+    const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(l,t,r,b));
+    if(rect.right<=rect.left || rect.bottom<=rect.top) return;
+    state.brush->SetColor(Packed(hex, std::min(1.f,a)));
     if (radius > 0.f)
         state.target->FillRoundedRectangle(D2D1::RoundedRect(
-            D2D1::RectF(l,t,r,b), radius, radius), state.brush.Get());
-    else state.target->FillRectangle(D2D1::RectF(l,t,r,b), state.brush.Get());
+            rect, radius, radius), state.brush.Get());
+    else state.target->FillRectangle(rect, state.brush.Get());
 }
 
 
@@ -12469,6 +12605,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
                     float x, float y, float width, float height, unsigned color,
                     float opacity, bool header, bool sorted, bool wrapped, bool deferCold = false,
                     bool filename = false) {
+    if(!VisibleOpacity(opacity)) return true;
     auto& cache = state.textLayouts[wrapped ? 3 : !header ? 0 : sorted ? 2 : 1];
     auto& shaped = cache.layouts.at(text);
     // Deferral is for newly exposed values. A mask miss at different bounds
@@ -12501,7 +12638,8 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
         const auto size=bitmap->GetPixelSize();
         // Like the ordinary DWrite pixel-snapped path, retain crisp glyphs
         // when scroll/row animation supplies fractional screen coordinates.
-        const float left=roundf(x), top=roundf(y);
+        const auto origin=SnapDrawPoint(state.target.Get(),D2D1::Point2F(x,y));
+        const float left=origin.x,top=origin.y;
         const auto destination=D2D1::RectF(left,top,left+size.width,top+size.height);
         const auto antialias=state.target->GetAntialiasMode();
         state.target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
@@ -12518,7 +12656,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
                 .v={left,top,double(size.width),double(size.height)}},true);
     };
     for (auto& raster : shaped.rasters) {
-        if (raster.width != width || raster.height != height) continue;
+        if (raster.width != width || raster.height != height || raster.rendering!=state.textRenderingSerial) continue;
         raster.used = ++state.textRasterTick;
         raster.painted = state.graphicsPaintSerial;
         draw(raster.bitmap.Get());
@@ -12555,8 +12693,8 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
             state.textRasterUnavailable = true;
             return false;
         }
-        state.textRasterTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     }
+    ConfigureTextTarget(state,state.textRasterTarget.Get());
     const auto size = D2D1::SizeU(static_cast<UINT32>(ceilf(width)), static_cast<UINT32>(ceilf(height)));
     const size_t bytes = GlyphAllocationEstimate(size.width,size.height);
     const size_t budget = kGlyphCacheBudget;
@@ -12584,6 +12722,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     }
     TextLayoutCache::Raster raster;
     raster.width=width; raster.height=height;
+    raster.rendering=state.textRenderingSerial;
     raster.used=++state.textRasterTick; raster.bytes=bytes;
     raster.painted=state.graphicsPaintSerial;
     const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
@@ -12624,7 +12763,9 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
           bool sortedHeader=false, bool wrapped=false, UINT32 highlight=0, bool deferCold=false,
           bool filename=false) {
     if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
-    if (text.empty() || r <= l || b <= t || opacity <= 0.f) return;
+    if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
+    RefreshTextRendering(state);
+    ConfigureTextTarget(state,state.target.Get());
     if (state.rtlLayout) {
         const float newLeft = state.paintWidth - r;
         r = state.paintWidth - l;
@@ -12633,8 +12774,9 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
     // Use the same physical pixel origin for direct and cached glyphs. A
     // fractional animation position must not change coverage when a cold
     // layout becomes a ready bitmap, or interpolate sharp text into a blur.
-    const float textWidth=r-l, textHeight=b-t;
-    l=roundf(l); t=roundf(t); r=l+textWidth; b=t+textHeight;
+    const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(l,t,r,b));
+    l=rect.left; t=rect.top; r=rect.right; b=rect.bottom;
+    if(r<=l || b<=t) return;
     state.brush->SetColor(Packed(hex, opacity));
     auto fmt = !header ? state.textFormat.Get() :
         (sortedHeader && state.sortedHeaderFormat ?
@@ -12670,7 +12812,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
-                    state.target->DrawRoundedRectangle(rc, state.brush.Get(), 1.f);
+                    StrokeRoundedRect(state,rc, state.brush.Get(), 1.f);
                 }
                 state.target->PopAxisAlignedClip();
             }
@@ -12709,9 +12851,9 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
     const float tipY = cy + (descending ? halfHeight : -halfHeight);
     const float thickness = std::max(1.f, Scale96(1, dpi) * 1.5f);
     state.brush->SetColor(Packed(color, opacity));
-    state.target->DrawLine(D2D1::Point2F(cx-halfWidth, wingY),
+    StrokeLine(state,D2D1::Point2F(cx-halfWidth, wingY),
                            D2D1::Point2F(cx, tipY), state.brush.Get(), thickness);
-    state.target->DrawLine(D2D1::Point2F(cx, tipY),
+    StrokeLine(state,D2D1::Point2F(cx, tipY),
                            D2D1::Point2F(cx+halfWidth, wingY), state.brush.Get(), thickness);
 }
 
@@ -12859,7 +13001,7 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
     // through a 256-item cliff. A 790-item folder of small icons fits cheaply;
     // large thumbnails still respect this tab's existing adaptive RAM budget.
     const bool thumbnail = !associationOnly && UsesThumbnails(state,entry);
-    const size_t side = state.gridView || thumbnail ? IconRequestSize(state) : 32;
+    const size_t side = IconRequestSize(state);
     const size_t bytes = sizeof(IconRecord) + 4*sizeof(void*) +
         2*key.size()*sizeof(wchar_t) + (side > 32 ? 12 : 8)*side*side;
     const size_t budget = std::max(FolderCacheBudget(state.folderCache), wanted.size()*bytes);
@@ -13051,6 +13193,7 @@ float ClipboardIconWiggleAngle(float size96, double elapsedMs, size_t seed = 0) 
 
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
                     float opacity = 1.f, float angle = 0.f) {
+    if(!VisibleOpacity(opacity)) return true;
     if (!icon.bitmap) return false;
     if (state.iconDemandStartedAt && (!state.iconFirstDrawLogged ||
         (!icon.association && !state.iconFirstSpecificDrawLogged))) {
@@ -13071,16 +13214,18 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     const float width = sourceWidth * scale, height = sourceHeight * scale;
     x += (side-width)*.5f; y += (side-height)*.5f;
     const float iconX = state.rtlLayout ? state.paintWidth - x - width : x;
+    const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(iconX,y,iconX+width,y+height));
+    if(rect.right<=rect.left || rect.bottom<=rect.top) return true;
     D2D1_MATRIX_3X2_F previous{};
     if (angle != 0.f) {
         state.target->GetTransform(&previous);
         state.target->SetTransform(D2D1::Matrix3x2F::Rotation(angle,
-            D2D1::Point2F(iconX+width*.5f,y+height*.5f)) * previous);
+            D2D1::Point2F((rect.left+rect.right)*.5f,(rect.top+rect.bottom)*.5f)) * previous);
     }
-    const auto rect = D2D1::RectF(iconX,y,iconX+width,y+height);
     if (state.uiTraceDrawItem)
         PipelineEvent(*state.background,{.operation=L"ui.icon.actual[x,y,w,h]",.a=state.uiTraceItem,
-            .b=reinterpret_cast<ULONG_PTR>(icon.bitmap.Get()),.v={iconX,y,width,height}},true);
+            .b=reinterpret_cast<ULONG_PTR>(icon.bitmap.Get()),
+            .v={rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top}},true);
     if (thumbnail) {
         const float dpi = std::max(96,state.textFormatDpi)/96.f;
         const float radius = std::min(std::max(0.f,g_thumbnailCornerRadius96)*dpi,
@@ -13096,8 +13241,12 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         }
         state.thumbnailBrush->SetBitmap(icon.bitmap.Get());
         state.thumbnailBrush->SetOpacity(opacity);
-        state.thumbnailBrush->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale) *
-            D2D1::Matrix3x2F::Translation(iconX,y));
+        state.thumbnailBrush->SetInterpolationMode((rect.right-rect.left)==sourceWidth &&
+            (rect.bottom-rect.top)==sourceHeight && angle==0.f ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR :
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        state.thumbnailBrush->SetTransform(D2D1::Matrix3x2F::Scale(
+            (rect.right-rect.left)/sourceWidth,(rect.bottom-rect.top)/sourceHeight) *
+            D2D1::Matrix3x2F::Translation(rect.left,rect.top));
         state.target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius,radius),
             state.thumbnailBrush.Get());
         // The reusable brush must not pin an evicted bitmap or obsolete device.
@@ -13108,18 +13257,24 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
             const float left = state.rtlLayout ? rect.left : rect.right-badge;
             const float top = static_cast<float>(icon.pixels.thumbnailHeight+2);
             const float size = static_cast<float>(icon.pixels.badgeSize);
-            state.target->DrawBitmap(icon.bitmap.Get(),D2D1::RectF(left,rect.bottom-badge,
-                left+badge,rect.bottom),opacity,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                D2D1::RectF(0,top,size,top+size));
+            const auto badgeRect=SnapDrawRect(state.target.Get(),D2D1::RectF(left,rect.bottom-badge,left+badge,rect.bottom));
+            const auto source=D2D1::RectF(0,top,size,top+size);
+            state.target->DrawBitmap(icon.bitmap.Get(),&badgeRect,opacity,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
         }
-    } else state.target->DrawBitmap(icon.bitmap.Get(),rect,opacity,
-        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,D2D1::RectF(0,0,sourceWidth,sourceHeight));
+    } else {
+        const auto source=D2D1::RectF(0,0,sourceWidth,sourceHeight);
+        const bool unscaled=fabsf((rect.right-rect.left)-sourceWidth)<.001f &&
+            fabsf((rect.bottom-rect.top)-sourceHeight)<.001f && angle==0.f;
+        state.target->DrawBitmap(icon.bitmap.Get(),&rect,opacity,unscaled ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR :
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+    }
     if (angle != 0.f) state.target->SetTransform(previous);
     return true;
 }
 
 void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
                     float opacity = 1.f) {
+    if(!VisibleOpacity(opacity)) return;
     const bool pending = state.clipboardPaths.contains(e.path);
     const float angle = pending ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
         state.clipboardIconElapsedMs,SelectionPathHash(e.path)) : 0.f;
@@ -13605,7 +13760,7 @@ void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                 part.left=state.paintWidth-part.right; part.right=state.paintWidth-left;
             }
             state.brush->SetColor(Packed(rgb,alpha));
-            state.target->DrawRoundedRectangle(D2D1::RoundedRect(part,radius,radius),
+            StrokeRoundedRect(state,D2D1::RoundedRect(part,radius,radius),
                 state.brush.Get(),static_cast<float>(Scale96(1,ViewDpi(state))));
         }
     }
@@ -13870,16 +14025,16 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
     state.brush->SetColor(Packed(headerColor, .75f * opacity));
     const float thickness = std::max(1.f, static_cast<float>(Scale96(1, dpi)));
     if (collapsed) {
-        state.target->DrawLine(D2D1::Point2F(centerX-arrowDirection*unit*.5f,
+        StrokeLine(state,D2D1::Point2F(centerX-arrowDirection*unit*.5f,
             centerY-unit), D2D1::Point2F(centerX+arrowDirection*unit*.5f,
             centerY), state.brush.Get(), thickness);
-        state.target->DrawLine(D2D1::Point2F(centerX+arrowDirection*unit*.5f,
+        StrokeLine(state,D2D1::Point2F(centerX+arrowDirection*unit*.5f,
             centerY), D2D1::Point2F(centerX-arrowDirection*unit*.5f,
             centerY+unit), state.brush.Get(), thickness);
     } else {
-        state.target->DrawLine(D2D1::Point2F(centerX-unit, centerY-unit*.5f),
+        StrokeLine(state,D2D1::Point2F(centerX-unit, centerY-unit*.5f),
             D2D1::Point2F(centerX, centerY+unit*.5f), state.brush.Get(), thickness);
-        state.target->DrawLine(D2D1::Point2F(centerX, centerY+unit*.5f),
+        StrokeLine(state,D2D1::Point2F(centerX, centerY+unit*.5f),
             D2D1::Point2F(centerX+unit, centerY-unit*.5f), state.brush.Get(), thickness);
     }
     Text(state, title, ListStartX(state) + leading + Scale96(18, dpi), top,
@@ -13989,7 +14144,7 @@ bool AppendColumnLayer(ViewState& state, IDCompositionVisual* parent, IUnknown* 
     ComPtr<IDCompositionVisual> visual;
     ComPtr<IDCompositionRectangleClip> clip;
     ComPtr<IDCompositionEffectGroup> fade;
-    if (!parent || !content || FAILED(state.composition->CreateVisual(&visual)) ||
+    if (!parent || !content || FAILED(CreatePixelAlignedVisual(state.composition.Get(),&visual)) ||
         FAILED(state.composition->CreateRectangleClip(&clip)) ||
         FAILED(clip->SetLeft(l)) || FAILED(clip->SetTop(t)) ||
         FAILED(clip->SetRight(r)) || FAILED(clip->SetBottom(b)) ||
@@ -14023,8 +14178,8 @@ bool PrepareFitComposition(ViewState& state, float w, float h) {
     ComPtr<IDCompositionRectangleClip> bounds,contentBounds;
     if (!CreateColumnPlane(state,mode.background,size) || !CreateColumnPlane(state,mode.chrome,size) ||
         (!state.sections.empty() && !CreateColumnPlane(state,mode.groups,size)) ||
-        FAILED(state.composition->CreateVisual(&mode.root)) || FAILED(state.composition->CreateVisual(&items)) ||
-        FAILED(state.composition->CreateVisual(&headings)) ||
+        FAILED(CreatePixelAlignedVisual(state.composition.Get(),&mode.root)) || FAILED(CreatePixelAlignedVisual(state.composition.Get(),&items)) ||
+        FAILED(CreatePixelAlignedVisual(state.composition.Get(),&headings)) ||
         FAILED(state.composition->CreateRectangleClip(&bounds)) ||
         FAILED(bounds->SetRight(w)) || FAILED(bounds->SetBottom(static_cast<float>(mode.size.cy))) ||
         FAILED(mode.root->SetClip(bounds.Get())) ||
@@ -14260,7 +14415,7 @@ bool PrepareModeComposition(ViewState& state) {
     const auto opacity = UiCompositionCurve(state,state.columnHeaderFrom/mode.header,state.columnHeaderTo/mode.header);
     bool ok = bodyY && headerY && headerBottom && opacity && plane(mode.background) && plane(mode.names) && plane(mode.chrome) &&
         (state.sections.empty() || plane(mode.groups)) &&
-        (state.gridView || plane(mode.metadata)) && SUCCEEDED(state.composition->CreateVisual(&mode.root));
+        (state.gridView || plane(mode.metadata)) && SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&mode.root));
     // All planes use the same immutable document coordinates. Columns are
     // independently clipped/transformed; one foreground plane has no metadata
     // underneath a growing Name clip, and backgrounds never slide sideways.
@@ -14276,8 +14431,8 @@ bool PrepareModeComposition(ViewState& state) {
         SUCCEEDED(bounds->SetRight(w)) && SUCCEEDED(bounds->SetBottom(static_cast<float>(mode.size.cy))) &&
         SUCCEEDED(mode.root->SetClip(bounds.Get())) &&
         layer(mode.root.Get(),mode.background.surface.Get(),0.f,mode.header,w,h,nullptr,bodyY.Get(),nullptr) &&
-        SUCCEEDED(state.composition->CreateVisual(&items)) && SUCCEEDED(AppendCompositionVisual(mode.root.Get(),items.Get())) &&
-        SUCCEEDED(state.composition->CreateVisual(&header)) &&
+        SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&items)) && SUCCEEDED(AppendCompositionVisual(mode.root.Get(),items.Get())) &&
+        SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&header)) &&
         SUCCEEDED(state.composition->CreateRectangleClip(&headerClip)) &&
         SUCCEEDED(headerClip->SetRight(w)) && SUCCEEDED(headerClip->SetBottom(headerBottom.Get())) &&
         SUCCEEDED(header->SetClip(headerClip.Get())) &&
@@ -14338,7 +14493,7 @@ struct ModeCompositionFrame {
         if (Rows()) {
             auto& mode=s.modeComposition;
             mode.itemTarget->BeginDraw();
-            mode.itemTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            ConfigureTextTarget(s,mode.itemTarget.Get());
             for(auto* p:{&mode.feedback,&mode.names,&mode.metadata,&mode.groups}) if(p->bitmap) {
                 mode.itemTarget->SetTarget(p->bitmap.Get());
                 mode.itemTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
@@ -14487,12 +14642,12 @@ bool PublishRowScene(ViewState& state) {
     ComPtr<IDCompositionVisual> body,feedback,icons,text,groups;
     ComPtr<IDCompositionRectangleClip> bounds,bodyClip;
     const float w=float(mode.size.cx),h=float(mode.size.cy),bottom=float(ContentViewport(state).bottom);
-    bool ok=SUCCEEDED(state.composition->CreateVisual(&mode.root)) &&
+    bool ok=SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&mode.root)) &&
         SUCCEEDED(state.composition->CreateRectangleClip(&bounds)) &&
         SUCCEEDED(bounds->SetRight(w)) && SUCCEEDED(bounds->SetBottom(h)) &&
         SUCCEEDED(mode.root->SetClip(bounds.Get())) &&
         AppendColumnLayer(state,mode.root.Get(),mode.background.surface.Get(),0,0,w,h) &&
-        SUCCEEDED(state.composition->CreateVisual(&body)) &&
+        SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&body)) &&
         SUCCEEDED(state.composition->CreateRectangleClip(&bodyClip)) &&
         SUCCEEDED(bodyClip->SetTop(mode.header)) && SUCCEEDED(bodyClip->SetRight(w)) &&
         SUCCEEDED(bodyClip->SetBottom(bottom)) && SUCCEEDED(body->SetClip(bodyClip.Get())) &&
@@ -14505,7 +14660,7 @@ bool PublishRowScene(ViewState& state) {
         ok=top && SUCCEEDED(bodyClip->SetTop(top.Get()));
     }
     for(auto* p:{std::addressof(feedback),std::addressof(icons),std::addressof(text)}) if(ok)
-        ok=SUCCEEDED(state.composition->CreateVisual(&*p)) && SUCCEEDED(AppendCompositionVisual(body.Get(),p->Get()));
+        ok=SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&*p)) && SUCCEEDED(AppendCompositionVisual(body.Get(),p->Get()));
     const auto slice=[&](IDCompositionVisual* parent,IUnknown* content,const ViewState::ItemSlice& item) {
         ComPtr<IDCompositionVisual> v; ComPtr<IDCompositionRectangleClip> clip; ComPtr<IDCompositionEffectGroup> alpha;
         const auto y=curve(item.from.top-item.cell.top,item.to.top-item.cell.top);
@@ -14514,7 +14669,7 @@ bool PublishRowScene(ViewState& state) {
             item.sourceLeft-item.cell.left+direction*(item.to.left-item.source.left));
         const auto end=curve(item.cell.top+item.from.height,item.cell.top+item.to.height);
         const auto opacity=curve(item.from.opacity,item.to.opacity);
-        return y && x && end && opacity && SUCCEEDED(state.composition->CreateVisual(&v)) &&
+        return y && x && end && opacity && SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&v)) &&
             SUCCEEDED(state.composition->CreateRectangleClip(&clip)) &&
             SUCCEEDED(clip->SetLeft(item.cell.left)) && SUCCEEDED(clip->SetRight(item.cell.right)) &&
             SUCCEEDED(clip->SetTop(item.cell.top)) && SUCCEEDED(clip->SetBottom(end.Get())) &&
@@ -14528,7 +14683,7 @@ bool PublishRowScene(ViewState& state) {
         ok=slice(feedback.Get(),mode.feedback.surface.Get(),item) && slice(icons.Get(),mode.names.surface.Get(),item) &&
             slice(text.Get(),mode.metadata.surface.Get(),item);
     if(ok && !mode.headings.empty()) {
-        ok=SUCCEEDED(state.composition->CreateVisual(&groups)) && SUCCEEDED(AppendCompositionVisual(mode.root.Get(),groups.Get()));
+        ok=SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&groups)) && SUCCEEDED(AppendCompositionVisual(mode.root.Get(),groups.Get()));
         for(bool ghost:{true,false}) for(const auto& item:mode.headings) if(ok && (item.key<0)==ghost)
             ok=slice(groups.Get(),mode.groups.surface.Get(),item);
     }
@@ -14633,6 +14788,7 @@ void Paint(ViewState& state) {
         return;
     }
     ScopedFlag rasterPainting(state.textRasterPainting);
+    RefreshTextRendering(state,true);
     ++state.graphicsPaintSerial;
     state.presentationContentAccepted=false;
     if (state.itemOpacityToken != state.token) ResetItemContentOpacity(state);
@@ -14701,8 +14857,7 @@ void Paint(ViewState& state) {
     // configured opacity: never invent a second dark/light RGB value.
     state.target->BeginDraw();
     state.target->SetTransform(D2D1::Matrix3x2F::Identity());
-    // Grayscale antialiasing works correctly with premultiplied alpha surfaces.
-    state.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    ConfigureTextTarget(state,state.target.Get());
     if (compositionFrame.active && !compositionFrame.Rows()) {
         for (auto* plane : {&state.modeComposition.names,&state.modeComposition.metadata,&state.modeComposition.groups,&state.modeComposition.chrome}) {
             if (!plane->bitmap) continue;
@@ -14978,7 +15133,7 @@ void Paint(ViewState& state) {
                  state.rtlLayout ? w - left : right, bottom,
                  rgb, opacity, 4.f);
             state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
-            state.target->DrawRoundedRectangle(D2D1::RoundedRect(rc, 4.f, 4.f),
+            StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),
                                                 state.brush.Get(), 1.f);
         }
     }
@@ -15392,10 +15547,10 @@ void Paint(ViewState& state) {
                 D2D1::Point2F(cx, cy), radius, radius);
             state.brush->SetColor(Packed(nameColor,
                 opacity * (.15f + .13f * p)));
-            state.target->FillEllipse(circle, state.brush.Get());
+            FillEllipsePrimitive(state,circle, state.brush.Get());
             state.brush->SetColor(Packed(nameColor,
                 opacity * (.35f + .5f * p)));
-            state.target->DrawEllipse(circle, state.brush.Get(),
+            StrokeEllipse(state,circle, state.brush.Get(),
                 static_cast<float>(Scale96(1, dpi)));
             // The ring grows with progress and fades in with the body. At
             // p=0 no part is visible; no minimum 1-segment stroke is drawn.
@@ -15405,7 +15560,7 @@ void Paint(ViewState& state) {
             for (int i = 0; i < segments; ++i) {
                 const float a = -1.5707963f + sweep * i / segments;
                 const float b = -1.5707963f + sweep * (i + 1) / segments;
-                state.target->DrawLine(
+                StrokeLine(state,
                     D2D1::Point2F(cx + ringRadius * cosf(a), cy + ringRadius * sinf(a)),
                     D2D1::Point2F(cx + ringRadius * cosf(b), cy + ringRadius * sinf(b)),
                     state.brush.Get(), static_cast<float>(Scale96(3, ViewDpi(state))));
@@ -15417,12 +15572,12 @@ void Paint(ViewState& state) {
             const float tail = cx - dir * stem;
             const float stroke = static_cast<float>(Scale96(2, ViewDpi(state)));
             state.brush->SetColor(Packed(nameColor, opacity));
-            state.target->DrawLine(D2D1::Point2F(tail, cy),
+            StrokeLine(state,D2D1::Point2F(tail, cy),
                 D2D1::Point2F(tip, cy), state.brush.Get(), stroke);
-            state.target->DrawLine(D2D1::Point2F(tip, cy),
+            StrokeLine(state,D2D1::Point2F(tip, cy),
                 D2D1::Point2F(tip - dir * radius * .28f, cy - radius * .28f),
                 state.brush.Get(), stroke);
-            state.target->DrawLine(D2D1::Point2F(tip, cy),
+            StrokeLine(state,D2D1::Point2F(tip, cy),
                 D2D1::Point2F(tip - dir * radius * .28f, cy + radius * .28f),
                 state.brush.Get(), stroke);
         }
@@ -15641,7 +15796,7 @@ void RecycleStandbyComposition(ViewState& state) {
     ComPtr<IDCompositionDevice> replacement;
     ComPtr<IDCompositionVisual> visual;
     if (FAILED(DCompositionCreateDevice(state.dxgiDevice.Get(),IID_PPV_ARGS(&replacement))) ||
-        FAILED(replacement->CreateVisual(&visual)) || FAILED(visual->SetContent(state.swapChain.Get())))
+        FAILED(CreatePixelAlignedVisual(replacement.Get(),&visual)) || FAILED(visual->SetContent(state.swapChain.Get())))
         return; // Keep the ready image if allocation fails; retry on a later hide.
     // Device creation can dispatch activation. Never detach a resumed tab's
     // ready composition target; its caller resumes presentation after setup.
@@ -17666,7 +17821,6 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.notificationHost = nullptr;
     ++r.epoch; // Invalidate any queued Enter/Escape/focus messages.
     r.editor = nullptr;
-    r.originalProc = nullptr;
     if (r.font) { DeleteObject(r.font); r.font = nullptr; }
     r.index = -1;
     r.path.clear();
@@ -17746,15 +17900,14 @@ void CancelRename(ViewState& state) {
     CloseRenameEditor(state);
 }
 
-LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
-    auto* state = reinterpret_cast<ViewState*>(
-        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    auto* state = reinterpret_cast<ViewState*>(data);
     // The frame-child EDIT can outlive its overlay HWND during retirement.
     // Its session stays alive until this procedure's final native NCDESTROY.
     const HWND overlay=state ? state->hwnd : nullptr;
     const bool current = state && state->rename.editor == hwnd;
-    WNDPROC original = current ? state->rename.originalProc : nullptr;
     // Notifications cover text mutations; paint also follows font/geometry
     // changes without enumerating each editor mutation message here.
     if (msg == WM_PAINT && current && !state->rename.finishing) {
@@ -17791,8 +17944,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     // Always call the genuine EDIT window procedure through WM_NCDESTROY.
     // The session (and its font) are released only AFTER it has completed.
-    const LRESULT result = original ? CallWindowProcW(original, hwnd, msg, wp, lp) :
-                                      DefWindowProcW(hwnd, msg, wp, lp);
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameEditProc, id);
+    const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
@@ -17842,15 +17995,11 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     r.tab = state.activeTabHost;
     r.native = state.nativeHwnd;
     r.frameRect = rc;
-    SetWindowLongPtrW(edit, GWLP_USERDATA,
-        reinterpret_cast<LONG_PTR>(&state));
-    SetLastError(0);
-    r.originalProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit,
-        GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(RenameEditProc)));
-    if (!r.originalProc) {
-        const DWORD error = GetLastError();
+    // Creation, input and overlay retirement run on this EDIT's owner thread.
+    if (!SetWindowSubclass(edit, RenameEditProc,
+            reinterpret_cast<UINT_PTR>(RenameEditProc), reinterpret_cast<DWORD_PTR>(&state))) {
         CloseRenameEditor(state);
-        Wh_Log(L"[GPU rename] EDIT subclass failed error=%lu", error);
+        Wh_Log(L"[GPU rename] EDIT subclass failed");
         return;
     }
     LOGFONTW editFont = NativeHeaderFont(state);
@@ -20119,7 +20268,8 @@ void TraceObserverActivity(DWORD ownerThread, const wchar_t*& stage,
     }
 }
 
-DWORD WINAPI TabVisibilityObserverProc(LPVOID) {
+DWORD WINAPI TabVisibilityObserverProc(LPVOID context) {
+    const HANDLE wake=static_cast<HANDLE>(context);
     HWND observedFrame = nullptr;
     HWND initialHost = nullptr;
     HWND lastHost = nullptr;
@@ -20129,7 +20279,7 @@ DWORD WINAPI TabVisibilityObserverProc(LPVOID) {
     DWORD lastInputTick = 0;
     DWORD delay = 50; // Avoid a slow first switch after the worker starts.
     while (!g_tabWatchStopping.load(std::memory_order_acquire)) {
-        if (WaitForSingleObject(g_tabWatchWake, delay) != WAIT_TIMEOUT ||
+        if (WaitForSingleObject(wake, delay) != WAIT_TIMEOUT ||
             g_tabWatchStopping.load(std::memory_order_acquire)) break;
         const bool trace = g_perf.load(std::memory_order_relaxed);
         HWND frame = GetAncestor(GetForegroundWindow(), GA_ROOT);
@@ -20264,7 +20414,7 @@ void StartTabVisibilityObserver() {
         g_tabWatchWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (g_tabWatchWake) {
             g_tabWatchThread = CreateThread(nullptr, 0,
-                TabVisibilityObserverProc, nullptr, 0, nullptr);
+                TabVisibilityObserverProc, g_tabWatchWake, 0, nullptr);
             if (g_tabWatchThread)
                 SetThreadPriority(g_tabWatchThread, THREAD_PRIORITY_BELOW_NORMAL);
             else {
@@ -21623,7 +21773,8 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
 
 bool StartPresentation(ViewState& state) {
     if(state.presenter) return true;
-    if(state.presentationOnly || g_unloading.load(std::memory_order_acquire)) return false;
+    if(state.presentationOnly || g_unloading.load(std::memory_order_acquire) ||
+        g_frameStopping.load(std::memory_order_acquire)) return false;
     auto lane=std::make_shared<PresentationLane>(); lane->hwnd=state.hwnd; lane->lifetime=state.lifetimeToken;
     state.background->hwnd=state.hwnd; state.background->presenter=lane;
     state.background->presentationSnapshots.store(true,std::memory_order_release);
@@ -21638,10 +21789,13 @@ bool StartPresentation(ViewState& state) {
     lane->wake=state.background->presentation.wake; state.presenter=lane;
     state.graphicsReady=true; state.graphicsSuspended=false;
     AcquireSRWLockExclusive(&g_frameLock);
-    g_presentationFrames.push_back(lane);
-    if(!g_frameEvent && !g_frameStopping.load(std::memory_order_acquire)) g_frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-    if(g_frameEvent && !g_frameThread) g_frameThread=CreateThread(nullptr,0,CompositionFrameProc,nullptr,0,nullptr);
-    const bool paced=g_frameEvent && g_frameThread;
+    bool paced=false;
+    if(!g_frameStopping.load(std::memory_order_acquire)) {
+        g_presentationFrames.push_back(lane);
+        if(!g_frameEvent) g_frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        if(g_frameEvent && !g_frameThread) g_frameThread=CreateThread(nullptr,0,CompositionFrameProc,g_frameEvent,0,nullptr);
+        paced=g_frameEvent && g_frameThread;
+    }
     ReleaseSRWLockExclusive(&g_frameLock);
     if(!paced) {
         lane->stopping.store(true,std::memory_order_release); SetEvent(lane->wake);
@@ -22087,6 +22241,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_SETTINGCHANGE:
     case WM_FONTCHANGE:
         if (s) {
+            ++g_textRenderingRevision;
             if (msg == WM_SETTINGCHANGE) ReconcileShellVisibility(*s);
             StopKeyboardSelectionAnimation(*s);
             RefreshNativePalette(*s);
@@ -23929,9 +24084,8 @@ void DisposeOverlayState(ViewState* s) {
         // this DLL before retiring the session. Its queued WM_CLOSE now runs
         // entirely in the genuine control procedure, using a stock font.
         const HWND edit=s->rename.editor;
-        if (s->rename.originalProc)
-            SetWindowLongPtrW(edit,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(s->rename.originalProc));
-        SetWindowLongPtrW(edit,GWLP_USERDATA,0);
+        // Disposal is deferred to the outermost owner-thread callback.
+        RemoveWindowSubclass(edit,RenameEditProc,reinterpret_cast<UINT_PTR>(RenameEditProc));
         SendMessageW(edit,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),FALSE);
         SetPresentationVisibility(edit,false);
         FinalizeDestroyedRenameEditor(*s,edit);
@@ -26052,7 +26206,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP,
         rc.left,rc.top,std::max<LONG>(1,rc.right-rc.left),
         std::max<LONG>(1,rc.bottom-rc.top),
-        frame,nullptr,GetModuleHandleW(nullptr),s);
+        frame,nullptr,OverlayModuleInstance(),s);
     if (!overlay) { delete s; return; }
     s->hwnd = overlay;
     g_instances.fetch_add(1);
@@ -26630,21 +26784,43 @@ struct FrameScanThrottle {
     HWND lastInputTarget=nullptr;
 };
 struct DispatchThreadState {
+    HANDLE thread=nullptr; // Real thread lifetime, never a reusable thread ID.
     std::unordered_map<HWND,FrameScanThrottle> frames;
 };
 std::mutex g_dispatchStateMutex;
 std::vector<std::unique_ptr<DispatchThreadState>> g_dispatchStates;
 thread_local DispatchThreadState* t_dispatchState=nullptr; // Trivial: no DLL-unload destructor.
 
-DispatchThreadState& CurrentDispatchThreadState() {
+bool ReapDispatchThreadStates() {
+    std::vector<std::unique_ptr<DispatchThreadState>> retired;
+    bool pending=false;
+    {
+        std::lock_guard lock(g_dispatchStateMutex);
+        for(auto it=g_dispatchStates.begin();it!=g_dispatchStates.end();) {
+            if(WaitForSingleObject((*it)->thread,0)==WAIT_OBJECT_0) {
+                retired.push_back(std::move(*it)); it=g_dispatchStates.erase(it);
+            } else {pending=true; ++it;}
+        }
+    }
+    // Only the regulator calls this: map destruction and handle cleanup stay off UI threads.
+    for(const auto& state:retired) CloseHandle(state->thread);
+    return pending;
+}
+
+DispatchThreadState* CurrentDispatchThreadState() {
     if (!t_dispatchState) {
         auto state=std::make_unique<DispatchThreadState>();
+        if(!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),
+                &state->thread,SYNCHRONIZE,FALSE,0)) return nullptr;
         auto* owned=state.get();
+        std::lock_guard lifetime(g_backgroundLifetimeMutex);
+        if(!EnsureBackgroundRegulatorLocked()) {CloseHandle(state->thread); return nullptr;}
         std::lock_guard lock(g_dispatchStateMutex);
         g_dispatchStates.push_back(std::move(state));
         t_dispatchState=owned;
+        SetEvent(g_backgroundReaperWake);
     }
-    return *t_dispatchState;
+    return t_dispatchState;
 }
 
 LRESULT WINAPI DispatchHook(const MSG* msg) {
@@ -26680,7 +26856,6 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     }
     // Reuse the existing per-frame scan state for diagnostic input timestamps:
     // no second polling loop, input hook, or per-tab worker is introduced.
-    auto& frameThrottles=CurrentDispatchThreadState().frames;
     const bool traceTab = msg && g_perf.load(std::memory_order_relaxed);
     const ULONGLONG hookStart = traceTab ? GetTickCount64() : 0;
     if (traceTab && msg->hwnd && !g_unloading.load(std::memory_order_relaxed)) {
@@ -26702,16 +26877,19 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
                 if (IsExplorerFrame(owner)) frame = owner;
             }
             if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
-                const ULONGLONG tick = GetTickCount64();
-                FrameScanThrottle& throttle = frameThrottles[frame];
-                throttle.lastInputTick = tick;
-                throttle.lastInputMessage = msg->message;
-                throttle.lastInputTarget = msg->hwnd;
-                // Includes Explorer content clicks; only a matching later
-                // DISPATCH_SWITCH establishes that it was a tab activation.
-                Wh_Log(L"[GPU tabs] INPUT_CANDIDATE tick=%llu frame=%p target=%p message=0x%X selected-before=%p",
-                    static_cast<unsigned long long>(tick), frame, msg->hwnd,
-                    msg->message, ActiveExplorerTab(frame));
+                auto* dispatch=CurrentDispatchThreadState();
+                if(dispatch) {
+                    const ULONGLONG tick = GetTickCount64();
+                    FrameScanThrottle& throttle = dispatch->frames[frame];
+                    throttle.lastInputTick = tick;
+                    throttle.lastInputMessage = msg->message;
+                    throttle.lastInputTarget = msg->hwnd;
+                    // Includes Explorer content clicks; only a matching later
+                    // DISPATCH_SWITCH establishes that it was a tab activation.
+                    Wh_Log(L"[GPU tabs] INPUT_CANDIDATE tick=%llu frame=%p target=%p message=0x%X selected-before=%p",
+                        static_cast<unsigned long long>(tick), frame, msg->hwnd,
+                        msg->message, ActiveExplorerTab(frame));
+                }
             }
         }
     }
@@ -26878,9 +27056,11 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
                 }
             }
             if (nearTabStrip) {
-                auto previous = frameThrottles.find(frame);
-                const HWND lastObserved = previous == frameThrottles.end() ?
-                    nullptr : previous->second.lastSelectedTab;
+                HWND lastObserved=nullptr;
+                if(auto* dispatch=CurrentDispatchThreadState()) {
+                    const auto previous=dispatch->frames.find(frame);
+                    if(previous!=dispatch->frames.end()) lastObserved=previous->second.lastSelectedTab;
+                }
                 // If Explorer already changed the host during the input
                 // dispatch, the normal DISPATCH_SWITCH path will present it
                 // immediately. Do not run a 3.5s probe of the new tab.
@@ -26926,6 +27106,9 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
         !checkTabIdentity) return result;
     HWND frame = GetAncestor(msg->hwnd, GA_ROOT);
     if (!IsExplorerFrame(frame) || !BelongsToThisProcess(frame)) return result;
+    auto* dispatch=CurrentDispatchThreadState();
+    if(!dispatch) return result;
+    auto& frameThrottles=dispatch->frames;
     // Recovery deadlines are per Explorer frame. One window's tab switch must
     // never postpone or force discovery for a different Explorer window.
     if (frameThrottles.size() > 32) {
@@ -27106,9 +27289,9 @@ void DrawViewToggle(const ViewState& state, const DRAWITEMSTRUCT& destination) {
     DRAWITEMSTRUCT item = destination;
     BP_PAINTPARAMS params{sizeof(params)};
     params.dwFlags = BPPF_ERASE;
-    // Explorer's frame can use redirected/composited child surfaces. Plain
-    // GDI text can leave zero alpha there, which an RGB-only readback misses.
-    // Publish the whole control opaque, including the icon's antialiased pixels.
+    // Rebuild every pixel. Explorer's frame isn't the status chrome's painter:
+    // parent-background requests can leave stale hover/icon pixels untouched.
+    // WS_EX_TRANSPARENT only delays sibling painting; it doesn't blend alpha.
     HPAINTBUFFER buffer = state.viewToggleBufferedPaint ? BeginBufferedPaint(
         destination.hDC, &destination.rcItem, BPBF_TOPDOWNDIB, &params, &item.hDC) : nullptr;
     if (!buffer) item.hDC = destination.hDC;
@@ -27178,16 +27361,34 @@ LRESULT CALLBACK ViewToggleSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             if (msg == WM_PAINT) EndPaint(hwnd, &paint);
             return 0;
         }
-        if (msg == WM_ERASEBKGND) return 1; // Our painter fills every pixel, without a light flash.
-        if (msg == WM_MOUSEMOVE && !state->viewToggleHot) {
-            state->viewToggleHot = true;
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
-            TrackMouseEvent(&track);
-            InvalidateRect(hwnd, nullptr, FALSE);
+        if (msg == WM_ERASEBKGND) return 1; // Paint covers the complete client area.
+        if (msg == WM_MOUSEMOVE) {
+            RECT client{}; GetClientRect(hwnd, &client);
+            const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            const bool hot = IsWindowEnabled(hwnd) && PtInRect(&client, point);
+            if (hot && !state->viewToggleHot) {
+                TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&track);
+            }
+            if (hot != state->viewToggleHot) {
+                state->viewToggleHot = hot;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
-        if ((msg == WM_MOUSELEAVE || msg == WM_CANCELMODE || (msg == WM_SHOWWINDOW && !wp)) && state->viewToggleHot) {
+        if ((msg == WM_MOUSELEAVE || msg == WM_CANCELMODE || msg == WM_SHOWWINDOW ||
+                (msg == WM_ENABLE && !wp)) && state->viewToggleHot) {
             state->viewToggleHot = false;
             InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (msg == WM_CAPTURECHANGED || msg == WM_LBUTTONUP) {
+            // Leave notifications can be deferred during native button capture.
+            POINT point{}; RECT client{}; GetClientRect(hwnd, &client);
+            const bool hot = IsWindowEnabled(hwnd) && IsWindowVisible(hwnd) &&
+                GetCursorPos(&point) && ScreenToClient(hwnd, &point) && PtInRect(&client, point);
+            if (hot != state->viewToggleHot) {
+                state->viewToggleHot = hot;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
         if (msg == WM_THEMECHANGED || msg == WM_SYSCOLORCHANGE || msg == WM_SETTINGCHANGE) {
             state->viewTogglePaletteDirty = true;
@@ -27284,7 +27485,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred) {
         }
         if (!IsWindow(state->viewToggle)) {
             state->viewToggle = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"BUTTON", L"",
-                WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON | BS_ICON | BS_FLAT, 0, 0, 1, 1, frame,
+                WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON | BS_ICON | BS_FLAT, 0, 0, 1, 1, frame,
                 nullptr, GetModuleHandleW(nullptr), nullptr);
             if (!state->viewToggle) continue;
             UsePhysicalClientCoordinates(state->viewToggle);
@@ -27449,6 +27650,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred) {
         {
             SetWindowPos(state->viewToggle, HWND_TOP, x, y, width, height,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            InvalidateRect(state->viewToggle, nullptr, FALSE);
             if(g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU status] layout source=%s root=%p neighbor=%p x=%d y=%d w=%d h=%d gap=%d pending=%d",
                     fromNative ? (state->viewToggleGeometry.accessible ? L"accessibility" : L"HWND") : L"fallback",
@@ -27461,32 +27663,21 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred) {
 
 namespace {
 bool g_overlayClassRegistered=false;
+HINSTANCE g_overlayClassInstance=nullptr;
 bool RegisterOverlayClass() {
     WNDCLASSEXW wc{}; wc.cbSize=sizeof(wc);
-    wc.lpfnWndProc=OverlayProc; wc.hInstance=GetModuleHandleW(nullptr);
+    wc.lpfnWndProc=OverlayProc; wc.hInstance=OverlayModuleInstance();
     wc.lpszClassName=kOverlayClass; wc.style=CS_DBLCLKS;
     wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
-    if (!RegisterClassExW(&wc)) {
-        if (GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return false;
-        WNDCLASSEXW previous{}; previous.cbSize=sizeof(previous);
-        if (!GetClassInfoExW(wc.hInstance,kOverlayClass,&previous)) return false;
-        if (previous.lpfnWndProc!=OverlayProc) {
-            // A failed older initialization can leave a process-owned class
-            // pointing into an unloaded DLL. Never accept that stale WndProc.
-            if (!UnregisterClassW(kOverlayClass,wc.hInstance) || !RegisterClassExW(&wc)) {
-                Wh_Log(L"[GPU lifetime] CLASS_CONFLICT error=%lu",GetLastError());
-                return false;
-            }
-            Wh_Log(L"[GPU lifetime] CLASS_REBOUND old-proc=%p",previous.lpfnWndProc);
-        }
-    }
+    if (!wc.hInstance || !RegisterClassExW(&wc)) return false;
+    g_overlayClassInstance=wc.hInstance;
     g_overlayClassRegistered=true;
     return true;
 }
 void ReleaseOverlayClass() {
     if (!g_overlayClassRegistered) return;
     bool reported=false;
-    while (!UnregisterClassW(kOverlayClass,GetModuleHandleW(nullptr))) {
+    while (!UnregisterClassW(kOverlayClass,g_overlayClassInstance)) {
         const DWORD error=GetLastError();
         if (error==ERROR_CLASS_DOES_NOT_EXIST) break;
         if (!reported) {
@@ -27498,6 +27689,7 @@ void ReleaseOverlayClass() {
         RemoveAllOverlays(); DrainApiCallbacks(); Sleep(25);
     }
     g_overlayClassRegistered=false;
+    g_overlayClassInstance=nullptr;
 }
 }
 
@@ -27523,9 +27715,12 @@ BOOL Wh_ModInit() {
         return failedInitialization();
     }
     g_tabWatchStopping.store(false, std::memory_order_release);
+    AcquireSRWLockExclusive(&g_frameLock);
     g_frameStopping.store(false, std::memory_order_release);
     g_frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_frameEvent || !RegisterOverlayClass()) return failedInitialization();
+    const bool frameReady=g_frameEvent!=nullptr;
+    ReleaseSRWLockExclusive(&g_frameLock);
+    if (!frameReady || !RegisterOverlayClass()) return failedInitialization();
     // Required pre-layout barriers. The subclass also covers native internal
     // layout messages; these hooks cover NOSENDCHANGING and deferred batches.
     if (!WindhawkUtils::SetFunctionHook(ShowWindow, NativeShowWindowHook, &g_showWindowOriginal) ||
@@ -27584,6 +27779,7 @@ void Wh_ModUninit() {
         std::lock_guard lock(g_dispatchStateMutex);
         if (g_perf.load(std::memory_order_relaxed))
             Wh_Log(L"[GPU lifetime] DISPATCH_STATES retired=%zu",g_dispatchStates.size());
+        for(const auto& state:g_dispatchStates) CloseHandle(state->thread);
         g_dispatchStates.clear();
         t_dispatchState=nullptr;
     }

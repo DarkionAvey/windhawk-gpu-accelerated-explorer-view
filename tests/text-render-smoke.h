@@ -2,6 +2,7 @@
 // transparent backgrounds. Both render paths use the real offscreen GPU.
 template<class State>
 static void TestTextRaster(State& state) {
+    RefreshTextRendering(state,true);
     ComPtr<ID2D1Image> original; state.target->GetTarget(&original);
     ComPtr<ID2D1Bitmap1> surface, readback;
     auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
@@ -11,7 +12,7 @@ static void TestTextRaster(State& state) {
     Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(360,160),nullptr,0,&props,&readback)),"text readback");
     state.target->SetTarget(surface.Get()); state.paintWidth=360;
     auto capture=[&](const std::wstring& text,bool cached,bool wrapped,float width,unsigned color,float opacity,bool deferred=false,bool filename=false) {
-        state.target->BeginDraw(); state.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        state.target->BeginDraw(); ConfigureTextTarget(state,state.target.Get());
         state.target->Clear(D2D1::ColorF(0,0.f));
         if (cached) {
             if constexpr (requires { state.frameProfile.textDeferred; })

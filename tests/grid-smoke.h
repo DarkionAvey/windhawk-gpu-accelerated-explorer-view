@@ -308,7 +308,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         state.hwnd = CreateWindowExW(0, L"STATIC", L"grid-fixture", WS_CHILD,
             0, 0, 640, 480, frame, nullptr, GetModuleHandleW(nullptr), nullptr);
         Check(state.hwnd != nullptr, "grid window");
-        state.frameHwnd = frame; state.nativeHwnd = state.activeTabHost = state.hwnd;
+        state.frameHwnd = state.activeTabHost = frame; state.nativeHwnd = state.hwnd;
         FocusFixture::Session focus(state.frameHwnd,state.nativeHwnd);
         state.background->hwnd = state.hwnd;
         state.gridView = state.visible = state.inScope = state.loaded = true;
@@ -593,7 +593,8 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             state.itemsPerRow-unselectedAnchor)<.05f,
             "unselected caret stole the zoom viewport");
         // The display can exceed both the old zoom and texture-size limits.
-        // Captions and provider request tiers must stop growing independently.
+        // Captions remain bounded, while image demand follows the physical
+        // viewport/budget rather than the unbounded offscreen cell extent.
         const auto windowData=SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,
             reinterpret_cast<LONG_PTR>(&state));
         const auto listZoom=state.rowHeight96[false];
@@ -618,9 +619,9 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             return IconKey(state,state.entries[0],lookup,attrs);
         };
         const auto largeKey=imageKey();
-        Check(largeIcon>512 && state.itemsPerRow==1 && IconRequestSize(state)==512 &&
+        Check(largeIcon>512 && state.itemsPerRow==1 && IconRequestSize(state)>=512 && IconRequestSize(state)<=640 &&
             state.fontPx==cappedFont && state.rowHeight96[false]==listZoom,
-            "extra-large grid image stayed capped, grew its caption/requests or changed list zoom");
+            "extra-large grid image grew its viewport-bounded requests/caption or changed list zoom");
         Paint(state);
         Check(state.target && state.fontPx==cappedFont,"oversized grid paint lost its target/caption");
         state.manipulationEnabled=true; state.touchpadPinching=false;

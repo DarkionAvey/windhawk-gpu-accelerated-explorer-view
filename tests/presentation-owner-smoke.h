@@ -41,8 +41,9 @@ struct Hold {
 struct Tab {
     ViewState state;
     HWND frame=nullptr;
-    Tab(const wchar_t* label,int count,bool rtl=false,bool grid=false,bool grouped=false,int width=800,int height=480) {
-        frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private presentation frame",
+    Tab(const wchar_t* label,int count,bool rtl=false,bool grid=false,bool grouped=false,int width=800,int height=480,
+        const wchar_t* frameClass=L"STATIC") {
+        frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,frameClass,L"private presentation frame",
             WS_POPUP|WS_VISIBLE,-32000,-32000,width,height,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         state.hwnd=CreateWindowExW(0,L"STATIC",label,WS_CHILD|WS_VISIBLE,0,0,width,height,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(frame && state.hwnd,"presentation fixture windows");

@@ -21,7 +21,7 @@ extern "C" __declspec(dllexport) void Prepare(int kind,FARPROC original) {
 }
 extern "C" __declspec(dllexport) void Invoke(int kind) {
     switch(kind) {
-    case 0: DispatchHook(nullptr); break;
+    case 0: (void)CurrentDispatchThreadState(); DispatchHook(nullptr); break;
     case 1: TranslateAcceleratorHook(nullptr,nullptr,nullptr); break;
     case 2: NativeShowWindowHook(nullptr,SW_HIDE); break;
     case 3: NativeShowWindowAsyncHook(nullptr,SW_HIDE); break;
@@ -32,19 +32,55 @@ extern "C" __declspec(dllexport) void Invoke(int kind) {
 }
 extern "C" __declspec(dllexport) void Before() { Wh_ModBeforeUninit(); }
 extern "C" __declspec(dllexport) void Unload() { Wh_ModUninit(); }
+extern "C" __declspec(dllexport) BOOL BlockedPoolAtProcessExit() {
+    g_unloading=false; g_backgroundShutdown=false;
+    struct ExitFixture {HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr), gate=CreateEventW(nullptr,TRUE,FALSE,nullptr);};
+    static ExitFixture fixture;
+    auto work=std::make_shared<TabBackground>();
+    work->hwnd=reinterpret_cast<HWND>(&fixture);
+    if (!StartTabPoolWorker(work,work->detailProviders[0],+[](void*)->DWORD {
+            SetEvent(fixture.entered); WaitForSingleObject(fixture.gate,INFINITE); return 0;
+        })) return FALSE;
+    work.reset(); // The global registry is now the worker group's only owner.
+    return WaitForSingleObject(fixture.entered,5000)==WAIT_OBJECT_0;
+}
+extern "C" __declspec(dllexport) HWND RetainedFrameAfterHookUpgrade() {
+    g_unloading=false;
+    WNDCLASSW type{}; type.hInstance=GetModuleHandleW(nullptr); type.lpfnWndProc=DefWindowProcW;
+    type.lpszClassName=L"CabinetWClass"; RegisterClassW(&type);
+    HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,type.lpszClassName,L"retained frame",WS_POPUP,
+        -32000,-32000,100,100,nullptr,nullptr,type.hInstance,nullptr);
+    if (!frame) return nullptr;
+    ViewState first; first.frameHwnd=frame;
+    InitializeFrameShellEvents(first);
+    if (!first.frameLifecycleSubscribed) return nullptr;
+    first.viewEvents=nullptr; // Owner admitted before the shared hook acquired its eventual identity.
+    ReleaseFrameShellViewHook(first);
+    return !g_shellViewHooks.contains(frame) && static_cast<ULONG_PTR>(GetWindowLongPtrW(frame,GWLP_WNDPROC))==
+        GetClassLongPtrW(frame,GCLP_WNDPROC) ? frame : nullptr;
+}
 extern "C" __declspec(dllexport) IUnknown* RetainSink() {
     return static_cast<IDispatch*>(new ShellAutomationNavigationSink(nullptr));
 }
 extern "C" __declspec(dllexport) BOOL FailedInitialization() {
-    WNDCLASSW stale{}; stale.hInstance=GetModuleHandleW(nullptr);
-    stale.lpfnWndProc=DefWindowProcW; stale.lpszClassName=kOverlayClass;
-    if(!RegisterClassW(&stale)) return FALSE;
-    // WH_EDITING deliberately rejects hooks. Initialization must unwind its
-    // earlier factory/event/class, including the replaced stale class.
-    if(Wh_ModInit()) return FALSE;
+    const HINSTANCE module=OverlayModuleInstance();
+    if(!module || module==GetModuleHandleW(nullptr)) return FALSE;
+    WNDCLASSW conflict{}; conflict.hInstance=module;
+    conflict.lpfnWndProc=DefWindowProcW; conflict.lpszClassName=kOverlayClass;
+    if(!RegisterClassW(&conflict)) return FALSE;
+    // A conflicting class in our own module must be rejected, never reused.
+    if(Wh_ModInit() || g_overlayClassRegistered) return FALSE;
     WNDCLASSW remaining{};
-    return !g_frameEvent && !g_writeFactory && !g_overlayClassRegistered &&
-        !GetClassInfoW(stale.hInstance,kOverlayClass,&remaining);
+    const bool preserved=GetClassInfoW(module,kOverlayClass,&remaining) && remaining.lpfnWndProc==DefWindowProcW;
+    if(!UnregisterClassW(kOverlayClass,module) || !preserved) return FALSE;
+    // The same name in the EXE has a different owner. WH_EDITING rejects the
+    // later API hooks: only the DLL's newly registered class should unwind.
+    conflict.hInstance=GetModuleHandleW(nullptr);
+    if(!RegisterClassW(&conflict) || Wh_ModInit()) return FALSE;
+    const bool unwound=!g_frameEvent && !g_writeFactory && !g_overlayClassRegistered &&
+        !GetClassInfoW(module,kOverlayClass,&remaining) &&
+        GetClassInfoW(conflict.hInstance,kOverlayClass,&remaining) && remaining.lpfnWndProc==DefWindowProcW;
+    return UnregisterClassW(kOverlayClass,conflict.hInstance) && unwound;
 }
 static bool editDestroyed=false;
 extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
@@ -54,15 +90,13 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
         type.lpszClassName=name;
         if(!RegisterClassW(&type) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return FALSE;
     }
-    type.lpfnWndProc=OverlayProc; type.lpszClassName=kOverlayClass;
-    if(!RegisterClassW(&type) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return FALSE;
-    g_overlayClassRegistered=true;
+    if(!RegisterOverlayClass()) return FALSE;
     HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"CabinetWClass",L"barrier DLL fixture",
         WS_POPUP|WS_VISIBLE,-32000,-32000,320,240,nullptr,nullptr,type.hInstance,nullptr);
     auto* state=new ViewState;
     state->frameHwnd=state->activeTabHost=frame;
     state->visible=state->inScope=state->detailsViewActive=true;
-    HWND overlay=CreateWindowExW(0,kOverlayClass,L"",WS_CHILD,0,0,320,240,frame,nullptr,type.hInstance,state);
+    HWND overlay=CreateWindowExW(0,kOverlayClass,L"",WS_CHILD,0,0,320,240,frame,nullptr,OverlayModuleInstance(),state);
     if(!overlay) { delete state; DestroyWindow(frame); return FALSE; }
     state->hwnd=overlay;
     ++g_instances;
@@ -127,32 +161,44 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     for(const auto name : {L"CabinetWClass",L"CtrlNotifySink",L"SHELLDLL_DefView",L"DirectUIHWND"}) UnregisterClassW(name,type.hInstance);
     return blocked && retired;
 }
-static WNDPROC nativeEditProcedure=nullptr;
-static LRESULT CALLBACK OriginalEdit(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
-    if(message==WM_NCDESTROY) editDestroyed=true;
-    return CallWindowProcW(nativeEditProcedure,window,message,wParam,lParam);
+static bool editFontAliveDuringDestroy=false;
+static LRESULT CALLBACK ObserveEditDestruction(HWND window,UINT message,WPARAM wParam,LPARAM lParam,
+                                              UINT_PTR id,DWORD_PTR data) {
+    if(message==WM_NCDESTROY) {
+        editDestroyed=true;
+        LOGFONTW font{};
+        editFontAliveDuringDestroy=GetObjectW(reinterpret_cast<HFONT>(SendMessageW(window,WM_GETFONT,0,0)),
+            sizeof(font),&font)!=0;
+        RemoveWindowSubclass(window,ObserveEditDestruction,id);
+    }
+    return DefSubclassProc(window,message,wParam,lParam);
 }
-extern "C" __declspec(dllexport) BOOL NestedRetirement() {
+static BOOL RenameRetirement(HWND* retainedEditor) {
     WNDCLASSW type{}; type.hInstance=GetModuleHandleW(nullptr);
-    type.lpfnWndProc=OverlayProc; type.lpszClassName=kOverlayClass;
-    if(!RegisterClassW(&type) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return FALSE;
-    g_overlayClassRegistered=true;
+    if(!RegisterOverlayClass()) return FALSE;
     HWND frame=CreateWindowExW(0,L"STATIC",L"unload-fixture",0,0,0,320,240,
         nullptr,nullptr,type.hInstance,nullptr);
     auto* state=new ViewState;
     state->frameHwnd=frame;
     state->hwnd=CreateWindowExW(0,kOverlayClass,L"",WS_CHILD,0,0,320,240,
-        frame,nullptr,type.hInstance,state);
+        frame,nullptr,OverlayModuleInstance(),state);
     if(!state->hwnd) { delete state; DestroyWindow(frame); return FALSE; }
     ++g_instances;
     editDestroyed=false;
+    editFontAliveDuringDestroy=false;
     HWND edit=CreateWindowExW(0,L"EDIT",L"private rename fixture",WS_CHILD,
         0,0,160,28,frame,nullptr,type.hInstance,nullptr);
     state->rename.editor=edit;
-    SetWindowLongPtrW(edit,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(state));
-    nativeEditProcedure=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit,GWLP_WNDPROC,
-        reinterpret_cast<LONG_PTR>(RenameEditProc)));
-    state->rename.originalProc=OriginalEdit;
+    if(!edit) return FALSE;
+    state->rename.font=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    if(!state->rename.font) return FALSE;
+    SendMessageW(edit,WM_SETFONT,reinterpret_cast<WPARAM>(state->rename.font),FALSE);
+    if(!retainedEditor && !SetWindowSubclass(edit,ObserveEditDestruction,1,0)) return FALSE;
+    if(!SetWindowSubclass(edit,RenameEditProc,reinterpret_cast<UINT_PTR>(RenameEditProc),
+        reinterpret_cast<DWORD_PTR>(state))) return FALSE;
+    // Keep a physical EDIT alive to exercise DisposeOverlayState's fallback.
+    state->rename.finishing=retainedEditor!=nullptr;
     struct ForeignRead { HWND window; bool rejected=false; } read{state->hwnd};
     HANDLE reader=CreateThread(nullptr,0,[](void* context) -> DWORD {
         auto& request=*static_cast<ForeignRead*>(context);
@@ -171,6 +217,23 @@ extern "C" __declspec(dllexport) BOOL NestedRetirement() {
         retained=!IsWindow(overlay) && state->background && State(overlay)==nullptr && g_instances==1;
     }
     const bool disposed=g_instances==0;
+    if(retainedEditor) {
+        // The standalone host uses legacy comctl32, which has no named
+        // GetWindowSubclass export. With no other subclasses in this fixture,
+        // the native class procedure establishes that the chain is detached.
+        const bool detached=IsWindow(edit) &&
+            static_cast<ULONG_PTR>(GetWindowLongPtrW(edit,GWLP_WNDPROC))==GetClassLongPtrW(edit,GCLP_WNDPROC) &&
+            SendMessageW(edit,WM_GETFONT,0,0)==reinterpret_cast<LRESULT>(GetStockObject(DEFAULT_GUI_FONT));
+        *retainedEditor=edit;
+        return retained && disposed && read.rejected && detached;
+    }
     DestroyWindow(frame);
-    return retained && disposed && read.rejected && editDestroyed && !IsWindow(edit);
+    return retained && disposed && read.rejected && editDestroyed && editFontAliveDuringDestroy && !IsWindow(edit);
+}
+extern "C" __declspec(dllexport) BOOL NestedRetirement() {
+    return RenameRetirement(nullptr);
+}
+extern "C" __declspec(dllexport) HWND RetainedRenameEditor() {
+    HWND editor=nullptr;
+    return RenameRetirement(&editor) ? editor : nullptr;
 }

@@ -326,6 +326,8 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     };
     Check(switchCaptionIs(L"Switch to native Explorer view"),"GPU switch lost its accessible action name");
     Check(state->viewToggleIcons[0] && state->viewToggleIcons[1],"view switch icon creation failed");
+    Check(!(GetWindowLongPtrW(switchButton,GWL_EXSTYLE)&WS_EX_TRANSPARENT) &&
+        (GetWindowLongPtrW(switchButton,GWL_STYLE)&WS_CLIPSIBLINGS),"switch retained deferred transparent sibling painting");
     Check(SendMessageW(switchButton,BM_GETIMAGE,IMAGE_ICON,0)==reinterpret_cast<LRESULT>(state->viewToggleIcons[0]),
         "view switch did not bind a native HICON");
     ICONINFO iconInfo{}; BITMAP iconBitmap{};
@@ -389,6 +391,34 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
                 "icon switch lost hover/press/focus/disabled feedback");
             SendMessageW(switchButton,WM_MOUSELEAVE,0,0);
             Check(!state->viewToggleHot && draw(0)==idle,"icon switch did not clear hover");
+            // Reuse the same destination through real BUTTON messages. A fresh
+            // bitmap per paint conceals accumulating glyph/hover artifacts.
+            auto print=[&] {
+                SendMessageW(switchButton,WM_PRINTCLIENT,reinterpret_cast<WPARAM>(dc),PRF_CLIENT);
+                GdiFlush();
+                return std::vector<DWORD>(static_cast<DWORD*>(bits),static_cast<DWORD*>(bits)+width*height);
+            };
+            PointerFixture::Session pointer;
+            PointerFixture::At(switchButton,{-4,-4});
+            for(int repeat=0;repeat<16;++repeat) {
+                SendMessageW(switchButton,WM_MOUSEMOVE,0,MAKELPARAM(4,4));
+                const auto hot=print();
+                SendMessageW(switchButton,BM_SETSTATE,TRUE,0);
+                const auto pushed=print();
+                Check(hot!=idle && pushed!=hot && print()==pushed,"successive button paints accumulated pixels");
+                SendMessageW(switchButton,BM_SETSTATE,FALSE,0);
+                Check(print()==hot,"button release retained pressed pixels");
+                SendMessageW(switchButton,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(-4,-4));
+                Check(!state->viewToggleHot && print()==idle,"captured mouse move outside retained hover pixels");
+                SendMessageW(switchButton,WM_MOUSEMOVE,0,MAKELPARAM(4,4));
+                SendMessageW(switchButton,WM_CAPTURECHANGED,0,0);
+                Check(!state->viewToggleHot && print()==idle,"capture loss retained hover pixels");
+                for(UINT msg:{WM_CANCELMODE,WM_SHOWWINDOW}) {
+                    SendMessageW(switchButton,WM_MOUSEMOVE,0,MAKELPARAM(4,4));
+                    SendMessageW(switchButton,msg,0,0);
+                    Check(!state->viewToggleHot && print()==idle,"cancel/tab hide retained hover pixels");
+                }
+            }
         }
         state->viewToggleBackground=savedBackground; state->viewToggleForeground=savedForeground;
         SendMessageW(switchButton,WM_THEMECHANGED,0,0);
@@ -397,8 +427,9 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         wchar_t tooltip[128]{}; TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
         tool.hwnd=frame; tool.uId=reinterpret_cast<UINT_PTR>(switchButton); tool.lpszText=tooltip;
         SendMessageW(switchTooltip,TTM_GETTEXTW,ARRAYSIZE(tooltip),reinterpret_cast<LPARAM>(&tool));
-        Check(IsWindow(switchTooltip) && wcscmp(tooltip,L"Switch to native Explorer view")==0,
-            "icon switch tooltip lost its English action");
+        Check(IsWindow(switchTooltip) && wcscmp(tooltip,L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)")==0 &&
+            SendMessageW(switchTooltip,TTM_GETMAXTIPWIDTH,0,0)>0,
+            "icon switch tooltip lost its multiline action and shortcut");
         SelectObject(dc,previous); DeleteObject(bitmap); DeleteDC(dc);
     }
     // Exercise the real button notification route without BM_CLICK, which
@@ -408,10 +439,52 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     Check(IsWindowVisible(switchButton) && switchCaptionIs(L"Switch to GPU overlay view") &&
         (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
         "native mode hid the switch back to GPU or retained native suppression");
+    {
+        wchar_t tooltip[128]{}; TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
+        tool.hwnd=frame; tool.uId=reinterpret_cast<UINT_PTR>(switchButton); tool.lpszText=tooltip;
+        SendMessageW(switchTooltip,TTM_GETTEXTW,ARRAYSIZE(tooltip),reinterpret_cast<LPARAM>(&tool));
+        Check(wcscmp(tooltip,L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)")==0,
+            "native mode tooltip lost its reverse action and shortcut");
+    }
     SendMessageW(frame,WM_COMMAND,MAKEWPARAM(0,BN_CLICKED),reinterpret_cast<LPARAM>(switchButton));
     Check(Eventually([&]{pump(); return state->visible && IsWindowVisible(overlay);}),"persistent switch did not restore GPU view");
     Check(state->viewToggle==switchButton && switchCaptionIs(L"Switch to native Explorer view") &&
         !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),"mode toggle replaced its control or exposed native content");
+    {
+        struct RestoreToggleFixture {
+            bool shown=g_showNativeViewToggleButton.load();
+            decltype(g_dispatchOriginal) dispatch=g_dispatchOriginal;
+            BYTE keys[256]{};
+            RestoreToggleFixture() {Check(GetKeyboardState(keys),"toggle shortcut key fixture");}
+            ~RestoreToggleFixture() {SetKeyboardState(keys); g_dispatchOriginal=dispatch; g_showNativeViewToggleButton=shown;}
+        } restore;
+        g_showNativeViewToggleButton=false;
+        SendMessageW(overlay,kMsgSettings,0,0);
+        Check(!IsWindowVisible(switchButton) && !IsWindowVisible(switchTooltip) && state->visible,
+            "hiding the switch changed view mode or retained button/tooltip visibility");
+        g_dispatchOriginal=+[](const MSG*)->LRESULT {return 0;};
+        MSG key{}; key.hwnd=frame; key.message=WM_KEYDOWN; key.wParam=VK_F9;
+        BYTE modifiers[256]{}; modifiers[VK_CONTROL]=modifiers[VK_MENU]=0x80;
+        for(bool gpu:{false,true}) {
+            Check(SetKeyboardState(modifiers),"toggle shortcut modifiers");
+            key.lParam=0; DispatchHook(&key);
+            Check(SetKeyboardState(restore.keys),"toggle shortcut key restoration");
+            Check(Eventually([&]{pump(); return state->visible==gpu && !IsWindowVisible(switchButton);}),
+                "Ctrl+Alt+F9 stopped switching views while its button was hidden");
+            Check(bool(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE)==!gpu,
+                "hidden-button shortcut exposed both native and GPU contents");
+            Check(SetKeyboardState(modifiers),"toggle shortcut repeat modifiers");
+            key.lParam=1LL<<30; DispatchHook(&key);
+            Check(SetKeyboardState(restore.keys) && state->visible==gpu,
+                "held toggle shortcut repeatedly switched views");
+        }
+        g_showNativeViewToggleButton=true;
+        SendMessageW(overlay,kMsgSettings,0,0);
+        Check(IsWindowVisible(switchButton) && state->viewToggle==switchButton && state->visible &&
+            switchCaptionIs(L"Switch to native Explorer view"),"re-enabling the switch did not reuse its correct view state");
+        Check(FocusFixture::Foreground()==foregroundBeforeSwitch && FocusFixture::Focus()==focusBeforeSwitch && !FocusFixture::sets,
+            "toggle visibility or its hidden shortcut moved focus/activation");
+    }
     for(bool rtl : {false,true}) {
         state->rtlLayout=rtl;
         for(int width : {320,960,640}) {
@@ -611,11 +684,20 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             pump();
             // An unchanged history restore requires a scan covered by the
             // installed watch, not merely a scan that beat watch creation.
-            return state->loaded && !state->namesPreview && !state->directoryPending &&
-                state->directoryWatch && state->validatedFolderStamp == state->directoryWatch->stamp &&
+            if (!state->loaded || state->namesPreview || state->directoryPending || state->enumerationError!=ERROR_SUCCESS)
+                return false;
+            if (IsRecycleBinLocation(state->folderPath)) return !state->namespaceCheckPending;
+            return state->directoryWatch && state->validatedFolderStamp == state->directoryWatch->stamp &&
                 state->validatedFolderRevision == state->directoryWatch->stamp->revision &&
                 WaitForSingleObject(state->directoryWatch->change,0) == WAIT_TIMEOUT;
         });
+    };
+    const auto historyRows=[&] {
+        // History no longer owns a directory handle. Validate names on the
+        // existing worker before testing its saved layout/animation pixels.
+        Check(Eventually([&] {ReceiveDirectoryResults(*state); return state->loaded && !state->namesPreview;}),
+            "history names did not validate after releasing their old watch");
+        Paint(*state);
     };
     response->grouping.enabled=true; response->grouping.key=PKEY_FileName;
     bindReplacement(grouped);
@@ -626,6 +708,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         bindReplacement(directory);
         Check(settled() && state->sections.empty(),"ungrouped parent inherited child headings");
         BeginOptimisticNavigation(*state,grouped);
+        historyRows();
         Check(state->loaded && state->sections.size()==2 && state->optimisticStartedAt,
             "cached child did not show its groups immediately");
         const auto order=state->displayedOrderHash;
@@ -668,6 +751,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             NativeViewInput input(state); // Navigation must discard toolbar intent.
             BeginOptimisticNavigation(*state,destination);
         }
+        historyRows();
         Check(state->optimisticStartedAt && state->loaded && state->directoryModePinned &&
             state->gridView==grid && state->columnsView==!grid && !state->nativeModeBeforeCommand,
             "cached destination rows arrived before their own layout or retained old input intent");
@@ -758,6 +842,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         response->mode=grid ? FVM_ICON : FVM_DETAILS;
         response->iconSize=96;
         bindReplacement(grid ? grouped : directory);
+        historyRows();
         Check(state->gridView==grid && state->columnModeTransition && state->loaded,
             "cached cross-directory mode did not start against the destination rows");
         Paint(*state);
@@ -799,6 +884,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         const bool grid=(pass&1)==0;
         response->mode=grid ? FVM_ICON : FVM_DETAILS;
         bindReplacement(grid ? grouped : directory);
+        historyRows();
         Check(state->gridView==grid && state->columnModeTransition && state->loaded,
             "rapid cached navigation lost its destination or mode transition");
         QueryPerformanceCounter(&state->columnTransitionStartedQpc);
@@ -963,6 +1049,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         SUCCEEDED(computerItem->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&response->folder))),
         "This PC startup folder");
     response->mode=FVM_TILE; response->iconSize=48;
+    g_showNativeViewToggleButton=false;
     AttachView(native,view,response->folder,browser,kThisPcLocation);
     const HWND tileStartup=OverlayForTab(frame);
     auto* tileState=tileStartup ? State(tileStartup) : nullptr;
@@ -978,6 +1065,12 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         <<" stage="<<tileState->graphicsFailureStage<<" hr="<<std::hex<<tileState->graphicsFailure<<std::dec<<std::endl;
 #endif
     Check(tileReady,"fresh This PC Tile attachment waited for a mode change or exposed native content");
+    Check(!tileState->viewToggle && !tileState->viewToggleTooltip,
+        "a new tab created a switch or tooltip while the option was disabled");
+    g_showNativeViewToggleButton=true;
+    RefreshViewToggleForFrame(frame);
+    Check(IsWindowVisible(tileState->viewToggle) && IsWindow(tileState->viewToggleTooltip),
+        "enabling the switch did not create it for a tab that started with it hidden");
     DestroyWindow(tileStartup);
     response->folder.Reset(); bindFolder(destination);
     response->mode = FVM_TILE;
@@ -1055,7 +1148,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     std::vector<std::shared_ptr<TabBackground>> retiring;
     {
         std::lock_guard lock(g_backgroundLifetimeMutex);
-        for(const auto& work:g_backgroundLifetimes)
+        for(const auto& work:*g_backgroundLifetimes)
             if(work->stopping.load() && work->presentation.thread) retiring.push_back(work);
     }
     for(const auto& work:retiring) Check(WaitForSingleObject(work->presentation.thread,10000)==WAIT_OBJECT_0,

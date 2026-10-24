@@ -78,7 +78,9 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     UpdateMetrics(state);
     for(int sample=0;sample<80;++sample)
         OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(MK_CONTROL,WHEEL_DELTA),0);
-    Check(state.iconPx>1000.f && IconRequestSize(state)==kMaxIconDimension && state.visible,
+    RECT viewport{}; ViewClientRect(state,&viewport);
+    Check(state.iconPx>1000.f && IconRequestSize(state)>=32 &&
+        IconRequestSize(state)<=UINT(std::max(viewport.right,viewport.bottom)) && state.visible,
         "large grid zoom was limited or detached before selection");
     native.selected.emplace_back(std::move(first)); native.selected.emplace_back(std::move(second));
     native.focused=alternate(70,98765); // Focus may use a third binary encoding.

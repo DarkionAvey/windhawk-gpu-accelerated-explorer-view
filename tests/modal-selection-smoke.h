@@ -6,18 +6,30 @@ class SelectionCommandMenu final : public IContextMenu {
 public:
     std::vector<std::pair<std::wstring,DWORD>> calls;
     std::function<void()> duringInvoke;
+    bool defaultSelection=false;
+    std::wstring defaultDirectory;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         *out=nullptr; if(iid!=IID_IUnknown && iid!=IID_IContextMenu) return E_NOINTERFACE;
         *out=static_cast<IContextMenu*>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
     ULONG STDMETHODCALLTYPE Release() override { const auto n=--refs; if(!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU,UINT,UINT,UINT,UINT) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU menu,UINT,UINT first,UINT,UINT flags) override {
+        if (!defaultSelection) return E_NOTIMPL;
+        Check(flags==CMF_DEFAULTONLY,"default activation requested the full popup menu");
+        AppendMenuW(menu,MF_STRING,first+7,L"Edit"); SetMenuDefaultItem(menu,first+7,FALSE);
+        return MAKE_HRESULT(SEVERITY_SUCCESS,0,8);
+    }
     HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR,UINT,UINT*,LPSTR,UINT) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
         const auto* command=reinterpret_cast<const CMINVOKECOMMANDINFOEX*>(info);
         Check(command->cbSize==sizeof(*command) && (command->fMask&CMIC_MASK_UNICODE),"shortcut lost Unicode command parameters");
-        calls.emplace_back(command->lpVerbW,command->fMask);
+        if (defaultSelection) {
+            Check(IS_INTRESOURCE(command->lpVerbW) && LOWORD(command->lpVerbW)==7,
+                "default activation forced a verb instead of the menu's default offset");
+            defaultDirectory=command->lpDirectoryW ? command->lpDirectoryW : L"";
+            calls.emplace_back(L"default",command->fMask);
+        } else calls.emplace_back(command->lpVerbW,command->fMask);
         if(duringInvoke) duringInvoke();
         return S_OK;
     }
@@ -119,6 +131,15 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
                 plain[modifier]=0;
             }
             Check(SetKeyboardState(plain),"clear file shortcut modifiers");
+            commands->defaultSelection=true;
+            const auto beforeDefault=commands->calls.size();
+            state.selectedFlags[6]=state.selectedFlags[7]=1; state.selected=state.anchor=7;
+            Check(SyncNativeSelection(state) && native.selected.size()==2,"default-command selected-group fixture");
+            Open(state,7);
+            Check(commands->calls.size()==beforeDefault+1 && commands->defaultDirectory==state.folderPath && native.selected.size()==2,
+                "selected-group default command lost its directory or failed to invoke");
+            commands->defaultSelection=false;
+            Select(state,7);
             testClipboard.Seed(DROPEFFECT_MOVE,L"C:\\private-frame-cut.txt");
             RefreshClipboardItems(state);
             key.wParam=VK_ESCAPE;

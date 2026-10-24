@@ -4,7 +4,7 @@ static void TestColdTextDrawing(HWND frame) {
     ViewState state;
     state.hwnd=CreateWindowExW(0,L"STATIC",L"cold metadata",WS_CHILD,0,0,1800,1200,
         frame,nullptr,GetModuleHandleW(nullptr),nullptr);
-    state.frameHwnd=frame; state.nativeHwnd=state.hwnd;
+    state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
     state.visible=state.inScope=state.loaded=state.columnsView=true;
     state.fontPx=16; state.rowPx=34; state.headerPx=38;
     state.firstContentSubmittedAt=GetTickCount64(); state.deferColumnProviders=false;

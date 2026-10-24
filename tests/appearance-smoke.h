@@ -3,7 +3,7 @@ static void TestAppearanceRefinements(HWND frame, const std::wstring& fixture) {
     state.hwnd=CreateWindowExW(0,L"STATIC",L"appearance",WS_CHILD,0,0,640,480,frame,
         nullptr,GetModuleHandleW(nullptr),nullptr);
     Check(state.hwnd!=nullptr,"appearance fixture window");
-    state.frameHwnd=frame; state.nativeHwnd=state.hwnd;
+    state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
     state.visible=state.inScope=state.detailsViewActive=state.loaded=state.columnsView=true;
     state.fontPx=16; state.rowPx=34; state.headerPx=38;
     UpdateRefreshRate(state); Check(EnsureTarget(state),"appearance GPU target");
@@ -180,7 +180,7 @@ static void TestItemOpacityTransitions(HWND frame, const std::wstring& fixture) 
     state.hwnd=CreateWindowExW(0,L"STATIC",L"opacity",WS_CHILD,0,0,640,480,frame,
         nullptr,GetModuleHandleW(nullptr),nullptr);
     Check(state.hwnd!=nullptr,"opacity fixture window");
-    state.frameHwnd=frame; state.nativeHwnd=state.hwnd;
+    state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
     state.visible=state.inScope=state.detailsViewActive=state.loaded=true;
     state.firstContentSubmittedAt=GetTickCount64(); state.featureInitializationStep=5;
     UpdateMetrics(state); Check(EnsureTarget(state),"opacity GPU target");

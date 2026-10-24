@@ -149,7 +149,7 @@ static void TestHighlightLayering(HWND frame) {
         state.hwnd=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"highlight layering",
             WS_POPUP|WS_VISIBLE,-32000,-32000,640,320,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(state.hwnd!=nullptr,"layering window");
-        state.nativeHwnd=state.hwnd; state.frameHwnd=frame; state.rtlLayout=rtl;
+        state.nativeHwnd=state.hwnd; state.frameHwnd=state.activeTabHost=frame; state.rtlLayout=rtl;
         FocusFixture::Session focus(state.frameHwnd,state.nativeHwnd);
         HWND edit=CreateWindowExW(0,L"EDIT",L"",WS_CHILD,0,0,20,20,state.hwnd,
             nullptr,GetModuleHandleW(nullptr),nullptr);
