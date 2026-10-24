@@ -1,0 +1,7 @@
+# Keep preserved release bytes stable across Git checkouts.
+*.cpp -text
+
+# Shell scripts must also work when checked out with core.autocrlf disabled.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.md text eol=lf

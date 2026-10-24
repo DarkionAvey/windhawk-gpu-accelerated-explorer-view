@@ -1,0 +1,106 @@
+$ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
+function Assert([bool]$Condition, [string]$Message) {
+    if (!$Condition) { throw "Repository regression: $Message" }
+}
+function Reject([scriptblock]$Action, [string]$Message) {
+    $rejected = $false
+    try { & $Action | Out-Null } catch { $rejected = $true }
+    Assert $rejected $Message
+}
+function Write-Utf8([string]$Path, [string]$Value) {
+    [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
+}
+$temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+$fixture = Join-Path $temporary ('gpu-overlay-repository-' + [guid]::NewGuid().ToString('N') + ' space [fixture] ' + [char]0x062A)
+New-Item -ItemType Directory -Path $fixture | Out-Null
+try {
+    $readme = Join-Path $fixture 'README.md'
+    $text = '# User documentation' + "`n`n" + 'Literal $1, ${name}, backticks ` and Unicode ' + [char]0x062A + "`n"
+    Write-Utf8 $readme $text
+    $original = "// @version         0.9.9`r`n// ==WindhawkModReadme==`r`n/*`r`nold`r`n*/`r`n// ==/WindhawkModReadme==`r`nint unchanged = 42;`r`n"
+    $old = Join-Path $fixture '0.9.9.cpp'
+    Write-Utf8 $old $original
+    $oldHash = (Get-SourceHash $old)
+    $new = New-ModVersion $fixture '0.9.10'
+    Assert ((Get-ModVersion $new) -eq [version]'0.9.10') 'version header was not updated'
+    Sync-ModReadme $new $readme
+    $embedded = [regex]::Match([IO.File]::ReadAllText($new), '(?s)/\*\r?\n(.*?)\*/').Groups[1].Value.Replace("`r`n", "`n")
+    Assert ($embedded -ceq $text) 'README content changed while embedding'
+    Assert ([IO.File]::ReadAllText($new).EndsWith("int unchanged = 42;`r`n")) 'sync changed the C++ body'
+    $newHash = (Get-SourceHash $new)
+    Sync-ModReadme $new $readme
+    Assert ((Get-SourceHash $new) -eq $newHash) 'README sync is not idempotent'
+    Write-Utf8 $readme 'unsafe */ text'
+    Reject { Sync-ModReadme $new $readme } 'unsafe README was accepted'
+    Assert ((Get-SourceHash $new) -eq $newHash) 'rejected README modified the source'
+    Write-Utf8 $readme $text
+    Publish-ModRelease $fixture $new
+    $latest = Join-Path $fixture 'latest.cpp'
+    $archive = Join-Path $fixture 'previous-versions'
+    Assert ((Get-SourceHash $latest) -eq $newHash) 'latest differs from the tested source'
+    Assert ((Get-SourceHash (Join-Path $archive '0.9.9.cpp')) -eq $oldHash) 'historical bytes changed'
+    Assert ((Get-SourceHash (Join-Path $archive '0.9.10.cpp')) -eq $newHash) 'archive differs from latest'
+    Assert (@(Get-VersionSources $fixture).Count -eq 0) 'numbered sources remain at root'
+    Copy-Item -LiteralPath (Join-Path $archive '0.9.10.cpp') -Destination $new
+    Publish-ModRelease $fixture $new
+    Assert ((Get-SourceHash $latest) -eq $newHash) 'identical archive retry failed'
+    Write-Utf8 $old ($original + 'conflict')
+    Copy-Item -LiteralPath (Join-Path $archive '0.9.10.cpp') -Destination $new
+    Reject { Publish-ModRelease $fixture $new } 'conflicting history was overwritten'
+    Assert ((Test-Path -LiteralPath $new) -and (Test-Path -LiteralPath $old)) 'archive conflict moved working files'
+    Assert ((Get-SourceHash $latest) -eq $newHash) 'archive conflict changed latest'
+    Remove-Item -LiteralPath $old, $new
+    Copy-Item -LiteralPath (Join-Path $archive '0.9.9.cpp') -Destination $old
+    Reject { Publish-ModRelease $fixture $old } 'older release replaced latest'
+    Remove-Item -LiteralPath $old
+    Reject { New-ModVersion $fixture '0.9.9' } 'existing version was accepted'
+    $next = New-ModVersion $fixture
+    Assert ((Split-Path -Leaf $next) -eq '0.9.11.cpp') 'automatic version sorting/increment failed'
+    Remove-Item -LiteralPath $next
+
+    # Exercise the real release orchestration with an isolated failing runner.
+    # No installed mod, Explorer process or system clipboard is involved.
+    $scripts = Join-Path $fixture 'scripts'
+    $tests = Join-Path $fixture 'tests'
+    $fakeWindhawk = Join-Path $fixture 'portable Windhawk'
+    New-Item -ItemType Directory -Path $scripts, $tests, (Join-Path $fakeWindhawk 'Compiler\bin') -Force | Out-Null
+    foreach ($name in @('repository.ps1', 'build.ps1')) {
+        Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) ('scripts\' + $name)) -Destination (Join-Path $scripts $name)
+    }
+    Write-Utf8 (Join-Path $fakeWindhawk 'Compiler\bin\clang++.exe') ''
+    Write-Utf8 (Join-Path $tests 'repository-regression.ps1') '# Isolated orchestration fixture.'
+    $runner = Join-Path $tests 'run-regressions.ps1'
+    Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); throw "deliberate regression failure"'
+    $build = Join-Path $scripts 'build.ps1'
+    $outside = Get-Location
+    try {
+        Set-Location -LiteralPath $temporary
+        Reject { & $build -WindhawkDirectory $fakeWindhawk } 'failed regression published a release'
+        Assert ((Get-SourceHash $latest) -eq $newHash) 'failed tests changed latest'
+        Assert (Test-Path -LiteralPath $next) 'failed tests discarded the working source'
+        Assert (!(Test-Path -LiteralPath (Join-Path $archive '0.9.11.cpp'))) 'failed tests archived the candidate'
+        Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); [IO.File]::AppendAllText($SourceFile, "changed during testing")'
+        Reject { & $build -WindhawkDirectory $fakeWindhawk } 'source changed during testing was published'
+        Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory)'
+        & $build -WindhawkDirectory $fakeWindhawk
+        Assert ((Get-ModVersion $latest) -eq [version]'0.9.11') 'successful run did not finalize'
+        Assert ((Get-SourceHash $latest) -eq
+            (Get-SourceHash (Join-Path $archive '0.9.11.cpp'))) 'final published/archive copies differ'
+    } finally { Set-Location -LiteralPath $outside.Path }
+    $previousWindhawk = $env:WINDHAWK_HOME
+    try {
+        $env:WINDHAWK_HOME = $fakeWindhawk
+        Assert ((Resolve-WindhawkDirectory) -eq $fakeWindhawk) 'WINDHAWK_HOME was not used'
+        Reject { Resolve-WindhawkDirectory (Join-Path $fixture 'missing installation') } 'bad explicit toolchain silently fell back'
+    } finally { $env:WINDHAWK_HOME = $previousWindhawk }
+    Write-Output 'PASS: README sync, version preservation, archive conflicts, failed-test guard, source-change guard, portable paths and release publication'
+} finally {
+    # Recursive cleanup is restricted to this uniquely named private fixture.
+    $resolved = [IO.Path]::GetFullPath($fixture)
+    if ((Split-Path -Parent $resolved) -ne $temporary -or
+        (Split-Path -Leaf $resolved) -notlike 'gpu-overlay-repository-*') {
+        throw 'Refusing cleanup outside the repository-test fixture'
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}

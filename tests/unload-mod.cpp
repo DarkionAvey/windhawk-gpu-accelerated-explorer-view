@@ -1,0 +1,176 @@
+// Test-only exports around the actual selected source. No Explorer injection.
+#undef WH_MOD_ID
+#define WH_MOD_ID L"gpu-accelerated-explorer-view"
+#include <windhawk_api.h>
+#ifndef GPU_OVERLAY_SOURCE
+#define GPU_OVERLAY_SOURCE "../latest.cpp"
+#endif
+#include GPU_OVERLAY_SOURCE
+
+extern "C" __declspec(dllexport) void Prepare(int kind,FARPROC original) {
+    g_perf=false; g_unloading=false; g_backgroundShutdown=false;
+    switch(kind) {
+    case 0: g_dispatchOriginal=reinterpret_cast<decltype(g_dispatchOriginal)>(original); break;
+    case 1: g_translateAcceleratorOriginal=reinterpret_cast<decltype(g_translateAcceleratorOriginal)>(original); break;
+    case 2: g_showWindowOriginal=reinterpret_cast<decltype(g_showWindowOriginal)>(original); break;
+    case 3: g_showWindowAsyncOriginal=reinterpret_cast<decltype(g_showWindowAsyncOriginal)>(original); break;
+    case 4: g_setWindowPosOriginal=reinterpret_cast<decltype(g_setWindowPosOriginal)>(original); break;
+    case 5: g_deferWindowPosOriginal=reinterpret_cast<decltype(g_deferWindowPosOriginal)>(original); break;
+    case 6: g_raiseStructureEventOriginal=reinterpret_cast<decltype(g_raiseStructureEventOriginal)>(original); break;
+    }
+}
+extern "C" __declspec(dllexport) void Invoke(int kind) {
+    switch(kind) {
+    case 0: DispatchHook(nullptr); break;
+    case 1: TranslateAcceleratorHook(nullptr,nullptr,nullptr); break;
+    case 2: NativeShowWindowHook(nullptr,SW_HIDE); break;
+    case 3: NativeShowWindowAsyncHook(nullptr,SW_HIDE); break;
+    case 4: NativeSetWindowPosHook(nullptr,nullptr,0,0,0,0,0); break;
+    case 5: NativeDeferWindowPosHook(nullptr,nullptr,nullptr,0,0,0,0,0); break;
+    case 6: RaiseStructureEventHook(nullptr,StructureChangeType_ChildrenInvalidated,nullptr,0); break;
+    }
+}
+extern "C" __declspec(dllexport) void Before() { Wh_ModBeforeUninit(); }
+extern "C" __declspec(dllexport) void Unload() { Wh_ModUninit(); }
+extern "C" __declspec(dllexport) IUnknown* RetainSink() {
+    return static_cast<IDispatch*>(new ShellAutomationNavigationSink(nullptr));
+}
+extern "C" __declspec(dllexport) BOOL FailedInitialization() {
+    WNDCLASSW stale{}; stale.hInstance=GetModuleHandleW(nullptr);
+    stale.lpfnWndProc=DefWindowProcW; stale.lpszClassName=kOverlayClass;
+    if(!RegisterClassW(&stale)) return FALSE;
+    // WH_EDITING deliberately rejects hooks. Initialization must unwind its
+    // earlier factory/event/class, including the replaced stale class.
+    if(Wh_ModInit()) return FALSE;
+    WNDCLASSW remaining{};
+    return !g_frameEvent && !g_writeFactory && !g_overlayClassRegistered &&
+        !GetClassInfoW(stale.hInstance,kOverlayClass,&remaining);
+}
+static bool editDestroyed=false;
+extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
+    g_unloading=false; g_backgroundShutdown=false;
+    WNDCLASSW type{}; type.hInstance=GetModuleHandleW(nullptr); type.lpfnWndProc=DefWindowProcW;
+    for(const auto name : {L"CabinetWClass",L"CtrlNotifySink",L"SHELLDLL_DefView",L"DirectUIHWND"}) {
+        type.lpszClassName=name;
+        if(!RegisterClassW(&type) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return FALSE;
+    }
+    type.lpfnWndProc=OverlayProc; type.lpszClassName=kOverlayClass;
+    if(!RegisterClassW(&type) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return FALSE;
+    g_overlayClassRegistered=true;
+    HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"CabinetWClass",L"barrier DLL fixture",
+        WS_POPUP|WS_VISIBLE,-32000,-32000,320,240,nullptr,nullptr,type.hInstance,nullptr);
+    auto* state=new ViewState;
+    state->frameHwnd=state->activeTabHost=frame;
+    state->visible=state->inScope=state->detailsViewActive=true;
+    HWND overlay=CreateWindowExW(0,kOverlayClass,L"",WS_CHILD,0,0,320,240,frame,nullptr,type.hInstance,state);
+    if(!overlay) { delete state; DestroyWindow(frame); return FALSE; }
+    state->hwnd=overlay;
+    ++g_instances;
+    RegisterTabOverlay(frame,frame,overlay);
+    InitializeFrameShellEvents(*state);
+    HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,frame,nullptr,type.hInstance,nullptr);
+    HWND view=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,host,nullptr,type.hInstance,nullptr);
+    state->nativeHwnd=view;
+    HWND list=CreateWindowExW(0,L"DirectUIHWND",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,view,nullptr,type.hInstance,nullptr);
+    NativeSetWindowPosHook(list,nullptr,0,0,0,0,SWP_NOZORDER|SWP_NOACTIVATE);
+    const bool blocked=host && view && GetPropW(host,kSuppressedHostProperty)==overlay &&
+        !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE) && list && GetPropW(list,kNativeViewportProperty);
+    const bool installed=!g_shellViewHooks.empty();
+#ifdef PRESENTATION_MODEL_FIELDS
+    // Start the real presentation and frame threads inside this DLL, then
+    // disable with an animation in flight. The host verifies actual unmapping
+    // after Uninit drains every worker, rather than testing a static wrapper.
+    if(FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf())))) return FALSE;
+    g_frameStopping=false;
+    state->folderPath=L"private-dll-presentation:"; state->loaded=true; state->total=80;
+    state->firstContentSubmittedAt=1; state->featureInitializationStep=kOverlayFeatureSteps;
+    state->deferColumnProviders=false; state->entries.resize(80); state->selectedFlags.assign(80,0);
+    for(int i=0;i<80;++i) {
+        state->entries[size_t(i)].name=L"Private item "+std::to_wstring(i);
+        state->entries[size_t(i)].path=state->folderPath+std::to_wstring(i);
+        state->entries[size_t(i)].folder=true;
+    }
+    state->presentationEntries=std::make_shared<const std::vector<Entry>>(state->entries);
+    state->presentationModelFolder=state->folderPath; state->presentationOrderHash=state->displayedOrderHash;
+    state->presentationModelGrouping=state->displayedGrouping;
+    UpdateMetrics(*state); UpdateColumns(*state); UpdateRefreshRate(*state);
+    ShowWindow(overlay,SW_SHOWNOACTIVATE);
+    if(!StartPresentation(*state)) return FALSE;
+    SubmitPresentation(*state);
+    bool presented=false;
+    const ULONGLONG deadline=GetTickCount64()+10000;
+    while(!presented && GetTickCount64()<deadline) {
+        {std::lock_guard lock(state->presenter->mutex);
+            presented=state->presenter->receipt && state->presenter->receipt->accepted && state->presenter->receipt->ready;}
+        if(!presented) Sleep(1);
+    }
+    if(!presented) return FALSE;
+    MoveScroll(*state,std::min(200.f,MaxScrollPx(*state))); SubmitPresentation(*state);
+#endif
+    Wh_ModBeforeUninit(); // Exercise actual disable, not just direct HWND destruction.
+    RECT bounds{}; GetClientRect(list,&bounds);
+    const bool retired=g_shellViewHooks.empty() && g_windowCallbacks.load()==0 && !g_instances.load() &&
+        !GetPropW(host,kSuppressedHostProperty) && (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE) &&
+        !GetPropW(list,kNativeViewportProperty) && bounds.right==320 && bounds.bottom==240;
+    if(!blocked || !retired) printf("BARRIER DLL blocked=%d installed=%d retired=%d hooks=%zu callbacks=%u instances=%d host=%p view=%p prop=%p style=0x%llx\n",
+        blocked,installed,retired,g_shellViewHooks.size(),g_windowCallbacks.load(),g_instances.load(),host,view,
+        GetPropW(host,kSuppressedHostProperty),static_cast<unsigned long long>(GetWindowLongPtrW(host,GWL_STYLE)));
+    DestroyWindow(frame);
+    // WinEvent delivery belongs to this UI apartment. The standalone host has
+    // no Explorer message loop; drain its queued delivery/retirement while the
+    // DLL is still mapped, after all production subscriptions are removed.
+    MSG pending{};
+    while(PeekMessageW(&pending,nullptr,0,0,PM_REMOVE)) {
+        TranslateMessage(&pending); DispatchMessageW(&pending);
+    }
+    for(const auto name : {L"CabinetWClass",L"CtrlNotifySink",L"SHELLDLL_DefView",L"DirectUIHWND"}) UnregisterClassW(name,type.hInstance);
+    return blocked && retired;
+}
+static WNDPROC nativeEditProcedure=nullptr;
+static LRESULT CALLBACK OriginalEdit(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
+    if(message==WM_NCDESTROY) editDestroyed=true;
+    return CallWindowProcW(nativeEditProcedure,window,message,wParam,lParam);
+}
+extern "C" __declspec(dllexport) BOOL NestedRetirement() {
+    WNDCLASSW type{}; type.hInstance=GetModuleHandleW(nullptr);
+    type.lpfnWndProc=OverlayProc; type.lpszClassName=kOverlayClass;
+    if(!RegisterClassW(&type) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return FALSE;
+    g_overlayClassRegistered=true;
+    HWND frame=CreateWindowExW(0,L"STATIC",L"unload-fixture",0,0,0,320,240,
+        nullptr,nullptr,type.hInstance,nullptr);
+    auto* state=new ViewState;
+    state->frameHwnd=frame;
+    state->hwnd=CreateWindowExW(0,kOverlayClass,L"",WS_CHILD,0,0,320,240,
+        frame,nullptr,type.hInstance,state);
+    if(!state->hwnd) { delete state; DestroyWindow(frame); return FALSE; }
+    ++g_instances;
+    editDestroyed=false;
+    HWND edit=CreateWindowExW(0,L"EDIT",L"private rename fixture",WS_CHILD,
+        0,0,160,28,frame,nullptr,type.hInstance,nullptr);
+    state->rename.editor=edit;
+    SetWindowLongPtrW(edit,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(state));
+    nativeEditProcedure=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit,GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(RenameEditProc)));
+    state->rename.originalProc=OriginalEdit;
+    struct ForeignRead { HWND window; bool rejected=false; } read{state->hwnd};
+    HANDLE reader=CreateThread(nullptr,0,[](void* context) -> DWORD {
+        auto& request=*static_cast<ForeignRead*>(context);
+        request.rejected=State(request.window)==nullptr;
+        return 0;
+    },&read,0,nullptr);
+    if(!reader) return FALSE;
+    WaitForSingleObject(reader,INFINITE); CloseHandle(reader);
+    bool retained=false;
+    {
+        WindowCallbackGuard outer;
+        const HWND overlay=state->hwnd;
+        DestroyWindow(overlay);
+        // A native call has reentered DestroyWindow. The outer callback must
+        // still have its state AND resources, while new input cannot find it.
+        retained=!IsWindow(overlay) && state->background && State(overlay)==nullptr && g_instances==1;
+    }
+    const bool disposed=g_instances==0;
+    DestroyWindow(frame);
+    return retained && disposed && read.rejected && editDestroyed && !IsWindow(edit);
+}

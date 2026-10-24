@@ -1,0 +1,135 @@
+#include <windows.h>
+#include <unknwn.h>
+#include <iostream>
+#include <stdexcept>
+#include <uiautomationcore.h>
+
+static HANDLE entered,released,returned,exitWorker,unloaded;
+static void Check(bool good,const char* message) { if(!good) throw std::runtime_error(message); }
+static void BlockNative() { SetEvent(entered); WaitForSingleObject(released,INFINITE); }
+static LRESULT WINAPI Dispatch(const MSG*) { BlockNative(); return 0; }
+static int WINAPI Accelerator(HWND,HACCEL,LPMSG) { BlockNative(); return 0; }
+static BOOL WINAPI Show(HWND,int) { BlockNative(); return TRUE; }
+static BOOL WINAPI Position(HWND,HWND,int,int,int,int,UINT) { BlockNative(); return TRUE; }
+static HDWP WINAPI Deferred(HDWP,HWND,HWND,int,int,int,int,UINT) { BlockNative(); return nullptr; }
+static HRESULT WINAPI Structure(IRawElementProviderSimple*,StructureChangeType,int*,int) { BlockNative(); return S_OK; }
+using InvokeFn=void(*)(int);
+static InvokeFn invoke;
+static unsigned recursiveDepth=0,recursiveReturns=0;
+static LRESULT WINAPI RecursiveDispatch(const MSG*) {
+    if (++recursiveDepth<32) invoke(0); // Actual DLL hook reenters the actual DLL hook.
+    --recursiveDepth;
+    ++recursiveReturns;
+    return 0;
+}
+static DWORD WINAPI SmallStackDispatch(void*) { invoke(0); return 0; }
+static void(*unload)();
+static DWORD WINAPI Worker(void* kind) {
+    invoke(static_cast<int>(reinterpret_cast<INT_PTR>(kind)));
+    SetEvent(returned);
+    WaitForSingleObject(exitWorker,INFINITE); // Deliberately outlive the mod DLL.
+    return 0;
+}
+static DWORD WINAPI Unloader(void*) { unload(); SetEvent(unloaded); return 0; }
+template<typename T> static T Export(HMODULE module,const char* name) {
+    auto address=GetProcAddress(module,name); Check(address!=nullptr,"missing lifecycle export");
+    return reinterpret_cast<T>(address);
+}
+static HMODULE Load(const wchar_t* path) {
+    HMODULE module=LoadLibraryW(path); Check(module!=nullptr,"test DLL load failed");
+    unload=Export<void(*)()>(module,"Unload");
+    return module;
+}
+
+int wmain(int argc,wchar_t** argv) {
+    if(argc!=2) return 2;
+    entered=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    released=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    returned=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    exitWorker=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    unloaded=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    try {
+        {
+            HMODULE nested=Load(argv[1]);
+            Export<void(*)(int,FARPROC)>(nested,"Prepare")(0,reinterpret_cast<FARPROC>(RecursiveDispatch));
+            invoke=Export<InvokeFn>(nested,"Invoke");
+            HANDLE small=CreateThread(nullptr,256*1024,SmallStackDispatch,nullptr,STACK_SIZE_PARAM_IS_A_RESERVATION,nullptr);
+            Check(small && WaitForSingleObject(small,5000)==WAIT_OBJECT_0 && recursiveReturns==32,
+                "nested native dispatch exhausted a 256 KiB thread stack");
+            CloseHandle(small);
+            Export<void(*)()>(nested,"Before")(); unload();
+            Check(FreeLibrary(nested)!=FALSE,"nested dispatch DLL release");
+            std::cout<<"PASS: 32 nested actual DLL dispatch hooks return on a 256 KiB stack\n";
+        }
+        const FARPROC originals[]{reinterpret_cast<FARPROC>(Dispatch),reinterpret_cast<FARPROC>(Accelerator),
+            reinterpret_cast<FARPROC>(Show),reinterpret_cast<FARPROC>(Show),
+            reinterpret_cast<FARPROC>(Position),reinterpret_cast<FARPROC>(Deferred),reinterpret_cast<FARPROC>(Structure)};
+        // Repeat actual LoadLibrary/FreeLibrary, keeping callback threads alive
+        // past unloading to exercise both return-address and TLS-dtor lifetime.
+        for(int round=0;round<3;++round) for(int kind=0;kind<7;++kind) {
+            for(HANDLE event : {entered,released,returned,exitWorker,unloaded}) ResetEvent(event);
+            HMODULE module=Load(argv[1]);
+            Export<void(*)(int,FARPROC)>(module,"Prepare")(kind,originals[kind]);
+            invoke=Export<InvokeFn>(module,"Invoke");
+            HANDLE worker=CreateThread(nullptr,0,Worker,reinterpret_cast<void*>(static_cast<INT_PTR>(kind)),0,nullptr);
+            Check(worker && WaitForSingleObject(entered,5000)==WAIT_OBJECT_0,"native hook did not enter");
+            Export<void(*)()>(module,"Before")(); // Must NOT wait before detours are removed.
+            HANDLE unloader=CreateThread(nullptr,0,Unloader,nullptr,0,nullptr);
+            Check(unloader!=nullptr,"unloader thread creation");
+            const bool held=WaitForSingleObject(unloaded,100)==WAIT_TIMEOUT;
+            SetEvent(released);
+            Check(WaitForSingleObject(returned,5000)==WAIT_OBJECT_0 &&
+                WaitForSingleObject(unloader,5000)==WAIT_OBJECT_0,"unload did not finish after native return");
+            if(!held) {
+                // Safe negative check against historical sources: finish the
+                // thread while its TLS destructor still has a mapped DLL.
+                SetEvent(exitWorker); WaitForSingleObject(worker,5000);
+                FreeLibrary(module); CloseHandle(worker); CloseHandle(unloader);
+                throw std::runtime_error("unload completed while a native hook retained a DLL return address");
+            }
+            Check(FreeLibrary(module)!=FALSE,"test DLL did not unload");
+            MEMORY_BASIC_INFORMATION memory{};
+            Check(VirtualQuery(module,&memory,sizeof(memory)) && memory.AllocationBase!=module,
+                "DLL remained mapped: thread-exit test would not establish unload safety");
+            SetEvent(exitWorker);
+            Check(WaitForSingleObject(worker,5000)==WAIT_OBJECT_0,"thread did not exit after DLL unload");
+            CloseHandle(worker); CloseHandle(unloader);
+        }
+        std::cout<<"PASS: all seven API hooks drain after removal, 21 real DLL unloads before callback-thread exit, no delayed TLS destructor\n";
+        {
+            HMODULE barrier=Load(argv[1]);
+            Check(Export<BOOL(*)()>(barrier,"NativeBarrierRetirement")(),"native creation barrier did not suppress/retire with its owning overlay");
+            Export<void(*)()>(barrier,"Before")();
+            unload();
+            Check(FreeLibrary(barrier)!=FALSE,"native barrier DLL release");
+            MEMORY_BASIC_INFORMATION memory{};
+            if(VirtualQuery(barrier,&memory,sizeof(memory)) && memory.AllocationBase==barrier) {
+                wchar_t file[MAX_PATH]{}; GetModuleFileNameW(barrier,file,MAX_PATH);
+                std::wcerr<<L"Native barrier retained image="<<file<<L" type="<<memory.Type<<L" state="<<memory.State<<L'\n';
+            }
+            Check(VirtualQuery(barrier,&memory,sizeof(memory)) && memory.AllocationBase!=barrier,
+                "synchronous native barrier retained its DLL after teardown");
+            std::cout<<"PASS: actual disable restores host visibility and nonempty native list geometry after zero-size echoes, before verified DLL unmapping\n";
+        }
+        HMODULE module=Load(argv[1]);
+        Check(Export<BOOL(*)()>(module,"FailedInitialization")(),"failed initialization retained a stale class/factory/event");
+        std::cout<<"PASS: failed hook initialization repairs stale class ownership and unwinds its class, event and factory\n";
+        Check(Export<BOOL(*)()>(module,"NestedRetirement")(),"nested destruction freed live overlay state/resources");
+        std::cout<<"PASS: foreign threads cannot borrow ViewState; reentrant destruction detaches immediately and retires state/resources after the outer callback\n";
+        IUnknown* sink=Export<IUnknown*(*)()>(module,"RetainSink")();
+        ResetEvent(unloaded);
+        Export<void(*)()>(module,"Before")();
+        HANDLE unloader=CreateThread(nullptr,0,Unloader,nullptr,0,nullptr);
+        Check(WaitForSingleObject(unloaded,100)==WAIT_TIMEOUT,"unload ignored an externally retained COM callback object");
+        sink->Release();
+        Check(WaitForSingleObject(unloader,5000)==WAIT_OBJECT_0,"COM reference release did not allow unload");
+        CloseHandle(unloader); FreeLibrary(module);
+        std::cout<<"PASS: an external COM reference keeps callback vtables mapped until its final Release\n";
+        for(HANDLE event : {entered,released,returned,exitWorker,unloaded}) CloseHandle(event);
+        return 0;
+    } catch(const std::exception& error) {
+        std::cerr<<"FAIL: "<<error.what()<<'\n';
+        // Do not unwind/free a DLL still executing on a test thread.
+        ExitProcess(1);
+    }
+}

@@ -1,0 +1,8 @@
+# Local diagnostic captures and generated binaries.
+*.log
+*.dmp
+*.exe
+*.dll
+*.whl
+latest.*.tmp
+tests/.symbol-cache/
