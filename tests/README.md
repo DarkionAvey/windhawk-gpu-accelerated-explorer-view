@@ -22,10 +22,15 @@ The release command embeds root README.md in the working source, runs repository
 checks, links the real Windhawk host DLL, and runs the full standalone and
 DLL-unload suites. Only after success does it move root numbered
 sources (and legacy mod.cpp, if present) into previous-versions and copy the
-tested release to latest.cpp. The archive and latest copy are byte-identical.
+tested release to latest.cpp. It then keeps only the five newest source versions
+in previous-versions, including the published version, ordered by numeric version.
+The legacy mod.cpp baseline counts toward this limit; unrelated files and
+subdirectories are left alone. The published release's archive and latest copy
+are byte-identical.
 Conflicting archives and downgrades fail without overwriting history. A failed
 run retains the working source and temporary binaries, and leaves latest.cpp
-unchanged. Update CHANGELOG.md with the results after testing.
+unchanged, without pruning archives. Update CHANGELOG.md with the results after
+testing.
 
 ## Toolchain discovery
 

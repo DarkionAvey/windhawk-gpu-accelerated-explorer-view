@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.241
+
+- After a successful release build, retain only the five newest source versions
+  in `previous-versions/`, including the published release. Remove older numbered
+  sources and the legacy baseline by numeric version; leave unrelated files and
+  subdirectories alone.
+- Keep archive conflict checks and failed-build preservation before cleanup.
+
+Validation: retention regressions and the full release gate passed, including
+Windhawk DLL linking, all C++/graphics/input suites and 21 real DLL unloads.
+The archive now contains only 0.9.237 through 0.9.241; retained historical bytes
+are unchanged, and the published source, export and new archive are identical.
+
 ## 0.9.240
 
 - Correct Shell image-factory bitmap transparency before GPU upload, removing

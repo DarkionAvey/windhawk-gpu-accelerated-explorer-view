@@ -22,6 +22,9 @@ try {
     $old = Join-Path $fixture '0.9.9.cpp'
     Write-Utf8 $old $original
     $oldHash = (Get-SourceHash $old)
+    $legacy = Join-Path $fixture 'mod.cpp'
+    Write-Utf8 $legacy ($original.Replace('0.9.9', '0.9.0'))
+    $legacyHash = Get-SourceHash $legacy
     $new = New-ModVersion $fixture '0.9.10'
     Assert ((Get-ModVersion $new) -eq [version]'0.9.10') 'version header was not updated'
     Sync-ModReadme $new $readme
@@ -43,17 +46,23 @@ try {
     Assert ((Get-SourceHash $export) -eq $newHash) 'Windhawk export differs from the tested source'
     Assert ((Get-SourceHash (Join-Path $archive '0.9.9.cpp')) -eq $oldHash) 'historical bytes changed'
     Assert ((Get-SourceHash (Join-Path $archive '0.9.10.cpp')) -eq $newHash) 'archive differs from latest'
+    Assert ((Get-SourceHash (Join-Path $archive 'mod.cpp')) -eq $legacyHash) 'legacy baseline changed below retention limit'
     Assert (@(Get-VersionSources $fixture).Count -eq 0) 'numbered sources remain at root'
     Copy-Item -LiteralPath (Join-Path $archive '0.9.10.cpp') -Destination $new
     Publish-ModRelease $fixture $new
     Assert ((Get-SourceHash $latest) -eq $newHash) 'identical archive retry failed'
     Assert ((Get-SourceHash $export) -eq $newHash) 'identical archive retry changed the Windhawk export'
+    foreach ($patch in 1..8) {
+        Write-Utf8 (Join-Path $archive ("0.9.$patch.cpp")) ($original.Replace('0.9.9', "0.9.$patch"))
+    }
     Write-Utf8 $old ($original + 'conflict')
     Copy-Item -LiteralPath (Join-Path $archive '0.9.10.cpp') -Destination $new
     Reject { Publish-ModRelease $fixture $new } 'conflicting history was overwritten'
     Assert ((Test-Path -LiteralPath $new) -and (Test-Path -LiteralPath $old)) 'archive conflict moved working files'
     Assert ((Get-SourceHash $latest) -eq $newHash) 'archive conflict changed latest'
     Assert ((Get-SourceHash $export) -eq $newHash) 'archive conflict changed the Windhawk export'
+    Assert (@(Get-VersionSources $archive).Count -eq 10) 'archive conflict pruned old versions'
+    Assert ((Get-SourceHash (Join-Path $archive 'mod.cpp')) -eq $legacyHash) 'archive conflict pruned the baseline'
     Remove-Item -LiteralPath $old, $new
     Copy-Item -LiteralPath (Join-Path $archive '0.9.9.cpp') -Destination $old
     Reject { Publish-ModRelease $fixture $old } 'older release replaced latest'
@@ -62,6 +71,20 @@ try {
     $next = New-ModVersion $fixture
     Assert ((Split-Path -Leaf $next) -eq '0.9.11.cpp') 'automatic version sorting/increment failed'
     Remove-Item -LiteralPath $next
+
+    $notes = Join-Path $archive 'notes.txt'
+    $unrelatedSource = Join-Path $archive 'reference.cpp'
+    $nested = Join-Path $archive 'nested'
+    New-Item -ItemType Directory -Path $nested | Out-Null
+    $nestedSource = Join-Path $nested '99.0.0.cpp'
+    Write-Utf8 $notes 'Unrelated archive notes'
+    Write-Utf8 $unrelatedSource 'Unrelated C++ source'
+    Write-Utf8 $nestedSource ($original.Replace('0.9.9', '99.0.0'))
+    $nestedHash = Get-SourceHash $nestedSource
+    $archiveHashes = @{}
+    foreach ($file in (Get-ChildItem -LiteralPath $archive -File)) {
+        $archiveHashes[$file.Name] = Get-SourceHash $file.FullName
+    }
 
     # Exercise the real release orchestration with an isolated failing runner.
     # No installed mod, Explorer process or system clipboard is involved.
@@ -85,15 +108,35 @@ try {
         Assert ((Get-SourceHash $export) -eq $newHash) 'failed tests changed the Windhawk export'
         Assert (Test-Path -LiteralPath $next) 'failed tests discarded the working source'
         Assert (!(Test-Path -LiteralPath (Join-Path $archive '0.9.11.cpp'))) 'failed tests archived the candidate'
+        foreach ($name in $archiveHashes.Keys) {
+            Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'failed tests changed or pruned an archive'
+        }
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); [IO.File]::AppendAllText($SourceFile, "changed during testing")'
         Reject { & $build -WindhawkDirectory $fakeWindhawk } 'source changed during testing was published'
         Assert ((Get-SourceHash $export) -eq $newHash) 'source-change guard published the Windhawk export'
+        foreach ($name in $archiveHashes.Keys) {
+            Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'source-change guard changed or pruned an archive'
+        }
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory)'
         & $build -WindhawkDirectory $fakeWindhawk
         Assert ((Get-ModVersion $latest) -eq [version]'0.9.11') 'successful run did not finalize'
         Assert ((Get-SourceHash $latest) -eq
             (Get-SourceHash (Join-Path $archive '0.9.11.cpp'))) 'final published/archive copies differ'
         Assert ((Get-SourceHash $export) -eq (Get-SourceHash $latest)) 'final Windhawk export differs from latest'
+        $retained = @(Get-VersionSources $archive)
+        Assert (($retained.Name -join ',') -eq '0.9.7.cpp,0.9.8.cpp,0.9.9.cpp,0.9.10.cpp,0.9.11.cpp') 'retention did not keep the five numerically newest versions'
+        Assert (!(Test-Path -LiteralPath (Join-Path $archive 'mod.cpp'))) 'obsolete legacy baseline was retained'
+        foreach ($file in ($retained | Select-Object -First 4)) {
+            Assert ((Get-SourceHash $file.FullName) -eq $archiveHashes[$file.Name]) 'retention changed historical bytes'
+        }
+        foreach ($name in @('notes.txt', 'reference.cpp')) {
+            Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'retention changed an unrelated file'
+        }
+        Assert ((Get-SourceHash $nestedSource) -eq $nestedHash) 'retention changed a nested source'
+        Copy-Item -LiteralPath (Join-Path $archive '0.9.11.cpp') -Destination $next
+        & $build -SourceFile '0.9.11.cpp' -WindhawkDirectory $fakeWindhawk
+        Assert ((@(Get-VersionSources $archive).Name -join ',') -eq ($retained.Name -join ',')) 'retention is not idempotent at five versions'
+        Assert ((Split-Path -Leaf (New-ModVersion $fixture)) -eq '0.9.12.cpp') 'version creation failed after pruning'
     } finally { Set-Location -LiteralPath $outside.Path }
     $previousWindhawk = $env:WINDHAWK_HOME
     try {
@@ -101,7 +144,7 @@ try {
         Assert ((Resolve-WindhawkDirectory) -eq $fakeWindhawk) 'WINDHAWK_HOME was not used'
         Reject { Resolve-WindhawkDirectory (Join-Path $fixture 'missing installation') } 'bad explicit toolchain silently fell back'
     } finally { $env:WINDHAWK_HOME = $previousWindhawk }
-    Write-Output 'PASS: README sync, version preservation, archive conflicts, failed-test guard, source-change guard, portable paths and release publication'
+    Write-Output 'PASS: README sync, version preservation, five-version retention, archive conflicts, failed-test guard, source-change guard, portable paths and release publication'
 } finally {
     # Recursive cleanup is restricted to this uniquely named private fixture.
     $resolved = [IO.Path]::GetFullPath($fixture)

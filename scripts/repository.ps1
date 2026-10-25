@@ -161,6 +161,17 @@ function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
         } else {
             Move-Item -LiteralPath $stagedExport -Destination $export
         }
+        # Prune only after both published copies are in place. Include the
+        # legacy baseline, but leave unrelated files and subdirectories alone.
+        $history = @(Get-VersionSources $archive)
+        $archivedLegacy = Join-Path $archive 'mod.cpp'
+        if (Test-Path -LiteralPath $archivedLegacy -PathType Leaf) {
+            $history += Get-Item -LiteralPath $archivedLegacy
+        }
+        foreach ($obsolete in ($history | Sort-Object { Get-ModVersion $_.FullName } -Descending |
+            Select-Object -Skip 5)) {
+            Remove-Item -LiteralPath $obsolete.FullName
+        }
     } finally {
         if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged }
         if (Test-Path -LiteralPath $stagedExport) { Remove-Item -LiteralPath $stagedExport }

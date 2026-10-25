@@ -6,7 +6,8 @@
   header to determine the current release. `mod.cpp`, if present in the archive,
   is the preserved 0.9.112 baseline, never the development target.
 - Historical sources live in `previous-versions/`. Never edit or overwrite them.
-  Preserve their bytes even when making portability or documentation changes.
+  After successful publication, the build deletes all but the five newest source
+  versions, including the published version. Preserve the retained files' bytes.
 - Before editing the mod, run
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/new-version.ps1`.
   This copies the newest source to the next numbered filename in the root and
