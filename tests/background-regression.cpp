@@ -15,7 +15,9 @@
 #include "locale-fixture.h"
 #include "settings-fixture.h"
 #include "selection-log-fixture.h"
+#include "animation-clock-fixture.h"
 #include GPU_OVERLAY_SOURCE
+#undef QueryPerformanceCounter
 #undef Wh_Log
 #undef CoCreateInstance
 #undef SetWinEventHook
@@ -1677,6 +1679,7 @@ static void TestPreviewInput() {
 #include "rename-reorder-smoke.h"
 #include "unexpected-input-smoke.h"
 #include "adaptive-image-smoke.h"
+#include "large-tile-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1708,7 +1711,17 @@ int wmain(int argc,wchar_t** argv) {
             CloseHandle(file);
         }
         const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--adaptive-images")==0) {
+        if (argc>1 && wcscmp(argv[1],L"--animation-continuity")==0) {
+            Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"continuity fonts");
+            HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private continuity frame",
+                WS_POPUP,-32000,-32000,800,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            Check(frame!=nullptr,"continuity frame");
+            TestColumnViewTransition(frame); TestIconGrid(frame,fixture.wstring());
+            DestroyWindow(frame); g_writeFactory.Reset();
+        } else if (argc>1 && wcscmp(argv[1],L"--large-tiles")==0) {
+            TestLargeTileBackpressure(); TestLargeTileSampling();
+        } else if (argc>1 && wcscmp(argv[1],L"--adaptive-images")==0) {
             TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
         } else if (argc>1 && wcscmp(argv[1],L"--unexpected-inputs")==0) {
             TestUnexpectedInputs(fixture.wstring(),argc>2 ? argv[2] : L"all");
@@ -1818,6 +1831,7 @@ int wmain(int argc,wchar_t** argv) {
         TestIconQueueIsolation();
         TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
         TestFrameBudgets();
+        TestLargeTileBackpressure(); TestLargeTileSampling();
         TestPipelineTrace();
         TestPropertyPoolIsolation(fixture.wstring());
         TestDriveSpaceRefresh();

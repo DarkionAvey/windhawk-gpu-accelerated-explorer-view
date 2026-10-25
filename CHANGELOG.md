@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.239
+
+- Skip ordinary tile drawing while a tab's swap chain is busy, retaining the
+  latest input/model without blocking Explorer or another tab's rendering.
+- Use cheaper sampling for large magnified icons while preserving native-size
+  sampling, high-quality downscaling, image resolution and pinch/zoom behavior.
+- Keep deferred frame acknowledgments, transition handoff, resize and GPU handle
+  cleanup consistent with the new readiness check.
+
+See the [large tile investigation and validation](docs/large-tile-rendering-0.9.239.md).
+Validation: the full release gate passed, including Windhawk DLL linking,
+repository/C++/graphics/input suites, 1,000 busy large-tile wakes and 21 actual
+DLL unloads. The 2K-icon offscreen benchmark used about 59% less GPU time in
+one measured run; this is not a live Explorer frame-rate measurement. Published
+source, export and archive are byte-identical; all 42 prior archives are unchanged.
+
 ## 0.9.238
 
 - Register the frame-hook release message under the mod identity before hooks

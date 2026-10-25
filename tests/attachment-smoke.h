@@ -881,6 +881,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     // Reverse navigation without settling the preceding scene. Late native
     // layout notifications must never reveal the swap chain's old header pose.
     for (int pass=0;pass<8;++pass) {
+        std::cout<<"RAPID CACHED NAVIGATION pass="<<pass<<std::endl;
         const bool grid=(pass&1)==0;
         response->mode=grid ? FVM_ICON : FVM_DETAILS;
         bindReplacement(grid ? grouped : directory);
@@ -892,7 +893,13 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         AdvanceColumnTransition(*state);
         Paint(*state);
 #ifdef PRESENTATION_MODEL_FIELDS
-        const auto presented=PresentationFixture::Await(*state,[](const auto& r) {return r.accepted && r.scenePublished;});
+        const float finalHeader=grid ? 0.f : float(Scale96(kHeader96,DpiOf(overlay)));
+        const auto presented=PresentationFixture::Await(*state,[&](const auto& r) {
+            // At 165 ms only 15 ms remain. A valid render/owner scheduling
+            // delay can finish the scene before this observer reads it.
+            return r.accepted && (r.scenePublished || (pass>=4 && !r.columns && !r.rows &&
+                fabsf(r.headerHeight-finalHeader)<.01f));
+        });
         const float header=state->headerPx;
         RECT client{}; GetClientRect(overlay,&client);
         SendMessageW(overlay,WM_SIZE,SIZE_RESTORED,MAKELPARAM(client.right,client.bottom));

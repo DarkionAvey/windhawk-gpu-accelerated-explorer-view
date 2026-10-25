@@ -212,21 +212,24 @@ static void TestColumnViewTransition(HWND frame) {
             "Details columns did not enter from the fixed-DIP offset");
         tick(60.);
         checkSlide();
-        tick(60.); // Readback must not age the reversal's sampled clock.
-        header = state.headerPx;
-        const auto fixedHeaders=state.columnMotion;
-        SetScrollImmediate(state, 120.f);
-        Check(state.columnModeTransition && state.scrollNow == 120.f,
-            "view-mode animation blocked concurrent scrolling");
-        SetColumnViewMode(state, false);
-        Check(fabsf(state.headerPx-header) < .2f && state.columnModeTransition,
-            "reversing a mode change restarted at an endpoint");
-        for(size_t i=0;i<fixedHeaders.size();++i)
-            Check(ColumnBounds(state,i,true)==std::pair{fixedHeaders[i].headerStart,fixedHeaders[i].headerEnd},
-                "mode reversal borrowed the body's sideways positions for header captions");
-        tick(60.); header = state.headerPx;
-        SetColumnViewMode(state, true);
-        Check(fabsf(state.headerPx-header) < .2f, "second mode reversal snapped the header");
+        {
+            AnimationClockFixture::Freeze instant;
+            tick(60.); // Retarget continuity compares geometry at one animation instant.
+            header = state.headerPx;
+            const auto fixedHeaders=state.columnMotion;
+            SetScrollImmediate(state, 120.f);
+            Check(state.columnModeTransition && state.scrollNow == 120.f,
+                "view-mode animation blocked concurrent scrolling");
+            SetColumnViewMode(state, false);
+            Check(fabsf(state.headerPx-header) < .2f && state.columnModeTransition,
+                "reversing a mode change restarted at an endpoint");
+            for(size_t i=0;i<fixedHeaders.size();++i)
+                Check(ColumnBounds(state,i,true)==std::pair{fixedHeaders[i].headerStart,fixedHeaders[i].headerEnd},
+                    "mode reversal borrowed the body's sideways positions for header captions");
+            tick(60.); header = state.headerPx;
+            SetColumnViewMode(state, true);
+            Check(fabsf(state.headerPx-header) < .2f, "second mode reversal snapped the header");
+        }
         checkSlide();
         header = state.headerPx; secondary = state.columns[1].start;
         for (double ms : {30., 60., 90., 120., 150., 181.}) {

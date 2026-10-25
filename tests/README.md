@@ -44,7 +44,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-regressions.ps1 -S
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/repository-regression.ps1
 ```
 
-The default source is latest.cpp. `--options` checks all exposed settings,
+The default source is latest.cpp. `--large-tiles` checks drawing backpressure at
+one large icon per row, GPU sampling times and LTR/RTL Cut pixels; see the
+[large tile report](../docs/large-tile-rendering-0.9.239.md). These are private
+offscreen tests, not measurements of live Explorer or displayed frame rates.
+`--animation-continuity` runs the grid-zoom and view-mode retarget checks; their
+instantaneous geometry comparisons use a scoped test clock without changing
+production animation timing.
+`--options` checks all exposed settings,
 clipping measurements and real asynchronous resize fitting; see the
 [coverage notes](../docs/options-regression-0.9.218.md). Supported focused suites are --selection,
 --graphics, --navigation, --rtl-windows, --native-viewport, --live-sort and

@@ -7,10 +7,17 @@ std::shared_ptr<const PresentationReceipt> Await(ViewState& state,Predicate pred
     Check(bool(state.presenter),"missing presentation endpoint");
     state.presenter->diagnostics=true;
     std::shared_ptr<const PresentationReceipt> result;
-    Check(Eventually([&] {
+    const bool acknowledged=Eventually([&] {
         {std::lock_guard lock(state.presenter->mutex); result=state.presenter->receipt;}
         return result && result->sequence==state.presentationSequence && predicate(*result);
-    }),"presentation owner did not acknowledge the current revision");
+    });
+    if(!acknowledged) std::cout<<"PRESENTATION revision timeout expected="<<state.presentationSequence
+        <<" receipt="<<bool(result)<<" sequence="<<(result ? result->sequence : 0)
+        <<" ready="<<(result && result->ready)<<" accepted="<<(result && result->accepted)
+        <<" scene="<<(result && result->scenePublished)<<" columns="<<(result && result->columns)
+        <<" rows="<<(result && result->rows)<<" frames="<<(result ? result->frames : 0)
+        <<" failure="<<std::hex<<(result ? result->failure : S_OK)<<std::dec<<std::endl;
+    Check(acknowledged,"presentation owner did not acknowledge the current revision");
     return result;
 }
 inline HWND held=nullptr;

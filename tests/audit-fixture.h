@@ -18,9 +18,17 @@ inline std::atomic<void(*)()> framePulseProbe{nullptr};
 inline std::atomic<HANDLE> watchedWait{nullptr};
 inline std::atomic<unsigned> infiniteWaits{0},secondPolls{0};
 inline thread_local bool failDispatchWait=false,watchEventRemoval=false;
+inline thread_local HANDLE busyFrame=nullptr;
+inline thread_local unsigned busyFrameProbes=0;
+inline std::atomic<DWORD> busyPresentationThread{0};
+inline std::atomic<unsigned> busySharedProbes{0};
 inline thread_local HWND rejectSubclass=nullptr;
 inline thread_local unsigned eventsRemoved=0,eventRemovalFailures=0;
 inline DWORD WINAPI Wait(HANDLE handle,DWORD delay) {
+    if (handle==busyFrame && busyFrame && delay==0) {++busyFrameProbes; return WAIT_TIMEOUT;}
+    if (delay==0 && handle && GetCurrentThreadId()==busyPresentationThread.load(std::memory_order_relaxed)) {
+        ++busySharedProbes; return WAIT_TIMEOUT;
+    }
     const HANDLE watched=watchedWait.load(std::memory_order_relaxed);
     if (watched && handle==watched) {
         if (delay==INFINITE) ++infiniteWaits;

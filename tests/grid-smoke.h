@@ -525,12 +525,16 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         Check(fabsf(halfway.left-from.left)>.1f &&
             fabsf(halfway.left-DocumentRowLeft(state,moving))>.1f,
             "overflow cell did not interpolate between its old and new columns");
-        const auto beforeRetarget=LayoutRowVisual(state,moving,LayoutTransitionProgress(state,true,state.rowTransitionStartedQpc));
-        ApplyRowHeight(state,90);
-        const auto retarget=LayoutRowVisual(state,moving,0.f);
-        Check(fabsf(retarget.left-beforeRetarget.left)<3.f &&
-            fabsf(retarget.top-beforeRetarget.top)<3.f,
-            "continuous zoom restarted cell motion at a stale layout");
+        {
+            AnimationClockFixture::Freeze instant;
+            AdvanceRowHeight(state); // Metrics and cell progress must describe the same instant.
+            const auto beforeRetarget=LayoutRowVisual(state,moving,LayoutTransitionProgress(state,true,state.rowTransitionStartedQpc));
+            ApplyRowHeight(state,90);
+            const auto retarget=LayoutRowVisual(state,moving,0.f);
+            Check(fabsf(retarget.left-beforeRetarget.left)<3.f &&
+                fabsf(retarget.top-beforeRetarget.top)<3.f,
+                "continuous zoom restarted cell motion at a stale layout");
+        }
         AdvanceRowHeight(state,true);
         const float after=(state.scrollNow+ViewHeight(state)*.5f)/state.rowPx*state.itemsPerRow;
         Check(!state.zoomAnimating && fabsf(after-anchor)<.05f,
@@ -559,6 +563,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                     "selection-aware grid zoom snapped its starting viewport");
                 const auto began = state.zoomStartedQpc;
                 for (double ms : {18.,54.,90.,135.,179.,181.}) {
+                    AnimationClockFixture::Freeze frameInstant;
                     state.zoomStartedQpc = began;
                     state.zoomStartedQpc.QuadPart -= static_cast<LONGLONG>(
                         ms*state.qpcFrequency/1000.);
