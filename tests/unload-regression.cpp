@@ -38,6 +38,7 @@ template<typename T> static T Export(HMODULE module,const char* name) {
 static HMODULE Load(const wchar_t* path) {
     HMODULE module=LoadLibraryW(path); Check(module!=nullptr,"test DLL load failed");
     unload=Export<void(*)()>(module,"Unload");
+    Check(Export<BOOL(*)()>(module,"PrepareMessages")(),"test DLL message registration");
     return module;
 }
 

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.238
+
+- Register the frame-hook release message under the mod identity before hooks
+  are installed, avoiding collisions with Explorer/other mods' private messages.
+- Give frame subscriptions a shared message-only cleanup window and retain their
+  installer thread's lifetime. Unload can release hooks on their owning STA even
+  after failed frame subclass installation or loss of the frame; exited-owner
+  and empty orphan records are reclaimed without retrying a nonexistent receiver.
+- Route adopted native rename input through a copied message, translate/dispatch
+  it once and report it consumed without modifying Explorer's message structure.
+- Replace dispatch-state one-second polling with thread-exit wait notifications;
+  cancel and drain those waits before DLL unload.
+
+See the [report decisions and lifetime checks](docs/frame-report-0.9.238.md).
+Validation: the focused report checks and full release gate passed, including
+the linked Windhawk DLL, repository/C++/graphics/input suites, process exit and
+21 actual DLL unloads before dispatch-owner thread exit. Published source,
+Windhawk export and archive are byte-identical; 41 prior archives are unchanged.
+
 ## 0.9.237
 
 - Remove the arbitrary 512px request/decode ceiling. Image demand follows

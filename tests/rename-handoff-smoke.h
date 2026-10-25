@@ -213,10 +213,12 @@ static void TestRenameHandoff(const std::wstring& directory) {
             Check(!AdoptNativeRenameEditor(state,editor) && IsWindow(editor),"late names lost native input");
             state.loaded=true; state.directoryPending=false;
             if(route==0) {
-                MSG input{}; input.hwnd=editor; input.message=WM_CHAR; input.wParam='a';
-                MSG routed{};
-                Check(RouteNativeRenameMessage(input,routed) && routed.hwnd==state.rename.editor &&
-                    routed.message==WM_CHAR && routed.wParam=='a',"first native character did not target the visible editor");
+                MSG input{}; input.hwnd=editor; input.message=WM_KEYDOWN; input.wParam=VK_SPACE;
+                input.lParam=1 | (LPARAM(MapVirtualKeyW(VK_SPACE,MAPVK_VK_TO_VSC))<<16);
+                input.time=123; input.pt={17,29};
+                MSG before; memcpy(&before,&input,sizeof(MSG));
+                Check(TranslateAcceleratorHook(tab.frame,nullptr,&input)!=0 &&
+                    !memcmp(&input,&before,sizeof(MSG)),"rename accelerator rewrote Explorer's MSG or left it unconsumed");
             } else {
                 QueueNativeRenameEditor(editor);
                 MSG wake{};
@@ -227,6 +229,16 @@ static void TestRenameHandoff(const std::wstring& directory) {
             wchar_t text[64]{}; GetWindowTextW(state.rename.editor,text,ARRAYSIZE(text));
             DWORD first=0,last=0; SendMessageW(state.rename.editor,EM_GETSEL,reinterpret_cast<WPARAM>(&first),reinterpret_cast<LPARAM>(&last));
             Check(!wcscmp(text,L"typed before names arrived") && first==2 && last==8,"handoff lost typed text/caret");
+            if(route==0) {
+                MSG character{};
+                Check(PeekMessageW(&character,state.rename.editor,WM_CHAR,WM_CHAR,PM_REMOVE) &&
+                    character.wParam==VK_SPACE,"rename accelerator did not translate its copied key to WM_CHAR");
+                DispatchMessageW(&character);
+                Check(!PeekMessageW(&character,state.rename.editor,WM_CHAR,WM_CHAR,PM_REMOVE),
+                    "rename accelerator translated a character twice");
+                GetWindowTextW(state.rename.editor,text,ARRAYSIZE(text));
+                Check(!wcscmp(text,L"ty fore names arrived"),"routed character did not reach the visible rename editor");
+            }
             ShowWindow(state.rename.editor,SW_HIDE); SetWindowPos(state.hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
             RepositionRenameEdit(state);
             Check(IsWindowVisible(state.rename.editor) && GetWindow(tab.frame,GW_CHILD)==state.rename.editor,"unchanged geometry did not repair EDIT visibility/Z order");
@@ -267,5 +279,5 @@ static void TestRenameHandoff(const std::wstring& directory) {
     }
     g_writeFactory=factory;
     Check(GetFocus()==actualFocus && GetForegroundWindow()==actualForeground,"rename tests changed user focus");
-    std::cout<<"PASS: rename click handoff precedes Shell work; native New editor adoption preserves text/caret; Z order, stale-name protection and failure rollback in LTR/RTL list/grid\n";
+    std::cout<<"PASS: rename click handoff precedes Shell work; native adoption preserves text/caret, accelerator MSG ownership and exactly one translated character; Z order, stale-name protection and rollback in LTR/RTL list/grid\n";
 }

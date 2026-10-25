@@ -7,6 +7,8 @@
 #endif
 #include GPU_OVERLAY_SOURCE
 
+extern "C" __declspec(dllexport) BOOL PrepareMessages() {return RegisterFrameHookReleaseMessage();}
+
 extern "C" __declspec(dllexport) void Prepare(int kind,FARPROC original) {
     g_perf=false; g_unloading=false; g_backgroundShutdown=false;
     switch(kind) {
@@ -34,6 +36,7 @@ extern "C" __declspec(dllexport) void Before() { Wh_ModBeforeUninit(); }
 extern "C" __declspec(dllexport) void Unload() { Wh_ModUninit(); }
 extern "C" __declspec(dllexport) BOOL BlockedPoolAtProcessExit() {
     g_unloading=false; g_backgroundShutdown=false;
+    if (!CurrentDispatchThreadState()) return FALSE;
     struct ExitFixture {HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr), gate=CreateEventW(nullptr,TRUE,FALSE,nullptr);};
     static ExitFixture fixture;
     auto work=std::make_shared<TabBackground>();

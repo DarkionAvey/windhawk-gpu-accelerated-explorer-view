@@ -94,6 +94,18 @@ static void TestDispatchStateRetirement() {
         return 0;
     },&live,0,nullptr);
     Check(keeper && WaitForSingleObject(live.entered,5000)==WAIT_OBJECT_0,"live dispatch state");
+    AuditFixture::infiniteWaits=AuditFixture::secondPolls=0;
+    AuditFixture::watchedWait=g_backgroundReaperWake; SetEvent(g_backgroundReaperWake);
+    const bool idle=Eventually([&] {return AuditFixture::infiniteWaits>0;});
+    Sleep(1200); // A live owner must not cause the old once-per-second poll.
+    const bool polling=AuditFixture::secondPolls!=0;
+    AuditFixture::watchedWait=nullptr;
+    HANDLE failed=CreateThread(nullptr,0,+[](void*)->DWORD {
+        AuditFixture::failDispatchWait=true;
+        return CurrentDispatchThreadState()==nullptr ? 0 : 1;
+    },nullptr,0,nullptr);
+    Check(failed && WaitForSingleObject(failed,5000)==WAIT_OBJECT_0,"dispatch wait failure fixture");
+    DWORD failedResult=1; GetExitCodeThread(failed,&failedResult); CloseHandle(failed);
     std::atomic<unsigned> registered{0};
     for(int batch=0;batch<8;++batch) {
         std::array<HANDLE,16> threads{};
@@ -115,7 +127,80 @@ static void TestDispatchStateRetirement() {
     SetEvent(live.release);
     const bool joined=WaitForSingleObject(keeper,5000)==WAIT_OBJECT_0;
     CloseHandle(keeper); CloseHandle(live.entered); CloseHandle(live.release);
-    Check(registered==128 && retired && joined && live.valid,"dispatch reaper lost live state or retained exited threads");
+    Check(idle && !polling && failedResult==0 && registered==128 && retired && joined && live.valid,
+        "dispatch reaper polled, lost live state, retained exited threads or mishandled wait failure");
     Check(Eventually([&] {return count()==baseline;}),"last dispatch thread state was not reclaimed");
-    std::cout<<"PASS: unrelated dispatches allocate no state; regulator reclaims 128 exited-thread maps while a live thread retains its independent cache\n";
+    std::cout<<"PASS: unrelated dispatches allocate no state; exit notifications reclaim 128 maps, preserve live caches, idle without one-second polling and tolerate wait-registration failure\n";
+}
+
+static void TestFrameHookRelease() {
+    Check(g_releaseFrameHooksMessage>=0xC000 && g_releaseFrameHooksMessage<=0xFFFF &&
+        g_releaseFrameHooksMessage==RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks"),
+        "frame release message is not registered under the mod identity");
+    for (unsigned mode=0;mode<4;++mode) {
+        struct Fixture {
+            HANDLE ready=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+            HWND frame=nullptr,cleanup=nullptr;
+            unsigned mode=0;
+            bool subscribed=false,removed=false;
+        } fixture;
+        fixture.mode=mode;
+        DWORD ownerId=0;
+        g_unloading=false;
+        HANDLE owner=CreateThread(nullptr,0,+[](void* context)->DWORD {
+            auto& fixture=*static_cast<Fixture*>(context);
+            HWND frame=fixture.frame=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"private hook owner",
+                WS_POPUP,-32000,-32000,100,100,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            ViewState state; state.frameHwnd=frame;
+            AuditFixture::watchEventRemoval=true;
+            if (fixture.mode==1) AuditFixture::rejectSubclass=frame;
+            InitializeFrameShellEvents(state);
+            AuditFixture::rejectSubclass=nullptr;
+            fixture.subscribed=state.frameLifecycleSubscribed;
+            AcquireSRWLockShared(&g_shellHookLock);
+            if (const auto it=g_shellViewHooks.find(frame);it!=g_shellViewHooks.end())
+                fixture.cleanup=it->second.cleanupWindow;
+            ReleaseSRWLockShared(&g_shellHookLock);
+            if (fixture.mode>=2) {
+                RemoveWindowSubclass(frame,ExplorerFrameSubclass,reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass));
+                DestroyWindow(frame); // Simulate loss of the frame without our NCDESTROY.
+            }
+            if (fixture.mode==3) {
+                RemoveWindowSubclass(fixture.cleanup,FrameHookCleanupSubclass,reinterpret_cast<UINT_PTR>(FrameHookCleanupSubclass));
+                DestroyWindow(fixture.cleanup);
+                SetEvent(fixture.ready); return 0; // USER automatically unhooks at thread exit.
+            }
+            SetEvent(fixture.ready);
+            MSG message{};
+            while (GetMessageW(&message,nullptr,0,0)>0) DispatchMessageW(&message);
+            fixture.removed=AuditFixture::eventsRemoved>0 && !AuditFixture::eventRemovalFailures &&
+                !IsWindow(fixture.cleanup);
+            ReleaseFrameShellViewHook(state);
+            if (IsWindow(frame)) DestroyWindow(frame);
+            return 0;
+        },&fixture,0,&ownerId);
+        Check(owner && WaitForSingleObject(fixture.ready,5000)==WAIT_OBJECT_0 &&
+            fixture.subscribed && fixture.cleanup,"frame release owner fixture");
+        if (mode==3) Check(WaitForSingleObject(owner,5000)==WAIT_OBJECT_0,"dead installer fixture");
+        g_unloading=true;
+        if (mode<2) {
+            SendMessageW(fixture.frame,WM_APP+73,0,0);
+            AcquireSRWLockShared(&g_shellHookLock);
+            const bool retained=g_shellViewHooks.contains(fixture.frame);
+            ReleaseSRWLockShared(&g_shellHookLock);
+            Check(retained,"foreign WM_APP message released frame hooks");
+        }
+        HANDLE clearing=CreateThread(nullptr,0,+[](void*)->DWORD {ClearFrameShellViewHooks(); return 0;},nullptr,0,nullptr);
+        const bool cleared=clearing && WaitForSingleObject(clearing,5000)==WAIT_OBJECT_0;
+        PostThreadMessageW(ownerId,WM_QUIT,0,0);
+        const bool joined=WaitForSingleObject(owner,5000)==WAIT_OBJECT_0;
+        CloseHandle(owner); if (clearing) CloseHandle(clearing); CloseHandle(fixture.ready);
+        AcquireSRWLockShared(&g_shellHookLock);
+        const bool absent=!g_shellViewHooks.contains(fixture.frame);
+        ReleaseSRWLockShared(&g_shellHookLock);
+        Check(cleared && joined && absent && (mode==3 || fixture.removed),
+            "frame cleanup hung or removed WinEvent hooks outside their installer STA");
+    }
+    g_unloading=false;
+    std::cout<<"PASS: registered release message ignores foreign WM_APP; owner-STA cleanup handles live frames, failed subclass installation, destroyed frames and exited installers\n";
 }

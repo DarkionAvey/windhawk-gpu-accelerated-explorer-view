@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <dcomp.h>
 #include <dwmapi.h>
+#include <commctrl.h>
 #include <atomic>
 #include <functional>
 #include <utility>
@@ -14,6 +15,32 @@ inline LPTHREAD_START_ROUTINE heldProcedure=nullptr;
 using ThreadProbe=void(*)(LPTHREAD_START_ROUTINE,LPVOID);
 inline std::atomic<ThreadProbe> threadProbe{nullptr};
 inline std::atomic<void(*)()> framePulseProbe{nullptr};
+inline std::atomic<HANDLE> watchedWait{nullptr};
+inline std::atomic<unsigned> infiniteWaits{0},secondPolls{0};
+inline thread_local bool failDispatchWait=false,watchEventRemoval=false;
+inline thread_local HWND rejectSubclass=nullptr;
+inline thread_local unsigned eventsRemoved=0,eventRemovalFailures=0;
+inline DWORD WINAPI Wait(HANDLE handle,DWORD delay) {
+    const HANDLE watched=watchedWait.load(std::memory_order_relaxed);
+    if (watched && handle==watched) {
+        if (delay==INFINITE) ++infiniteWaits;
+        if (delay==1000) ++secondPolls;
+    }
+    return ::WaitForSingleObject(handle,delay);
+}
+inline BOOL WINAPI RegisterWait(PHANDLE wait,HANDLE object,WAITORTIMERCALLBACK callback,
+        void* context,ULONG delay,ULONG flags) {
+    if (failDispatchWait) {SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE;}
+    return ::RegisterWaitForSingleObject(wait,object,callback,context,delay,flags);
+}
+inline BOOL WINAPI Subclass(HWND hwnd,SUBCLASSPROC procedure,UINT_PTR id,DWORD_PTR data) {
+    return hwnd==rejectSubclass ? FALSE : ::SetWindowSubclass(hwnd,procedure,id,data);
+}
+inline BOOL WINAPI UnhookEvent(HWINEVENTHOOK hook) {
+    const BOOL result=::UnhookWinEvent(hook);
+    if (watchEventRemoval) {++eventsRemoved; if (!result) ++eventRemovalFailures;}
+    return result;
+}
 struct ProbeStart {LPTHREAD_START_ROUTINE procedure; LPVOID context; ThreadProbe probe;};
 inline DWORD WINAPI ProbeThread(LPVOID value) {
     auto* start=static_cast<ProbeStart*>(value); const auto captured=*start; delete start;
@@ -49,6 +76,10 @@ inline HRESULT WINAPI FramePulse() {
 #define CreateThread AuditFixture::Thread
 #define DCompositionCreateDevice AuditFixture::Composition
 #define DwmFlush AuditFixture::FramePulse
+#define WaitForSingleObject AuditFixture::Wait
+#define RegisterWaitForSingleObject AuditFixture::RegisterWait
+#define SetWindowSubclass AuditFixture::Subclass
+#define UnhookWinEvent AuditFixture::UnhookEvent
 // Only explicitly enabled private discovery/failure scenarios are substituted.
 #include <exdisp.h>
 namespace ReportApiFixture {

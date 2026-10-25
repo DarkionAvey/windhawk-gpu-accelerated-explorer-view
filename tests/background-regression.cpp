@@ -1684,6 +1684,7 @@ int wmain(int argc,wchar_t** argv) {
     WorkerComApartment mainApartment; // Keep the test process's main STA alive through worker shutdown.
     try {
         g_perf = false;
+        Check(RegisterFrameHookReleaseMessage(),"registered frame lifecycle message");
         {
             // These are identities only; no real volume/share is accessed.
             Check(IsTargetPath(L"Q:\\") && IsTargetPath(L"q:/ordinary/folder") &&
@@ -1715,8 +1716,10 @@ int wmain(int argc,wchar_t** argv) {
             TestLlmReport(); TestFilesystemMutationDelivery(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--render-quality")==0) {
             TestRenderQuality(); TestToggleRepaint();
+        } else if (argc>1 && wcscmp(argv[1],L"--frame-report")==0) {
+            TestFrameHookRelease(); TestDispatchStateRetirement(); TestRenameHandoff(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--lifetime")==0) {
-            TestLifetimeRaces(); TestDispatchStateRetirement();
+            TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
         } else if (argc>1 && wcscmp(argv[1],L"--namespace-mutations")==0) {
             TestNamespaceItemMutations(fixture.wstring());
             TestNativeStartupPipeline(fixture.wstring());
@@ -1794,7 +1797,7 @@ int wmain(int argc,wchar_t** argv) {
             TestUiFeedbackAudit(fixture.wstring());
         } else {
         TestLlmReport(); TestRenderQuality(); TestToggleRepaint();
-        TestLifetimeRaces(); TestDispatchStateRetirement();
+        TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
         TestStatusButtonLayout();
         TestUserOptions();
         TestClippingPreflight();
