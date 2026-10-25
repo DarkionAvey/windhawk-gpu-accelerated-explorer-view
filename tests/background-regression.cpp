@@ -1680,6 +1680,7 @@ static void TestPreviewInput() {
 #include "unexpected-input-smoke.h"
 #include "adaptive-image-smoke.h"
 #include "large-tile-smoke.h"
+#include "icon-alpha-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1711,7 +1712,9 @@ int wmain(int argc,wchar_t** argv) {
             CloseHandle(file);
         }
         const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--animation-continuity")==0) {
+        if (argc>1 && wcscmp(argv[1],L"--icon-alpha")==0) {
+            TestIconAlphaQuality(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--animation-continuity")==0) {
             Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
                 reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"continuity fonts");
             HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private continuity frame",
@@ -1832,6 +1835,7 @@ int wmain(int argc,wchar_t** argv) {
         TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
         TestFrameBudgets();
         TestLargeTileBackpressure(); TestLargeTileSampling();
+        TestIconAlphaQuality(fixture.wstring());
         TestPipelineTrace();
         TestPropertyPoolIsolation(fixture.wstring());
         TestDriveSpaceRefresh();

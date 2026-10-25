@@ -44,7 +44,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-regressions.ps1 -S
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/repository-regression.ps1
 ```
 
-The default source is latest.cpp. `--large-tiles` checks drawing backpressure at
+The default source is latest.cpp. `--icon-alpha` compares real Shell icon decoding
+with native HICON pixels and transparent PNG references, plus GPU edge pixels
+on dark/light backgrounds, RTL/LTR, Cut opacity and 24..256px sizes. Set
+`GPU_OVERLAY_ICON_ALPHA_PREVIEW` to a PNG output path for a comparison image.
+See the [alpha investigation](../docs/icon-alpha-0.9.240.md).
+`--large-tiles` checks drawing backpressure at
 one large icon per row, GPU sampling times and LTR/RTL Cut pixels; see the
 [large tile report](../docs/large-tile-rendering-0.9.239.md). These are private
 offscreen tests, not measurements of live Explorer or displayed frame rates.

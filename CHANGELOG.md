@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.240
+
+- Correct Shell image-factory bitmap transparency before GPU upload, removing
+  bright edge fringes and jagged-looking outlines on icons and transparent
+  thumbnails.
+- Preserve the existing icon sizes, zoom, filtering and large-tile drawing
+  optimizations; alpha conversion remains on the image worker.
+
+See the [native-reference investigation and comparison](docs/icon-alpha-0.9.240.md).
+Validation: unchanged 0.9.239 reproduces the alpha failure; 0.9.240 passes native
+HICON/transparent-PNG comparisons and GPU edge checks. The complete release gate
+passed, including Windhawk DLL linking, all C++/graphics/input suites and 21 real
+DLL unloads. Published source, export and archive are byte-identical; all 43
+earlier archives are unchanged.
+
 ## 0.9.239
 
 - Skip ordinary tile drawing while a tab's swap chain is busy, retaining the
