@@ -1212,6 +1212,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 
 static void TestGraphicsIsolation(const std::wstring& fixture) {
     WorkerComApartment apartment;
+    TestScrollbarPressRouting();
     Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "DirectWrite setup");
     HWND frame = CreateWindowExW(0, L"STATIC", L"hidden-graphics-frame", 0,
@@ -1879,6 +1880,8 @@ int wmain(int argc,wchar_t** argv) {
             TestRenameHandoff(fixture.wstring());
             TestEditorSelectionOwnership(fixture.wstring());
             TestRenameReorderReadiness(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--scrollbar-input")==0) {
+            TestScrollbarPressRouting();
         } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {
             TestNativeSuppression();
             TestGraphicsIsolation(fixture.wstring());

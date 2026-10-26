@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.245
+
+- Fix rapid scrollbar track clicks followed by thumb dragging, including
+  presses that Windows reports as double-clicks.
+- Keep scrollbar presses and captured releases responsive while directory
+  names are loading.
+
 ## 0.9.244
 
 - Size the shared storage-bar label area from the visible labels instead of

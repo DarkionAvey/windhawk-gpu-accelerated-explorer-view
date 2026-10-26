@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.244
+// @version         0.9.245
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -22890,6 +22890,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 }
         }
     } fitContinuation{hwnd,s,msg};
+    // CS_DBLCLKS replaces a rapid second DOWN even when a track click has
+    // moved the thumb under the pointer. Every scrollbar press must use the
+    // same capture path, before row input bookkeeping and readiness gates.
+    // A captured release belongs to the bar even outside its hit rectangle.
+    const bool scrollbarButton = s &&
+        (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_LBUTTONUP) &&
+        ((msg==WM_LBUTTONUP && (s->draggingScrollbar || s->draggingHorizontal)) ||
+         OnScrollbar(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)) ||
+         OnHorizontalBar(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)));
+    if (scrollbarButton && msg==WM_LBUTTONDBLCLK) msg=WM_LBUTTONDOWN;
     if (s && !s->lastFolderNativePending.empty() &&
         (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN ||
          msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL ||
@@ -22974,7 +22984,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         previewRow >= 0 && previewRow < s->total &&
         s->entries[static_cast<size_t>(previewRow)].folder &&
         (!s->thisPcGpu || s->entries[static_cast<size_t>(previewRow)].shellIdentity);
-    if (preview && !previewFolderOpen &&
+    if (preview && !previewFolderOpen && !scrollbarButton &&
         (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
          msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN ||
          msg == WM_RBUTTONUP || msg == WM_KEYDOWN ||
@@ -24279,7 +24289,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case WM_LBUTTONDOWN:
         if (s && s->pendingNativeSelection) CancelNativeSelectionPreparation(*s);
-        if (s && s->optimisticStartedAt) {
+        if (s && s->optimisticStartedAt && !scrollbarButton) {
             ResetMouseClickSequence(*s);
             return 0;
         }
@@ -24782,7 +24792,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 // Windows may label the FIRST press in the new folder DBLCLK
                 // because the HWND has not changed. Treat it as an ordinary
                 // first row press, preserving selection and capture. Keep the
-                // old no-op behavior for header and scrollbar double-clicks.
+                // old no-op behavior for header double-clicks.
                 if (row >= 0)
                     return OverlayProc(hwnd, WM_LBUTTONDOWN, wParam, lParam);
                 return 0;

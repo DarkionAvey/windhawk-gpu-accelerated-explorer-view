@@ -4,6 +4,100 @@ static LRESULT CALLBACK SampledPointerProc(HWND hwnd, UINT message, WPARAM wp, L
     return DefWindowProcW(hwnd, message, wp, lp);
 }
 
+static void TestScrollbarPressRouting() {
+    FrameInputFixture::Session inputQueue;
+    PointerFixture::Session pointer;
+    ViewState state;
+    state.hwnd=IconTestWindow();
+    state.frameHwnd=state.activeTabHost=state.background->hwnd=state.hwnd;
+    state.visible=state.inScope=state.loaded=state.detailsViewActive=true;
+    state.featureInitializationStep=5;
+    state.rowPx=34; state.headerPx=26; state.iconPx=20;
+    state.total=10000; state.entries.resize(state.total); state.selectedFlags.resize(state.total);
+    state.selected=state.anchor=1; state.selectedFlags[1]=1;
+    ExplorerColumn name; name.key=PKEY_FileName; name.width=1600;
+    state.columns={name}; UpdateRefreshRate(state);
+    SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
+    const auto original=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(SampledPointerProc)));
+    FocusFixture::Session focus(state.hwnd,state.hwnd);
+    const bool smooth=g_smooth.load(), instant=g_instantScrub.load(), bars=g_scrollbar.exchange(true);
+    unsigned trials=0;
+    for (int mode : {0,1,2}) for (bool rtl : {false,true})
+    for (bool easing : {true,false}) for (bool snapped : {false,true})
+    for (int preview : {0,1,2,3}) for (bool horizontal : {false,true})
+    for (UINT press : {WM_LBUTTONDBLCLK,WM_LBUTTONDOWN}) {
+        if (horizontal && mode!=0) continue;
+        ResetMouseGestureForNavigation(state);
+        state.columnsView=mode==0; state.gridView=mode==2; state.rtlLayout=rtl;
+        state.namesPreview=preview==1; state.thisPcGpu=preview==2; state.loaded=preview==0;
+        state.optimisticStartedAt=preview==3 ? GetTickCount64() : 0;
+        g_smooth=easing; g_instantScrub=snapped;
+        UpdateColumns(state); SetScrollImmediate(state,0); SetHorizontalScroll(state,0);
+        auto geometry=[&] { return horizontal ? HorizontalBar(state) : Scrollbar(state); };
+        auto pointAt=[&](const ScrollbarGeometry& bar,float along) {
+            return POINT{LogicalX(state,LONG(horizontal ? along : (bar.left+bar.right)*.5f)),
+                LONG(horizontal ? (bar.top+bar.bottom)*.5f : along)};
+        };
+        auto send=[&](UINT message,POINT point) {
+            PointerFixture::At(state.hwnd,point);
+            PointerFixture::held=message!=WM_LBUTTONUP;
+            OverlayProc(state.hwnd,message,PointerFixture::held ? MK_LBUTTON : 0,MAKELPARAM(point.x,point.y));
+        };
+        auto bar=geometry(); Check(bar.usable,"scrollbar routing fixture has no bar");
+        const auto track=pointAt(bar,(horizontal ? bar.left : bar.top)+bar.thumbLength*.5f+bar.travel*.55f);
+        send(WM_LBUTTONDOWN,track);
+        Check((horizontal ? state.horizontalTarget : state.scrollTarget)>0 &&
+            !state.draggingScrollbar && !state.draggingHorizontal,
+            "track press was swallowed or became a row/thumbnail drag");
+        send(WM_LBUTTONUP,track);
+        // Settle the production animation: the thumb now lies beneath the
+        // first click, so Windows may deliver the next press as DBLCLK.
+        state.smoothStartedQpc.QuadPart-=LONGLONG(state.qpcFrequency);
+        state.horizontalStartedQpc.QuadPart-=LONGLONG(state.qpcFrequency);
+        AdvanceScroll(state); AdvanceHorizontalTrack(state);
+        bar=geometry();
+        const auto thumb=pointAt(bar,bar.thumbStart+bar.thumbLength*.5f);
+        send(press,thumb);
+        Check(GetCapture()==state.hwnd && (horizontal ? state.draggingHorizontal : state.draggingScrollbar),
+            "rapid track-to-thumb press did not immediately capture the thumb");
+        Check(state.mousePressActive && state.mousePressRow<0 && !state.marqueePossible &&
+            state.shellDragRow<0 && !state.columnDragArmed && state.dragDivider<0,
+            "scrollbar press leaked into row, marquee, Shell or column input");
+        const float before=horizontal ? state.horizontalTarget : state.scrollTarget;
+        auto moved=thumb;
+        if (horizontal) moved.x+=rtl ? -30 : 30; else moved.y+=30;
+        send(WM_MOUSEMOVE,moved);
+        Check((horizontal ? state.horizontalTarget : state.scrollTarget)>before,
+            "thumb did not follow movement after the rapid second press");
+        // A preview can arrive during a held drag. Release outside the bar
+        // must still reach its capture owner, even with rows under the cursor.
+        state.namesPreview=true; state.loaded=false;
+        auto released=moved;
+        if (horizontal) released.y-=40; else released.x=LogicalX(state,60);
+        send(WM_LBUTTONUP,released);
+        Check(GetCapture()!=state.hwnd && !state.draggingHorizontal && !state.draggingScrollbar &&
+            !state.mousePressActive,"preview swallowed the captured scrollbar release");
+        Check(state.selected==1 && state.anchor==1 && state.selectedFlags[1] &&
+            std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==1 && state.mouseClickRow<0,
+            "scrollbar interaction changed selection or armed a row double-click");
+        // Double-click messages on the track also represent a real press.
+        state.namesPreview=preview==1; state.loaded=preview==0;
+        SetScrollImmediate(state,0); SetHorizontalScroll(state,0);
+        send(WM_LBUTTONDBLCLK,track);
+        Check((horizontal ? state.horizontalTarget : state.scrollTarget)>0 &&
+            !state.marqueePossible,"track double-click was swallowed or reached the list");
+        send(WM_LBUTTONUP,track);
+        ++trials;
+    }
+    g_smooth=smooth; g_instantScrub=instant; g_scrollbar=bars;
+    ResetMouseGestureForNavigation(state); UnregisterAnimationWindow(state.hwnd);
+    SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(original));
+    SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
+    Stop(state.background); DestroyWindow(state.hwnd);
+    std::cout<<"PASS: "<<trials<<" rapid track-to-thumb message sequences across Details/List/grid, LTR/RTL, smooth/instant settings and names/This PC/optimistic previews; captured releases and selection isolation\n";
+}
+
 static void TestScrollbarItemSteps(ViewState& state) {
     g_instantScrub=true;
     for (int i=0;i<state.total;++i) {
