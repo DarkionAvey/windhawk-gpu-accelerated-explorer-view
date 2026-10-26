@@ -60,6 +60,14 @@ source versus live column bounds, moved Name columns, LTR/RTL, reversal and the
 settled handoff, plus offscreen GPU source pixels. See the
 [storage-bar investigation](../docs/drive-bars-0.9.243.md) and
 [remaining-space refinement](../docs/drive-bars-0.9.244.md).
+`--context-menu` compares real private Shell-view menus with the overlay path
+for files/folders, single, multiple and 128-item selections, with and without Shift. It checks
+native menu ownership, item/submenu parity, popup position, hidden zero-size
+native viewports and stale-tab rejection. Popup tracking and focus APIs are
+substituted; no menu is displayed. Native Rename is entered and cancelled on
+a private file without changing it. This is an offscreen
+component test, not validation of the user's live Explorer/menu customizer.
+See the [context-menu investigation](../docs/context-menu-0.9.246.md).
 `--smart-refresh` checks retained metadata with blocked providers, unchanged
 results without repaint, changed and empty values, stale-result cancellation,
 and independent This PC capacity updates. These are private component tests;

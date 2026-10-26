@@ -18,6 +18,8 @@ extern "C" __declspec(dllexport) void Prepare(int kind,FARPROC original) {
     case 3: g_showWindowAsyncOriginal=reinterpret_cast<decltype(g_showWindowAsyncOriginal)>(original); break;
     case 4: g_setWindowPosOriginal=reinterpret_cast<decltype(g_setWindowPosOriginal)>(original); break;
     case 5: g_deferWindowPosOriginal=reinterpret_cast<decltype(g_deferWindowPosOriginal)>(original); break;
+    case 7: g_trackPopupMenuOriginal=reinterpret_cast<decltype(g_trackPopupMenuOriginal)>(original); break;
+    case 8: g_trackPopupMenuExOriginal=reinterpret_cast<decltype(g_trackPopupMenuExOriginal)>(original); break;
     case 6: g_raiseStructureEventOriginal=reinterpret_cast<decltype(g_raiseStructureEventOriginal)>(original); break;
     }
 }
@@ -29,6 +31,8 @@ extern "C" __declspec(dllexport) void Invoke(int kind) {
     case 3: NativeShowWindowAsyncHook(nullptr,SW_HIDE); break;
     case 4: NativeSetWindowPosHook(nullptr,nullptr,0,0,0,0,0); break;
     case 5: NativeDeferWindowPosHook(nullptr,nullptr,nullptr,0,0,0,0,0); break;
+    case 7: NativeTrackPopupMenuHook(nullptr,0,0,0,0,nullptr,nullptr); break;
+    case 8: NativeTrackPopupMenuExHook(nullptr,0,0,0,nullptr,nullptr); break;
     case 6: RaiseStructureEventHook(nullptr,StructureChangeType_ChildrenInvalidated,nullptr,0); break;
     }
 }

@@ -12,6 +12,8 @@ static int WINAPI Accelerator(HWND,HACCEL,LPMSG) { BlockNative(); return 0; }
 static BOOL WINAPI Show(HWND,int) { BlockNative(); return TRUE; }
 static BOOL WINAPI Position(HWND,HWND,int,int,int,int,UINT) { BlockNative(); return TRUE; }
 static HDWP WINAPI Deferred(HDWP,HWND,HWND,int,int,int,int,UINT) { BlockNative(); return nullptr; }
+static BOOL WINAPI Popup(HMENU,UINT,int,int,int,HWND,const RECT*) { BlockNative(); return 0; }
+static BOOL WINAPI PopupEx(HMENU,UINT,int,int,HWND,LPTPMPARAMS) { BlockNative(); return 0; }
 static HRESULT WINAPI Structure(IRawElementProviderSimple*,StructureChangeType,int*,int) { BlockNative(); return S_OK; }
 using InvokeFn=void(*)(int);
 static InvokeFn invoke;
@@ -94,10 +96,10 @@ int wmain(int argc,wchar_t** argv) {
         }
         const FARPROC originals[]{reinterpret_cast<FARPROC>(Dispatch),reinterpret_cast<FARPROC>(Accelerator),
             reinterpret_cast<FARPROC>(Show),reinterpret_cast<FARPROC>(Show),
-            reinterpret_cast<FARPROC>(Position),reinterpret_cast<FARPROC>(Deferred),reinterpret_cast<FARPROC>(Structure)};
+            reinterpret_cast<FARPROC>(Position),reinterpret_cast<FARPROC>(Deferred),reinterpret_cast<FARPROC>(Structure),reinterpret_cast<FARPROC>(Popup),reinterpret_cast<FARPROC>(PopupEx)};
         // Repeat actual LoadLibrary/FreeLibrary, keeping callback threads alive
         // past unloading to exercise both return-address and TLS-dtor lifetime.
-        for(int round=0;round<3;++round) for(int kind=0;kind<7;++kind) {
+        for(int round=0;round<3;++round) for(int kind=0;kind<9;++kind) {
             for(HANDLE event : {entered,released,returned,exitWorker,unloaded}) ResetEvent(event);
             HMODULE module=Load(argv[1]);
             Export<void(*)(int,FARPROC)>(module,"Prepare")(kind,originals[kind]);
@@ -126,7 +128,7 @@ int wmain(int argc,wchar_t** argv) {
             Check(WaitForSingleObject(worker,5000)==WAIT_OBJECT_0,"thread did not exit after DLL unload");
             CloseHandle(worker); CloseHandle(unloader);
         }
-        std::cout<<"PASS: all seven API hooks drain after removal, 21 real DLL unloads before callback-thread exit, no delayed TLS destructor\n";
+        std::cout<<"PASS: all nine API hooks drain after removal, 27 real DLL unloads before callback-thread exit, no delayed TLS destructor\n";
         {
             HMODULE rename=Load(argv[1]);
             HWND editor=Export<HWND(*)()>(rename,"RetainedRenameEditor")();

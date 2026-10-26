@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.241
+// @version         0.9.246
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,7 +16,7 @@
 ![Showcase GIF](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/assets/showcase.gif)
 
 
-# GPU-accelerated `explorer.exe` list and grid views
+# GPU-accelerated list and grid views for `explorer.exe`
 
 A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations and modern look.
 
@@ -29,20 +29,16 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - Less likely to break in future Windows updates since it does not modify the default views of explorer but recreates them
 
 ## Features
-- **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
+- **Adjustable Item Height** — Smooth zooming with Ctrl+mouse wheel or pinch gestures.
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
-- **Text Antialiasing** — Use Windows monitor tuning, smooth grayscale, or no antialiasing while preserving transparent backgrounds.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
-- **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
-- **Adaptive Image Quality** — Matches icon and thumbnail resolution to visible size and available memory.
 
 ## Report bugs
-Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues).
-Enable **Enable logging** when reproducing a bug and include Windhawk's log in
-the report. Logs include file names and paths; disable the option afterward.
+Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
+Enable **Enable logging** when reproducing a bug and include Windhawk's log in the report. Note: logs include file names and paths; scramble the file names before submitting the logs if you wish.
 */
 // ==/WindhawkModReadme==
 
@@ -310,7 +306,7 @@ constexpr ULONGLONG kDriveSpaceRefreshMs = 60000;
 // Group headings occupy the same row-height rhythm as file rows. No separate
 // typography or fixed section-header height is maintained.
 
-// An elastic track uses the remaining Name-column width. These values are
+// Inline tracks fill the Name column after a shared measured label band. These values are
 // DPI-scaled in one place and used for both fitting and GPU drawing.
 constexpr int kDriveBarSideMargin96 = 20; // Same gap after label and before divider.
 constexpr int kDriveBarMinimumWidth96 = 72; // For fitting/ellipsis only.
@@ -408,7 +404,6 @@ constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
-constexpr UINT kMsgBeginRename = WM_APP + 48;
 // Safety net for builds that update the native list without a WinEvent or
 // posted settings broadcast. Runs on the existing idle timer, not a new timer.
 constexpr ULONGLONG kVisibilityFallbackProbeMs = 1200;
@@ -712,6 +707,8 @@ struct Entry {
     unsigned long long columnEpoch = 0;
     // Shell associations invalidate property text independently of UI columns.
     unsigned long long propertyEpoch = 1;
+    // Refresh freshness is independent of the last displayed property values.
+    unsigned long long detailsRefreshEpoch = 0;
     FILETIME lastWrite{};
     ULONGLONG byteSize = 0;
     bool folder = false;
@@ -1504,9 +1501,9 @@ struct CallbackObjectLifetime {
 // API hooks can remain inside Explorer/USER after every overlay has gone.
 // Drain these only AFTER Windhawk removes detours, in Wh_ModUninit. Waiting
 // before removal would admit new calls indefinitely (including modal loops).
-enum class ApiHook { Dispatch, Accelerator, Show, ShowAsync, Position, DeferredPosition, StructureEvent, Count };
+enum class ApiHook { Dispatch, Accelerator, Show, ShowAsync, Position, DeferredPosition, StructureEvent, Popup, PopupEx, Count };
 constexpr const wchar_t* kApiHookNames[]{L"DispatchMessageW",L"TranslateAcceleratorW",
-    L"ShowWindow",L"ShowWindowAsync",L"SetWindowPos",L"DeferWindowPos",L"UiaRaiseStructureChangedEvent"};
+    L"ShowWindow",L"ShowWindowAsync",L"SetWindowPos",L"DeferWindowPos",L"UiaRaiseStructureChangedEvent",L"TrackPopupMenu",L"TrackPopupMenuEx"};
 std::array<std::atomic<unsigned>,static_cast<size_t>(ApiHook::Count)> g_apiCallbacks{};
 struct ApiCallbackGuard {
     std::atomic<unsigned>& count;
@@ -2378,6 +2375,7 @@ struct ViewState {
     ULONGLONG pendingWidthEarliest = 0;
     unsigned long long columnEpoch = 1;
     unsigned long long propertyEpoch = 1;
+    unsigned long long detailsRefreshEpoch = 0;
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     bool columnVerticalBarVisible = false; // Last layout's scrollbar clearance.
@@ -2792,6 +2790,13 @@ struct ViewState {
     struct WidthEntry {float available=0.f, width=0.f, font=0.f;};
     std::unordered_map<int, WidthEntry> widthCache;
     TextLayoutCache textLayouts[4]; // Body, header, sorted header, wrapped icon labels.
+    struct {
+        ComPtr<IDWriteTextFormat> format;
+        std::vector<std::wstring> labels;
+        float font = 0.f, width = 0.f;
+        int dpi = 0;
+        unsigned long long paint = ~0ULL;
+    } inlineDriveLabels;
     std::deque<TextLayoutCache::Layout> retiredTextLayouts;
     size_t retiredRasterBytes = 0;
     struct RetiredIconBitmap { ComPtr<ID2D1Bitmap> bitmap; size_t bytes; };
@@ -3040,6 +3045,8 @@ struct ViewState {
         std::vector<FitPlane> fitted;
         ComPtr<IDCompositionVisual> root;
         std::vector<std::pair<float,float>> columns;
+        // Borrowed only while a ModeCompositionFrame paints canonical sources.
+        const std::vector<std::array<float,3>>* logicalColumns = nullptr;
     } modeComposition;
     ComPtr<ID2D1DeviceContext> target;
     ComPtr<ID2D1DeviceContext> textRasterTarget;
@@ -6461,21 +6468,22 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
                 old.newIndex = static_cast<int>(i);
                 Entry& fresh = names[i];
                 const Entry& previous = old.entry;
-                // A directory diff does not invalidate the metadata
-                // of surviving, unchanged visible items. Keep their
-                // completed cells and let only new/modified rows load.
+                // Keep surviving visible cells until their replacements
+                // arrive. Modified rows revalidate all keys without an
+                // intermediate empty Date/Type/Size or provider column.
                 // This is bounded by the captured viewport and runs
                 // entirely on the directory worker.
-                if (!fresh.detailsReady && previous.detailsReady &&
-                    previous.columnEpoch == directory.columnEpoch &&
-                    SameEntryMetadata(previous, fresh)) {
+                if (!fresh.detailsReady &&
+                    (previous.detailsReady || !previous.cells.empty())) {
+                    const bool unchanged = SameEntryMetadata(previous, fresh);
                     fresh.date = std::move(old.entry.date);
                     fresh.type = std::move(old.entry.type);
                     fresh.size = std::move(old.entry.size);
                     fresh.cells = std::move(old.entry.cells);
                     fresh.columnEpoch = previous.columnEpoch;
                     fresh.propertyEpoch = previous.propertyEpoch;
-                    fresh.detailsReady = true;
+                    fresh.detailsRefreshEpoch = unchanged ? previous.detailsRefreshEpoch : ~0ULL;
+                    fresh.detailsReady = unchanged;
                     // Never retain an obsolete in-flight detail token.
                     fresh.detailsPending = false;
                 }
@@ -7730,6 +7738,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
         entry.type = saved.type;
         entry.size = saved.size;
         entry.cells = saved.cells;
+        entry.detailsRefreshEpoch = saved.detailsRefreshEpoch;
         // QueueVisibleDetails decides completeness for the current columns.
         // A column generation invalidates jobs, never completed property keys.
         cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
@@ -7737,6 +7746,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     }
     if (entry.cells.empty() || entry.propertyEpoch != state.propertyEpoch) return;
     if (it != cache.entries.end() && it->second.value.propertyEpoch == entry.propertyEpoch &&
+        it->second.value.detailsRefreshEpoch == entry.detailsRefreshEpoch &&
         SameEntryMetadata(entry, it->second.value) &&
         entry.cells.size() == it->second.value.cells.size() &&
         std::equal(entry.cells.begin(), entry.cells.end(), it->second.value.cells.begin(),
@@ -7757,6 +7767,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     saved.byteSize = entry.byteSize;
     saved.folder = entry.folder;
     saved.propertyEpoch = entry.propertyEpoch;
+    saved.detailsRefreshEpoch = entry.detailsRefreshEpoch;
     saved.date = entry.date;
     saved.type = entry.type;
     saved.size = entry.size;
@@ -8376,18 +8387,16 @@ void RevalidateActiveSort(ViewState& state, const std::vector<std::wstring>* ite
     SetEvent(targeted ? state.background->layout.wake : state.background->directory.wake);
 }
 
-// An explicit refresh is stronger than unchanged-name revalidation. Advance
-// both job and cached-property generations; visible demand refetches values,
-// while offscreen rows invalidate lazily instead of walking the whole folder.
+// Revalidate even properties whose size/timestamps did not change, retaining
+// displayed cells until the worker has replacements. Offscreen rows follow
+// lazily; cancellation still rejects older provider completions.
 void ForceRefresh(ViewState& state) {
     InvalidateDetailJobs(state);
-    ++state.propertyEpoch;
-    RetireCachedEntries(state, state.rowDetails);
+    ++state.detailsRefreshEpoch;
     state.columnFitPendingEpoch = 0;
     QueueDirectoryRefresh(state, true, true);
     if (state.thisPcGpu) QueueNativeRows(state);
     QueueVisibleDataFrame(state);
-    Redraw(state);
 }
 
 // File notifications are change *hints*, not an atomic operation boundary.
@@ -8797,13 +8806,15 @@ void QueueVisibleDetails(ViewState& state) {
         }
         if ((e.detailsPending && e.detailsPendingEpoch == state.columnEpoch &&
              e.detailsPendingToken == state.directoryToken) ||
-            (e.detailsReady && e.columnEpoch == state.columnEpoch)) continue;
+            (e.detailsReady && e.columnEpoch == state.columnEpoch &&
+             e.detailsRefreshEpoch == state.detailsRefreshEpoch)) continue;
         CacheRowDetails(state, e, false);
         // No full-directory walk: at most the displayed rows and the currently
         // enabled property keys are examined on Explorer's owning UI thread.
         DetailRequest req;
         for (const PROPERTYKEY& key : neededColumns)
-            if (!HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
+            if (e.detailsRefreshEpoch != state.detailsRefreshEpoch ||
+                !HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
         if (req.missingKeys.empty()) {
             e.columnEpoch = state.columnEpoch;
             e.detailsReady = true;
@@ -9467,32 +9478,39 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 // in any other column. Merge only the keys this request
                 // actually resolved, including legitimately empty values.
                 for (auto& cell : v.cells) {
-                    if (SameKey(cell.key, PKEY_DateModified)) e.date = cell.text;
-                    else if (SameKey(cell.key, PKEY_ItemTypeText)) e.type = cell.text;
-                    else if (SameKey(cell.key, PKEY_Size)) e.size = cell.text;
+                    if (SameKey(cell.key, PKEY_DateModified)) {
+                        changed |= e.date != cell.text; e.date = cell.text;
+                    } else if (SameKey(cell.key, PKEY_ItemTypeText)) {
+                        changed |= e.type != cell.text; e.type = cell.text;
+                    } else if (SameKey(cell.key, PKEY_Size)) {
+                        changed |= e.size != cell.text; e.size = cell.text;
+                    }
                     auto existing = std::find_if(e.cells.begin(), e.cells.end(),
                         [&](const ColumnCell& old) {
                             return SameKey(old.key, cell.key);
                         });
-                    if (existing == e.cells.end())
+                    if (existing == e.cells.end()) {
+                        changed |= !cell.text.empty();
                         e.cells.push_back(std::move(cell));
-                    else
+                    } else if (existing->text != cell.text) {
+                        changed = true;
                         existing->text = std::move(cell.text);
+                    }
                 }
                 e.columnEpoch = v.columnEpoch;
                 e.propertyEpoch = state.propertyEpoch;
+                e.detailsRefreshEpoch = state.detailsRefreshEpoch;
                 e.detailsReady = true;
                 PipelineEvent(*state.background,{.operation=L"metadata.apply[index,cells]",.a=state.directoryToken,.b=v.columnEpoch,
                     .v={static_cast<double>(v.index),static_cast<double>(e.cells.size())}});
                 CacheRowDetails(state, e, true);
                 if (v.columnEpoch == e.detailsPendingEpoch)
                     e.detailsPending = false;
-                changed = true;
             }
-            if (changed) {
-                detailsChanged = true;
-                contentChanged = true;
-            }
+            // Identical values still release pending work and advance demand,
+            // but do not schedule another content paint.
+            detailsChanged = true;
+            contentChanged |= changed;
         } else {
             if (result.kind == DirectoryResult::Complete && state.loaded)
                 // The worker can complete between timer ticks. Observe any
@@ -9560,7 +9578,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
         if (delivery == DirectoryDelivery::Details) state.viewportDemandPending = true;
         else QueueVisibleDetails(state);
         MaybeFinishColumnFit(state);
-        if (!state.rowTransitionActive && !state.groupAnimating) Redraw(state);
+        if (contentChanged && !state.rowTransitionActive && !state.groupAnimating) Redraw(state);
     }
     if (state.columnMenuPending && state.columnCatalogReady) {
         PostMessageW(state.hwnd, kMsgColumnMenuReady,
@@ -9699,6 +9717,35 @@ float NameColumnEnd(ViewState& state) {
     // fallback is also used when a provider temporarily has no Name column.
     return ListEndX(state);
 }
+
+// Source images keep a fixed column origin while DWM translates/clips them.
+// Width-dependent contents must still use the live extent, expressed at that
+// source origin. Otherwise a track or an ellipsized label changes geometry
+// abruptly when the canonical source hands back to the ordinary renderer.
+float NameContentEnd(ViewState& state) {
+    const auto* logical = state.modeComposition.painting ?
+        state.modeComposition.logicalColumns : nullptr;
+    if (logical) for (size_t i=0;i<std::min(logical->size(),state.columns.size());++i) {
+        const auto& column=state.columns[i];
+        if (ClassifySort(column.key)!=SortKind::Name) continue;
+        const auto& live=(*logical)[i];
+        const float translation=live[0]-column.start;
+        return std::min(ListStartX(state)-state.horizontalScroll+column.start+live[1]-live[0],
+            ListEndX(state)-translation);
+    }
+    return std::min(ColumnsPresented(state) ? NameColumnEnd(state) : ListEndX(state),ListEndX(state));
+}
+
+float InlineDriveLabelWidth(float available, float label, int dpi) {
+    const float room=available-2.f*Scale96(kDriveBarSideMargin96,dpi);
+    const float minimum=float(Scale96(kDriveBarMinimumWidth96,dpi));
+    return std::max(0.f,std::min(std::ceil(label+1.f),room-minimum));
+}
+
+float InlineDriveContentWidth(float label, int dpi) {
+    return std::ceil(label+1.f)+Scale96(kDriveBarMinimumWidth96,dpi)+
+        2.f*Scale96(kDriveBarSideMargin96,dpi);
+}
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
@@ -9752,12 +9799,19 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
-            (state.modeComposition.painting && state.modeComposition.widths ? NameColumnEnd(state) :
-                std::min(ColumnsPresented(state) ? NameColumnEnd(state) : end,end))-8.f,
+            NameContentEnd(state)-8.f,
             visual.top+state.rowPx);
     }
     return g;
 }
+
+struct DriveBarGeometry {
+    float labelRight = 0.f;
+    D2D1_RECT_F track{}, caption{};
+    bool visible = false;
+};
+DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item);
+
 // The side clearance is the actual vertical track placement, not a separate
 // 22px estimate. Using the same components avoids a phantom horizontal bar.
 int VerticalScrollbarClearance(int dpi) {
@@ -11274,6 +11328,37 @@ ColumnVisibleSample SampleColumnRows(ViewState& state) {
     return sample;
 }
 
+// Use the fitter's bounded visible sample and its existing intrinsic shaping
+// cache. Window/column width is deliberately absent from the measurement key:
+// widening the view grows only the track, never the gap after short labels.
+// Sample once per paint, then share one result across all row/feedback passes.
+float SharedInlineDriveLabelWidth(ViewState& state) {
+    auto& cache=state.inlineDriveLabels;
+    const int dpi=ViewDpi(state);
+    const bool sameFont=cache.format.Get()==state.textFormat.Get() &&
+        cache.font==state.fontPx && cache.dpi==dpi;
+    if (state.textRasterPainting && sameFont && cache.paint==state.graphicsPaintSerial)
+        return cache.width;
+    const auto sample=SampleColumnRows(state);
+    const auto labelAt=[&](size_t i) {
+        return std::wstring_view(ModelEntry(state,sample.At(i)).name).substr(0,kColumnFitTextLimit);
+    };
+    bool sameLabels=sample.count==cache.labels.size();
+    for (size_t i=0;sameLabels && i<sample.count;++i)
+        sameLabels=labelAt(i)==cache.labels[i];
+    if (!sameFont || !sameLabels) {
+        cache.labels.clear(); cache.labels.reserve(sample.count);
+        cache.width=0.f;
+        for (size_t i=0;i<sample.count;++i) {
+            cache.labels.emplace_back(labelAt(i));
+            cache.width=std::max(cache.width,ColumnTextWidth(state,cache.labels.back(),false));
+        }
+        cache.format=state.textFormat; cache.font=state.fontPx; cache.dpi=dpi;
+    }
+    cache.paint=state.textRasterPainting ? state.graphicsPaintSerial : ~0ULL;
+    return cache.width;
+}
+
 // Request at most one post-load refinement when the visible Shell metadata
 // has not arrived. A Name-only view never needs a metadata follow-up.
 bool HasPendingVisibleColumnDetails(ViewState& state) {
@@ -11344,10 +11429,8 @@ void FitColumnsToVisibleRows(ViewState& state) {
             std::min(headerNeeded, bodyMinimum * 2.f))));
         minimums[i] = minimum;
         minimumTotal += minimum;
-        const float bodyNeeded = textWidth + contentInset +
-            (state.thisPcGpu && name && sample.count
-                ? Scale96(2 * kDriveBarSideMargin96 +
-                    kDriveBarMinimumWidth96, dpi) : 0.f);
+        const float bodyNeeded = contentInset + (state.thisPcGpu && name && sample.count ?
+            InlineDriveContentWidth(textWidth,dpi) : textWidth);
         // Don't let one outlier take the entire viewport; show ellipsis there.
         // An unresolved body adds no content estimate beyond its readable
         // floor/header. Guessing a wider default can send an entering column
@@ -11463,6 +11546,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
         }
 
         const auto content = ColumnTextBounds(state, columnIndex, false, listStart, listEnd, dpi);
+        const float driveLabel=name && state.thisPcGpu ? SharedInlineDriveLabelWidth(state) : 0.f;
         for (size_t j = 0; j < sample.count; ++j) {
             const int row = sample.At(j);
             if (row < 0 || static_cast<size_t>(row) >= state.entries.size())
@@ -11475,8 +11559,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
             float room = content.right - content.left - tolerance;
             if (name && state.thisPcGpu &&
                 (entry.driveTotal || entry.driveUsedPercent >= 0)) {
-                room -= Scale96(2 * kDriveBarSideMargin96 +
-                    kDriveBarMinimumWidth96, dpi);
+                room = InlineDriveLabelWidth(room,driveLabel,dpi);
             }
             if (room <= 0.f) return true;
             const float measured = ColumnTextWidth(state, *cell, false);
@@ -14026,6 +14109,8 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
     }
     D2D1_RECT_F rc = RowHighlightRect(state, top, row);
     if (ViewOptionEnabled(state,g_filenameOnly)) {
+        const auto usage=LayoutDriveBar(state,index,LayoutItem(state,{top,row,1.f}));
+        if (usage.visible) nameRight=std::min(nameRight,usage.labelRight);
         const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
         const float available = std::max(0.f, nameRight - nameLeft);
         const float width = SelectedFilenameWidth(state, index, available);
@@ -14270,12 +14355,6 @@ void StartKeyboardSelectionAnimation(ViewState& state, int index,
 // One themed usage track serves inline Name cells and horizontal drive tiles.
 // Item geometry owns the tile's two text lines; all coordinates remain logical
 // so drawing, pointer geometry and RTL use the existing grid paths.
-struct DriveBarGeometry {
-    float labelRight = 0.f;
-    D2D1_RECT_F track{}, caption{};
-    bool visible = false;
-};
-
 DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item) {
     DriveBarGeometry result;
     if (!state.thisPcGpu || row < 0 || row >= state.total ||
@@ -14293,13 +14372,12 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     const float textLeft = item.text.left, columnRight = item.text.right + 8.f;
     const float margin = static_cast<float>(Scale96(kDriveBarSideMargin96, dpi));
     const float minimum = static_cast<float>(Scale96(kDriveBarMinimumWidth96, dpi));
-    const float labelLimit = columnRight - textLeft - 2.f * margin - minimum;
+    const float labelLimit = InlineDriveLabelWidth(columnRight-textLeft,SharedInlineDriveLabelWidth(state),dpi);
     if (labelLimit <= 0.f) return result; // Never draw across another column.
 
-    const float labelWidth = SelectedFilenameWidth(state, row, labelLimit);
-    // Allow a pixel for DirectWrite glyph overhang so the final character
-    // never gets clipped exactly at the measured layout width.
-    result.labelRight = textLeft + std::min(labelLimit, ceilf(labelWidth + 1.f));
+    // All rows share the measured label band; the track takes everything
+    // after it. Narrow columns retain the existing filename trimming.
+    result.labelRight = textLeft + labelLimit;
     const float height = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
     const float top = (item.text.top + item.text.bottom - height) * .5f;
     result.track = D2D1::RectF(result.labelRight + margin, top, columnRight - margin, top + height);
@@ -14746,10 +14824,15 @@ bool PrepareModeComposition(ViewState& state) {
     const float start = ListStartX(state)-state.horizontalScroll;
     for (size_t i=0; ok && i<state.columns.size(); ++i) {
         const auto& motion = state.columnMotion[i];
-        const float base = state.columnsView ? motion.toStart : motion.fromStart;
-        const float end = state.columnsView ? motion.toEnd : motion.fromEnd;
-        mode.columns.emplace_back(base,end);
         const bool primary = ClassifySort(state.columns[i].key)==SortKind::Name;
+        // A moved Name column can be wider at either endpoint. Anchor its
+        // source at the earlier start so visible live content is not painted
+        // beyond the fixed surface and then clipped away before translation.
+        const float base = primary ? std::min(motion.fromStart,motion.toStart) :
+            state.columnsView ? motion.toStart : motion.fromStart;
+        const float end = primary ? base+std::max(motion.fromEnd-motion.fromStart,motion.toEnd-motion.toStart) :
+            state.columnsView ? motion.toEnd : motion.fromEnd;
+        mode.columns.emplace_back(base,end);
         name |= primary;
         if (state.gridView) continue; // No per-column body slices in a grid.
         const float direction = state.rtlLayout ? -1.f : 1.f;
@@ -14813,6 +14896,7 @@ struct ModeCompositionFrame {
         if (!active) return;
         if (state.target) state.target->SetTransform(D2D1::Matrix3x2F::Identity());
         state.modeComposition.painting=false;
+        state.modeComposition.logicalColumns=nullptr;
         if (Rows()) return;
         state.headerPx=header;
         for (size_t i=0;i<std::min(columns.size(),state.columns.size());++i) {
@@ -14825,6 +14909,7 @@ struct ModeCompositionFrame {
         if (Rows()) { state.modeComposition.painting=true; return; }
         state.modeComposition.logicalHeader=header;
         state.modeComposition.painting=true;
+        state.modeComposition.logicalColumns=&columns;
         state.headerPx=state.modeComposition.header;
         for (size_t i=0;i<columns.size();++i) {
             state.columns[i].start=state.modeComposition.columns[i].first;
@@ -15633,6 +15718,10 @@ void Paint(ViewState& state) {
                     geometry.icon.bottom-geometry.icon.top}},true);
         }
         const DriveBarGeometry usage = LayoutDriveBar(state, i, geometry);
+        if (state.uiTraceDrawItem && usage.visible)
+            PipelineEvent(*state.background,{.operation=L"ui.drive.track[x,y,w,h]",.a=state.uiTraceItem,.b=state.token,
+                .v={usage.track.left,usage.track.top,usage.track.right-usage.track.left,
+                    usage.track.bottom-usage.track.top}},true);
         paintedItems.push_back({i,v,geometry,usage,contentOpacity});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
@@ -19400,167 +19489,112 @@ void ClearSelectionForFolderMenu(ViewState& state) {
     Redraw(state);
 }
 
-// Get *relative* PIDLs from the Shell folder actually shown by this tab.
-// The previous code mixed absolute SHParseDisplayName PIDLs with ILFindLastID,
-// and left Explorer's native selection unsynchronized. Certain commands then
-// acted on the parent folder instead of the selected files.
-void ContextMenu(ViewState& state, int index, POINT screen) {
-    if (!state.folder || !state.folderView || index < 0 || index >= state.total) return;
-    const bool clickedSelected = index < static_cast<int>(state.selectedFlags.size()) &&
-        state.selectedFlags[static_cast<size_t>(index)] != 0;
-    if (!clickedSelected) Select(state, index); // Context-menu mouse selection fades.
-    if (state.pendingNativeSelection) {
-        state.pendingSelectionContextMenu = true;
-        state.pendingSelectionContextPoint = MAKELPARAM(screen.x, screen.y);
-        return;
+// Explorer owns item menu construction, flags, site services, popup messages
+// and invocation. Request its selection menu without hit-testing the suppressed
+// native viewport; supply only the visible GPU anchor to its root popup.
+struct NativeItemMenuAnchor;
+thread_local NativeItemMenuAnchor* t_nativeItemMenuAnchor=nullptr;
+decltype(&TrackPopupMenu) g_trackPopupMenuOriginal=TrackPopupMenu;
+decltype(&TrackPopupMenuEx) g_trackPopupMenuExOriginal=TrackPopupMenuEx;
+struct NativeItemMenuAnchor {
+    HWND owner, native;
+    unsigned long long lifetime, token;
+    POINT screen;
+    bool tracked=false;
+    NativeItemMenuAnchor* previous=t_nativeItemMenuAnchor;
+    NativeItemMenuAnchor(const ViewState& s,POINT p) : owner(s.hwnd),native(s.nativeHwnd),
+        lifetime(s.lifetimeToken),token(s.token),screen(p) { t_nativeItemMenuAnchor=this; }
+    ~NativeItemMenuAnchor() { t_nativeItemMenuAnchor=previous; }
+    bool Current() const {
+        const auto* s=State(owner);
+        return s && s->lifetimeToken==lifetime && s->token==token && s->nativeHwnd==native &&
+            s->visible && s->inScope && !s->optimisticStartedAt && TabOwnsActiveView(*s) &&
+            !g_unloading.load(std::memory_order_acquire);
     }
+};
+bool AnchorNativeItemMenu(HWND owner,int& x,int& y) {
+    auto* anchor=t_nativeItemMenuAnchor;
+    // Do not reposition submenus, later extension popups, or other owners.
+    if (!anchor || anchor->native!=owner || anchor->tracked) return true;
+    if (!anchor->Current()) return false;
+    anchor->tracked=true; x=anchor->screen.x; y=anchor->screen.y;
+    return true;
+}
+BOOL WINAPI NativeTrackPopupMenuHook(HMENU menu,UINT flags,int x,int y,int reserved,HWND owner,const RECT* exclude) {
+    ApiCallbackGuard callback(ApiHook::Popup);
+    if (!AnchorNativeItemMenu(owner,x,y)) return FALSE;
+    return g_trackPopupMenuOriginal(menu,flags,x,y,reserved,owner,exclude);
+}
+BOOL WINAPI NativeTrackPopupMenuExHook(HMENU menu,UINT flags,int x,int y,HWND owner,LPTPMPARAMS parameters) {
+    ApiCallbackGuard callback(ApiHook::PopupEx);
+    if (!AnchorNativeItemMenu(owner,x,y)) return FALSE;
+    return g_trackPopupMenuExOriginal(menu,flags,x,y,owner,parameters);
+}
+
+void ContextMenu(ViewState& state,int index,POINT screen) {
+    if (!state.folder || !state.folderView || !state.shellBrowser || index<0 || index>=state.total ||
+        !state.visible || !state.inScope || !state.loaded || state.namesPreview ||
+        !TabOwnsActiveView(state) || !IsWindow(state.nativeHwnd)) return;
+    const HWND owner=state.hwnd,target=state.nativeHwnd;
+    const auto lifetime=state.lifetimeToken,token=state.token;
+    const auto view=state.folderView;
+    const auto browser=state.shellBrowser;
+    const std::wstring directory=state.folderPath;
+    const auto current=[&] {
+        const auto* live=State(owner);
+        return live==&state && live->lifetimeToken==lifetime && live->token==token &&
+            live->nativeHwnd==target && live->folderView.Get()==view.Get() && live->visible && live->inScope &&
+            !live->optimisticStartedAt && TabOwnsActiveView(*live) && !g_unloading.load(std::memory_order_acquire);
+    };
+    const auto defer=[&] {
+        state.pendingSelectionContextMenu=true;
+        state.pendingSelectionContextPoint=MAKELPARAM(screen.x,screen.y);
+    };
+    if (index>=static_cast<int>(state.selectedFlags.size()) || !state.selectedFlags[size_t(index)]) Select(state,index);
+    if (!current()) return;
+    if (state.pendingNativeSelection) { defer(); return; }
     if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
-
-    // A native Ctrl+A can select tens of thousands of items without ever
-    // enumerating their PIDLs in the GPU overlay. Never undo that by parsing
-    // every filename just because the user right-clicked one selected row.
-    const size_t selectedCount = static_cast<size_t>(std::count_if(
-        state.selectedFlags.begin(), state.selectedFlags.end(),
-        [](unsigned char flag) { return flag != 0; }));
-    if (selectedCount > kMaxDirectNativeSelectionItems) {
-        int nativeCount = -1;
-        ComPtr<IShellView> nativeView;
-        ComPtr<IContextMenu> nativeMenu;
-        if (SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount)) &&
-            nativeCount >= 0 && static_cast<size_t>(nativeCount) == selectedCount &&
-            state.shellBrowser && SUCCEEDED(state.shellBrowser->QueryActiveShellView(
-                nativeView.GetAddressOf())) && nativeView &&
-            SUCCEEDED(nativeView->GetItemObject(SVGIO_SELECTION,
-                IID_PPV_ARGS(&nativeMenu))) && nativeMenu) {
-            HMENU popup = CreatePopupMenu();
-            if (popup) {
-                if (SUCCEEDED(nativeMenu->QueryContextMenu(
-                        popup, 0, 1, 0x7FFF, CMF_NORMAL))) {
-                    const UINT command = TrackPopupMenuEx(popup,
-                        ShellMenuFlags(state),
-                        screen.x, screen.y, state.hwnd, nullptr);
-                    if (command) {
-                        CMINVOKECOMMANDINFOEX invoke{};
-                        invoke.cbSize = sizeof(invoke);
-                        invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-                        invoke.hwnd = state.nativeHwnd;
-                        invoke.lpVerb = MAKEINTRESOURCEA(command - 1);
-                        invoke.lpVerbW = MAKEINTRESOURCEW(command - 1);
-                        invoke.nShow = SW_SHOWNORMAL;
-                        invoke.ptInvoke = screen;
-                        TabTraceSlowScope commandTrace(L"Shell selected-item command", state.hwnd);
-                        const HRESULT hr = InvokeShellSelectionCommand(state,nativeMenu.Get(),
-                            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
-                        if (FAILED(hr)) Wh_Log(
-                            L"[GPU selection] bulk context command failed hr=0x%08X",
-                            static_cast<unsigned>(hr));
-                    }
-                }
-                DestroyMenu(popup);
-            }
-        } else {
-            // If the native selection is not verified, do not expose a context
-            // menu whose Delete/Properties could apply to a different group.
-            Wh_Log(L"[GPU selection] bulk context menu refused: gpu=%zu native=%d",
-                selectedCount, nativeCount);
+    ComPtr<IShellView> native;
+    HWND active=nullptr;
+    if (FAILED(browser->QueryActiveShellView(&native)) || !current() || !native ||
+        FAILED(native->GetWindow(&active)) || !current() || active!=target) return;
+    std::wstring path;
+    ComPtr<IShellFolder> folder;
+    if (!GetFolderPath(view.Get(),path,folder) || !current() ||
+        _wcsicmp(path.c_str(),directory.c_str()) || !IsSupportedLocation(path)) return;
+    const auto selectedCount=static_cast<size_t>(std::count_if(state.selectedFlags.begin(),state.selectedFlags.end(),
+        [](unsigned char flag) { return flag!=0; }));
+    if (!selectedCount) return; // A failed selection must never become a folder menu.
+    if (selectedCount<=kMaxDirectNativeSelectionItems) {
+        if (!SyncNativeSelection(state) || !current()) return;
+        // The filesystem commit already verifies exact identities. This PC's
+        // best-effort synchronization also needs proof before a native menu.
+        if (state.thisPcGpu) {
+            PidlSelection expected;
+            if (!CollectSelectedPidls(state,expected) || !current() ||
+                !VerifyNativeSelection(state,expected) || !current()) return;
+        }
+    } else {
+        // Ctrl+A and prepared marquee groups already own native selection.
+        // Never resolve thousands of filenames again on the UI thread.
+        int count=-1;
+        const auto hr=view->ItemCount(SVGIO_SELECTION,&count);
+        if (!current()) return;
+        if (FAILED(hr) || count<0 || static_cast<size_t>(count)!=selectedCount) {
             ReconcileFailedNativeSelection(state);
-            if (state.pendingNativeSelection) {
-                state.pendingSelectionContextMenu=true;
-                state.pendingSelectionContextPoint=MAKELPARAM(screen.x,screen.y);
-            }
-        }
-        return;
-    }
-
-    std::vector<PITEMID_CHILD> ownedPidls;
-    std::vector<PCUITEMID_CHILD> children;
-    std::wstring current;
-    ComPtr<IShellFolder> actualFolder;
-    if (!GetFolderPath(state.folderView.Get(), current, actualFolder) ||
-        _wcsicmp(current.c_str(), state.folderPath.c_str()) != 0 ||
-        !IsSupportedLocation(current)) return;
-    for (int i = 0; i < state.total; ++i) {
-        if (i >= static_cast<int>(state.selectedFlags.size()) ||
-            !state.selectedFlags[static_cast<size_t>(i)]) continue;
-        PITEMID_CHILD child = nullptr;
-        EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
-        if (child) {
-            ownedPidls.push_back(child);
-            children.push_back(child);
+            if (current() && state.pendingNativeSelection) defer();
+            return;
         }
     }
-    if (children.empty()) return;
-
-    // Sync the native selection even if the user never opened a menu before.
-    // The overlay's marquee and Ctrl-selection already call this on commit.
-    if (!state.thisPcGpu && !SyncNativeSelection(state)) {
-        // Never invoke a native command on a possibly stale selection. This
-        // could otherwise run Properties/Delete on the containing folder.
-        Wh_Log(L"[GPU overlay] context menu refused: native selection not synchronized");
-        for (auto p : ownedPidls) CoTaskMemFree(p);
-        return;
-    }
-
-    ComPtr<IContextMenu> menu;
-    if (SUCCEEDED(actualFolder->GetUIObjectOf(state.nativeHwnd,
-        static_cast<UINT>(children.size()), children.data(),
-        IID_IContextMenu, nullptr,
-        reinterpret_cast<void**>(menu.GetAddressOf()))) && menu) {
-        HMENU popup = CreatePopupMenu();
-        if (popup) {
-            if (SUCCEEDED(menu->QueryContextMenu(popup, 0, 1, 0x7FFF, CMF_NORMAL))) {
-                const UINT command = TrackPopupMenuEx(popup,
-                    ShellMenuFlags(state),
-                    screen.x, screen.y, state.hwnd, nullptr);
-                if (command) {
-                    // Property sheets use the selected files' IDataObject
-                    // explicitly, avoiding Explorer's parent-folder fallback.
-                    wchar_t verb[80]{};
-                    const HRESULT verbHr = menu->GetCommandString(
-                        command - 1, GCS_VERBW, nullptr,
-                        reinterpret_cast<LPSTR>(verb), ARRAYSIZE(verb));
-                    bool handled = false;
-                    if (SUCCEEDED(verbHr) && _wcsicmp(verb, L"rename") == 0 &&
-                        children.size() == 1 && !state.thisPcGpu) {
-                        // The native list content remains suppressed. Queue
-                        // only this item's GPU editor AFTER the popup exits.
-                        handled = PostMessageW(state.hwnd, kMsgBeginRename,
-                            static_cast<WPARAM>(index),
-                            static_cast<LPARAM>(state.mouseFolderEpoch)) != FALSE;
-                    }
-                    if (!handled && SUCCEEDED(verbHr) &&
-                        _wcsicmp(verb, L"properties") == 0) {
-                        ComPtr<IDataObject> data;
-                        if (SUCCEEDED(actualFolder->GetUIObjectOf(state.nativeHwnd,
-                            static_cast<UINT>(children.size()), children.data(),
-                            IID_IDataObject, nullptr,
-                            reinterpret_cast<void**>(data.GetAddressOf()))) && data) {
-                            const HRESULT result = SHMultiFileProperties(data.Get(), 0);
-                            handled = true; // no fallback to parent-folder Properties
-                            if (FAILED(result)) Wh_Log(L"[GPU overlay] file Properties failed: 0x%08X", result);
-                        }
-                    }
-                    if (!handled) {
-                        CMINVOKECOMMANDINFOEX invoke{};
-                        invoke.cbSize = sizeof(invoke);
-                        invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-                        invoke.hwnd = state.nativeHwnd;
-                        invoke.lpVerb = MAKEINTRESOURCEA(command - 1);
-                        invoke.lpVerbW = MAKEINTRESOURCEW(command - 1);
-                        invoke.nShow = SW_SHOWNORMAL;
-                        invoke.ptInvoke = screen;
-                        TabTraceSlowScope commandTrace(L"Shell selected-item command", state.hwnd);
-                        const HRESULT result = InvokeShellSelectionCommand(state,menu.Get(),
-                            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
-                        if (FAILED(result))
-                            Wh_Log(L"[GPU overlay] context command failed: 0x%08X", result);
-                    }
-                }
-            }
-            DestroyMenu(popup);
-        }
-    }
-    for (auto p : ownedPidls) CoTaskMemFree(p);
+    if (!current() || state.pendingNativeSelection || state.nativeSelectionUnsafe ||
+        state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
+    TabTraceSlowScope trace(L"native selected-item menu",owner);
+    NativeFileCommandScope command(&state);
+    if (!current()) return;
+    NativeItemMenuAnchor anchor(state,screen);
+    SendMessageW(target,WM_CONTEXTMENU,reinterpret_cast<WPARAM>(target),-1);
+    // Existing editor handoff also covers extension commands entering Rename.
+    if (current() && NativeRenameEditor(state,GetFocus())) AdoptNativeRenameEditor(state,GetFocus());
 }
 
 // Explorer-style incremental prefix search. No filesystem reads on keystrokes.
@@ -22800,6 +22834,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 }
         }
     } fitContinuation{hwnd,s,msg};
+    // CS_DBLCLKS replaces a rapid second DOWN even when a track click has
+    // moved the thumb under the pointer. Every scrollbar press must use the
+    // same capture path, before row input bookkeeping and readiness gates.
+    // A captured release belongs to the bar even outside its hit rectangle.
+    const bool scrollbarButton = s &&
+        (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_LBUTTONUP) &&
+        ((msg==WM_LBUTTONUP && (s->draggingScrollbar || s->draggingHorizontal)) ||
+         OnScrollbar(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)) ||
+         OnHorizontalBar(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)));
+    if (scrollbarButton && msg==WM_LBUTTONDBLCLK) msg=WM_LBUTTONDOWN;
     if (s && !s->lastFolderNativePending.empty() &&
         (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN ||
          msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL ||
@@ -22884,7 +22928,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         previewRow >= 0 && previewRow < s->total &&
         s->entries[static_cast<size_t>(previewRow)].folder &&
         (!s->thisPcGpu || s->entries[static_cast<size_t>(previewRow)].shellIdentity);
-    if (preview && !previewFolderOpen &&
+    if (preview && !previewFolderOpen && !scrollbarButton &&
         (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
          msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN ||
          msg == WM_RBUTTONUP || msg == WM_KEYDOWN ||
@@ -24189,7 +24233,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case WM_LBUTTONDOWN:
         if (s && s->pendingNativeSelection) CancelNativeSelectionPreparation(*s);
-        if (s && s->optimisticStartedAt) {
+        if (s && s->optimisticStartedAt && !scrollbarButton) {
             ResetMouseClickSequence(*s);
             return 0;
         }
@@ -24566,11 +24610,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             QueueVisibleDataFrame(*s);
         }
         return 0;
-    case kMsgBeginRename:
-        if (s && s->mouseFolderEpoch == static_cast<ULONGLONG>(lParam) &&
-            TabOwnsActiveView(*s))
-            BeginRename(*s, static_cast<int>(wParam));
-        return 0;
     case kMsgNativeRenameEditor:
         if (s && s->token == static_cast<unsigned long long>(lParam))
             AdoptNativeRenameEditor(*s, reinterpret_cast<HWND>(wParam));
@@ -24692,7 +24731,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 // Windows may label the FIRST press in the new folder DBLCLK
                 // because the HWND has not changed. Treat it as an ordinary
                 // first row press, preserving selection and capture. Keep the
-                // old no-op behavior for header and scrollbar double-clicks.
+                // old no-op behavior for header double-clicks.
                 if (row >= 0)
                     return OverlayProc(hwnd, WM_LBUTTONDOWN, wParam, lParam);
                 return 0;
@@ -26476,6 +26515,7 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
             // discarding every prior Shell property value.
             entry.columnEpoch = oldRow->columnEpoch;
             entry.propertyEpoch = oldRow->propertyEpoch;
+            entry.detailsRefreshEpoch = oldRow->detailsRefreshEpoch;
             entry.detailsReady = oldRow->detailsReady;
             entry.detailsPending = oldRow->detailsPending;
             entry.detailsPendingEpoch = oldRow->detailsPendingEpoch;
@@ -28679,6 +28719,9 @@ BOOL Wh_ModInit() {
         !WindhawkUtils::SetFunctionHook(DeferWindowPos, NativeDeferWindowPosHook, &g_deferWindowPosOriginal))
         return failedInitialization();
     if (!WindhawkUtils::SetFunctionHook(DispatchMessageW,DispatchHook,&g_dispatchOriginal))
+        return failedInitialization();
+    if (!WindhawkUtils::SetFunctionHook(TrackPopupMenu,NativeTrackPopupMenuHook,&g_trackPopupMenuOriginal) ||
+        !WindhawkUtils::SetFunctionHook(TrackPopupMenuEx,NativeTrackPopupMenuExHook,&g_trackPopupMenuExOriginal))
         return failedInitialization();
     // Some Explorer builds implement list accelerators before DispatchMessage;
     // this small fallback activates only for Ctrl+A on the active native list.
