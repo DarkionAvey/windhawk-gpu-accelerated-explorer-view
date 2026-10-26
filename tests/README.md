@@ -54,6 +54,10 @@ with native HICON pixels and transparent PNG references, plus GPU edge pixels
 on dark/light backgrounds, RTL/LTR, Cut opacity and 24..256px sizes. Set
 `GPU_OVERLAY_ICON_ALPHA_PREVIEW` to a PNG output path for a comparison image.
 See the [alpha investigation](../docs/icon-alpha-0.9.240.md).
+`--smart-refresh` checks retained metadata with blocked providers, unchanged
+results without repaint, changed and empty values, stale-result cancellation,
+and independent This PC capacity updates. These are private component tests;
+they do not operate a live Explorer context menu.
 `--large-tiles` checks drawing backpressure at
 one large icon per row, GPU sampling times and LTR/RTL Cut pixels; see the
 [large tile report](../docs/large-tile-rendering-0.9.239.md). These are private

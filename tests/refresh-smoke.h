@@ -69,6 +69,7 @@ static void TestDriveSpaceRefresh() {
     state.entries[0].cells.push_back({PKEY_Author,L"old provider value"});
     state.entries[0].detailsReady=true;
     const auto propertyEpoch=state.propertyEpoch;
+    const auto refreshEpoch=state.detailsRefreshEpoch;
     CapacityFixture::freeBytes=125;
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     {
@@ -77,21 +78,23 @@ static void TestDriveSpaceRefresh() {
         ModifierFixture::Session modifiers;
         modifiers.keys[VK_MENU]=0x80;
         OverlayProc(state.hwnd,WM_KEYDOWN,VK_F5,0);
-        Check(state.propertyEpoch==propertyEpoch,"Alt+F5 unexpectedly forced a volume refresh");
+        Check(state.detailsRefreshEpoch==refreshEpoch,"Alt+F5 unexpectedly forced a volume refresh");
         modifiers.keys[VK_MENU]=0;
         OverlayProc(state.hwnd,WM_KEYDOWN,VK_F5,0);
     }
-    Check(state.propertyEpoch!=propertyEpoch,"This PC F5 did not invalidate provider values");
+    Check(state.detailsRefreshEpoch!=refreshEpoch && state.propertyEpoch==propertyEpoch,
+        "This PC F5 did not revalidate while retaining displayed provider values");
     Check(Eventually([&]{
         QueuePendingDriveSpaceRefresh(state,GetTickCount64()+2000);
         ReceiveDirectoryResults(state);
         return !state.directoryPending && !state.driveSpaceRefreshPending;
     }),"forced volume result did not arrive");
     RefreshThisPcRows(state,false);
+    const auto* author=ColumnCellText(state.entries[0],PKEY_Author,state.columnEpoch,state.propertyEpoch);
     Check(state.entries[0].driveUsed==875 &&
-        !ColumnCellText(state.entries[0],PKEY_Author,state.columnEpoch,state.propertyEpoch) &&
+        author && *author==L"old provider value" &&
         ColumnCellText(state.entries[0],PKEY_FreeSpace,state.columnEpoch,state.propertyEpoch),
-        "This PC projection revived invalidated extras or hid freshly probed seeded properties");
+        "This PC projection blanked retained extras or hid freshly probed seeded properties");
     std::weak_ptr<TabBackground> lifetime=state.background;
     UnregisterAnimationWindow(state.hwnd); Stop(state.background);
     Check(Eventually([&]{return lifetime.expired();}),"capacity refresh workers did not retire");

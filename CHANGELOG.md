@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.242
+
+- Keep existing metadata visible during F5, Ctrl+R and right-click Refresh
+  while checking for changes in the background. Identical property results
+  no longer request a repaint; changed values replace their previous text
+  directly, including properties that become empty.
+
 ## 0.9.240
 
 - Correct Shell image-factory bitmap transparency before GPU upload, removing

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.241
+// @version         0.9.242
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,7 +16,7 @@
 ![Showcase GIF](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/assets/showcase.gif)
 
 
-# GPU-accelerated `explorer.exe` list and grid views
+# GPU-accelerated list and grid views for `explorer.exe`
 
 A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations and modern look.
 
@@ -29,20 +29,16 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - Less likely to break in future Windows updates since it does not modify the default views of explorer but recreates them
 
 ## Features
-- **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
+- **Adjustable Item Height** — Smooth zooming with Ctrl+mouse wheel or pinch gestures.
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
-- **Text Antialiasing** — Use Windows monitor tuning, smooth grayscale, or no antialiasing while preserving transparent backgrounds.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
-- **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
-- **Adaptive Image Quality** — Matches icon and thumbnail resolution to visible size and available memory.
 
 ## Report bugs
-Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues).
-Enable **Enable logging** when reproducing a bug and include Windhawk's log in
-the report. Logs include file names and paths; disable the option afterward.
+Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
+Enable **Enable logging** when reproducing a bug and include Windhawk's log in the report. Note: logs include file names and paths; scramble the file names before submitting the logs if you wish.
 */
 // ==/WindhawkModReadme==
 
@@ -712,6 +708,8 @@ struct Entry {
     unsigned long long columnEpoch = 0;
     // Shell associations invalidate property text independently of UI columns.
     unsigned long long propertyEpoch = 1;
+    // Refresh freshness is independent of the last displayed property values.
+    unsigned long long detailsRefreshEpoch = 0;
     FILETIME lastWrite{};
     ULONGLONG byteSize = 0;
     bool folder = false;
@@ -2378,6 +2376,7 @@ struct ViewState {
     ULONGLONG pendingWidthEarliest = 0;
     unsigned long long columnEpoch = 1;
     unsigned long long propertyEpoch = 1;
+    unsigned long long detailsRefreshEpoch = 0;
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     bool columnVerticalBarVisible = false; // Last layout's scrollbar clearance.
@@ -6461,21 +6460,22 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
                 old.newIndex = static_cast<int>(i);
                 Entry& fresh = names[i];
                 const Entry& previous = old.entry;
-                // A directory diff does not invalidate the metadata
-                // of surviving, unchanged visible items. Keep their
-                // completed cells and let only new/modified rows load.
+                // Keep surviving visible cells until their replacements
+                // arrive. Modified rows revalidate all keys without an
+                // intermediate empty Date/Type/Size or provider column.
                 // This is bounded by the captured viewport and runs
                 // entirely on the directory worker.
-                if (!fresh.detailsReady && previous.detailsReady &&
-                    previous.columnEpoch == directory.columnEpoch &&
-                    SameEntryMetadata(previous, fresh)) {
+                if (!fresh.detailsReady &&
+                    (previous.detailsReady || !previous.cells.empty())) {
+                    const bool unchanged = SameEntryMetadata(previous, fresh);
                     fresh.date = std::move(old.entry.date);
                     fresh.type = std::move(old.entry.type);
                     fresh.size = std::move(old.entry.size);
                     fresh.cells = std::move(old.entry.cells);
                     fresh.columnEpoch = previous.columnEpoch;
                     fresh.propertyEpoch = previous.propertyEpoch;
-                    fresh.detailsReady = true;
+                    fresh.detailsRefreshEpoch = unchanged ? previous.detailsRefreshEpoch : ~0ULL;
+                    fresh.detailsReady = unchanged;
                     // Never retain an obsolete in-flight detail token.
                     fresh.detailsPending = false;
                 }
@@ -7730,6 +7730,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
         entry.type = saved.type;
         entry.size = saved.size;
         entry.cells = saved.cells;
+        entry.detailsRefreshEpoch = saved.detailsRefreshEpoch;
         // QueueVisibleDetails decides completeness for the current columns.
         // A column generation invalidates jobs, never completed property keys.
         cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
@@ -7737,6 +7738,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     }
     if (entry.cells.empty() || entry.propertyEpoch != state.propertyEpoch) return;
     if (it != cache.entries.end() && it->second.value.propertyEpoch == entry.propertyEpoch &&
+        it->second.value.detailsRefreshEpoch == entry.detailsRefreshEpoch &&
         SameEntryMetadata(entry, it->second.value) &&
         entry.cells.size() == it->second.value.cells.size() &&
         std::equal(entry.cells.begin(), entry.cells.end(), it->second.value.cells.begin(),
@@ -7757,6 +7759,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     saved.byteSize = entry.byteSize;
     saved.folder = entry.folder;
     saved.propertyEpoch = entry.propertyEpoch;
+    saved.detailsRefreshEpoch = entry.detailsRefreshEpoch;
     saved.date = entry.date;
     saved.type = entry.type;
     saved.size = entry.size;
@@ -8376,18 +8379,16 @@ void RevalidateActiveSort(ViewState& state, const std::vector<std::wstring>* ite
     SetEvent(targeted ? state.background->layout.wake : state.background->directory.wake);
 }
 
-// An explicit refresh is stronger than unchanged-name revalidation. Advance
-// both job and cached-property generations; visible demand refetches values,
-// while offscreen rows invalidate lazily instead of walking the whole folder.
+// Revalidate even properties whose size/timestamps did not change, retaining
+// displayed cells until the worker has replacements. Offscreen rows follow
+// lazily; cancellation still rejects older provider completions.
 void ForceRefresh(ViewState& state) {
     InvalidateDetailJobs(state);
-    ++state.propertyEpoch;
-    RetireCachedEntries(state, state.rowDetails);
+    ++state.detailsRefreshEpoch;
     state.columnFitPendingEpoch = 0;
     QueueDirectoryRefresh(state, true, true);
     if (state.thisPcGpu) QueueNativeRows(state);
     QueueVisibleDataFrame(state);
-    Redraw(state);
 }
 
 // File notifications are change *hints*, not an atomic operation boundary.
@@ -8797,13 +8798,15 @@ void QueueVisibleDetails(ViewState& state) {
         }
         if ((e.detailsPending && e.detailsPendingEpoch == state.columnEpoch &&
              e.detailsPendingToken == state.directoryToken) ||
-            (e.detailsReady && e.columnEpoch == state.columnEpoch)) continue;
+            (e.detailsReady && e.columnEpoch == state.columnEpoch &&
+             e.detailsRefreshEpoch == state.detailsRefreshEpoch)) continue;
         CacheRowDetails(state, e, false);
         // No full-directory walk: at most the displayed rows and the currently
         // enabled property keys are examined on Explorer's owning UI thread.
         DetailRequest req;
         for (const PROPERTYKEY& key : neededColumns)
-            if (!HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
+            if (e.detailsRefreshEpoch != state.detailsRefreshEpoch ||
+                !HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
         if (req.missingKeys.empty()) {
             e.columnEpoch = state.columnEpoch;
             e.detailsReady = true;
@@ -9467,32 +9470,39 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 // in any other column. Merge only the keys this request
                 // actually resolved, including legitimately empty values.
                 for (auto& cell : v.cells) {
-                    if (SameKey(cell.key, PKEY_DateModified)) e.date = cell.text;
-                    else if (SameKey(cell.key, PKEY_ItemTypeText)) e.type = cell.text;
-                    else if (SameKey(cell.key, PKEY_Size)) e.size = cell.text;
+                    if (SameKey(cell.key, PKEY_DateModified)) {
+                        changed |= e.date != cell.text; e.date = cell.text;
+                    } else if (SameKey(cell.key, PKEY_ItemTypeText)) {
+                        changed |= e.type != cell.text; e.type = cell.text;
+                    } else if (SameKey(cell.key, PKEY_Size)) {
+                        changed |= e.size != cell.text; e.size = cell.text;
+                    }
                     auto existing = std::find_if(e.cells.begin(), e.cells.end(),
                         [&](const ColumnCell& old) {
                             return SameKey(old.key, cell.key);
                         });
-                    if (existing == e.cells.end())
+                    if (existing == e.cells.end()) {
+                        changed |= !cell.text.empty();
                         e.cells.push_back(std::move(cell));
-                    else
+                    } else if (existing->text != cell.text) {
+                        changed = true;
                         existing->text = std::move(cell.text);
+                    }
                 }
                 e.columnEpoch = v.columnEpoch;
                 e.propertyEpoch = state.propertyEpoch;
+                e.detailsRefreshEpoch = state.detailsRefreshEpoch;
                 e.detailsReady = true;
                 PipelineEvent(*state.background,{.operation=L"metadata.apply[index,cells]",.a=state.directoryToken,.b=v.columnEpoch,
                     .v={static_cast<double>(v.index),static_cast<double>(e.cells.size())}});
                 CacheRowDetails(state, e, true);
                 if (v.columnEpoch == e.detailsPendingEpoch)
                     e.detailsPending = false;
-                changed = true;
             }
-            if (changed) {
-                detailsChanged = true;
-                contentChanged = true;
-            }
+            // Identical values still release pending work and advance demand,
+            // but do not schedule another content paint.
+            detailsChanged = true;
+            contentChanged |= changed;
         } else {
             if (result.kind == DirectoryResult::Complete && state.loaded)
                 // The worker can complete between timer ticks. Observe any
@@ -9560,7 +9570,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
         if (delivery == DirectoryDelivery::Details) state.viewportDemandPending = true;
         else QueueVisibleDetails(state);
         MaybeFinishColumnFit(state);
-        if (!state.rowTransitionActive && !state.groupAnimating) Redraw(state);
+        if (contentChanged && !state.rowTransitionActive && !state.groupAnimating) Redraw(state);
     }
     if (state.columnMenuPending && state.columnCatalogReady) {
         PostMessageW(state.hwnd, kMsgColumnMenuReady,
@@ -26476,6 +26486,7 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
             // discarding every prior Shell property value.
             entry.columnEpoch = oldRow->columnEpoch;
             entry.propertyEpoch = oldRow->propertyEpoch;
+            entry.detailsRefreshEpoch = oldRow->detailsRefreshEpoch;
             entry.detailsReady = oldRow->detailsReady;
             entry.detailsPending = oldRow->detailsPending;
             entry.detailsPendingEpoch = oldRow->detailsPendingEpoch;

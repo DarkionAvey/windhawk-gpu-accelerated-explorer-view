@@ -1015,7 +1015,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             nullptr,reinterpret_cast<void**>(menu.GetAddressOf()))) && menu,
             "Recycle Bin native item menu could not bind the enumerated child identity");
     }
-    const auto recyclePropertyEpoch=state->propertyEpoch;
+    const auto recyclePropertyEpoch=state->detailsRefreshEpoch;
     // This is an unmodified synthetic F5, independent of the user's Alt state
     // (including state retained by earlier test message pumps). Like the other
     // key fixtures, change only this private thread's keyboard-state table.
@@ -1024,10 +1024,10 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     const auto refreshAlt=GetKeyState(VK_MENU);
     const auto refreshOptimistic=state->optimisticStartedAt;
     SendMessageW(overlay,WM_KEYDOWN,VK_F5,0);
-    const bool refreshAccepted=state->propertyEpoch!=recyclePropertyEpoch;
+    const bool refreshAccepted=state->detailsRefreshEpoch!=recyclePropertyEpoch;
     Check(SetKeyboardState(savedRefreshKeys),"Recycle Bin refresh key restoration");
     const bool recycleRefreshed=refreshAccepted && settled();
-    if(!recycleRefreshed) std::cerr<<"RECYCLE F5 epoch="<<recyclePropertyEpoch<<"->"<<state->propertyEpoch
+    if(!recycleRefreshed) std::cerr<<"RECYCLE F5 epoch="<<recyclePropertyEpoch<<"->"<<state->detailsRefreshEpoch
         <<" loaded="<<state->loaded<<" pending="<<state->directoryPending<<" native-pending="<<state->nativeRowsPending
         <<" optimistic="<<state->optimisticStartedAt<<" in-scope="<<state->inScope<<" visible="<<state->visible
         <<" active="<<state->detailsViewActive<<" token="<<state->token<<" preview="<<state->namesPreview

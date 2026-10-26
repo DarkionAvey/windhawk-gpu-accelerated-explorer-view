@@ -703,24 +703,89 @@ static void TestSortDetails(const std::wstring& directory) {
     FlushShellChangeHints(state, GetTickCount64() + kShellVisualCoalesceMs);
     refresh();
     Check(state.entries[1].cells.empty(), "UPDATEITEM resurrected an invalidated cached property");
+    const auto seedDetails = [&](bool viewportOnly=false) {
+        DirectoryResult values; values.kind=DirectoryResult::Details; values.token=state.directoryToken;
+        const auto visible=VisibleItemRows(state,12.f);
+        for(int i=0;i<state.total;++i) {
+            if(viewportOnly && std::find(visible.begin(),visible.end(),i)==visible.end()) continue;
+            DetailValue value; value.index=i; value.columnEpoch=state.columnEpoch;
+            for(size_t k=0;k<keys.size();++k) value.cells.push_back({keys[k],expected(state.entries[i],k)});
+            values.details.push_back(std::move(value));
+        }
+        PublishDirectoryResult(*state.background,std::move(values));
+        return ReceiveDirectoryResults(state);
+    };
+    seedDetails(); SetScrollImmediate(state,0);
+    const auto checkDisplayed = [&] {
+        for(int i : VisibleItemRows(state,12.f))
+            for(size_t k=0;k<keys.size();++k) {
+                const auto* text=ColumnCellText(state.entries[i],keys[k],state.columnEpoch,state.propertyEpoch);
+                Check(text && *text==expected(state.entries[i],k),"smart refresh blanked or replaced a displayed cell before revalidation");
+            }
+    };
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
-    BYTE savedKeys[256]{},keysDown[256]{}; GetKeyboardState(savedKeys); SetKeyboardState(keysDown);
-    for(int mode=0;mode<3;++mode) {
+    ModifierFixture::Session modifiers;
+    for(int mode=0;mode<4;++mode) {
         state.gridView=mode==1; state.columnsView=mode==0;
         state.selected=17; state.selectedFlags.assign(state.total,0); state.selectedFlags[17]=1;
-        const auto propertyEpoch=state.propertyEpoch;
-        if(mode==2) { keysDown[VK_CONTROL]=0x80; SetKeyboardState(keysDown); }
-        OverlayProc(state.hwnd,WM_KEYDOWN,mode==2 ? 'R' : VK_F5,0);
-        Check(state.propertyEpoch!=propertyEpoch,"F5/Ctrl+R retained the old property generation");
+        const auto refreshEpoch=state.detailsRefreshEpoch, propertyEpoch=state.propertyEpoch;
+        const auto previousColumnEpoch=state.columnEpoch;
+        modifiers.keys[VK_CONTROL]=mode==2 ? 0x80 : 0;
+        if(mode==3) {
+            HANDLE changed=CreateFileW(state.entries[0].path.c_str(),FILE_APPEND_DATA,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+            DWORD bytes=0;
+            Check(changed!=INVALID_HANDLE_VALUE && WriteFile(changed,"x",1,&bytes,nullptr) && bytes==1,
+                "smart refresh changed-file fixture");
+            CloseHandle(changed);
+        }
+        ValidateRect(state.hwnd,nullptr);
+        if(mode==3) ForceRefresh(state); // Canonical background Refresh uses this same entry point.
+        else OverlayProc(state.hwnd,WM_KEYDOWN,mode==2 ? 'R' : VK_F5,0);
+        Check(state.detailsRefreshEpoch!=refreshEpoch && state.propertyEpoch==propertyEpoch,
+            "F5/Ctrl+R/menu refresh did not separate freshness from displayed values");
+        checkDisplayed();
+        Check(!GetUpdateRect(state.hwnd,nullptr,FALSE),"smart refresh invalidated unchanged content at invocation");
         auto refreshed=WaitForComplete(*state.background,state.directoryToken);
         PublishDirectoryResult(*state.background,std::move(refreshed)); ReceiveDirectoryResults(state);
         state.columnsView=true; QueueVisibleDetails(state);
-        Check(state.selected==17 && state.selectedFlags[17],"forced refresh lost selection");
+        Check(state.selected==17 && state.selectedFlags[17],"smart refresh lost selection");
+        checkDisplayed();
+        if(mode==3) {
+            ForceRefresh(state); // Repeat while the modified row's provider is still blocked.
+            auto repeated=WaitForComplete(*state.background,state.directoryToken);
+            PublishDirectoryResult(*state.background,std::move(repeated)); ReceiveDirectoryResults(state);
+            checkDisplayed();
+        }
         inspectDemand([&](const DetailRequest& req) {
-            Check(req.missingKeys.size()==4,"forced refresh revived an old property-cell cache");
+            Check(req.missingKeys.size()==4,"smart refresh trusted unverified cached property values");
         },"unchanged names blocked forced metadata retrieval");
+        DirectoryResult stale; stale.kind=DirectoryResult::Details; stale.token=state.directoryToken;
+        DetailValue old; old.index=0; old.columnEpoch=previousColumnEpoch;
+        old.cells={{PKEY_Author,L"obsolete result"}}; stale.details.push_back(std::move(old));
+        PublishDirectoryResult(*state.background,std::move(stale)); ReceiveDirectoryResults(state);
+        checkDisplayed();
+        ValidateRect(state.hwnd,nullptr);
+        Check(!seedDetails(true),"identical refreshed values reported a content change");
+        Check(!GetUpdateRect(state.hwnd,nullptr,FALSE),"identical refreshed values scheduled a content repaint");
+        checkDisplayed();
     }
-    SetKeyboardState(savedKeys); SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
+    SetScrollImmediate(state,MaxScrollPx(state));
+    inspectDemand([&](const DetailRequest& req) {
+        Check(req.missingKeys.size()==4,"offscreen refresh trusted stale cached cells");
+    },"offscreen values were not revalidated on return");
+    checkDisplayed(); seedDetails(); SetScrollImmediate(state,0);
+    SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
+    const int changedRow=VisibleItemRows(state,0.f).front();
+    const auto deliverAuthor = [&](const std::wstring& text) {
+        DirectoryResult result; result.kind=DirectoryResult::Details; result.token=state.directoryToken;
+        DetailValue value; value.index=changedRow; value.columnEpoch=state.columnEpoch;
+        value.cells={{PKEY_Author,text}}; result.details.push_back(std::move(value));
+        PublishDirectoryResult(*state.background,std::move(result)); return ReceiveDirectoryResults(state);
+    };
+    Check(deliverAuthor(L"updated author"),"changed provider-only value was not published");
+    Check(!deliverAuthor(L"updated author"),"repeated provider-only value reported a content change");
+    Check(deliverAuthor(L""),"a legitimately emptied property was not published");
     DirectoryResult refetched; refetched.kind=DirectoryResult::Details; refetched.token=state.directoryToken;
     for(int i=0;i<state.total;++i) {
         DetailValue value; value.index=i; value.columnEpoch=state.columnEpoch;
@@ -738,7 +803,7 @@ static void TestSortDetails(const std::wstring& directory) {
     Check(Eventually([&] { return lifetime.expired(); }), "sort property workers did not retire");
     DestroyWindow(state.hwnd);
     CloseHandle(providerGate); providerGate = nullptr;
-    std::cout << "PASS: repeated name/date/type/size sorts preserve cached cells before paint with blocked providers; offscreen/cache returns, column generations and real invalidations\n";
+    std::cout << "PASS: smart F5/Ctrl+R/menu entry retains displayed cells with blocked providers; identical results avoid repaint, changed/empty values update, stale jobs cancel; sorts, offscreen/cache returns and real invalidations\n";
 }
 
 static LRESULT CALLBACK PointerCaptureProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
@@ -1745,6 +1810,8 @@ int wmain(int argc,wchar_t** argv) {
             TestStatusButtonLayout();
         } else if (argc>1 && wcscmp(argv[1],L"--drive-refresh")==0) {
             TestDriveSpaceRefresh();
+        } else if (argc>1 && wcscmp(argv[1],L"--smart-refresh")==0) {
+            TestSortDetails(fixture.wstring()); TestDriveSpaceRefresh();
         } else if (argc>1 && wcscmp(argv[1],L"--column-minimum")==0) {
             TestColumnMinimumWidths();
         } else if (argc>1 && wcscmp(argv[1],L"--column-bridge")==0) {

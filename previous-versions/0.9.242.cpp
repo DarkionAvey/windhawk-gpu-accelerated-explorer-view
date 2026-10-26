@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.237
+// @version         0.9.242
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,7 +16,7 @@
 ![Showcase GIF](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/assets/showcase.gif)
 
 
-# GPU-accelerated `explorer.exe` list and grid views
+# GPU-accelerated list and grid views for `explorer.exe`
 
 A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations and modern look.
 
@@ -29,20 +29,16 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - Less likely to break in future Windows updates since it does not modify the default views of explorer but recreates them
 
 ## Features
-- **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
+- **Adjustable Item Height** — Smooth zooming with Ctrl+mouse wheel or pinch gestures.
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
-- **Text Antialiasing** — Use Windows monitor tuning, smooth grayscale, or no antialiasing while preserving transparent backgrounds.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
-- **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
-- **Adaptive Image Quality** — Matches icon and thumbnail resolution to visible size and available memory.
 
 ## Report bugs
-Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues).
-Enable **Enable logging** when reproducing a bug and include Windhawk's log in
-the report. Logs include file names and paths; disable the option afterward.
+Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
+Enable **Enable logging** when reproducing a bug and include Windhawk's log in the report. Note: logs include file names and paths; scramble the file names before submitting the logs if you wish.
 */
 // ==/WindhawkModReadme==
 
@@ -398,7 +394,11 @@ constexpr UINT kMsgRetireGraphics = WM_APP + 69;
 constexpr UINT kMsgFilesystemChanged = WM_APP + 70;
 constexpr UINT kMsgFlushDirectoryChanges = WM_APP + 71;
 constexpr UINT kMsgPresentationReady = WM_APP + 72;
-constexpr UINT kMsgReleaseFrameHooks = WM_APP + 73;
+UINT g_releaseFrameHooksMessage = 0;
+bool RegisterFrameHookReleaseMessage() {
+    g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
+    return g_releaseFrameHooksMessage!=0;
+}
 constexpr UINT kMsgNativeRenameEditor = WM_APP + 74;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
@@ -708,6 +708,8 @@ struct Entry {
     unsigned long long columnEpoch = 0;
     // Shell associations invalidate property text independently of UI columns.
     unsigned long long propertyEpoch = 1;
+    // Refresh freshness is independent of the last displayed property values.
+    unsigned long long detailsRefreshEpoch = 0;
     FILETIME lastWrite{};
     ULONGLONG byteSize = 0;
     bool folder = false;
@@ -1907,7 +1909,7 @@ std::mutex g_backgroundLifetimeMutex;
     g_backgroundLifetimes{std::in_place};
 HANDLE g_backgroundReaperWake = nullptr, g_backgroundReaper = nullptr;
 bool g_backgroundShutdown = false; // Protected by g_backgroundLifetimeMutex.
-bool ReapDispatchThreadStates();
+void ReapDispatchThreadStates();
 
 DWORD WINAPI BackgroundReaperProc(LPVOID) {
     DWORD delay = INFINITE;
@@ -1929,8 +1931,8 @@ DWORD WINAPI BackgroundReaperProc(LPVOID) {
         // Potentially enormous discarded snapshots are destroyed here, outside
         // the registry lock and outside every overlay's input/paint thread.
         finished.clear();
-        const bool dispatchPending=ReapDispatchThreadStates();
-        delay = pending ? 50 : dispatchPending ? 1000 : INFINITE;
+        ReapDispatchThreadStates();
+        delay = pending ? 50 : INFINITE;
     }
     return 0;
 }
@@ -2312,7 +2314,10 @@ struct ViewState {
         viewTogglePaletteDirty = true;
     }
     ViewState() {background->notificationLifetime=lifetimeToken;}
-    ~ViewState() { ReleaseViewToggle(); }
+    ~ViewState() {
+        ReleaseViewToggle();
+        if (frameLatencyWaitable) CloseHandle(frameLatencyWaitable);
+    }
     bool rtlLayout = false; // Follow Shell UI direction, not filename script.
     float paintWidth = 0.f; // Cached paint width for inexpensive logical->visual mapping.
     bool inScope = true;
@@ -2371,6 +2376,7 @@ struct ViewState {
     ULONGLONG pendingWidthEarliest = 0;
     unsigned long long columnEpoch = 1;
     unsigned long long propertyEpoch = 1;
+    unsigned long long detailsRefreshEpoch = 0;
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     bool columnVerticalBarVisible = false; // Last layout's scrollbar clearance.
@@ -2972,6 +2978,8 @@ struct ViewState {
     ComPtr<IDCompositionDevice> composition;
     ComPtr<ID2D1Device> d2dDevice;
     bool presentPending = false;
+    HANDLE frameLatencyWaitable = nullptr; // Owned by this tab's GPU lane; zero-time readiness probes only.
+    LARGE_INTEGER rejectedPresentQpc{};
     bool graphicsReady = false;
     bool graphicsInitializing = false;
     bool graphicsReleaseQueued = false, graphicsSuspended = false, gpuDeviceCounted = false;
@@ -5408,7 +5416,10 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
     ComPtr<IWICBitmap> source;
     if (SUCCEEDED(hr) && bitmap)
         hr = factory->CreateBitmapFromHBITMAP(bitmap.get(), nullptr,
-            WICBitmapUsePremultipliedAlpha, source.GetAddressOf());
+            // Shell image-factory HBITMAPs carry straight BGRA. Let the
+            // existing WIC conversion premultiply once, including edge/shadow
+            // pixels; declaring this source PBGRA creates bright fringes.
+            WICBitmapUseAlpha, source.GetAddressOf());
     if (FAILED(hr) || !source) { if (status) *status = FAILED(hr) ? hr : E_FAIL; return {}; }
     auto pixels = DecodeIconPixels(factory, source.Get(), status, job.pixelSize,
         4ULL*job.pixelSize*job.pixelSize);
@@ -6449,21 +6460,22 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
                 old.newIndex = static_cast<int>(i);
                 Entry& fresh = names[i];
                 const Entry& previous = old.entry;
-                // A directory diff does not invalidate the metadata
-                // of surviving, unchanged visible items. Keep their
-                // completed cells and let only new/modified rows load.
+                // Keep surviving visible cells until their replacements
+                // arrive. Modified rows revalidate all keys without an
+                // intermediate empty Date/Type/Size or provider column.
                 // This is bounded by the captured viewport and runs
                 // entirely on the directory worker.
-                if (!fresh.detailsReady && previous.detailsReady &&
-                    previous.columnEpoch == directory.columnEpoch &&
-                    SameEntryMetadata(previous, fresh)) {
+                if (!fresh.detailsReady &&
+                    (previous.detailsReady || !previous.cells.empty())) {
+                    const bool unchanged = SameEntryMetadata(previous, fresh);
                     fresh.date = std::move(old.entry.date);
                     fresh.type = std::move(old.entry.type);
                     fresh.size = std::move(old.entry.size);
                     fresh.cells = std::move(old.entry.cells);
                     fresh.columnEpoch = previous.columnEpoch;
                     fresh.propertyEpoch = previous.propertyEpoch;
-                    fresh.detailsReady = true;
+                    fresh.detailsRefreshEpoch = unchanged ? previous.detailsRefreshEpoch : ~0ULL;
+                    fresh.detailsReady = unchanged;
                     // Never retain an obsolete in-flight detail token.
                     fresh.detailsPending = false;
                 }
@@ -7718,6 +7730,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
         entry.type = saved.type;
         entry.size = saved.size;
         entry.cells = saved.cells;
+        entry.detailsRefreshEpoch = saved.detailsRefreshEpoch;
         // QueueVisibleDetails decides completeness for the current columns.
         // A column generation invalidates jobs, never completed property keys.
         cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
@@ -7725,6 +7738,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     }
     if (entry.cells.empty() || entry.propertyEpoch != state.propertyEpoch) return;
     if (it != cache.entries.end() && it->second.value.propertyEpoch == entry.propertyEpoch &&
+        it->second.value.detailsRefreshEpoch == entry.detailsRefreshEpoch &&
         SameEntryMetadata(entry, it->second.value) &&
         entry.cells.size() == it->second.value.cells.size() &&
         std::equal(entry.cells.begin(), entry.cells.end(), it->second.value.cells.begin(),
@@ -7745,6 +7759,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     saved.byteSize = entry.byteSize;
     saved.folder = entry.folder;
     saved.propertyEpoch = entry.propertyEpoch;
+    saved.detailsRefreshEpoch = entry.detailsRefreshEpoch;
     saved.date = entry.date;
     saved.type = entry.type;
     saved.size = entry.size;
@@ -8364,18 +8379,16 @@ void RevalidateActiveSort(ViewState& state, const std::vector<std::wstring>* ite
     SetEvent(targeted ? state.background->layout.wake : state.background->directory.wake);
 }
 
-// An explicit refresh is stronger than unchanged-name revalidation. Advance
-// both job and cached-property generations; visible demand refetches values,
-// while offscreen rows invalidate lazily instead of walking the whole folder.
+// Revalidate even properties whose size/timestamps did not change, retaining
+// displayed cells until the worker has replacements. Offscreen rows follow
+// lazily; cancellation still rejects older provider completions.
 void ForceRefresh(ViewState& state) {
     InvalidateDetailJobs(state);
-    ++state.propertyEpoch;
-    RetireCachedEntries(state, state.rowDetails);
+    ++state.detailsRefreshEpoch;
     state.columnFitPendingEpoch = 0;
     QueueDirectoryRefresh(state, true, true);
     if (state.thisPcGpu) QueueNativeRows(state);
     QueueVisibleDataFrame(state);
-    Redraw(state);
 }
 
 // File notifications are change *hints*, not an atomic operation boundary.
@@ -8785,13 +8798,15 @@ void QueueVisibleDetails(ViewState& state) {
         }
         if ((e.detailsPending && e.detailsPendingEpoch == state.columnEpoch &&
              e.detailsPendingToken == state.directoryToken) ||
-            (e.detailsReady && e.columnEpoch == state.columnEpoch)) continue;
+            (e.detailsReady && e.columnEpoch == state.columnEpoch &&
+             e.detailsRefreshEpoch == state.detailsRefreshEpoch)) continue;
         CacheRowDetails(state, e, false);
         // No full-directory walk: at most the displayed rows and the currently
         // enabled property keys are examined on Explorer's owning UI thread.
         DetailRequest req;
         for (const PROPERTYKEY& key : neededColumns)
-            if (!HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
+            if (e.detailsRefreshEpoch != state.detailsRefreshEpoch ||
+                !HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
         if (req.missingKeys.empty()) {
             e.columnEpoch = state.columnEpoch;
             e.detailsReady = true;
@@ -9455,32 +9470,39 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 // in any other column. Merge only the keys this request
                 // actually resolved, including legitimately empty values.
                 for (auto& cell : v.cells) {
-                    if (SameKey(cell.key, PKEY_DateModified)) e.date = cell.text;
-                    else if (SameKey(cell.key, PKEY_ItemTypeText)) e.type = cell.text;
-                    else if (SameKey(cell.key, PKEY_Size)) e.size = cell.text;
+                    if (SameKey(cell.key, PKEY_DateModified)) {
+                        changed |= e.date != cell.text; e.date = cell.text;
+                    } else if (SameKey(cell.key, PKEY_ItemTypeText)) {
+                        changed |= e.type != cell.text; e.type = cell.text;
+                    } else if (SameKey(cell.key, PKEY_Size)) {
+                        changed |= e.size != cell.text; e.size = cell.text;
+                    }
                     auto existing = std::find_if(e.cells.begin(), e.cells.end(),
                         [&](const ColumnCell& old) {
                             return SameKey(old.key, cell.key);
                         });
-                    if (existing == e.cells.end())
+                    if (existing == e.cells.end()) {
+                        changed |= !cell.text.empty();
                         e.cells.push_back(std::move(cell));
-                    else
+                    } else if (existing->text != cell.text) {
+                        changed = true;
                         existing->text = std::move(cell.text);
+                    }
                 }
                 e.columnEpoch = v.columnEpoch;
                 e.propertyEpoch = state.propertyEpoch;
+                e.detailsRefreshEpoch = state.detailsRefreshEpoch;
                 e.detailsReady = true;
                 PipelineEvent(*state.background,{.operation=L"metadata.apply[index,cells]",.a=state.directoryToken,.b=v.columnEpoch,
                     .v={static_cast<double>(v.index),static_cast<double>(e.cells.size())}});
                 CacheRowDetails(state, e, true);
                 if (v.columnEpoch == e.detailsPendingEpoch)
                     e.detailsPending = false;
-                changed = true;
             }
-            if (changed) {
-                detailsChanged = true;
-                contentChanged = true;
-            }
+            // Identical values still release pending work and advance demand,
+            // but do not schedule another content paint.
+            detailsChanged = true;
+            contentChanged |= changed;
         } else {
             if (result.kind == DirectoryResult::Complete && state.loaded)
                 // The worker can complete between timer ticks. Observe any
@@ -9548,7 +9570,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
         if (delivery == DirectoryDelivery::Details) state.viewportDemandPending = true;
         else QueueVisibleDetails(state);
         MaybeFinishColumnFit(state);
-        if (!state.rowTransitionActive && !state.groupAnimating) Redraw(state);
+        if (contentChanged && !state.rowTransitionActive && !state.groupAnimating) Redraw(state);
     }
     if (state.columnMenuPending && state.columnCatalogReady) {
         PostMessageW(state.hwnd, kMsgColumnMenuReady,
@@ -12500,8 +12522,10 @@ void DropTarget(ViewState& state) {
     }
     state.visual.Reset();
     state.compTarget.Reset();
+    if (state.frameLatencyWaitable) CloseHandle(std::exchange(state.frameLatencyWaitable,nullptr));
     state.swapChain.Reset();
     state.presentPending = false;
+    state.rejectedPresentQpc = {};
     state.graphicsReady = false;
     state.composition.Reset();
     state.compositionSurfacePoolUsed=false;
@@ -12559,7 +12583,7 @@ bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     state.target->SetTarget(nullptr);
     state.backbuffer.Reset();
     const HRESULT hr = state.swapChain->ResizeBuffers(2, width, height,
-        DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
     if (FAILED(hr) || !BindBackbuffer(state)) {
         DropTarget(state);
         return false;
@@ -12628,10 +12652,18 @@ bool EnsureTarget(ViewState& state) {
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         state.graphicsFailureStage=3;
         hr = state.dxgiFactory->CreateSwapChainForComposition(state.d3d.Get(),
             &desc, nullptr, state.swapChain.GetAddressOf());
         if (FAILED(hr)) goto failed;
+        ComPtr<IDXGISwapChain2> paced;
+        hr = state.swapChain.As(&paced);
+        if (FAILED(hr)) goto failed;
+        hr = paced->SetMaximumFrameLatency(1);
+        if (FAILED(hr)) goto failed;
+        state.frameLatencyWaitable = paced->GetFrameLatencyWaitableObject();
+        if (!state.frameLatencyWaitable) { hr = E_FAIL; goto failed; }
     }
     state.graphicsFailureStage=4;
     hr = state.composition->CreateTargetForHwnd(state.hwnd, TRUE,
@@ -13452,6 +13484,18 @@ float ClipboardIconWiggleAngle(float size96, double elapsedMs, size_t seed = 0) 
         (6.283185307179586 / periodMs)));
 }
 
+D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
+    float sourceWidth, float sourceHeight, float angle) {
+    if (fabsf(width-sourceWidth)<.001f && fabsf(height-sourceHeight)<.001f && angle==0.f)
+        return D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
+    // Magnifying a small Shell icon over a large tile cannot recover detail.
+    // Use hardware bilinear sampling there, as for thumbnails; keep cubic's
+    // prefilter for minification and its reconstruction for ordinary sizes.
+    if (std::max(width,height)>=512.f && width>=2.f*sourceWidth && height>=2.f*sourceHeight)
+        return D2D1_INTERPOLATION_MODE_LINEAR;
+    return D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
+}
+
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
                     float opacity = 1.f, float angle = 0.f) {
     if(!VisibleOpacity(opacity)) return true;
@@ -13524,10 +13568,8 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         }
     } else {
         const auto source=D2D1::RectF(0,0,sourceWidth,sourceHeight);
-        const bool unscaled=fabsf((rect.right-rect.left)-sourceWidth)<.001f &&
-            fabsf((rect.bottom-rect.top)-sourceHeight)<.001f && angle==0.f;
-        state.target->DrawBitmap(icon.bitmap.Get(),&rect,opacity,unscaled ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR :
-            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+        state.target->DrawBitmap(icon.bitmap.Get(),&rect,opacity,IconInterpolation(
+            rect.right-rect.left,rect.bottom-rect.top,sourceWidth,sourceHeight,angle),&source,nullptr);
     }
     if (angle != 0.f) state.target->SetTransform(previous);
     return true;
@@ -15038,6 +15080,8 @@ void ClearBodyBand(ViewState& state, ID2D1Bitmap1* frame, float top, float botto
     state.target->SetPrimitiveBlend(blend); state.target->SetAntialiasMode(antialias);
 }
 
+bool PresentationFrameReady(ViewState& state);
+
 void Paint(ViewState& state) {
     if(state.presenter && !state.presentationOnly) { SubmitPresentation(state); return; }
     GraphicsContinuation continuation(state);
@@ -15059,6 +15103,14 @@ void Paint(ViewState& state) {
     }
     ScopedFlag rasterPainting(state.textRasterPainting);
     RefreshTextRendering(state,true);
+    ModeCompositionFrame compositionFrame(state);
+    // The presentation lane coalesces input while DXGI owns the previous
+    // frame. Probe before uploading, rasterizing text or drawing large tiles.
+    // DComp planes and their ready-frame handoff do not use that DXGI slot.
+    if (state.presentationOnly) {
+        if (!compositionFrame.active && !state.modeRootAttached && !PresentationFrameReady(state)) return;
+        UploadVisibleIcons(state);
+    }
     ++state.graphicsPaintSerial;
     state.presentationContentAccepted=false;
     if (state.itemOpacityToken != state.token) ResetItemContentOpacity(state);
@@ -15069,7 +15121,6 @@ void Paint(ViewState& state) {
     state.clipboardIconsVisible = false;
     state.clipboardIconSize96 = 0.f;
     state.clipboardIconElapsedMs = 0.;
-    ModeCompositionFrame compositionFrame(state);
     state.uiTracePaint=state.uiTraceDrawItem=false;
     if (g_uiTransitionLogging.load(std::memory_order_relaxed)) {
         EnsurePipelineTrace(state);
@@ -15917,6 +15968,8 @@ void Paint(ViewState& state) {
         PipelineEvent(*state.background,{.operation=L"render.present[pos,target]",.a=static_cast<unsigned>(present),
             .b=PipelineFlags(state),.v={state.scrollNow,state.scrollTarget}});
         state.presentPending = present == DXGI_ERROR_WAS_STILL_DRAWING;
+        if (state.presentPending) QueryPerformanceCounter(&state.rejectedPresentQpc);
+        else state.rejectedPresentQpc = {};
         if (state.uiTracePaint)
             PipelineEvent(*state.background,{.operation=L"ui.submit[scene,accepted,header,rootAttached]",
                 .a=static_cast<unsigned>(present),.b=state.token,
@@ -21406,12 +21459,44 @@ struct FrameShellViewHook {
     HWINEVENTHOOK presentationHandle = nullptr;
     HWINEVENTHOOK selectionHandle = nullptr;
     HWINEVENTHOOK foregroundHandle = nullptr;
+    HWND cleanupWindow = nullptr;
+    HANDLE ownerThread = nullptr;
     bool subclassInstalled = false;
     unsigned owners = 0;
 };
 SRWLOCK g_shellHookLock = SRWLOCK_INIT;
 std::unordered_map<HWND, FrameShellViewHook> g_shellViewHooks;
-void ReleaseAllFrameShellViewHooks(HWND frame);
+void ReleaseAllFrameShellViewHooks(HWND frame, HWND destroyingOwner = nullptr);
+LRESULT CALLBACK ExplorerFrameSubclass(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
+
+// A private message-only window survives loss of the Explorer frame/subclass.
+// Every WinEvent hook can therefore be removed on its installer STA at unload.
+LRESULT CALLBACK FrameHookCleanupSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                        UINT_PTR id, DWORD_PTR frame) {
+    WindowCallbackGuard callback;
+    if (g_releaseFrameHooksMessage && msg==g_releaseFrameHooksMessage &&
+        g_unloading.load(std::memory_order_acquire)) {
+        ReleaseAllFrameShellViewHooks(reinterpret_cast<HWND>(frame));
+        return 0;
+    }
+    if (msg==WM_NCDESTROY) {
+        ReleaseAllFrameShellViewHooks(reinterpret_cast<HWND>(frame),hwnd);
+        RemoveWindowSubclass(hwnd,FrameHookCleanupSubclass,id);
+    }
+    return DefSubclassProc(hwnd,msg,wp,lp);
+}
+
+void ReleaseFrameHookResources(HWND frame, const FrameShellViewHook& hooks,
+                               HWND destroyingOwner = nullptr) {
+    for (HWINEVENTHOOK hook : {hooks.handle,hooks.presentationHandle,hooks.selectionHandle,hooks.foregroundHandle})
+        if (hook) UnhookWinEvent(hook);
+    if (hooks.subclassInstalled) {
+        RemovePropW(frame,kFrameSizingProperty);
+        RemoveWindowSubclass(frame,ExplorerFrameSubclass,reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass));
+    }
+    if (hooks.cleanupWindow && hooks.cleanupWindow!=destroyingOwner) DestroyWindow(hooks.cleanupWindow);
+    if (hooks.ownerThread) CloseHandle(hooks.ownerThread);
+}
 
 // Observe sent minimize/restore messages as well as posted ones. Do no Shell,
 // presentation or focus work inside USER's activation transaction, especially
@@ -21419,7 +21504,7 @@ void ReleaseAllFrameShellViewHooks(HWND frame);
 LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                        UINT_PTR id, DWORD_PTR wasMinimized) {
     WindowCallbackGuard callback;
-    if (msg == kMsgReleaseFrameHooks && g_unloading.load(std::memory_order_acquire)) {
+    if (g_releaseFrameHooksMessage && msg == g_releaseFrameHooksMessage && g_unloading.load(std::memory_order_acquire)) {
         ReleaseAllFrameShellViewHooks(hwnd);
         return 0;
     }
@@ -21479,41 +21564,25 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 
 void ReleaseFrameShellViewHook(ViewState& state) {
     if (!state.frameLifecycleSubscribed) return;
-    HWINEVENTHOOK toUnhook = nullptr;
-    HWINEVENTHOOK presentationToUnhook = nullptr;
-    HWINEVENTHOOK selectionToUnhook = nullptr;
-    HWINEVENTHOOK foregroundToUnhook = nullptr;
-    bool removeSubclass = false;
+    FrameShellViewHook released;
     AcquireSRWLockExclusive(&g_shellHookLock);
     const auto it = g_shellViewHooks.find(state.frameHwnd);
     if (it != g_shellViewHooks.end()) {
         if (it->second.owners > 0) --it->second.owners;
         if (!it->second.owners) {
-            toUnhook = it->second.handle;
-            presentationToUnhook = it->second.presentationHandle;
-            selectionToUnhook = it->second.selectionHandle;
-            foregroundToUnhook = it->second.foregroundHandle;
-            removeSubclass = it->second.subclassInstalled;
+            released=it->second;
             g_shellViewHooks.erase(it);
         }
     }
     ReleaseSRWLockExclusive(&g_shellHookLock);
-    if (toUnhook) UnhookWinEvent(toUnhook);
-    if (presentationToUnhook) UnhookWinEvent(presentationToUnhook);
-    if (selectionToUnhook) UnhookWinEvent(selectionToUnhook);
-    if (foregroundToUnhook) UnhookWinEvent(foregroundToUnhook);
-    if (removeSubclass) {
-        RemovePropW(state.frameHwnd,kFrameSizingProperty);
-        RemoveWindowSubclass(state.frameHwnd, ExplorerFrameSubclass,
-            reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass));
-    }
+    ReleaseFrameHookResources(state.frameHwnd,released);
     state.viewEvents = nullptr;
     state.nativeSelectionEvents = nullptr;
     state.nativeForegroundEvents = nullptr;
     state.frameLifecycleSubscribed = false;
 }
 
-void ReleaseAllFrameShellViewHooks(HWND frame) {
+void ReleaseAllFrameShellViewHooks(HWND frame, HWND destroyingOwner) {
     FrameShellViewHook hooks;
     AcquireSRWLockExclusive(&g_shellHookLock);
     if (auto it = g_shellViewHooks.find(frame); it != g_shellViewHooks.end()) {
@@ -21521,23 +21590,54 @@ void ReleaseAllFrameShellViewHooks(HWND frame) {
         g_shellViewHooks.erase(it);
     }
     ReleaseSRWLockExclusive(&g_shellHookLock);
-    for (HWINEVENTHOOK hook : {hooks.handle, hooks.presentationHandle, hooks.selectionHandle, hooks.foregroundHandle})
-        if (hook) UnhookWinEvent(hook);
-    RemovePropW(frame, kFrameSizingProperty);
-    RemoveWindowSubclass(frame, ExplorerFrameSubclass, reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass));
+    ReleaseFrameHookResources(frame,hooks,destroyingOwner);
 }
 
 void ClearFrameShellViewHooks() {
+    bool reported=false;
     for (;;) {
-        AcquireSRWLockShared(&g_shellHookLock);
-        const HWND frame = g_shellViewHooks.empty() ? nullptr : g_shellViewHooks.begin()->first;
-        ReleaseSRWLockShared(&g_shellHookLock);
-        if (!frame) return;
+        HWND frame=nullptr, receiver=nullptr;
+        HANDLE exited=nullptr;
+        AcquireSRWLockExclusive(&g_shellHookLock);
+        if (!g_shellViewHooks.empty()) {
+            auto it=g_shellViewHooks.begin(); frame=it->first;
+            const auto& hooks=it->second;
+            if (hooks.ownerThread && WaitForSingleObject(hooks.ownerThread,0)==WAIT_OBJECT_0) {
+                // USER removes thread-owned WinEvent hooks/windows at exit.
+                exited=hooks.ownerThread; g_shellViewHooks.erase(it);
+            } else {
+                if (IsWindow(hooks.cleanupWindow)) receiver=hooks.cleanupWindow;
+                if (!receiver && hooks.subclassInstalled && IsWindow(frame)) receiver=frame;
+                if (!receiver && !hooks.subclassInstalled && !hooks.handle &&
+                    !hooks.presentationHandle && !hooks.selectionHandle && !hooks.foregroundHandle) {
+                    if (hooks.ownerThread) CloseHandle(hooks.ownerThread);
+                    g_shellViewHooks.erase(it); frame=nullptr;
+                }
+            }
+        }
+        const bool empty=g_shellViewHooks.empty();
+        ReleaseSRWLockExclusive(&g_shellHookLock);
+        if (exited) {CloseHandle(exited); continue;}
+        if (empty) return;
+        if (!frame) continue;
         // Never erase live hook bookkeeping on Windhawk's unload thread.
         // WinEvent removal and subclass removal belong to their installer STA.
         DWORD_PTR result = 0;
-        if (!SendMessageTimeoutW(frame, kMsgReleaseFrameHooks, 0, 0,
-                SMTO_ABORTIFHUNG | SMTO_BLOCK, 400, &result)) Sleep(25);
+        if (receiver && g_releaseFrameHooksMessage)
+            SendMessageTimeoutW(receiver,g_releaseFrameHooksMessage,0,0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,400,&result);
+        AcquireSRWLockShared(&g_shellHookLock);
+        const bool remaining=g_shellViewHooks.contains(frame);
+        ReleaseSRWLockShared(&g_shellHookLock);
+        if (remaining) {
+            if (!reported) {
+                Wh_Log(L"[GPU lifetime] FRAME_RELEASE_WAIT frame=%p receiver=%p",frame,receiver);
+                reported=true;
+            }
+            // A genuinely unresponsive live installer still owns executable
+            // callbacks. Keep the DLL mapped until it services cleanup/exits.
+            Sleep(25);
+        }
     }
 }
 
@@ -22339,7 +22439,8 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
         DCOMPOSITION_FRAME_STATISTICS statistics{};
         if(SUCCEEDED(state.composition->GetFrameStatistics(&statistics))) receipt->compositionTime=statistics.currentTime;
     }
-    receipt->ready=state.graphicsReady; receipt->accepted=state.lastAcceptedPaint==state.graphicsPaintSerial && state.lastAcceptedPaint;
+    receipt->ready=state.graphicsReady; receipt->accepted=!state.presentPending &&
+        state.lastAcceptedPaint==state.graphicsPaintSerial && state.lastAcceptedPaint;
     receipt->content=receipt->accepted && state.presentationContentAccepted;
     receipt->failed=failed; receipt->standby=state.graphicsStandby && !state.graphicsStandbyPending;
     receipt->failure=state.graphicsFailure; receipt->failureStage=state.graphicsFailureStage;
@@ -22423,6 +22524,32 @@ void TrimPresentationImages(ViewState& state) {
     state.presentationCachePending=state.iconCacheBytes>budget && attempts>=limit && limit==64;
 }
 
+bool PresentationFrameReady(ViewState& state) {
+    if (!state.frameLatencyWaitable) return true;
+    const DWORD ready=WaitForSingleObject(state.frameLatencyWaitable,0);
+    if (ready==WAIT_OBJECT_0) return true;
+    const DWORD waitError=ready==WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+    // Device loss may leave readiness unsignaled. Keep the existing recovery
+    // and native fallback reachable instead of deferring every future paint.
+    const HRESULT device=state.d3d ? state.d3d->GetDeviceRemovedReason() : S_OK;
+    if (ready==WAIT_FAILED || FAILED(device)) {
+        state.graphicsFailure=FAILED(device) ? device : HRESULT_FROM_WIN32(waitError ? waitError : ERROR_GEN_FAILURE);
+        state.graphicsFailureStage=6;
+        DropTarget(state); return false;
+    }
+    // A rejected nonblocking Present can retain the acquired DXGI slot. Retry
+    // at the tab's refresh cadence in that case; never spin/redraw at each
+    // input wake, and never wait for the GPU on Explorer's owner STA.
+    if (state.rejectedPresentQpc.QuadPart) {
+        LARGE_INTEGER now{},frequency{}; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+        if (now.QuadPart-state.rejectedPresentQpc.QuadPart>=frequency.QuadPart/std::max(1,state.refreshHz))
+            return true;
+    }
+    state.presentPending=true;
+    state.presentationContentAccepted=false;
+    return false;
+}
+
 DWORD WINAPI PresentationWorkerProc(LPVOID context) {
     auto& worker=*static_cast<TabBackground::Worker*>(context);
     auto& work=*worker.owner; const auto lane=work.presenter;
@@ -22483,12 +22610,16 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         }
         BeginFrameProfile(state);
         AdvanceAnimationFrame(state,false);
-        if(state.target) UploadVisibleIcons(state);
+        const auto previousPaint=state.graphicsPaintSerial;
         Paint(state);
         EndFrameProfile(state);
         TrimPresentationImages(state);
         if(state.target) {ScheduleVisibleIconUploads(state);}
-        PublishPresentationReceipt(state,lane,!state.graphicsReady);
+        // A readiness miss produced no new pixels. Keep the last accepted
+        // receipt available to an unpumped owner until a newer model needs a
+        // deferred acknowledgment, or a new paint/device failure supersedes it.
+        if (state.graphicsPaintSerial!=previousPaint || model || !state.graphicsReady)
+            PublishPresentationReceipt(state,lane,!state.graphicsReady);
         const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
         PulsePresentation(lane,state.presentationActive && (NeedsAnimationPaint(state) || handoff || state.presentationCachePending));
     }
@@ -26355,6 +26486,7 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
             // discarding every prior Shell property value.
             entry.columnEpoch = oldRow->columnEpoch;
             entry.propertyEpoch = oldRow->propertyEpoch;
+            entry.detailsRefreshEpoch = oldRow->detailsRefreshEpoch;
             entry.detailsReady = oldRow->detailsReady;
             entry.detailsPending = oldRow->detailsPending;
             entry.detailsPendingEpoch = oldRow->detailsPendingEpoch;
@@ -26515,14 +26647,28 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
 }
 
 void InitializeFrameShellEvents(ViewState& state) {
-    if (state.frameLifecycleSubscribed) return;
+    if (state.frameLifecycleSubscribed || !g_releaseFrameHooksMessage) return;
     AcquireSRWLockShared(&g_shellHookLock);
     const auto previousHook = g_shellViewHooks.find(state.frameHwnd);
     HWINEVENTHOOK sharedHook = previousHook == g_shellViewHooks.end() ?
         nullptr : previousHook->second.handle;
     HWINEVENTHOOK sharedPresentationHook = previousHook == g_shellViewHooks.end() ?
         nullptr : previousHook->second.presentationHandle;
+    HWND cleanupWindow=previousHook==g_shellViewHooks.end() ? nullptr : previousHook->second.cleanupWindow;
     ReleaseSRWLockShared(&g_shellHookLock);
+    HANDLE ownerThread=nullptr;
+    const bool newOwner=!cleanupWindow;
+    if (newOwner) {
+        if (!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),
+                &ownerThread,SYNCHRONIZE,FALSE,0)) return;
+        cleanupWindow=CreateWindowExW(0,L"STATIC",L"",0,0,0,0,0,HWND_MESSAGE,
+            nullptr,OverlayModuleInstance(),nullptr);
+        if (!cleanupWindow || !SetWindowSubclass(cleanupWindow,FrameHookCleanupSubclass,
+                reinterpret_cast<UINT_PTR>(FrameHookCleanupSubclass),reinterpret_cast<DWORD_PTR>(state.frameHwnd))) {
+            if (cleanupWindow) DestroyWindow(cleanupWindow);
+            CloseHandle(ownerThread); return;
+        }
+    }
     HWINEVENTHOOK candidateHook = nullptr;
     HWINEVENTHOOK candidatePresentationHook = nullptr;
     HWINEVENTHOOK candidateSelectionHook = nullptr;
@@ -26556,6 +26702,7 @@ void InitializeFrameShellEvents(ViewState& state) {
     }
     AcquireSRWLockExclusive(&g_shellHookLock);
     auto& viewHook = g_shellViewHooks[state.frameHwnd];
+    if (newOwner) {viewHook.cleanupWindow=cleanupWindow; viewHook.ownerThread=ownerThread;}
     if (!viewHook.handle) viewHook.handle = candidateHook;
     if (!viewHook.presentationHandle) viewHook.presentationHandle = candidatePresentationHook;
     if (!viewHook.selectionHandle) viewHook.selectionHandle = candidateSelectionHook;
@@ -26572,6 +26719,9 @@ void InitializeFrameShellEvents(ViewState& state) {
         g_shellViewHooks.erase(state.frameHwnd);
     }
     ReleaseSRWLockExclusive(&g_shellHookLock);
+    if (!state.frameLifecycleSubscribed && newOwner) {
+        DestroyWindow(cleanupWindow); CloseHandle(ownerThread);
+    }
     if (candidateHook && candidateHook != state.viewEvents)
         UnhookWinEvent(candidateHook);
     if (candidatePresentationHook && candidatePresentationHook != sharedPresentationHook)
@@ -27451,8 +27601,9 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
         return g_translateAcceleratorOriginal(hwnd,accelerator,msg);
     MSG renamedInput{};
     if (msg && RouteNativeRenameMessage(*msg, renamedInput)) {
-        *msg = renamedInput;
-        return FALSE; // The caller still translates text for the visible EDIT.
+        TranslateMessage(&renamedInput);
+        DispatchMessageW(&renamedInput);
+        return TRUE; // Consumed exactly once; Explorer's MSG stays untouched.
     }
     if (msg && HandleNativeSelectionKey(*msg)) return TRUE;
     if (msg) NoteNativeNewFolderShortcut(*msg);
@@ -27569,26 +27720,34 @@ struct FrameScanThrottle {
 };
 struct DispatchThreadState {
     HANDLE thread=nullptr; // Real thread lifetime, never a reusable thread ID.
+    HANDLE exitWait=nullptr;
     std::unordered_map<HWND,FrameScanThrottle> frames;
 };
 std::mutex g_dispatchStateMutex;
 std::vector<std::unique_ptr<DispatchThreadState>> g_dispatchStates;
 thread_local DispatchThreadState* t_dispatchState=nullptr; // Trivial: no DLL-unload destructor.
 
-bool ReapDispatchThreadStates() {
+void ReleaseDispatchThreadState(DispatchThreadState& state) {
+    // Unregister/drain before closing the watched handle or unloading the DLL.
+    // The callback only signals an event and never acquires registry locks.
+    if (state.exitWait) UnregisterWaitEx(state.exitWait,INVALID_HANDLE_VALUE);
+    CloseHandle(state.thread);
+}
+
+void CALLBACK DispatchThreadExited(void* wake, BOOLEAN) {SetEvent(static_cast<HANDLE>(wake));}
+
+void ReapDispatchThreadStates() {
     std::vector<std::unique_ptr<DispatchThreadState>> retired;
-    bool pending=false;
     {
         std::lock_guard lock(g_dispatchStateMutex);
         for(auto it=g_dispatchStates.begin();it!=g_dispatchStates.end();) {
             if(WaitForSingleObject((*it)->thread,0)==WAIT_OBJECT_0) {
                 retired.push_back(std::move(*it)); it=g_dispatchStates.erase(it);
-            } else {pending=true; ++it;}
+            } else ++it;
         }
     }
     // Only the regulator calls this: map destruction and handle cleanup stay off UI threads.
-    for(const auto& state:retired) CloseHandle(state->thread);
-    return pending;
+    for(const auto& state:retired) ReleaseDispatchThreadState(*state);
 }
 
 DispatchThreadState* CurrentDispatchThreadState() {
@@ -27600,7 +27759,12 @@ DispatchThreadState* CurrentDispatchThreadState() {
         std::lock_guard lifetime(g_backgroundLifetimeMutex);
         if(!EnsureBackgroundRegulatorLocked()) {CloseHandle(state->thread); return nullptr;}
         std::lock_guard lock(g_dispatchStateMutex);
-        g_dispatchStates.push_back(std::move(state));
+        try {g_dispatchStates.push_back(std::move(state));}
+        catch (const std::bad_alloc&) {CloseHandle(owned->thread); return nullptr;}
+        if(!RegisterWaitForSingleObject(&owned->exitWait,owned->thread,DispatchThreadExited,
+                g_backgroundReaperWake,INFINITE,WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD)) {
+            CloseHandle(owned->thread); g_dispatchStates.pop_back(); return nullptr;
+        }
         t_dispatchState=owned;
         SetEvent(g_backgroundReaperWake);
     }
@@ -28502,6 +28666,7 @@ BOOL Wh_ModInit() {
         Wh_Log(L"[GPU lifetime] INIT_FAILED core registrations released");
         return FALSE;
     };
+    if (!RegisterFrameHookReleaseMessage()) return failedInitialization();
     HRESULT graphicsHr = S_OK;
     if (SUCCEEDED(graphicsHr)) graphicsHr = DWriteCreateFactory(
         DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -28576,7 +28741,7 @@ void Wh_ModUninit() {
         std::lock_guard lock(g_dispatchStateMutex);
         if (g_perf.load(std::memory_order_relaxed))
             Wh_Log(L"[GPU lifetime] DISPATCH_STATES retired=%zu",g_dispatchStates.size());
-        for(const auto& state:g_dispatchStates) CloseHandle(state->thread);
+        for(const auto& state:g_dispatchStates) ReleaseDispatchThreadState(*state);
         g_dispatchStates.clear();
         t_dispatchState=nullptr;
     }
