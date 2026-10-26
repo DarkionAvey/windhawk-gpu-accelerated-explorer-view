@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.244
+
+- Size the shared storage-bar label area from the visible labels instead of
+  the window width. Bars fill the remaining Name-column space while keeping
+  their alignment, fixed gaps and smooth column transitions.
+
+## 0.9.243
+
+- Keep storage bars aligned across This PC Details rows, using shared label
+  and track space regardless of drive-label length.
+- Preserve the current column bounds for width-dependent contents during
+  navigation and view transitions, avoiding a size jump when animation settles.
+
 ## 0.9.242
 
 - Keep existing metadata visible during F5, Ctrl+R and right-click Refresh

@@ -1191,6 +1191,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 
 #include "animation-smoke.h"
 #include "column-fit-composition-smoke.h"
+#include "drive-bar-smoke.h"
 #include "row-composition-smoke.h"
 #include "presentation-owner-smoke.h"
 #include "group-heading-smoke.h"
@@ -1287,6 +1288,7 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
         TestColdTextDrawing(frame);
         TestColumnViewTransition(frame);
         TestColumnFitComposition(frame);
+        TestInlineDriveBars(frame);
         TestRowComposition<ViewState>(frame);
         TestStickyGroupHeaders(frame);
         TestIconGrid(frame, fixture);
@@ -1786,6 +1788,13 @@ int wmain(int argc,wchar_t** argv) {
                 WS_POPUP,-32000,-32000,800,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
             Check(frame!=nullptr,"continuity frame");
             TestColumnViewTransition(frame); TestIconGrid(frame,fixture.wstring());
+            DestroyWindow(frame); g_writeFactory.Reset();
+        } else if (argc>1 && wcscmp(argv[1],L"--drive-bars")==0) {
+            Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"drive bar fonts");
+            HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private drive bar frame",
+                WS_POPUP,-32000,-32000,1000,600,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            Check(frame!=nullptr,"drive bar frame"); TestInlineDriveBars(frame);
             DestroyWindow(frame); g_writeFactory.Reset();
         } else if (argc>1 && wcscmp(argv[1],L"--large-tiles")==0) {
             TestLargeTileBackpressure(); TestLargeTileSampling();

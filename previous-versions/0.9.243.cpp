@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.238
+// @version         0.9.243
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,7 +16,7 @@
 ![Showcase GIF](https://raw.githubusercontent.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/refs/heads/main/assets/showcase.gif)
 
 
-# GPU-accelerated `explorer.exe` list and grid views
+# GPU-accelerated list and grid views for `explorer.exe`
 
 A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations and modern look.
 
@@ -29,20 +29,16 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - Less likely to break in future Windows updates since it does not modify the default views of explorer but recreates them
 
 ## Features
-- **Adjustable Item Height** — Smooth zooming with `Ctrl`+ mouse wheel or pinch gestures.
+- **Adjustable Item Height** — Smooth zooming with Ctrl+mouse wheel or pinch gestures.
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
-- **Text Antialiasing** — Use Windows monitor tuning, smooth grayscale, or no antialiasing while preserving transparent backgrounds.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
-- **Dynamic Zebra Striping** — Animated alternating row colors for improved readability.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
-- **Adaptive Image Quality** — Matches icon and thumbnail resolution to visible size and available memory.
 
 ## Report bugs
-Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues).
-Enable **Enable logging** when reproducing a bug and include Windhawk's log in
-the report. Logs include file names and paths; disable the option afterward.
+Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
+Enable **Enable logging** when reproducing a bug and include Windhawk's log in the report. Note: logs include file names and paths; scramble the file names before submitting the logs if you wish.
 */
 // ==/WindhawkModReadme==
 
@@ -310,7 +306,7 @@ constexpr ULONGLONG kDriveSpaceRefreshMs = 60000;
 // Group headings occupy the same row-height rhythm as file rows. No separate
 // typography or fixed section-header height is maintained.
 
-// An elastic track uses the remaining Name-column width. These values are
+// Inline labels and tracks share aligned Name-column bands. These values are
 // DPI-scaled in one place and used for both fitting and GPU drawing.
 constexpr int kDriveBarSideMargin96 = 20; // Same gap after label and before divider.
 constexpr int kDriveBarMinimumWidth96 = 72; // For fitting/ellipsis only.
@@ -712,6 +708,8 @@ struct Entry {
     unsigned long long columnEpoch = 0;
     // Shell associations invalidate property text independently of UI columns.
     unsigned long long propertyEpoch = 1;
+    // Refresh freshness is independent of the last displayed property values.
+    unsigned long long detailsRefreshEpoch = 0;
     FILETIME lastWrite{};
     ULONGLONG byteSize = 0;
     bool folder = false;
@@ -2316,7 +2314,10 @@ struct ViewState {
         viewTogglePaletteDirty = true;
     }
     ViewState() {background->notificationLifetime=lifetimeToken;}
-    ~ViewState() { ReleaseViewToggle(); }
+    ~ViewState() {
+        ReleaseViewToggle();
+        if (frameLatencyWaitable) CloseHandle(frameLatencyWaitable);
+    }
     bool rtlLayout = false; // Follow Shell UI direction, not filename script.
     float paintWidth = 0.f; // Cached paint width for inexpensive logical->visual mapping.
     bool inScope = true;
@@ -2375,6 +2376,7 @@ struct ViewState {
     ULONGLONG pendingWidthEarliest = 0;
     unsigned long long columnEpoch = 1;
     unsigned long long propertyEpoch = 1;
+    unsigned long long detailsRefreshEpoch = 0;
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     bool columnVerticalBarVisible = false; // Last layout's scrollbar clearance.
@@ -2976,6 +2978,8 @@ struct ViewState {
     ComPtr<IDCompositionDevice> composition;
     ComPtr<ID2D1Device> d2dDevice;
     bool presentPending = false;
+    HANDLE frameLatencyWaitable = nullptr; // Owned by this tab's GPU lane; zero-time readiness probes only.
+    LARGE_INTEGER rejectedPresentQpc{};
     bool graphicsReady = false;
     bool graphicsInitializing = false;
     bool graphicsReleaseQueued = false, graphicsSuspended = false, gpuDeviceCounted = false;
@@ -3035,6 +3039,8 @@ struct ViewState {
         std::vector<FitPlane> fitted;
         ComPtr<IDCompositionVisual> root;
         std::vector<std::pair<float,float>> columns;
+        // Borrowed only while a ModeCompositionFrame paints canonical sources.
+        const std::vector<std::array<float,3>>* logicalColumns = nullptr;
     } modeComposition;
     ComPtr<ID2D1DeviceContext> target;
     ComPtr<ID2D1DeviceContext> textRasterTarget;
@@ -5412,7 +5418,10 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
     ComPtr<IWICBitmap> source;
     if (SUCCEEDED(hr) && bitmap)
         hr = factory->CreateBitmapFromHBITMAP(bitmap.get(), nullptr,
-            WICBitmapUsePremultipliedAlpha, source.GetAddressOf());
+            // Shell image-factory HBITMAPs carry straight BGRA. Let the
+            // existing WIC conversion premultiply once, including edge/shadow
+            // pixels; declaring this source PBGRA creates bright fringes.
+            WICBitmapUseAlpha, source.GetAddressOf());
     if (FAILED(hr) || !source) { if (status) *status = FAILED(hr) ? hr : E_FAIL; return {}; }
     auto pixels = DecodeIconPixels(factory, source.Get(), status, job.pixelSize,
         4ULL*job.pixelSize*job.pixelSize);
@@ -6453,21 +6462,22 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
                 old.newIndex = static_cast<int>(i);
                 Entry& fresh = names[i];
                 const Entry& previous = old.entry;
-                // A directory diff does not invalidate the metadata
-                // of surviving, unchanged visible items. Keep their
-                // completed cells and let only new/modified rows load.
+                // Keep surviving visible cells until their replacements
+                // arrive. Modified rows revalidate all keys without an
+                // intermediate empty Date/Type/Size or provider column.
                 // This is bounded by the captured viewport and runs
                 // entirely on the directory worker.
-                if (!fresh.detailsReady && previous.detailsReady &&
-                    previous.columnEpoch == directory.columnEpoch &&
-                    SameEntryMetadata(previous, fresh)) {
+                if (!fresh.detailsReady &&
+                    (previous.detailsReady || !previous.cells.empty())) {
+                    const bool unchanged = SameEntryMetadata(previous, fresh);
                     fresh.date = std::move(old.entry.date);
                     fresh.type = std::move(old.entry.type);
                     fresh.size = std::move(old.entry.size);
                     fresh.cells = std::move(old.entry.cells);
                     fresh.columnEpoch = previous.columnEpoch;
                     fresh.propertyEpoch = previous.propertyEpoch;
-                    fresh.detailsReady = true;
+                    fresh.detailsRefreshEpoch = unchanged ? previous.detailsRefreshEpoch : ~0ULL;
+                    fresh.detailsReady = unchanged;
                     // Never retain an obsolete in-flight detail token.
                     fresh.detailsPending = false;
                 }
@@ -7722,6 +7732,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
         entry.type = saved.type;
         entry.size = saved.size;
         entry.cells = saved.cells;
+        entry.detailsRefreshEpoch = saved.detailsRefreshEpoch;
         // QueueVisibleDetails decides completeness for the current columns.
         // A column generation invalidates jobs, never completed property keys.
         cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
@@ -7729,6 +7740,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     }
     if (entry.cells.empty() || entry.propertyEpoch != state.propertyEpoch) return;
     if (it != cache.entries.end() && it->second.value.propertyEpoch == entry.propertyEpoch &&
+        it->second.value.detailsRefreshEpoch == entry.detailsRefreshEpoch &&
         SameEntryMetadata(entry, it->second.value) &&
         entry.cells.size() == it->second.value.cells.size() &&
         std::equal(entry.cells.begin(), entry.cells.end(), it->second.value.cells.begin(),
@@ -7749,6 +7761,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     saved.byteSize = entry.byteSize;
     saved.folder = entry.folder;
     saved.propertyEpoch = entry.propertyEpoch;
+    saved.detailsRefreshEpoch = entry.detailsRefreshEpoch;
     saved.date = entry.date;
     saved.type = entry.type;
     saved.size = entry.size;
@@ -8368,18 +8381,16 @@ void RevalidateActiveSort(ViewState& state, const std::vector<std::wstring>* ite
     SetEvent(targeted ? state.background->layout.wake : state.background->directory.wake);
 }
 
-// An explicit refresh is stronger than unchanged-name revalidation. Advance
-// both job and cached-property generations; visible demand refetches values,
-// while offscreen rows invalidate lazily instead of walking the whole folder.
+// Revalidate even properties whose size/timestamps did not change, retaining
+// displayed cells until the worker has replacements. Offscreen rows follow
+// lazily; cancellation still rejects older provider completions.
 void ForceRefresh(ViewState& state) {
     InvalidateDetailJobs(state);
-    ++state.propertyEpoch;
-    RetireCachedEntries(state, state.rowDetails);
+    ++state.detailsRefreshEpoch;
     state.columnFitPendingEpoch = 0;
     QueueDirectoryRefresh(state, true, true);
     if (state.thisPcGpu) QueueNativeRows(state);
     QueueVisibleDataFrame(state);
-    Redraw(state);
 }
 
 // File notifications are change *hints*, not an atomic operation boundary.
@@ -8789,13 +8800,15 @@ void QueueVisibleDetails(ViewState& state) {
         }
         if ((e.detailsPending && e.detailsPendingEpoch == state.columnEpoch &&
              e.detailsPendingToken == state.directoryToken) ||
-            (e.detailsReady && e.columnEpoch == state.columnEpoch)) continue;
+            (e.detailsReady && e.columnEpoch == state.columnEpoch &&
+             e.detailsRefreshEpoch == state.detailsRefreshEpoch)) continue;
         CacheRowDetails(state, e, false);
         // No full-directory walk: at most the displayed rows and the currently
         // enabled property keys are examined on Explorer's owning UI thread.
         DetailRequest req;
         for (const PROPERTYKEY& key : neededColumns)
-            if (!HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
+            if (e.detailsRefreshEpoch != state.detailsRefreshEpoch ||
+                !HasCachedColumnCell(e, key)) req.missingKeys.push_back(key);
         if (req.missingKeys.empty()) {
             e.columnEpoch = state.columnEpoch;
             e.detailsReady = true;
@@ -9459,32 +9472,39 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 // in any other column. Merge only the keys this request
                 // actually resolved, including legitimately empty values.
                 for (auto& cell : v.cells) {
-                    if (SameKey(cell.key, PKEY_DateModified)) e.date = cell.text;
-                    else if (SameKey(cell.key, PKEY_ItemTypeText)) e.type = cell.text;
-                    else if (SameKey(cell.key, PKEY_Size)) e.size = cell.text;
+                    if (SameKey(cell.key, PKEY_DateModified)) {
+                        changed |= e.date != cell.text; e.date = cell.text;
+                    } else if (SameKey(cell.key, PKEY_ItemTypeText)) {
+                        changed |= e.type != cell.text; e.type = cell.text;
+                    } else if (SameKey(cell.key, PKEY_Size)) {
+                        changed |= e.size != cell.text; e.size = cell.text;
+                    }
                     auto existing = std::find_if(e.cells.begin(), e.cells.end(),
                         [&](const ColumnCell& old) {
                             return SameKey(old.key, cell.key);
                         });
-                    if (existing == e.cells.end())
+                    if (existing == e.cells.end()) {
+                        changed |= !cell.text.empty();
                         e.cells.push_back(std::move(cell));
-                    else
+                    } else if (existing->text != cell.text) {
+                        changed = true;
                         existing->text = std::move(cell.text);
+                    }
                 }
                 e.columnEpoch = v.columnEpoch;
                 e.propertyEpoch = state.propertyEpoch;
+                e.detailsRefreshEpoch = state.detailsRefreshEpoch;
                 e.detailsReady = true;
                 PipelineEvent(*state.background,{.operation=L"metadata.apply[index,cells]",.a=state.directoryToken,.b=v.columnEpoch,
                     .v={static_cast<double>(v.index),static_cast<double>(e.cells.size())}});
                 CacheRowDetails(state, e, true);
                 if (v.columnEpoch == e.detailsPendingEpoch)
                     e.detailsPending = false;
-                changed = true;
             }
-            if (changed) {
-                detailsChanged = true;
-                contentChanged = true;
-            }
+            // Identical values still release pending work and advance demand,
+            // but do not schedule another content paint.
+            detailsChanged = true;
+            contentChanged |= changed;
         } else {
             if (result.kind == DirectoryResult::Complete && state.loaded)
                 // The worker can complete between timer ticks. Observe any
@@ -9552,7 +9572,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
         if (delivery == DirectoryDelivery::Details) state.viewportDemandPending = true;
         else QueueVisibleDetails(state);
         MaybeFinishColumnFit(state);
-        if (!state.rowTransitionActive && !state.groupAnimating) Redraw(state);
+        if (contentChanged && !state.rowTransitionActive && !state.groupAnimating) Redraw(state);
     }
     if (state.columnMenuPending && state.columnCatalogReady) {
         PostMessageW(state.hwnd, kMsgColumnMenuReady,
@@ -9691,6 +9711,35 @@ float NameColumnEnd(ViewState& state) {
     // fallback is also used when a provider temporarily has no Name column.
     return ListEndX(state);
 }
+
+// Source images keep a fixed column origin while DWM translates/clips them.
+// Width-dependent contents must still use the live extent, expressed at that
+// source origin. Otherwise a track or an ellipsized label changes geometry
+// abruptly when the canonical source hands back to the ordinary renderer.
+float NameContentEnd(ViewState& state) {
+    const auto* logical = state.modeComposition.painting ?
+        state.modeComposition.logicalColumns : nullptr;
+    if (logical) for (size_t i=0;i<std::min(logical->size(),state.columns.size());++i) {
+        const auto& column=state.columns[i];
+        if (ClassifySort(column.key)!=SortKind::Name) continue;
+        const auto& live=(*logical)[i];
+        const float translation=live[0]-column.start;
+        return std::min(ListStartX(state)-state.horizontalScroll+column.start+live[1]-live[0],
+            ListEndX(state)-translation);
+    }
+    return std::min(ColumnsPresented(state) ? NameColumnEnd(state) : ListEndX(state),ListEndX(state));
+}
+
+float InlineDriveLabelWidth(float available, int dpi) {
+    const float room=available-2.f*Scale96(kDriveBarSideMargin96,dpi);
+    const float minimum=float(Scale96(kDriveBarMinimumWidth96,dpi));
+    return std::max(0.f,std::min(room*.5f,room-minimum));
+}
+
+float InlineDriveContentWidth(float label, int dpi) {
+    return label+std::max(label,float(Scale96(kDriveBarMinimumWidth96,dpi)))+
+        2.f*Scale96(kDriveBarSideMargin96,dpi);
+}
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
@@ -9744,12 +9793,19 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
-            (state.modeComposition.painting && state.modeComposition.widths ? NameColumnEnd(state) :
-                std::min(ColumnsPresented(state) ? NameColumnEnd(state) : end,end))-8.f,
+            NameContentEnd(state)-8.f,
             visual.top+state.rowPx);
     }
     return g;
 }
+
+struct DriveBarGeometry {
+    float labelRight = 0.f;
+    D2D1_RECT_F track{}, caption{};
+    bool visible = false;
+};
+DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item);
+
 // The side clearance is the actual vertical track placement, not a separate
 // 22px estimate. Using the same components avoids a phantom horizontal bar.
 int VerticalScrollbarClearance(int dpi) {
@@ -11336,10 +11392,8 @@ void FitColumnsToVisibleRows(ViewState& state) {
             std::min(headerNeeded, bodyMinimum * 2.f))));
         minimums[i] = minimum;
         minimumTotal += minimum;
-        const float bodyNeeded = textWidth + contentInset +
-            (state.thisPcGpu && name && sample.count
-                ? Scale96(2 * kDriveBarSideMargin96 +
-                    kDriveBarMinimumWidth96, dpi) : 0.f);
+        const float bodyNeeded = contentInset + (state.thisPcGpu && name && sample.count ?
+            InlineDriveContentWidth(textWidth,dpi) : textWidth);
         // Don't let one outlier take the entire viewport; show ellipsis there.
         // An unresolved body adds no content estimate beyond its readable
         // floor/header. Guessing a wider default can send an entering column
@@ -11467,8 +11521,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
             float room = content.right - content.left - tolerance;
             if (name && state.thisPcGpu &&
                 (entry.driveTotal || entry.driveUsedPercent >= 0)) {
-                room -= Scale96(2 * kDriveBarSideMargin96 +
-                    kDriveBarMinimumWidth96, dpi);
+                room = InlineDriveLabelWidth(room,dpi);
             }
             if (room <= 0.f) return true;
             const float measured = ColumnTextWidth(state, *cell, false);
@@ -12504,8 +12557,10 @@ void DropTarget(ViewState& state) {
     }
     state.visual.Reset();
     state.compTarget.Reset();
+    if (state.frameLatencyWaitable) CloseHandle(std::exchange(state.frameLatencyWaitable,nullptr));
     state.swapChain.Reset();
     state.presentPending = false;
+    state.rejectedPresentQpc = {};
     state.graphicsReady = false;
     state.composition.Reset();
     state.compositionSurfacePoolUsed=false;
@@ -12563,7 +12618,7 @@ bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     state.target->SetTarget(nullptr);
     state.backbuffer.Reset();
     const HRESULT hr = state.swapChain->ResizeBuffers(2, width, height,
-        DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
     if (FAILED(hr) || !BindBackbuffer(state)) {
         DropTarget(state);
         return false;
@@ -12632,10 +12687,18 @@ bool EnsureTarget(ViewState& state) {
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         state.graphicsFailureStage=3;
         hr = state.dxgiFactory->CreateSwapChainForComposition(state.d3d.Get(),
             &desc, nullptr, state.swapChain.GetAddressOf());
         if (FAILED(hr)) goto failed;
+        ComPtr<IDXGISwapChain2> paced;
+        hr = state.swapChain.As(&paced);
+        if (FAILED(hr)) goto failed;
+        hr = paced->SetMaximumFrameLatency(1);
+        if (FAILED(hr)) goto failed;
+        state.frameLatencyWaitable = paced->GetFrameLatencyWaitableObject();
+        if (!state.frameLatencyWaitable) { hr = E_FAIL; goto failed; }
     }
     state.graphicsFailureStage=4;
     hr = state.composition->CreateTargetForHwnd(state.hwnd, TRUE,
@@ -13456,6 +13519,18 @@ float ClipboardIconWiggleAngle(float size96, double elapsedMs, size_t seed = 0) 
         (6.283185307179586 / periodMs)));
 }
 
+D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
+    float sourceWidth, float sourceHeight, float angle) {
+    if (fabsf(width-sourceWidth)<.001f && fabsf(height-sourceHeight)<.001f && angle==0.f)
+        return D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
+    // Magnifying a small Shell icon over a large tile cannot recover detail.
+    // Use hardware bilinear sampling there, as for thumbnails; keep cubic's
+    // prefilter for minification and its reconstruction for ordinary sizes.
+    if (std::max(width,height)>=512.f && width>=2.f*sourceWidth && height>=2.f*sourceHeight)
+        return D2D1_INTERPOLATION_MODE_LINEAR;
+    return D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
+}
+
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
                     float opacity = 1.f, float angle = 0.f) {
     if(!VisibleOpacity(opacity)) return true;
@@ -13528,10 +13603,8 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         }
     } else {
         const auto source=D2D1::RectF(0,0,sourceWidth,sourceHeight);
-        const bool unscaled=fabsf((rect.right-rect.left)-sourceWidth)<.001f &&
-            fabsf((rect.bottom-rect.top)-sourceHeight)<.001f && angle==0.f;
-        state.target->DrawBitmap(icon.bitmap.Get(),&rect,opacity,unscaled ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR :
-            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+        state.target->DrawBitmap(icon.bitmap.Get(),&rect,opacity,IconInterpolation(
+            rect.right-rect.left,rect.bottom-rect.top,sourceWidth,sourceHeight,angle),&source,nullptr);
     }
     if (angle != 0.f) state.target->SetTransform(previous);
     return true;
@@ -13998,6 +14071,8 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
     }
     D2D1_RECT_F rc = RowHighlightRect(state, top, row);
     if (ViewOptionEnabled(state,g_filenameOnly)) {
+        const auto usage=LayoutDriveBar(state,index,LayoutItem(state,{top,row,1.f}));
+        if (usage.visible) nameRight=std::min(nameRight,usage.labelRight);
         const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
         const float available = std::max(0.f, nameRight - nameLeft);
         const float width = SelectedFilenameWidth(state, index, available);
@@ -14242,12 +14317,6 @@ void StartKeyboardSelectionAnimation(ViewState& state, int index,
 // One themed usage track serves inline Name cells and horizontal drive tiles.
 // Item geometry owns the tile's two text lines; all coordinates remain logical
 // so drawing, pointer geometry and RTL use the existing grid paths.
-struct DriveBarGeometry {
-    float labelRight = 0.f;
-    D2D1_RECT_F track{}, caption{};
-    bool visible = false;
-};
-
 DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item) {
     DriveBarGeometry result;
     if (!state.thisPcGpu || row < 0 || row >= state.total ||
@@ -14265,13 +14334,12 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     const float textLeft = item.text.left, columnRight = item.text.right + 8.f;
     const float margin = static_cast<float>(Scale96(kDriveBarSideMargin96, dpi));
     const float minimum = static_cast<float>(Scale96(kDriveBarMinimumWidth96, dpi));
-    const float labelLimit = columnRight - textLeft - 2.f * margin - minimum;
+    const float labelLimit = InlineDriveLabelWidth(columnRight-textLeft,dpi);
     if (labelLimit <= 0.f) return result; // Never draw across another column.
 
-    const float labelWidth = SelectedFilenameWidth(state, row, labelLimit);
-    // Allow a pixel for DirectWrite glyph overhang so the final character
-    // never gets clipped exactly at the measured layout width.
-    result.labelRight = textLeft + std::min(labelLimit, ceilf(labelWidth + 1.f));
+    // One shared partition for every row, independent of label text and
+    // provider readiness. Long labels use the existing filename trimming.
+    result.labelRight = textLeft + labelLimit;
     const float height = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
     const float top = (item.text.top + item.text.bottom - height) * .5f;
     result.track = D2D1::RectF(result.labelRight + margin, top, columnRight - margin, top + height);
@@ -14718,10 +14786,15 @@ bool PrepareModeComposition(ViewState& state) {
     const float start = ListStartX(state)-state.horizontalScroll;
     for (size_t i=0; ok && i<state.columns.size(); ++i) {
         const auto& motion = state.columnMotion[i];
-        const float base = state.columnsView ? motion.toStart : motion.fromStart;
-        const float end = state.columnsView ? motion.toEnd : motion.fromEnd;
-        mode.columns.emplace_back(base,end);
         const bool primary = ClassifySort(state.columns[i].key)==SortKind::Name;
+        // A moved Name column can be wider at either endpoint. Anchor its
+        // source at the earlier start so visible live content is not painted
+        // beyond the fixed surface and then clipped away before translation.
+        const float base = primary ? std::min(motion.fromStart,motion.toStart) :
+            state.columnsView ? motion.toStart : motion.fromStart;
+        const float end = primary ? base+std::max(motion.fromEnd-motion.fromStart,motion.toEnd-motion.toStart) :
+            state.columnsView ? motion.toEnd : motion.fromEnd;
+        mode.columns.emplace_back(base,end);
         name |= primary;
         if (state.gridView) continue; // No per-column body slices in a grid.
         const float direction = state.rtlLayout ? -1.f : 1.f;
@@ -14785,6 +14858,7 @@ struct ModeCompositionFrame {
         if (!active) return;
         if (state.target) state.target->SetTransform(D2D1::Matrix3x2F::Identity());
         state.modeComposition.painting=false;
+        state.modeComposition.logicalColumns=nullptr;
         if (Rows()) return;
         state.headerPx=header;
         for (size_t i=0;i<std::min(columns.size(),state.columns.size());++i) {
@@ -14797,6 +14871,7 @@ struct ModeCompositionFrame {
         if (Rows()) { state.modeComposition.painting=true; return; }
         state.modeComposition.logicalHeader=header;
         state.modeComposition.painting=true;
+        state.modeComposition.logicalColumns=&columns;
         state.headerPx=state.modeComposition.header;
         for (size_t i=0;i<columns.size();++i) {
             state.columns[i].start=state.modeComposition.columns[i].first;
@@ -15042,6 +15117,8 @@ void ClearBodyBand(ViewState& state, ID2D1Bitmap1* frame, float top, float botto
     state.target->SetPrimitiveBlend(blend); state.target->SetAntialiasMode(antialias);
 }
 
+bool PresentationFrameReady(ViewState& state);
+
 void Paint(ViewState& state) {
     if(state.presenter && !state.presentationOnly) { SubmitPresentation(state); return; }
     GraphicsContinuation continuation(state);
@@ -15063,6 +15140,14 @@ void Paint(ViewState& state) {
     }
     ScopedFlag rasterPainting(state.textRasterPainting);
     RefreshTextRendering(state,true);
+    ModeCompositionFrame compositionFrame(state);
+    // The presentation lane coalesces input while DXGI owns the previous
+    // frame. Probe before uploading, rasterizing text or drawing large tiles.
+    // DComp planes and their ready-frame handoff do not use that DXGI slot.
+    if (state.presentationOnly) {
+        if (!compositionFrame.active && !state.modeRootAttached && !PresentationFrameReady(state)) return;
+        UploadVisibleIcons(state);
+    }
     ++state.graphicsPaintSerial;
     state.presentationContentAccepted=false;
     if (state.itemOpacityToken != state.token) ResetItemContentOpacity(state);
@@ -15073,7 +15158,6 @@ void Paint(ViewState& state) {
     state.clipboardIconsVisible = false;
     state.clipboardIconSize96 = 0.f;
     state.clipboardIconElapsedMs = 0.;
-    ModeCompositionFrame compositionFrame(state);
     state.uiTracePaint=state.uiTraceDrawItem=false;
     if (g_uiTransitionLogging.load(std::memory_order_relaxed)) {
         EnsurePipelineTrace(state);
@@ -15596,6 +15680,10 @@ void Paint(ViewState& state) {
                     geometry.icon.bottom-geometry.icon.top}},true);
         }
         const DriveBarGeometry usage = LayoutDriveBar(state, i, geometry);
+        if (state.uiTraceDrawItem && usage.visible)
+            PipelineEvent(*state.background,{.operation=L"ui.drive.track[x,y,w,h]",.a=state.uiTraceItem,.b=state.token,
+                .v={usage.track.left,usage.track.top,usage.track.right-usage.track.left,
+                    usage.track.bottom-usage.track.top}},true);
         paintedItems.push_back({i,v,geometry,usage,contentOpacity});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
@@ -15921,6 +16009,8 @@ void Paint(ViewState& state) {
         PipelineEvent(*state.background,{.operation=L"render.present[pos,target]",.a=static_cast<unsigned>(present),
             .b=PipelineFlags(state),.v={state.scrollNow,state.scrollTarget}});
         state.presentPending = present == DXGI_ERROR_WAS_STILL_DRAWING;
+        if (state.presentPending) QueryPerformanceCounter(&state.rejectedPresentQpc);
+        else state.rejectedPresentQpc = {};
         if (state.uiTracePaint)
             PipelineEvent(*state.background,{.operation=L"ui.submit[scene,accepted,header,rootAttached]",
                 .a=static_cast<unsigned>(present),.b=state.token,
@@ -22390,7 +22480,8 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
         DCOMPOSITION_FRAME_STATISTICS statistics{};
         if(SUCCEEDED(state.composition->GetFrameStatistics(&statistics))) receipt->compositionTime=statistics.currentTime;
     }
-    receipt->ready=state.graphicsReady; receipt->accepted=state.lastAcceptedPaint==state.graphicsPaintSerial && state.lastAcceptedPaint;
+    receipt->ready=state.graphicsReady; receipt->accepted=!state.presentPending &&
+        state.lastAcceptedPaint==state.graphicsPaintSerial && state.lastAcceptedPaint;
     receipt->content=receipt->accepted && state.presentationContentAccepted;
     receipt->failed=failed; receipt->standby=state.graphicsStandby && !state.graphicsStandbyPending;
     receipt->failure=state.graphicsFailure; receipt->failureStage=state.graphicsFailureStage;
@@ -22474,6 +22565,32 @@ void TrimPresentationImages(ViewState& state) {
     state.presentationCachePending=state.iconCacheBytes>budget && attempts>=limit && limit==64;
 }
 
+bool PresentationFrameReady(ViewState& state) {
+    if (!state.frameLatencyWaitable) return true;
+    const DWORD ready=WaitForSingleObject(state.frameLatencyWaitable,0);
+    if (ready==WAIT_OBJECT_0) return true;
+    const DWORD waitError=ready==WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+    // Device loss may leave readiness unsignaled. Keep the existing recovery
+    // and native fallback reachable instead of deferring every future paint.
+    const HRESULT device=state.d3d ? state.d3d->GetDeviceRemovedReason() : S_OK;
+    if (ready==WAIT_FAILED || FAILED(device)) {
+        state.graphicsFailure=FAILED(device) ? device : HRESULT_FROM_WIN32(waitError ? waitError : ERROR_GEN_FAILURE);
+        state.graphicsFailureStage=6;
+        DropTarget(state); return false;
+    }
+    // A rejected nonblocking Present can retain the acquired DXGI slot. Retry
+    // at the tab's refresh cadence in that case; never spin/redraw at each
+    // input wake, and never wait for the GPU on Explorer's owner STA.
+    if (state.rejectedPresentQpc.QuadPart) {
+        LARGE_INTEGER now{},frequency{}; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+        if (now.QuadPart-state.rejectedPresentQpc.QuadPart>=frequency.QuadPart/std::max(1,state.refreshHz))
+            return true;
+    }
+    state.presentPending=true;
+    state.presentationContentAccepted=false;
+    return false;
+}
+
 DWORD WINAPI PresentationWorkerProc(LPVOID context) {
     auto& worker=*static_cast<TabBackground::Worker*>(context);
     auto& work=*worker.owner; const auto lane=work.presenter;
@@ -22534,12 +22651,16 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         }
         BeginFrameProfile(state);
         AdvanceAnimationFrame(state,false);
-        if(state.target) UploadVisibleIcons(state);
+        const auto previousPaint=state.graphicsPaintSerial;
         Paint(state);
         EndFrameProfile(state);
         TrimPresentationImages(state);
         if(state.target) {ScheduleVisibleIconUploads(state);}
-        PublishPresentationReceipt(state,lane,!state.graphicsReady);
+        // A readiness miss produced no new pixels. Keep the last accepted
+        // receipt available to an unpumped owner until a newer model needs a
+        // deferred acknowledgment, or a new paint/device failure supersedes it.
+        if (state.graphicsPaintSerial!=previousPaint || model || !state.graphicsReady)
+            PublishPresentationReceipt(state,lane,!state.graphicsReady);
         const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
         PulsePresentation(lane,state.presentationActive && (NeedsAnimationPaint(state) || handoff || state.presentationCachePending));
     }
@@ -26406,6 +26527,7 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
             // discarding every prior Shell property value.
             entry.columnEpoch = oldRow->columnEpoch;
             entry.propertyEpoch = oldRow->propertyEpoch;
+            entry.detailsRefreshEpoch = oldRow->detailsRefreshEpoch;
             entry.detailsReady = oldRow->detailsReady;
             entry.detailsPending = oldRow->detailsPending;
             entry.detailsPendingEpoch = oldRow->detailsPendingEpoch;

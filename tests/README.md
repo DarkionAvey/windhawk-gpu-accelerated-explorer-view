@@ -54,6 +54,12 @@ with native HICON pixels and transparent PNG references, plus GPU edge pixels
 on dark/light backgrounds, RTL/LTR, Cut opacity and 24..256px sizes. Set
 `GPU_OVERLAY_ICON_ALPHA_PREVIEW` to a PNG output path for a comparison image.
 See the [alpha investigation](../docs/icon-alpha-0.9.240.md).
+`--drive-bars` checks remaining-space inline tracks, wide/narrow resizing,
+intrinsic label/font updates, fitting at standard/custom DPI, canonical
+source versus live column bounds, moved Name columns, LTR/RTL, reversal and the
+settled handoff, plus offscreen GPU source pixels. See the
+[storage-bar investigation](../docs/drive-bars-0.9.243.md) and
+[remaining-space refinement](../docs/drive-bars-0.9.244.md).
 `--smart-refresh` checks retained metadata with blocked providers, unchanged
 results without repaint, changed and empty values, stale-result cancellation,
 and independent This PC capacity updates. These are private component tests;

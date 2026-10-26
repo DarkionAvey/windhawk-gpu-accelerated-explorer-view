@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.242
+// @version         0.9.244
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -306,7 +306,7 @@ constexpr ULONGLONG kDriveSpaceRefreshMs = 60000;
 // Group headings occupy the same row-height rhythm as file rows. No separate
 // typography or fixed section-header height is maintained.
 
-// An elastic track uses the remaining Name-column width. These values are
+// Inline tracks fill the Name column after a shared measured label band. These values are
 // DPI-scaled in one place and used for both fitting and GPU drawing.
 constexpr int kDriveBarSideMargin96 = 20; // Same gap after label and before divider.
 constexpr int kDriveBarMinimumWidth96 = 72; // For fitting/ellipsis only.
@@ -2791,6 +2791,13 @@ struct ViewState {
     struct WidthEntry {float available=0.f, width=0.f, font=0.f;};
     std::unordered_map<int, WidthEntry> widthCache;
     TextLayoutCache textLayouts[4]; // Body, header, sorted header, wrapped icon labels.
+    struct {
+        ComPtr<IDWriteTextFormat> format;
+        std::vector<std::wstring> labels;
+        float font = 0.f, width = 0.f;
+        int dpi = 0;
+        unsigned long long paint = ~0ULL;
+    } inlineDriveLabels;
     std::deque<TextLayoutCache::Layout> retiredTextLayouts;
     size_t retiredRasterBytes = 0;
     struct RetiredIconBitmap { ComPtr<ID2D1Bitmap> bitmap; size_t bytes; };
@@ -3039,6 +3046,8 @@ struct ViewState {
         std::vector<FitPlane> fitted;
         ComPtr<IDCompositionVisual> root;
         std::vector<std::pair<float,float>> columns;
+        // Borrowed only while a ModeCompositionFrame paints canonical sources.
+        const std::vector<std::array<float,3>>* logicalColumns = nullptr;
     } modeComposition;
     ComPtr<ID2D1DeviceContext> target;
     ComPtr<ID2D1DeviceContext> textRasterTarget;
@@ -9709,6 +9718,35 @@ float NameColumnEnd(ViewState& state) {
     // fallback is also used when a provider temporarily has no Name column.
     return ListEndX(state);
 }
+
+// Source images keep a fixed column origin while DWM translates/clips them.
+// Width-dependent contents must still use the live extent, expressed at that
+// source origin. Otherwise a track or an ellipsized label changes geometry
+// abruptly when the canonical source hands back to the ordinary renderer.
+float NameContentEnd(ViewState& state) {
+    const auto* logical = state.modeComposition.painting ?
+        state.modeComposition.logicalColumns : nullptr;
+    if (logical) for (size_t i=0;i<std::min(logical->size(),state.columns.size());++i) {
+        const auto& column=state.columns[i];
+        if (ClassifySort(column.key)!=SortKind::Name) continue;
+        const auto& live=(*logical)[i];
+        const float translation=live[0]-column.start;
+        return std::min(ListStartX(state)-state.horizontalScroll+column.start+live[1]-live[0],
+            ListEndX(state)-translation);
+    }
+    return std::min(ColumnsPresented(state) ? NameColumnEnd(state) : ListEndX(state),ListEndX(state));
+}
+
+float InlineDriveLabelWidth(float available, float label, int dpi) {
+    const float room=available-2.f*Scale96(kDriveBarSideMargin96,dpi);
+    const float minimum=float(Scale96(kDriveBarMinimumWidth96,dpi));
+    return std::max(0.f,std::min(std::ceil(label+1.f),room-minimum));
+}
+
+float InlineDriveContentWidth(float label, int dpi) {
+    return std::ceil(label+1.f)+Scale96(kDriveBarMinimumWidth96,dpi)+
+        2.f*Scale96(kDriveBarSideMargin96,dpi);
+}
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
@@ -9762,12 +9800,19 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
-            (state.modeComposition.painting && state.modeComposition.widths ? NameColumnEnd(state) :
-                std::min(ColumnsPresented(state) ? NameColumnEnd(state) : end,end))-8.f,
+            NameContentEnd(state)-8.f,
             visual.top+state.rowPx);
     }
     return g;
 }
+
+struct DriveBarGeometry {
+    float labelRight = 0.f;
+    D2D1_RECT_F track{}, caption{};
+    bool visible = false;
+};
+DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item);
+
 // The side clearance is the actual vertical track placement, not a separate
 // 22px estimate. Using the same components avoids a phantom horizontal bar.
 int VerticalScrollbarClearance(int dpi) {
@@ -11284,6 +11329,37 @@ ColumnVisibleSample SampleColumnRows(ViewState& state) {
     return sample;
 }
 
+// Use the fitter's bounded visible sample and its existing intrinsic shaping
+// cache. Window/column width is deliberately absent from the measurement key:
+// widening the view grows only the track, never the gap after short labels.
+// Sample once per paint, then share one result across all row/feedback passes.
+float SharedInlineDriveLabelWidth(ViewState& state) {
+    auto& cache=state.inlineDriveLabels;
+    const int dpi=ViewDpi(state);
+    const bool sameFont=cache.format.Get()==state.textFormat.Get() &&
+        cache.font==state.fontPx && cache.dpi==dpi;
+    if (state.textRasterPainting && sameFont && cache.paint==state.graphicsPaintSerial)
+        return cache.width;
+    const auto sample=SampleColumnRows(state);
+    const auto labelAt=[&](size_t i) {
+        return std::wstring_view(ModelEntry(state,sample.At(i)).name).substr(0,kColumnFitTextLimit);
+    };
+    bool sameLabels=sample.count==cache.labels.size();
+    for (size_t i=0;sameLabels && i<sample.count;++i)
+        sameLabels=labelAt(i)==cache.labels[i];
+    if (!sameFont || !sameLabels) {
+        cache.labels.clear(); cache.labels.reserve(sample.count);
+        cache.width=0.f;
+        for (size_t i=0;i<sample.count;++i) {
+            cache.labels.emplace_back(labelAt(i));
+            cache.width=std::max(cache.width,ColumnTextWidth(state,cache.labels.back(),false));
+        }
+        cache.format=state.textFormat; cache.font=state.fontPx; cache.dpi=dpi;
+    }
+    cache.paint=state.textRasterPainting ? state.graphicsPaintSerial : ~0ULL;
+    return cache.width;
+}
+
 // Request at most one post-load refinement when the visible Shell metadata
 // has not arrived. A Name-only view never needs a metadata follow-up.
 bool HasPendingVisibleColumnDetails(ViewState& state) {
@@ -11354,10 +11430,8 @@ void FitColumnsToVisibleRows(ViewState& state) {
             std::min(headerNeeded, bodyMinimum * 2.f))));
         minimums[i] = minimum;
         minimumTotal += minimum;
-        const float bodyNeeded = textWidth + contentInset +
-            (state.thisPcGpu && name && sample.count
-                ? Scale96(2 * kDriveBarSideMargin96 +
-                    kDriveBarMinimumWidth96, dpi) : 0.f);
+        const float bodyNeeded = contentInset + (state.thisPcGpu && name && sample.count ?
+            InlineDriveContentWidth(textWidth,dpi) : textWidth);
         // Don't let one outlier take the entire viewport; show ellipsis there.
         // An unresolved body adds no content estimate beyond its readable
         // floor/header. Guessing a wider default can send an entering column
@@ -11473,6 +11547,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
         }
 
         const auto content = ColumnTextBounds(state, columnIndex, false, listStart, listEnd, dpi);
+        const float driveLabel=name && state.thisPcGpu ? SharedInlineDriveLabelWidth(state) : 0.f;
         for (size_t j = 0; j < sample.count; ++j) {
             const int row = sample.At(j);
             if (row < 0 || static_cast<size_t>(row) >= state.entries.size())
@@ -11485,8 +11560,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
             float room = content.right - content.left - tolerance;
             if (name && state.thisPcGpu &&
                 (entry.driveTotal || entry.driveUsedPercent >= 0)) {
-                room -= Scale96(2 * kDriveBarSideMargin96 +
-                    kDriveBarMinimumWidth96, dpi);
+                room = InlineDriveLabelWidth(room,driveLabel,dpi);
             }
             if (room <= 0.f) return true;
             const float measured = ColumnTextWidth(state, *cell, false);
@@ -14036,6 +14110,8 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
     }
     D2D1_RECT_F rc = RowHighlightRect(state, top, row);
     if (ViewOptionEnabled(state,g_filenameOnly)) {
+        const auto usage=LayoutDriveBar(state,index,LayoutItem(state,{top,row,1.f}));
+        if (usage.visible) nameRight=std::min(nameRight,usage.labelRight);
         const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
         const float available = std::max(0.f, nameRight - nameLeft);
         const float width = SelectedFilenameWidth(state, index, available);
@@ -14280,12 +14356,6 @@ void StartKeyboardSelectionAnimation(ViewState& state, int index,
 // One themed usage track serves inline Name cells and horizontal drive tiles.
 // Item geometry owns the tile's two text lines; all coordinates remain logical
 // so drawing, pointer geometry and RTL use the existing grid paths.
-struct DriveBarGeometry {
-    float labelRight = 0.f;
-    D2D1_RECT_F track{}, caption{};
-    bool visible = false;
-};
-
 DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item) {
     DriveBarGeometry result;
     if (!state.thisPcGpu || row < 0 || row >= state.total ||
@@ -14303,13 +14373,12 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     const float textLeft = item.text.left, columnRight = item.text.right + 8.f;
     const float margin = static_cast<float>(Scale96(kDriveBarSideMargin96, dpi));
     const float minimum = static_cast<float>(Scale96(kDriveBarMinimumWidth96, dpi));
-    const float labelLimit = columnRight - textLeft - 2.f * margin - minimum;
+    const float labelLimit = InlineDriveLabelWidth(columnRight-textLeft,SharedInlineDriveLabelWidth(state),dpi);
     if (labelLimit <= 0.f) return result; // Never draw across another column.
 
-    const float labelWidth = SelectedFilenameWidth(state, row, labelLimit);
-    // Allow a pixel for DirectWrite glyph overhang so the final character
-    // never gets clipped exactly at the measured layout width.
-    result.labelRight = textLeft + std::min(labelLimit, ceilf(labelWidth + 1.f));
+    // All rows share the measured label band; the track takes everything
+    // after it. Narrow columns retain the existing filename trimming.
+    result.labelRight = textLeft + labelLimit;
     const float height = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
     const float top = (item.text.top + item.text.bottom - height) * .5f;
     result.track = D2D1::RectF(result.labelRight + margin, top, columnRight - margin, top + height);
@@ -14756,10 +14825,15 @@ bool PrepareModeComposition(ViewState& state) {
     const float start = ListStartX(state)-state.horizontalScroll;
     for (size_t i=0; ok && i<state.columns.size(); ++i) {
         const auto& motion = state.columnMotion[i];
-        const float base = state.columnsView ? motion.toStart : motion.fromStart;
-        const float end = state.columnsView ? motion.toEnd : motion.fromEnd;
-        mode.columns.emplace_back(base,end);
         const bool primary = ClassifySort(state.columns[i].key)==SortKind::Name;
+        // A moved Name column can be wider at either endpoint. Anchor its
+        // source at the earlier start so visible live content is not painted
+        // beyond the fixed surface and then clipped away before translation.
+        const float base = primary ? std::min(motion.fromStart,motion.toStart) :
+            state.columnsView ? motion.toStart : motion.fromStart;
+        const float end = primary ? base+std::max(motion.fromEnd-motion.fromStart,motion.toEnd-motion.toStart) :
+            state.columnsView ? motion.toEnd : motion.fromEnd;
+        mode.columns.emplace_back(base,end);
         name |= primary;
         if (state.gridView) continue; // No per-column body slices in a grid.
         const float direction = state.rtlLayout ? -1.f : 1.f;
@@ -14823,6 +14897,7 @@ struct ModeCompositionFrame {
         if (!active) return;
         if (state.target) state.target->SetTransform(D2D1::Matrix3x2F::Identity());
         state.modeComposition.painting=false;
+        state.modeComposition.logicalColumns=nullptr;
         if (Rows()) return;
         state.headerPx=header;
         for (size_t i=0;i<std::min(columns.size(),state.columns.size());++i) {
@@ -14835,6 +14910,7 @@ struct ModeCompositionFrame {
         if (Rows()) { state.modeComposition.painting=true; return; }
         state.modeComposition.logicalHeader=header;
         state.modeComposition.painting=true;
+        state.modeComposition.logicalColumns=&columns;
         state.headerPx=state.modeComposition.header;
         for (size_t i=0;i<columns.size();++i) {
             state.columns[i].start=state.modeComposition.columns[i].first;
@@ -15643,6 +15719,10 @@ void Paint(ViewState& state) {
                     geometry.icon.bottom-geometry.icon.top}},true);
         }
         const DriveBarGeometry usage = LayoutDriveBar(state, i, geometry);
+        if (state.uiTraceDrawItem && usage.visible)
+            PipelineEvent(*state.background,{.operation=L"ui.drive.track[x,y,w,h]",.a=state.uiTraceItem,.b=state.token,
+                .v={usage.track.left,usage.track.top,usage.track.right-usage.track.left,
+                    usage.track.bottom-usage.track.top}},true);
         paintedItems.push_back({i,v,geometry,usage,contentOpacity});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
