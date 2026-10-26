@@ -35,8 +35,8 @@
 - `README.md` is public user documentation and the source of the embedded
   Windhawk README. Keep it clean, minimal and focused on use and installation.
   **Do not turn README.md into a changelog, audit dump or test report.**
-- Add release changes and validation results to `CHANGELOG.md`. Keep technical
-  investigations in `tests/` or `docs/` and link them from the changelog.
+- Add user-readable changes to `CHANGELOG.md`. Keep technical
+  investigations in `tests/` or `docs/`. Do not make it verbose.
 - Do not hand-edit the embedded Windhawk README; the build replaces it from
   root `README.md`. Avoid C++ comment terminators in README content.
 - Distinguish offscreen component tests and CPU submission measurements from
