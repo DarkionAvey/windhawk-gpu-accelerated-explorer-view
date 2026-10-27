@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.257
+// @version         0.9.261
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -218,6 +218,8 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <emmintrin.h>
 #include <limits>
 #include <atomic>
 #include <map>
@@ -817,6 +819,7 @@ struct TextLayoutCache {
     std::unordered_map<std::wstring, Layout> layouts;
     size_t rasterBytes = 0;
     unsigned long long generation = 0;
+    unsigned long long faceSerial = 0;
 };
 struct GroupHeaderMotion {
     int sectionIndex = -1;
@@ -1054,7 +1057,36 @@ struct IconJob {
     std::wstring extension;
     int dpi = 96;
 };
-using IconCache = std::unordered_map<std::wstring, IconRecord>;
+std::wstring_view BaseIconKey(std::wstring_view key);
+// Probe a size tier without constructing or rehashing the provider identity.
+// The owning map and its memory bound are unchanged; probes are stack-only.
+struct IconCacheLookup {
+    std::wstring_view prefix, base;
+    size_t baseHash;
+    explicit IconCacheLookup(std::wstring_view key) : base(BaseIconKey(key)),
+        baseHash(std::hash<std::wstring_view>{}(base)) {
+        prefix=key.substr(0,key.size()-base.size());
+    }
+    size_t Hash() const noexcept {
+        const auto tier=std::hash<std::wstring_view>{}(prefix);
+        return baseHash^(tier+0x9e3779b97f4a7c15ULL+(baseHash<<6)+(baseHash>>2));
+    }
+};
+struct IconCacheHash {
+    using is_transparent=void;
+    size_t operator()(std::wstring_view key) const {return IconCacheLookup(key).Hash();}
+    size_t operator()(const IconCacheLookup& key) const noexcept {return key.Hash();}
+};
+struct IconCacheEqual {
+    using is_transparent=void;
+    bool operator()(std::wstring_view a,std::wstring_view b) const noexcept {return a==b;}
+    bool operator()(const IconCacheLookup& a,std::wstring_view b) const noexcept {
+        return b.size()==a.prefix.size()+a.base.size() && b.starts_with(a.prefix) &&
+            b.substr(a.prefix.size())==a.base;
+    }
+    bool operator()(std::wstring_view a,const IconCacheLookup& b) const noexcept {return (*this)(b,a);}
+};
+using IconCache = std::unordered_map<std::wstring, IconRecord, IconCacheHash, IconCacheEqual>;
 enum class FrameStage : size_t { Delivery, Demand, Upload, Draw, Present, Flush, Cleanup, Count };
 struct FrameProfile {
     static constexpr size_t stages = static_cast<size_t>(FrameStage::Count);
@@ -1234,7 +1266,25 @@ struct DriveCapacity {
 // CF_HDROP paths without allocating a lowercase copy on every painted row.
 struct ClipboardPathLess {
     bool operator()(const std::wstring& a, const std::wstring& b) const {
-        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+        // Opaque Shell identities and sibling paths share long exact prefixes.
+        // Skip those before locale folding, keeping the original comparison
+        // for the differing suffix (including Unicode and embedded terminators).
+        size_t same=0;
+        const auto length=std::min(a.size(),b.size());
+        // SSE2 is part of the mod's x64 baseline. Read only complete blocks
+        // inside both strings; equal NULs stop comparison just like _wcsicmp.
+        constexpr size_t lanes=sizeof(__m128i)/sizeof(wchar_t);
+        const auto zero=_mm_setzero_si128();
+        while(length-same>=lanes) {
+            const auto left=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a.data()+same));
+            const auto right=_mm_loadu_si128(reinterpret_cast<const __m128i*>(b.data()+same));
+            const auto equal=_mm_andnot_si128(_mm_cmpeq_epi16(left,zero),_mm_cmpeq_epi16(left,right));
+            const unsigned mask=static_cast<unsigned>(_mm_movemask_epi8(equal));
+            if(mask!=0xFFFFu) {same+=std::countr_one(mask)/sizeof(wchar_t); break;}
+            same+=lanes;
+        }
+        while(same<length && a[same] && a[same]==b[same]) ++same;
+        return _wcsicmp(a.c_str()+same,b.c_str()+same) < 0;
     }
 };
 class ClipboardPaths {
@@ -3067,6 +3117,7 @@ struct ViewState {
     ComPtr<IDWriteRenderingParams> textRenderingParams;
     HMONITOR textRenderingMonitor = nullptr;
     unsigned long long textRenderingRevision = 0, textRenderingSerial = 0;
+    unsigned long long textFaceSerial = 0;
     TextAntialiasing textAntialiasing = TextAntialiasing::System;
     D2D1_TEXT_ANTIALIAS_MODE textAntialiasMode = D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
     unsigned long long textRasterTick = 0;
@@ -11380,6 +11431,10 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     auto format = !header ? state.textFormat.Get() :
         (sortedHeader && state.sortedHeaderFormat ?
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
+    // Shape in local pixel bounds, independently of the row's translated
+    // origin. Selection and painting must agree: rounding both screen edges
+    // made wrapped labels alternate sizes while scrolling or crossing columns.
+    width = roundf(width); height = roundf(height);
     if (!format || !g_writeFactory || width <= 0.f || height <= 0.f) return nullptr;
     auto& cache = state.textLayouts[wrapped ? 3 : !header ? 0 : sortedHeader ? 2 : 1];
     const auto alignment = format->GetTextAlignment();
@@ -11387,18 +11442,36 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         // Readiness belongs to the value, not a particular font. Keep the
         // bounded LRU and replace only requested shapes as their font changes;
         // retiring the whole cache here made visible metadata cold at zoom end.
+        if(cache.faceSerial!=state.textFaceSerial || cache.alignment!=alignment)
+            ++cache.generation;
+        cache.faceSerial=state.textFaceSerial;
         cache.format = format;
         cache.alignment = alignment;
-        ++cache.generation;
     }
     const bool middleTrim = filename && ViewOptionEnabled(state,g_middleEllipsis);
     auto it = cache.layouts.find(text);
+    float previousSize=0.f;
+    const bool fontChanged=it==cache.layouts.end() ||
+        FAILED(it->second.text->GetFontSize(0,&previousSize)) || previousSize!=format->GetFontSize();
     bool geometryChanged = false;
     if (it == cache.layouts.end() || it->second.generation != cache.generation ||
-        (!naturalWidth && it->second.middleTrim != middleTrim)) {
+        fontChanged || (!naturalWidth && it->second.middleTrim != middleTrim)) {
         geometryChanged = true;
         ComPtr<IDWriteTextLayout> layout;
-        if (FAILED(g_writeFactory->CreateTextLayout(text.c_str(),
+        // A body-only zoom keeps the face, direction and alignment. Resize its
+        // existing layout at native resolution instead of recreating/shaping
+        // every visible value. New geometry still performs normal trimming.
+        if(it!=cache.layouts.end() && it->second.generation==cache.generation &&
+            it->second.middleTrim==middleTrim && fontChanged) {
+            auto* textLayout=it->second.text.Get();
+            DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
+            if(SUCCEEDED(format->GetTrimming(&trimming,&sign)) &&
+                SUCCEEDED(textLayout->SetInlineObject(nullptr,{0,static_cast<UINT32>(text.size())})) &&
+                SUCCEEDED(textLayout->SetFontSize(format->GetFontSize(),{0,static_cast<UINT32>(text.size())})) &&
+                SUCCEEDED(textLayout->SetMaxWidth(width)) && SUCCEEDED(textLayout->SetMaxHeight(height)) &&
+                SUCCEEDED(textLayout->SetTrimming(&trimming,sign.Get()))) layout=it->second.text;
+        }
+        if (!layout && FAILED(g_writeFactory->CreateTextLayout(text.c_str(),
             static_cast<UINT32>(text.size()), format, width, height,
             layout.GetAddressOf()))) return nullptr;
         if (wrapped) {
@@ -11446,7 +11519,7 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         } else {
             auto& old = it->second;
             const bool displayed = old.displayed;
-            const float natural = old.generation == cache.generation ? old.naturalWidth : -1.f;
+            const float natural = !fontChanged && old.generation == cache.generation ? old.naturalWidth : -1.f;
             const auto recent = old.recent;
             cache.rasterBytes -= old.rasterBytes;
             // Reclaim old glyph surfaces after presentation, in the existing
@@ -12709,6 +12782,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
                 previous->GetFontWeight(), previous->GetFontStyle(), previous->GetFontStretch(),
                 state.fontPx, locale.c_str(), &format))) {
             ConfigureTextFormat(format.Get(), state.rtlLayout, true);
+            if(previous->GetReadingDirection()!=format->GetReadingDirection()) ++state.textFaceSerial;
             state.textFormat = std::move(format);
             return true;
         }
@@ -12763,6 +12837,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         state.headerFormat = std::move(header);
         state.sortedHeaderFormat = std::move(sorted);
         state.textFormatDpi = dpi;
+        ++state.textFaceSerial;
         return true;
     };
     return tryFamily(uiFontFamily,true) ||
@@ -13385,8 +13460,9 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
     // Use the same physical pixel origin for direct and cached glyphs. A
     // fractional animation position must not change coverage when a cold
     // layout becomes a ready bitmap, or interpolate sharp text into a blur.
-    const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(l,t,r,b));
-    l=rect.left; t=rect.top; r=rect.right; b=rect.bottom;
+    const float width=roundf(r-l), height=roundf(b-t);
+    const auto origin=SnapDrawPoint(state.target.Get(),D2D1::Point2F(l,t));
+    l=origin.x; t=origin.y; r=l+width; b=t+height;
     if(r<=l || b<=t) return;
     state.brush->SetColor(Packed(hex, opacity));
     auto fmt = !header ? state.textFormat.Get() :
@@ -13504,45 +13580,65 @@ void AccountIconCache(ViewState& state, const std::wstring& key, IconRecord& rec
 IconRecord* FindIconRecord(ViewState& state, const std::wstring& key,
                            bool sizeFallback = false, bool bitmapOnly = false,
                            std::wstring* resolvedKey = nullptr, bool skipExact = false) {
-    auto lookup = [&](const std::wstring& value) -> IconRecord* {
-        if (value == kDefaultFolderIconKey) {
-            if(resolvedKey) *resolvedKey=value;
-            return &state.defaultFolderIcon;
-        }
+    const auto lookup = [&](const IconCacheLookup& value) -> std::pair<IconRecord*,const std::wstring*> {
+        if (value.prefix.empty() && value.base == kDefaultFolderIconKey)
+            return {&state.defaultFolderIcon,nullptr};
         const auto found = state.icons.find(value);
-        if(found==state.icons.end()) return nullptr;
-        if(resolvedKey) *resolvedKey=value;
-        return &found->second;
+        return found==state.icons.end() ? std::pair<IconRecord*,const std::wstring*>{nullptr,nullptr} :
+            std::pair<IconRecord*,const std::wstring*>{&found->second,&found->first};
     };
     auto usable = [bitmapOnly](const IconRecord* record) {
         return record && (record->bitmap || (!bitmapOnly &&
             record->pixels.Ready() && !record->bitmapAttempted));
     };
-    auto* exact = lookup(key);
-    if(!sizeFallback) return exact;
+    const IconCacheLookup query(key);
+    auto* exact = lookup(query).first;
+    if(!sizeFallback) {if(exact && resolvedKey) *resolvedKey=key; return exact;}
     const auto extent=[](const IconRecord& record) {
         return std::max(record.pixels.thumbnailWidth ? record.pixels.thumbnailWidth : record.pixels.width,
             record.pixels.thumbnailHeight ? record.pixels.thumbnailHeight : record.pixels.height);
     };
     const UINT requested=ImageKeySize(key);
-    if(!skipExact && usable(exact) && extent(*exact)>=requested) return exact;
-    const std::wstring base(BaseIconKey(key));
+    if(!skipExact && usable(exact) && extent(*exact)>=requested) {
+        if(resolvedKey) *resolvedKey=key;
+        return exact;
+    }
     IconRecord* best=!skipExact && usable(exact) ? exact : nullptr;
-    std::wstring bestKey=key;
+    const std::wstring* bestKey=&key;
+    // Hash the potentially long provider identity once. Only the tiny tier
+    // prefix changes; map keys remain owned and exact string equality wins.
     VisitImageTiers([&](UINT size) {
-        const auto variant=SizedImageKey(base,size);
-        if(variant==key) return true;
-        auto* candidate=lookup(variant);
+        wchar_t prefix[16]; size_t start=std::size(prefix);
+        auto probe=query;
+        if(size==32) {
+            probe.prefix={};
+            // An unsized literal beginning with '@' may itself contain '|'.
+            if(query.base.starts_with(L"@")) probe=IconCacheLookup(query.base);
+        }
+        else {
+            prefix[--start]=L'|';
+            for(UINT digits=size;digits;digits/=10) prefix[--start]=wchar_t(L'0'+digits%10);
+            prefix[--start]=L'@'; probe.prefix={prefix+start,std::size(prefix)-start};
+        }
+        if(probe.prefix==query.prefix && probe.base==query.base) return true;
+        const auto [candidate,candidateKey]=lookup(probe);
         if(!usable(candidate)) return true;
         const UINT pixels=extent(*candidate), previous=best ? extent(*best) : 0;
         if(!best || (pixels>=requested ? previous<requested || pixels<previous :
             previous<requested && pixels>previous) ||
             (pixels==previous && candidate->sourceLimited && !best->sourceLimited)) {
-            best=candidate; bestKey=variant;
+            best=candidate;
+            bestKey=candidateKey;
         }
         return true;
     });
-    if(best) {if(resolvedKey) *resolvedKey=bestKey; return best;}
+    if(best) {
+        if(resolvedKey) {
+            if(bestKey) *resolvedKey=*bestKey;
+            else *resolvedKey=kDefaultFolderIconKey;
+        }
+        return best;
+    }
     if(resolvedKey && exact) *resolvedKey=key;
     return skipExact ? nullptr : exact;
 }
@@ -15286,6 +15382,7 @@ bool PublishRowScene(ViewState& state) {
     auto& mode=state.modeComposition;
     if (!mode.rows) return true;
     if (mode.root) return true;
+    PipelineScope pipeline(state.background,L"rows.composition.build");
     LARGE_INTEGER origin=state.rowTransitionStartedQpc;
     mode.newRowOrigin=!origin.QuadPart || mode.previousStarted.QuadPart;
     if (mode.newRowOrigin) QueryPerformanceCounter(&origin);
@@ -15338,7 +15435,15 @@ bool PublishRowScene(ViewState& state) {
             .v={p,double(mode.items.size()),double(mode.headings.size())}},true);
         mode.previousItems.clear(); mode.previousHeadings.clear(); mode.previousStarted={};
     }
-    const auto curve=[&](float a,float b) { return UiCompositionCurve(state,a,b,origin); };
+    // One scene has one clock. Repeated column/row offsets and fades share
+    // curves; constant properties need no animation object or timeline at all.
+    std::map<std::pair<float,float>,ComPtr<IDCompositionAnimation>> curves;
+    const auto property=[&](float from,float to,auto assign) {
+        if(from==to) return SUCCEEDED(assign(to));
+        const auto [it,inserted]=curves.try_emplace(std::make_pair(from,to));
+        if(inserted) it->second=UiCompositionCurve(state,from,to,origin);
+        return it->second && SUCCEEDED(assign(it->second.Get()));
+    };
     ComPtr<IDCompositionVisual> body,feedback,icons,text,groups;
     ComPtr<IDCompositionRectangleClip> bounds,bodyClip;
     const float w=float(mode.size.cx),h=float(mode.size.cy),bottom=float(ContentViewport(state).bottom);
@@ -15355,37 +15460,45 @@ bool PublishRowScene(ViewState& state) {
     const int pinned=GroupAtDocument(state,state.scrollNow);
     if(ok && pinned>=0) {
         const auto from=LayoutGroupHeader(state,size_t(pinned),0),to=LayoutGroupHeader(state,size_t(pinned),1);
-        const auto top=curve(std::clamp(from.top+from.height,mode.header,bottom),
-            std::clamp(to.top+to.height,mode.header,bottom));
-        ok=top && SUCCEEDED(bodyClip->SetTop(top.Get()));
+        ok=property(std::clamp(from.top+from.height,mode.header,bottom),
+            std::clamp(to.top+to.height,mode.header,bottom),[&](auto value) {return bodyClip->SetTop(value);});
     }
     for(auto* p:{std::addressof(feedback),std::addressof(icons),std::addressof(text)}) if(ok)
         ok=SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&*p)) && SUCCEEDED(AppendCompositionVisual(body.Get(),p->Get()));
-    const auto slice=[&](IDCompositionVisual* parent,IUnknown* content,const ViewState::ItemSlice& item) {
-        ComPtr<IDCompositionVisual> v; ComPtr<IDCompositionRectangleClip> clip; ComPtr<IDCompositionEffectGroup> alpha;
-        const auto y=curve(item.from.top-item.cell.top,item.to.top-item.cell.top);
+    const auto slice=[&](const ViewState::ItemSlice& item,
+        std::initializer_list<std::pair<IDCompositionVisual*,IUnknown*>> layers) {
+        ComPtr<IDCompositionRectangleClip> clip; ComPtr<IDCompositionEffectGroup> alpha;
         const float direction=state.rtlLayout ? -1.f : 1.f;
-        const auto x=curve(item.sourceLeft-item.cell.left+direction*(item.from.left-item.source.left),
-            item.sourceLeft-item.cell.left+direction*(item.to.left-item.source.left));
-        const auto end=curve(item.cell.top+item.from.height,item.cell.top+item.to.height);
-        const auto opacity=curve(item.from.opacity,item.to.opacity);
-        return y && x && end && opacity && SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&v)) &&
-            SUCCEEDED(state.composition->CreateRectangleClip(&clip)) &&
+        // The three ordered pixel layers have identical bounds and opacity.
+        // Share their clip/effect without merging pixels or changing Z-order.
+        if(!(SUCCEEDED(state.composition->CreateRectangleClip(&clip)) &&
             SUCCEEDED(clip->SetLeft(item.cell.left)) && SUCCEEDED(clip->SetRight(item.cell.right)) &&
-            SUCCEEDED(clip->SetTop(item.cell.top)) && SUCCEEDED(clip->SetBottom(end.Get())) &&
-            SUCCEEDED(v->SetClip(clip.Get())) && SUCCEEDED(v->SetContent(content)) &&
-            SUCCEEDED(v->SetOffsetX(x.Get())) && SUCCEEDED(v->SetOffsetY(y.Get())) &&
-            SUCCEEDED(state.composition->CreateEffectGroup(&alpha)) && SUCCEEDED(alpha->SetOpacity(opacity.Get())) &&
-            SUCCEEDED(v->SetEffect(alpha.Get())) && SUCCEEDED(AppendCompositionVisual(parent,v.Get()));
+            SUCCEEDED(clip->SetTop(item.cell.top)) && property(item.cell.top+item.from.height,item.cell.top+item.to.height,
+                [&](auto value) {return clip->SetBottom(value);}))) return false;
+        if(item.from.opacity!=1.f || item.to.opacity!=1.f) {
+            if(FAILED(state.composition->CreateEffectGroup(&alpha)) ||
+                !property(item.from.opacity,item.to.opacity,[&](auto value) {return alpha->SetOpacity(value);})) return false;
+        }
+        for(const auto& [parent,content]:layers) {
+            ComPtr<IDCompositionVisual> v;
+            if(!(SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&v)) &&
+                SUCCEEDED(v->SetClip(clip.Get())) && SUCCEEDED(v->SetContent(content)) &&
+                property(item.sourceLeft-item.cell.left+direction*(item.from.left-item.source.left),
+                    item.sourceLeft-item.cell.left+direction*(item.to.left-item.source.left),
+                    [&](auto value) {return v->SetOffsetX(value);}) &&
+                property(item.from.top-item.cell.top,item.to.top-item.cell.top,[&](auto value) {return v->SetOffsetY(value);}) &&
+                (!alpha || SUCCEEDED(v->SetEffect(alpha.Get()))) && SUCCEEDED(AppendCompositionVisual(parent,v.Get())))) return false;
+        }
+        return true;
     };
     // Outgoing items remain underneath survivors within each ordered layer.
     for(bool ghost:{true,false}) for(const auto& item:mode.items) if(ok && (item.key<0)==ghost)
-        ok=slice(feedback.Get(),mode.feedback.surface.Get(),item) && slice(icons.Get(),mode.names.surface.Get(),item) &&
-            slice(text.Get(),mode.metadata.surface.Get(),item);
+        ok=slice(item,{{feedback.Get(),mode.feedback.surface.Get()},
+            {icons.Get(),mode.names.surface.Get()},{text.Get(),mode.metadata.surface.Get()}});
     if(ok && !mode.headings.empty()) {
         ok=SUCCEEDED(CreatePixelAlignedVisual(state.composition.Get(),&groups)) && SUCCEEDED(AppendCompositionVisual(mode.root.Get(),groups.Get()));
         for(bool ghost:{true,false}) for(const auto& item:mode.headings) if(ok && (item.key<0)==ghost)
-            ok=slice(groups.Get(),mode.groups.surface.Get(),item);
+            ok=slice(item,{{groups.Get(),mode.groups.surface.Get()}});
     }
     if(ok) ok=AppendColumnLayer(state,mode.root.Get(),mode.chrome.surface.Get(),0,0,w,h);
     if(ok) {
@@ -15394,6 +15507,7 @@ bool PublishRowScene(ViewState& state) {
             .a=state.rowSceneRevision,.b=static_cast<unsigned long long>(origin.QuadPart),
             .v={double(mode.items.size()),double(mode.headings.size()),double(mode.names.bitmap->GetPixelSize().height),
                 double(mode.names.estimatedBytes+mode.metadata.estimatedBytes+mode.feedback.estimatedBytes)}},true);
+        PipelineEvent(*state.background,{.operation=L"rows.composition.curves[shared]",.a=curves.size()},true);
     } else mode.root.Reset();
     return ok;
 }
@@ -15998,6 +16112,8 @@ void Paint(ViewState& state) {
     };
     std::vector<PaintedItem> paintedItems;
     paintedItems.reserve(visibleItems.size());
+    std::optional<PipelineScope> contentTrace;
+    contentTrace.emplace(state.background,L"render.items");
     bool uiComparisonRow=true;
     for (int i : visibleItems) {
         const Entry& e = ModelEntry(state,i);
@@ -16059,6 +16175,7 @@ void Paint(ViewState& state) {
         state.uiTraceDrawItem=false;
         if (growing) state.target->PopAxisAlignedClip();
     }
+    contentTrace.reset();
     // Old ghosts draw behind surviving/new items. The contents clip to their
     // collapsing row; there is no stale hit target or resurrected selection.
     if (state.rowTransitionActive) {
@@ -16100,6 +16217,7 @@ void Paint(ViewState& state) {
         }
     }
     uiComparisonRow=true;
+    contentTrace.emplace(state.background,L"render.labels");
     for (const auto& item:paintedItems) {
         const int i=item.index;
         RowSourceScope source(state,i,2);
@@ -16153,6 +16271,7 @@ void Paint(ViewState& state) {
         state.uiTraceDrawItem=false;
         if (growing) state.target->PopAxisAlignedClip();
     }
+    contentTrace.reset();
     std::erase_if(state.itemOpacityRows, [&](const auto& item) {
         return item.second.seen != state.itemOpacityPaint;
     });
@@ -22503,6 +22622,7 @@ void PulsePresentation(const std::shared_ptr<PresentationLane>& lane,bool active
 }
 
 std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& state) {
+    PipelineScope pipeline(state.background,L"presentation.capture");
     auto model=std::make_shared<PresentationModel>();
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
@@ -22574,22 +22694,27 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
             model->items.at(i).entry.path == state.renamePreviewPath)
             model->items.at(i).entry.name = state.renamePreviewName;
     }
-    std::set<std::wstring> keys;
-    const auto image=[&](const std::wstring& key) {
-        if(!keys.insert(key).second) return;
-        const IconRecord* icon=nullptr;
-        if(key==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
-        else if(const auto found=state.icons.find(key);found!=state.icons.end()) icon=&found->second;
-        if(icon && icon->pixels.Ready()) model->images.push_back({key,icon->pixels,icon->requestedSize,icon->association});
+    // Membership only: ordered comparisons repeatedly walk long shared PIDL
+    // prefixes for every nearby row on Explorer's owner thread.
+    std::unordered_set<std::wstring> keys;
+    const auto image=[&](std::wstring key) -> const std::wstring& {
+        const auto [stored,inserted]=keys.insert(std::move(key));
+        if(inserted) {
+            const IconRecord* icon=nullptr;
+            if(*stored==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
+            else if(const auto found=state.icons.find(*stored);found!=state.icons.end()) icon=&found->second;
+            if(icon && icon->pixels.Ready()) model->images.push_back({*stored,icon->pixels,icon->requestedSize,icon->association});
+        }
+        return *stored;
     };
     const auto icons=[&](const Entry& entry) {
         for(bool fallback:{false,true}) {
             std::wstring path; bool attrs=false;
-            const auto key=IconKey(state,entry,path,attrs,fallback);
+            auto key=IconKey(state,entry,path,attrs,fallback);
             if(keys.contains(key)) continue;
-            image(key);
+            const auto& captured=image(std::move(key));
             std::wstring fallbackKey;
-            if(FindIconRecord(state,key,true,false,&fallbackKey,true)) image(fallbackKey);
+            if(FindIconRecord(state,captured,true,false,&fallbackKey,true)) image(std::move(fallbackKey));
         }
     };
     for(const auto& [index,item]:model->items) icons(item.entry);

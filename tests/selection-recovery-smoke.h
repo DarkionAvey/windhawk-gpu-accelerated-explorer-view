@@ -6,6 +6,7 @@ static void TestSelectionRecovery(ViewState& state,SelectionFolderView& native) 
     const float originalScroll=state.scrollNow;
     const bool smooth=g_smooth.exchange(false);
     FocusFixture::Session focus(state.frameHwnd,state.hwnd);
+    ModifierFixture::Session modifiers;
     ComPtr<SelectionCommandMenu> menu; menu.Attach(new SelectionCommandMenu);
     ComPtr<SelectionCommandView> shell; shell.Attach(new SelectionCommandView(menu.Get()));
     shell->window=state.nativeHwnd;
@@ -62,7 +63,14 @@ static void TestSelectionRecovery(ViewState& state,SelectionFolderView& native) 
             "transient empty-selection failure detached or abandoned recovery");
     }
     MSG key{}; key.hwnd=state.hwnd; key.message=WM_KEYDOWN; key.wParam=VK_DELETE;
-    Check(HandleNativeFileKey(key,&state) && menu->calls.size()==calls,
+    const bool handled=HandleNativeFileKey(key,&state);
+    if(!handled || menu->calls.size()!=calls)
+        std::cout<<"RECOVERY KEY handled="<<handled<<" calls="<<menu->calls.size()<<"/"<<calls
+            <<" visible="<<state.visible<<" interactive="<<ShellRowsInteractive(state)
+            <<" focus="<<OverlayHasInputFocus(state)<<" owner="<<TabOwnsActiveView(state)
+            <<" optimistic="<<state.optimisticStartedAt<<" pending="<<state.pendingNativeSelection
+            <<" unsafe="<<state.nativeSelectionUnsafe<<std::endl;
+    Check(handled && menu->calls.size()==calls,
         "unverified selection recovery authorized a file operation");
     native.rejectSelection=false;
     MaybeRecoverNativeSelection(state);

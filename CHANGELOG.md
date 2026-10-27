@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.261
+
+- Reduce compositor work during streamed file insertions, deletions and grid
+  reflow by sharing identical motion across layers and items.
+- Avoid animation objects for stationary properties and opacity effects for
+  fully opaque items. Preserve animation timing, layer order and image quality.
+
+## 0.9.260
+
+- Speed up file feedback in dense views by comparing long shared identity
+  prefixes in bounded vector blocks, preserving native case comparison.
+- Reuse native text layouts during font-size-only zoom to reduce layout
+  allocation and preparation while retaining full-resolution text and trimming.
+
+## 0.9.259
+
+- Reduce frame preparation and drawing overhead for long Shell-provider
+  identities, including dense Recycle Bin grids, without raising cache budgets.
+- Avoid repeated identity copies and comparisons during icon lookup and
+  snapshot capture. Preserve image quality and case-insensitive file feedback.
+
+## 0.9.258
+
+- Reuse grid label shapes and cached text while scrolling at fractional row
+  sizes, avoiding extra glyph surfaces caused by screen-position rounding.
+- Reduce temporary allocation work when finding cached icons at another zoom
+  size, including long Shell-provider identities. Keep existing cache budgets.
+
 ## 0.9.257
 
 - Replace the withdrawn 0.9.256 sizing change. Load unframed Shell icons and

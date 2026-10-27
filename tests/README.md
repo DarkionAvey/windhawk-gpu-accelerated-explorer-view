@@ -98,6 +98,26 @@ they do not operate a live Explorer context menu.
 one large icon per row, GPU sampling times and LTR/RTL Cut pixels; see the
 [large tile report](../docs/large-tile-rendering-0.9.239.md). These are private
 offscreen tests, not measurements of live Explorer or displayed frame rates.
+`--dense-rows` publishes successive insertion scenes for a private 4,000-item
+grid at 4,751 × 1,958 in LTR and RTL. It measures scene construction and DComp
+commit separately, checks viewport culling and retargeted hit geometry, and
+does not operate Explorer or measure displayed frame rates. It also runs as
+part of `--dense-grid` and the full suite.
+
+`--dense-grid` checks a private 1,003-item grid at the supplied log's
+4,751 by 1,958 viewport size, including wrapped/trimmed names, selection,
+fractional scrolling and LTR/RTL mask reuse without cache growth. It also
+checks 96/144/192 DPI and measures cached icon lookup for long generated
+provider identities. These are offscreen CPU submission and lookup
+measurements, not displayed frame rates.
+It also checks private provider frames with 1,024-character identities and
+512 cached icons, exact size-tier keys, rehashing, reserved folder fallbacks,
+and the original case/Unicode path comparison behavior.
+Render-stage measurements separate opacity tracking, icons and labels, and
+include a 24-step wrapped-label zoom. `--graphics` also compares resized native
+layouts with fresh-layout pixels for fractional font sizes, wrapping,
+middle trimming, opacity and RTL. See the
+[165 Hz investigation](../docs/dense-grid-0.9.260.md).
 `--animation-continuity` runs the grid-zoom and view-mode retarget checks; their
 instantaneous geometry comparisons use a scoped test clock without changing
 production animation timing.

@@ -191,6 +191,32 @@ static void TestTextRaster(State& state) {
     }
     state.gridView=grid; state.rtlLayout=rtl; g_middleEllipsis=middlePolicy;
     MakeTextFormats(state);
+    if constexpr (requires { state.textFaceSerial; }) {
+        const float font=state.fontPx;
+        const auto policy=g_middleEllipsis.load();
+        g_middleEllipsis=ViewOption::AlwaysOn;
+        for(bool direction:{false,true}) for(bool wrapped:{false,true}) {
+            state.rtlLayout=direction; Check(MakeTextFormats(state),"resize reference direction");
+            const std::wstring name=direction ? L"زهرة في الحديقة תמונה עם שם ארוך.jpg" :
+                L"A long resized filename with wrapping and a preserved extension.jpg";
+            auto& cache=state.textLayouts[wrapped ? 3 : 0];
+            for(float size:{13.5f,18.25f,22.f,16.f}) {
+                ComPtr<IDWriteTextLayout> previous;
+                if(const auto found=cache.layouts.find(name);found!=cache.layouts.end()) previous=found->second.text;
+                state.fontPx=size; Check(MakeTextFormats(state,true),"body-only font resize");
+                const auto reused=capture(name,true,wrapped,120,0xFFFFFF,.7f,false,true);
+                Check(!previous || cache.layouts.at(name).text==previous,"body zoom replaced a reusable text layout");
+                auto found=cache.layouts.find(name);
+                cache.rasterBytes-=found->second.rasterBytes;
+                cache.recent.erase(found->second.recent);
+                RetireTextLayout(state,std::move(found->second)); cache.layouts.erase(found);
+                const auto fresh=capture(name,true,wrapped,120,0xFFFFFF,.7f,false,true);
+                Check(reused==fresh,"resized native text changed pixels, wrapping, trimming or direction");
+            }
+        }
+        state.rtlLayout=rtl; state.fontPx=font; g_middleEllipsis=policy;
+        Check(MakeTextFormats(state),"restore resized text reference");
+    }
     // Geometry-variant replacement and the shaped-value LRU must retain old
     // GPU masks until the existing after-paint cleanup, just like font changes.
     const std::wstring retiring=L"A sufficiently long cached label with many clipped geometry variants";
@@ -215,5 +241,5 @@ static void TestTextRaster(State& state) {
     Check(!state.retiredTextLayouts.empty(),"font change synchronously discarded the old raster cache");
     for(int i=0;i<100 && !state.retiredTextLayouts.empty();++i) Paint(state);
     Check(state.retiredTextLayouts.empty(),"retired text resources stopped draining");
-    std::cout<<"PASS: shared text raster pixels, trimming/wrapping/RTL, opacity, geometry variants, intrinsic reuse during auto-fit, metadata continuity across font changes, cold budget and paced glyph retirement\n";
+    std::cout<<"PASS: shared text raster pixels, trimming/wrapping/RTL, opacity, native resized/fresh layout equivalence, geometry variants, intrinsic reuse during auto-fit, metadata continuity across font changes, cold budget and paced glyph retirement\n";
 }

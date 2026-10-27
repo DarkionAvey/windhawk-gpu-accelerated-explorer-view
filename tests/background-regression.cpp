@@ -646,6 +646,12 @@ static void TestSortDetails(const std::wstring& directory) {
             const auto& entry = state.entries[i];
             for (size_t k = 0; k < keys.size(); ++k) {
                 const auto* value = ColumnCellText(entry, keys[k], state.columnEpoch, state.propertyEpoch);
+                if(!value || *value!=expected(entry,k))
+                    std::wcout<<L"SORT CACHE row="<<i<<L" name="<<entry.name<<L" key="<<k
+                        <<L" sort="<<int(state.sort.kind)<<L" direction="<<int(state.sort.direction)
+                        <<L" column="<<entry.columnEpoch<<L"/"<<state.columnEpoch
+                        <<L" property="<<entry.propertyEpoch<<L"/"<<state.propertyEpoch
+                        <<L" cells="<<entry.cells.size()<<L" value="<<(value ? *value : L"<missing>")<<std::endl;
                 Check(value && *value == expected(entry, k),
                       "sort discarded a previously resolved property before the first paint");
             }
@@ -1778,6 +1784,7 @@ static void TestPreviewInput() {
 #include "unexpected-input-smoke.h"
 #include "adaptive-image-smoke.h"
 #include "large-tile-smoke.h"
+#include "dense-grid-smoke.h"
 #include "icon-alpha-smoke.h"
 #include "icon-sizing-smoke.h"
 #include "shell-provider-smoke.h"
@@ -1835,6 +1842,10 @@ int wmain(int argc,wchar_t** argv) {
                 WS_POPUP,-32000,-32000,1000,600,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
             Check(frame!=nullptr,"drive bar frame"); TestInlineDriveBars(frame);
             DestroyWindow(frame); g_writeFactory.Reset();
+        } else if (argc>1 && wcscmp(argv[1],L"--dense-rows")==0) {
+            TestDenseRowPublication();
+        } else if (argc>1 && wcscmp(argv[1],L"--dense-grid")==0) {
+            TestDenseGridDrawing();
         } else if (argc>1 && wcscmp(argv[1],L"--large-tiles")==0) {
             TestLargeTileBackpressure(); TestLargeTileSampling();
         } else if (argc>1 && wcscmp(argv[1],L"--adaptive-images")==0) {
@@ -1975,6 +1986,7 @@ int wmain(int argc,wchar_t** argv) {
         TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
         TestFrameBudgets();
         TestLargeTileBackpressure(); TestLargeTileSampling();
+        TestDenseGridDrawing();
         TestIconAlphaQuality(fixture.wstring());
         TestNativeIconSizing(fixture.wstring());
         TestPipelineTrace();
