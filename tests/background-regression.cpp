@@ -17,7 +17,20 @@
 #include "selection-log-fixture.h"
 #include "animation-clock-fixture.h"
 #include "menu-fixture.h"
+#include "style-fixture.h"
 #include GPU_OVERLAY_SOURCE
+#undef OpenThemeData
+#undef GetWindowTheme
+#undef CloseThemeData
+#undef GetThemeColor
+#undef GetThemeFont
+#undef GetSysColor
+#undef GetDpiForWindow
+#undef SystemParametersInfoW
+#undef SystemParametersInfoForDpi
+#undef DwmGetColorizationColor
+#undef RoActivateInstance
+#undef SHGetSetSettings
 #undef TrackPopupMenuEx
 #undef QueryPerformanceCounter
 #undef Wh_Log
@@ -1746,6 +1759,8 @@ static void TestPreviewInput() {
 #include "selection-trace.h"
 #include "timing-readiness-smoke.h"
 #include "options-smoke.h"
+#include "style-smoke.h"
+#include "style-events-smoke.h"
 #include "column-bridge-smoke.h"
 #include "column-minimum-smoke.h"
 #include "namespace-mutations-smoke.h"
@@ -1845,6 +1860,10 @@ int wmain(int argc,wchar_t** argv) {
             TestUserOptions();
             TestClippingPreflight();
             TestResizeAutoRefit();
+        } else if (argc>1 && wcscmp(argv[1],L"--styles")==0) {
+            TestResolvedStyles();
+            TestStyleEvents(fixture.wstring());
+            TestPeriodicCapacityRefresh();
         } else if (argc>1 && wcscmp(argv[1],L"--live-sort")==0) {
             HWND frame=CreateWindowExW(0,L"STATIC",L"hidden-live-sort-frame",0,
                 0,0,640,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -1918,6 +1937,9 @@ int wmain(int argc,wchar_t** argv) {
         TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
         TestStatusButtonLayout();
         TestUserOptions();
+        TestResolvedStyles();
+        TestStyleEvents(fixture.wstring());
+        TestPeriodicCapacityRefresh();
         TestClippingPreflight();
         TestResizeAutoRefit();
         TestColumnMinimumWidths();

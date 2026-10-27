@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.250
+// @version         0.9.254
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -403,14 +403,13 @@ bool RegisterFrameHookReleaseMessage() {
     return g_releaseFrameHooksMessage!=0;
 }
 constexpr UINT kMsgNativeRenameEditor = WM_APP + 74;
+constexpr UINT kMsgStyleChanged = WM_APP + 75;
+constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
 constexpr UINT kMsgBeginRename = WM_APP + 48;
-// Safety net for builds that update the native list without a WinEvent or
-// posted settings broadcast. Runs on the existing idle timer, not a new timer.
-constexpr ULONGLONG kVisibilityFallbackProbeMs = 1200;
 // One navigation-rebind policy regardless of whether the signal came from
 // a Shell view event, the message dispatcher, or an overlay action.
 constexpr ULONGLONG kNavigationRetryWindowMs = 700;
@@ -2470,7 +2469,6 @@ struct ViewState {
     SharedPidl directoryFolderIdentity; // Captured once per binding, never per refresh/hover.
     std::wstring folderPath;
     ShellVisibilityPolicy visibility;
-    ULONGLONG lastVisibilityProbe = 0;
     bool visibilitySignalQueued = false;
     bool visibilitySelectionSyncPending = false;
     // A GPU-only speculative destination while Explorer builds the next
@@ -3007,11 +3005,15 @@ struct ViewState {
     bool hardwareTarget = false;
     int wheelRemainder = 0;
     ULONGLONG lastRefresh = 0;
-    ULONGLONG lastThemeCheck = 0;
+    unsigned pendingStyleChanges = 0;
+    bool styleChangeQueued = false, nativePaletteResolved = false;
     // Retrieved from Explorer's active visual styles, not dark/light-mode
     // branches. COLORREF is kept in Win32 format until the drawing call.
     COLORREF nativeTextColor = CLR_INVALID;
     COLORREF nativeHeaderTextColor = CLR_INVALID;
+    COLORREF lastThemeTextColor = CLR_INVALID, lastThemeHeaderTextColor = CLR_INVALID;
+    bool nativeAppPaletteResolved = false;
+    COLORREF nativeAppBackground = CLR_INVALID, nativeAppForeground = CLR_INVALID;
     ComPtr<IDXGISwapChain1> swapChain;
     ComPtr<IDCompositionTarget> compTarget;
     ComPtr<IDCompositionVisual> visual;
@@ -3195,7 +3197,10 @@ struct PresentationLane {
 };
 
 int DpiOf(HWND hwnd);
-int ViewDpi(const ViewState& state) { return state.presentationOnly ? state.presentationDpi : DpiOf(state.hwnd); }
+int ViewDpi(const ViewState& state) {
+    const int dpi = state.presentationOnly ? state.presentationDpi : DpiOf(state.hwnd);
+    return dpi >= 72 && dpi <= 768 ? dpi : 96;
+}
 BOOL ViewClientRect(const ViewState& state,RECT* rect) {
     if(state.presentationOnly) { *rect=state.presentationClient; return TRUE; }
     return GetClientRect(state.hwnd,rect);
@@ -3283,6 +3288,8 @@ bool ShellRowsInteractive(const ViewState& state) {
 constexpr unsigned kOverlayFeatureSteps = 5;
 void InitializeFrameShellEvents(ViewState& state);
 void PrepareInitialOverlay(ViewState& state);
+unsigned SystemStyleChangeMask(UINT message, WPARAM action, LPARAM area);
+void QueueStyleChange(ViewState& state, unsigned changes);
 void BindShellAutomation(ViewState& state, IDispatch* browser);
 void RefreshExplorerColumns(ViewState& state, bool force);
 void QueueColumnFit(ViewState& state);
@@ -4622,6 +4629,8 @@ HRESULT WINAPI RaiseStructureEventHook(IRawElementProviderSimple* provider,Struc
 LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                     UINT_PTR id, DWORD_PTR owner) {
     WindowCallbackGuard callback;
+    if (const auto changes=SystemStyleChangeMask(msg,wp,lp))
+        if (auto state=State(reinterpret_cast<HWND>(owner))) QueueStyleChange(*state,changes);
     if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
         QueueInputFocusUpdate(reinterpret_cast<HWND>(owner));
     auto* viewport = static_cast<ViewState::NativeViewportOwnership*>(GetPropW(hwnd, kNativeViewportProperty));
@@ -5010,6 +5019,39 @@ int DpiOf(HWND hwnd) {
 
 int Scale96(int value, int dpi) { return MulDiv(value, dpi, 96); }
 
+bool ValidFontName(std::wstring_view name) {
+    return !name.empty() && name.size() <= 256 &&
+        name.find_first_not_of(L" \t\r\n") != std::wstring_view::npos &&
+        std::none_of(name.begin(), name.end(), [](wchar_t c) { return c < L' ' || c == 0x7F; });
+}
+
+bool ValidRgb(COLORREF color) { return (color & 0xFF000000u) == 0; }
+
+double ColorLuminance(COLORREF color) {
+    const auto linear = [](BYTE channel) {
+        const double c = channel / 255.;
+        return c <= .04045 ? c / 12.92 : std::pow((c + .055) / 1.055, 2.4);
+    };
+    return .2126 * linear(GetRValue(color)) + .7152 * linear(GetGValue(color)) +
+        .0722 * linear(GetBValue(color));
+}
+
+double ColorContrast(COLORREF a, COLORREF b) {
+    const double x = ColorLuminance(a), y = ColorLuminance(b);
+    return (std::max(x, y) + .05) / (std::min(x, y) + .05);
+}
+
+// Only use this on an opaque surface we paint ourselves (the status button).
+// Explorer's inherited background cannot be inferred from a theme fill or the
+// app palette, so neither may veto a successful native text-color lookup.
+COLORREF ReadableForeground(COLORREF background, std::initializer_list<COLORREF> candidates) {
+    if (!ValidRgb(background)) background = RGB(255,255,255);
+    for (const auto color : candidates)
+        if (ValidRgb(color) && ColorContrast(color, background) >= 2.) return color;
+    return ColorContrast(RGB(0,0,0), background) >= ColorContrast(RGB(255,255,255), background) ?
+        RGB(0,0,0) : RGB(255,255,255);
+}
+
 D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
     return D2D1::ColorF(rgb & 0xFFFFFF, alpha);
 }
@@ -5017,8 +5059,11 @@ D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
 void RefreshThemeColor() {
     if (g_dynamicAccent.load(std::memory_order_relaxed)) {
         DWORD dwm = 0; BOOL opaque = FALSE;
-        if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)))
-            g_selectionRgb.store(RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255));
+        COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
+        if (!ValidRgb(accent)) accent = RGB(0,120,215);
+        if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
+            accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
+        g_selectionRgb.store(accent);
     }
 }
 
@@ -5034,79 +5079,143 @@ unsigned ThemeRgb(COLORREF c) {
 // OpenThemeData uses native Windows theme resources; no registry color guesses.
 // This is still not a guarantee of reproducing modifications made solely to
 // Explorer's private DirectUI painting code.
-bool RefreshNativePalette(ViewState& state) {
-    COLORREF text = GetSysColor(COLOR_WINDOWTEXT);
-    COLORREF headerText = text;
+bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
+    // Resolve WinRT only at attachment/theme/settings changes. Maintenance
+    // probes reuse this tab's copied values, without activating a COM provider.
+    if (!state.nativeAppPaletteResolved || refreshAppPalette) {
+        state.nativeAppPaletteResolved = true;
+        state.nativeAppBackground = state.nativeAppForeground = CLR_INVALID;
+        using namespace ABI::Windows::UI::ViewManagement;
+        constexpr wchar_t name[] = L"Windows.UI.ViewManagement.UISettings";
+        HSTRING_HEADER stringHeader{}; HSTRING className = nullptr;
+        ComPtr<IInspectable> instance;
+        ComPtr<IUISettings3> colors;
+        if (SUCCEEDED(WindowsCreateStringReference(name, ARRAYSIZE(name)-1, &stringHeader, &className)) &&
+            SUCCEEDED(RoActivateInstance(className, &instance)) && SUCCEEDED(instance.As(&colors))) {
+            ABI::Windows::UI::Color bg{}, fg{};
+            if (SUCCEEDED(colors->GetColorValue(UIColorType_Background, &bg)) && bg.A == 255)
+                state.nativeAppBackground = RGB(bg.R,bg.G,bg.B);
+            if (SUCCEEDED(colors->GetColorValue(UIColorType_Foreground, &fg)) && fg.A == 255)
+                state.nativeAppForeground = RGB(fg.R,fg.G,fg.B);
+        }
+    }
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON);
     auto themeColor = [](HTHEME theme, int part, int stateId,
                          int property, COLORREF* result) {
-        return theme && SUCCEEDED(GetThemeColor(theme, part, stateId,
-                                                 property, result));
+        COLORREF color = CLR_INVALID;
+        if (!theme || FAILED(GetThemeColor(theme, part, stateId, property, &color)) ||
+            !ValidRgb(color)) return false;
+        *result = color;
+        return true;
     };
     // Prefer an already associated theme for the native view, if available.
     HTHEME attached = GetWindowTheme(state.nativeHwnd);
-    bool gotText = themeColor(attached, 0, 0, TMT_TEXTCOLOR, &text);
     HTHEME items = OpenThemeData(state.nativeHwnd, L"ItemsView");
-    if (items) {
-        if (!gotText) {
-            gotText = themeColor(items, 0, 0, TMT_TEXTCOLOR, &text);
-            if (!gotText)
-                themeColor(items, LVP_LISTITEM, LISS_NORMAL, TMT_TEXTCOLOR, &text);
-        }
-        CloseThemeData(items);
-    }
+    COLORREF attachedText = CLR_INVALID, itemText = CLR_INVALID, normalText = CLR_INVALID;
+    themeColor(attached, 0, 0, TMT_TEXTCOLOR, &attachedText);
+    themeColor(items, 0, 0, TMT_TEXTCOLOR, &itemText);
+    themeColor(items, LVP_LISTITEM, LISS_NORMAL, TMT_TEXTCOLOR, &normalText);
+    if (items) CloseThemeData(items);
+    const COLORREF themeText = ValidRgb(attachedText) ? attachedText :
+        ValidRgb(itemText) ? itemText : normalText;
+    if (!highContrast && ValidRgb(themeText)) state.lastThemeTextColor = themeText;
+    const COLORREF systemText = GetSysColor(COLOR_WINDOWTEXT);
+    // A fallback is used only when the native source is unavailable/invalid.
+    // Keep native colors through transient failures and app-palette changes.
+    // White/black and even low-contrast theme colors are valid; the actual
+    // inherited surface may differ from every background resource we can read.
+    const COLORREF text = highContrast && ValidRgb(systemText) ? systemText :
+        ValidRgb(state.lastThemeTextColor) ? state.lastThemeTextColor :
+        ValidRgb(state.nativeAppForeground) ? state.nativeAppForeground :
+        ValidRgb(state.nativeTextColor) ? state.nativeTextColor :
+        ValidRgb(systemText) ? systemText : RGB(0,0,0);
+    COLORREF headerText = CLR_INVALID;
     HTHEME header = OpenThemeData(state.nativeHwnd, L"Header");
     if (header) {
-        if (!themeColor(header, HP_HEADERITEM, HIS_NORMAL,
-                        TMT_TEXTCOLOR, &headerText))
-            headerText = text;
+        themeColor(header, HP_HEADERITEM, HIS_NORMAL, TMT_TEXTCOLOR, &headerText);
         CloseThemeData(header);
     }
-    // COLOR_WINDOWTEXT is a Windows-defined fallback, not a made-up RGB value.
+    if (!highContrast && ValidRgb(headerText)) state.lastThemeHeaderTextColor = headerText;
+    headerText = highContrast ? text : ValidRgb(state.lastThemeHeaderTextColor) ?
+        state.lastThemeHeaderTextColor : text;
     const bool changed = text != state.nativeTextColor ||
                          headerText != state.nativeHeaderTextColor;
+    if (changed && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU style] attached=%08lx items=%08lx normal=%08lx retainedText=%08lx retainedHeader=%08lx appFg=%08lx text=%08lx header=%08lx highContrast=%d",
+            attachedText,itemText,normalText,state.lastThemeTextColor,state.lastThemeHeaderTextColor,
+            state.nativeAppForeground,text,headerText,highContrast);
     state.nativeTextColor = text;
     state.nativeHeaderTextColor = headerText;
-    if (IsWindow(state.viewToggle) && state.viewTogglePaletteDirty) {
+    state.nativePaletteResolved = true;
+    if (state.viewTogglePaletteDirty) {
         state.viewTogglePaletteDirty = false;
         COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
-        HIGHCONTRASTW contrast{sizeof(contrast)};
-        const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
-            (contrast.dwFlags & HCF_HIGHCONTRASTON);
         if (!highContrast) {
             // Classic BUTTON/Explorer themes can remain light in dark-mode
             // Explorer. Read Windows' app palette once on creation/theme change,
             // never from paint, input or the periodic maintenance path.
-            using namespace ABI::Windows::UI::ViewManagement;
-            constexpr wchar_t name[] = L"Windows.UI.ViewManagement.UISettings";
-            HSTRING_HEADER header{}; HSTRING className = nullptr;
-            ComPtr<IInspectable> instance;
-            ComPtr<IUISettings3> colors;
-            ABI::Windows::UI::Color bg{}, fg{};
-            if (SUCCEEDED(WindowsCreateStringReference(name, ARRAYSIZE(name) - 1, &header, &className)) &&
-                SUCCEEDED(RoActivateInstance(className, &instance)) && SUCCEEDED(instance.As(&colors)) &&
-                SUCCEEDED(colors->GetColorValue(UIColorType_Background, &bg)) &&
-                SUCCEEDED(colors->GetColorValue(UIColorType_Foreground, &fg))) {
-                background = RGB(bg.R, bg.G, bg.B);
-                foreground = RGB(fg.R, fg.G, fg.B);
+            if (ValidRgb(state.nativeAppBackground)) {
+                background = state.nativeAppBackground;
+                foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
                 // UISettings supplies page black/white. Derive the
                 // status-chrome surface from that palette, without a fixed
                 // dark/light RGB table. High contrast keeps its exact colors.
-                const int bgLight = 2 * bg.R + 5 * bg.G + bg.B;
-                const int fgLight = 2 * fg.R + 5 * fg.G + fg.B;
+                const int bgLight = 2 * GetRValue(background) + 5 * GetGValue(background) + GetBValue(background);
+                const int fgLight = 2 * GetRValue(foreground) + 5 * GetGValue(foreground) + GetBValue(foreground);
                 const int amount = bgLight < fgLight ? 12 : 4;
-                background = RGB((bg.R * (100 - amount) + fg.R * amount) / 100,
-                    (bg.G * (100 - amount) + fg.G * amount) / 100,
-                    (bg.B * (100 - amount) + fg.B * amount) / 100);
+                background = RGB((GetRValue(background) * (100 - amount) + GetRValue(foreground) * amount) / 100,
+                    (GetGValue(background) * (100 - amount) + GetGValue(foreground) * amount) / 100,
+                    (GetBValue(background) * (100 - amount) + GetBValue(foreground) * amount) / 100);
             }
         }
+        if (!ValidRgb(background)) background = RGB(255,255,255);
+        if (!highContrast || !ValidRgb(foreground))
+            foreground = ReadableForeground(background, {foreground, text});
         if (background != state.viewToggleBackground || foreground != state.viewToggleForeground) {
             state.viewToggleBackground = background;
             state.viewToggleForeground = foreground;
-            InvalidateRect(state.viewToggle, nullptr, FALSE);
+            if (IsWindow(state.viewToggle)) InvalidateRect(state.viewToggle, nullptr, FALSE);
             if (state.viewToggleIcons[0]) RefreshViewToggleForFrame(state.frameHwnd, true);
         }
     }
     return changed;
+}
+
+// Classify borrowed WM_SETTINGCHANGE strings while the message is in scope;
+// only the resulting bits cross the asynchronous owner-thread boundary.
+unsigned SystemStyleChangeMask(UINT message, WPARAM action, LPARAM area) {
+    switch (message) {
+    case WM_THEMECHANGED: return kStyleColors | kStyleFonts;
+    case WM_SYSCOLORCHANGE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED: return kStyleColors;
+    case WM_FONTCHANGE: return kStyleFonts | kStyleFontCollection;
+    case WM_SETTINGCHANGE: {
+        if (action==SPI_SETHIGHCONTRAST) return kStyleColors | kStyleFonts;
+        if (action==SPI_SETNONCLIENTMETRICS || action==SPI_SETICONTITLELOGFONT ||
+            action==SPI_SETFONTSMOOTHING || action==SPI_SETFONTSMOOTHINGTYPE ||
+            action==SPI_SETFONTSMOOTHINGCONTRAST || action==SPI_SETFONTSMOOTHINGORIENTATION)
+            return kStyleFonts;
+        const auto name=reinterpret_cast<const wchar_t*>(area);
+        if (!name || !*name) return action==0 ? kStyleColors | kStyleFonts : 0;
+        if (_wcsicmp(name,L"ImmersiveColorSet")==0 || _wcsicmp(name,L"Colors")==0 ||
+            _wcsicmp(name,L"Control Panel\\Colors")==0) return kStyleColors;
+        if (_wcsicmp(name,L"WindowsThemeElement")==0 || _wcsicmp(name,L"HighContrast")==0)
+            return kStyleColors | kStyleFonts;
+        if (_wcsicmp(name,L"WindowMetrics")==0) return kStyleFonts;
+        return 0;
+    }
+    default: return 0;
+    }
+}
+
+void QueueStyleChange(ViewState& state, unsigned changes) {
+    if (!changes || g_unloading.load(std::memory_order_relaxed)) return;
+    state.pendingStyleChanges |= changes;
+    if (!state.styleChangeQueued)
+        state.styleChangeQueued = PostMessageW(state.hwnd,kMsgStyleChanged,
+            static_cast<WPARAM>(state.lifetimeToken),0)!=FALSE;
 }
 
 void LoadSettings() {
@@ -5122,6 +5231,7 @@ void LoadSettings() {
         const size_t last = fontFamily.find_last_not_of(L" \t\r\n");
         fontFamily = fontFamily.substr(first, last - first + 1);
     }
+    if (!fontFamily.empty() && !ValidFontName(fontFamily)) fontFamily.clear();
     AcquireSRWLockExclusive(&g_fontFamilyLock);
     g_fontFamily.swap(fontFamily);
     ReleaseSRWLockExclusive(&g_fontFamilyLock);
@@ -5139,8 +5249,9 @@ void LoadSettings() {
     g_touchpadSwipeNavigation.store(
         Wh_GetIntSetting(L"Navigation.touchpadSwipeNavigation") != 0);
     UINT wheelLines = 3;
-    if (SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0))
-        g_wheelLines.store(wheelLines, std::memory_order_relaxed);
+    if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0) ||
+        (wheelLines != WHEEL_PAGESCROLL && wheelLines > 100)) wheelLines = 3;
+    g_wheelLines.store(wheelLines, std::memory_order_relaxed);
     const auto placementSetting = WindhawkUtils::StringSetting::make(L"Columns.folderPlacement");
     const wchar_t* placement = placementSetting.get();
     g_folderPlacement.store(
@@ -5164,12 +5275,13 @@ void LoadSettings() {
     g_marqueeAlpha.store(std::clamp(Wh_GetIntSetting(L"Selection.marqueeOpacity"), 0, 100));
     auto color = WindhawkUtils::StringSetting::make(L"Selection.selectionColor");
     const wchar_t* value = color.get();
-    while (*value == L' ' || *value == L'\t') ++value;
+    std::wstring trimmedColor(value);
+    const auto colorFirst = trimmedColor.find_first_not_of(L" \t\r\n");
+    trimmedColor = colorFirst == std::wstring::npos ? L"" : trimmedColor.substr(colorFirst,
+        trimmedColor.find_last_not_of(L" \t\r\n") - colorFirst + 1);
+    value = trimmedColor.c_str();
     if (_wcsicmp(value, L"accent") == 0 || *value == L'\0') {
         g_dynamicAccent.store(true);
-        DWORD dwm = 0; BOOL opaque = FALSE;
-        if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)))
-            g_selectionRgb.store(RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255));
     } else {
         if (*value == L'#') ++value;
         unsigned v = 0;
@@ -8602,8 +8714,8 @@ void UpdateWatchedDirectory(ViewState& state, ULONGLONG now) {
     QueueDirectoryRefresh(state, false, true, verifyOnly);
 }
 
-// All visibility broadcasts, native list reorder hints and the slow safety
-// probe converge here. Unchanged settings cost no enumeration, no redraw, no
+// Visibility broadcasts and native list reorder hints converge here.
+// Unchanged settings cost no enumeration, no redraw, no
 // cache eviction. A changed policy uses the SAME worker/diff/animation path
 // as a deletion or insertion, including cancellation of older worker jobs.
 void PostShellVisibilityProbe(ViewState& state, bool modeOnly = false, bool command = false,
@@ -8734,7 +8846,6 @@ struct NativeViewInput {
 };
 
 void ReconcileShellVisibility(ViewState& state) {
-    state.lastVisibilityProbe = GetTickCount64();
     const ShellVisibilityPolicy current = ReadShellVisibilityPolicy();
     if (current == state.visibility) return;
     state.visibility = current;
@@ -8746,9 +8857,9 @@ void ReconcileShellVisibility(ViewState& state) {
         QueueDirectoryRefresh(state, true, true);
 }
 
-// Polling only the active Shell view's small sort descriptor avoids hooks into
-// Explorer's private Sort menu. GetSortColumns is a quick owning-STA COM call;
-// all actual resorting and provider I/O remain on the background worker.
+// Legacy active-view reconciliation also catches programmatic sort changes.
+// This owning-STA COM call can block; the descriptor's small size is no latency
+// guarantee. Actual resorting and property enrichment run on the worker.
 bool ReadShellSort(ViewState& state, SortSpec& out) {
     if (!state.folderView) return false;
     SORTCOLUMN column{};
@@ -10020,13 +10131,13 @@ void ClampScroll(ViewState& state) {
 // DWM timing is preferable because it describes the compositor rather than
 // assuming all Explorer windows run on the primary display.
 void UpdateRefreshRate(ViewState& state) {
-    UINT hz = 60;
+    double hz = 60.;
     DWM_TIMING_INFO timing{};
     timing.cbSize = sizeof(timing);
     if (SUCCEEDED(DwmGetCompositionTimingInfo(state.hwnd, &timing)) &&
         timing.rateRefresh.uiDenominator && timing.rateRefresh.uiNumerator) {
-        hz = static_cast<UINT>(static_cast<double>(timing.rateRefresh.uiNumerator) /
-                               timing.rateRefresh.uiDenominator + .5);
+        hz = std::round(static_cast<double>(timing.rateRefresh.uiNumerator) /
+                               timing.rateRefresh.uiDenominator);
     } else {
         MONITORINFOEXW info{};
         info.cbSize = sizeof(info);
@@ -10038,11 +10149,11 @@ void UpdateRefreshRate(ViewState& state) {
             mode.dmDisplayFrequency > 1)
             hz = mode.dmDisplayFrequency;
     }
-    state.refreshHz = std::clamp(static_cast<int>(hz), 30, 360);
+    state.refreshHz = static_cast<int>(std::clamp(hz, 30., 360.));
     state.frameIntervalMs = static_cast<UINT>(std::max(1,
         static_cast<int>(1000. / state.refreshHz + .5)));
     LARGE_INTEGER frequency{};
-    if (QueryPerformanceFrequency(&frequency))
+    if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0)
         state.qpcFrequency = static_cast<double>(frequency.QuadPart);
 }
 
@@ -12280,8 +12391,27 @@ void RefreshClipboardItems(ViewState& state, bool cancelCut = false) {
 // Use Windows' own DPI-aware native header font. The body text has its own
 // Ctrl+wheel/tab zoom, but the column titles follow Explorer's UI typography.
 // Resolve this on format creation (not during every GPU paint).
+bool ValidNativeFont(const LOGFONTW& font, int dpi) {
+    const auto end = std::find(std::begin(font.lfFaceName), std::end(font.lfFaceName), L'\0');
+    const double height96 = std::abs(static_cast<double>(font.lfHeight)) * 96. / dpi;
+    return end != std::end(font.lfFaceName) &&
+        ValidFontName(std::wstring_view(font.lfFaceName, end - font.lfFaceName)) &&
+        height96 >= 4. && height96 <= 96. && font.lfWeight >= 0 && font.lfWeight <= 1000;
+}
+
+LOGFONTW FallbackUiFont(int dpi) {
+    LOGFONTW font{};
+    font.lfHeight = -Scale96(12,dpi);
+    font.lfWeight = FW_NORMAL;
+    font.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(font.lfFaceName, L"Segoe UI");
+    return font;
+}
+
 LOGFONTW NativeHeaderFont(ViewState& state) {
-    if(state.presentationOnly) return state.presentationFont;
+    const int dpi = ViewDpi(state);
+    if(state.presentationOnly) return ValidNativeFont(state.presentationFont,dpi) ?
+        state.presentationFont : FallbackUiFont(dpi);
     LOGFONTW font{};
     const HWND themeHwnd = IsWindow(state.nativeHwnd) ? state.nativeHwnd : state.hwnd;
     HTHEME theme = OpenThemeData(themeHwnd, L"Header");
@@ -12291,28 +12421,24 @@ LOGFONTW NativeHeaderFont(ViewState& state) {
                                         TMT_FONT, &font);
         if (dc) ReleaseDC(themeHwnd, dc);
         CloseThemeData(theme);
-        if (SUCCEEDED(hr) && font.lfHeight != 0 && font.lfFaceName[0])
+        if (SUCCEEDED(hr) && ValidNativeFont(font,dpi))
             return font;
     }
     NONCLIENTMETRICSW metrics{};
     metrics.cbSize = sizeof(metrics);
     if (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
                                    &metrics, 0, ViewDpi(state)) &&
-        metrics.lfMessageFont.lfHeight != 0)
+        ValidNativeFont(metrics.lfMessageFont,dpi))
         return metrics.lfMessageFont;
+    metrics = {}; metrics.cbSize = sizeof(metrics);
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics),
-                              &metrics, 0) && metrics.lfMessageFont.lfHeight != 0)
+                              &metrics, 0) && ValidNativeFont(metrics.lfMessageFont,dpi))
         return metrics.lfMessageFont;
     HFONT stock = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    if (stock) GetObjectW(stock, sizeof(font), &font);
-    if (!font.lfFaceName[0]) {
-        HDC dc = GetDC(nullptr);
-        if (dc) {
-            GetTextFaceW(dc, LF_FACESIZE, font.lfFaceName);
-            ReleaseDC(nullptr, dc);
-        }
-    }
-    return font;
+    font = {};
+    if (stock && GetObjectW(stock, sizeof(font), &font) == sizeof(font) && ValidNativeFont(font,dpi))
+        return font;
+    return FallbackUiFont(dpi);
 }
 
 // DirectWrite's CreateTextFormat takes a *family*, not a full font face name.
@@ -12332,6 +12458,7 @@ SRWLOCK g_resolvedFontLock = SRWLOCK_INIT;
 std::wstring g_resolvedFontSetting;
 ResolvedManualFont g_resolvedFont;
 bool g_resolvedFontValid = false;
+std::atomic<bool> g_refreshFontCollection{false};
 
 std::wstring LocalizedFontName(IDWriteLocalizedStrings* strings) {
     if (!strings || strings->GetCount() == 0) return {};
@@ -12340,7 +12467,7 @@ std::wstring LocalizedFontName(IDWriteLocalizedStrings* strings) {
     if (FAILED(strings->FindLocaleName(L"en-us", &index, &found)) || !found)
         index = 0;
     UINT32 length = 0;
-    if (FAILED(strings->GetStringLength(index, &length)) || !length) return {};
+    if (FAILED(strings->GetStringLength(index, &length)) || !length || length > 256) return {};
     std::wstring name(length + 1, L'\0');
     if (FAILED(strings->GetString(index, name.data(), length + 1))) return {};
     name.resize(length);
@@ -12386,7 +12513,7 @@ bool MatchInstalledFace(IDWriteFontFamily* family, const std::wstring& wanted,
                 // "Family Style" name, so also match the family/face pair.
                 for (UINT32 j = 0; j < faceNames->GetCount(); ++j) {
                     UINT32 length = 0;
-                    if (FAILED(faceNames->GetStringLength(j, &length))) continue;
+                    if (FAILED(faceNames->GetStringLength(j, &length)) || length > 256) continue;
                     std::wstring face(length + 1, L'\0');
                     if (FAILED(faceNames->GetString(j, face.data(), length + 1))) continue;
                     face.resize(length);
@@ -12433,17 +12560,19 @@ bool MatchInstalledFace(IDWriteFontFamily* family, const std::wstring& wanted,
 
 ResolvedManualFont ResolveManualFontSlow(const std::wstring& requested) {
     ResolvedManualFont result;
-    result.family = result.gdiFamily = requested;
-    if (requested.empty() || !g_writeFactory) return result;
+    if (!ValidFontName(requested) || !g_writeFactory) return result;
     ComPtr<IDWriteFontCollection> fonts;
-    if (FAILED(g_writeFactory->GetSystemFontCollection(&fonts, FALSE)) || !fonts)
+    if (FAILED(g_writeFactory->GetSystemFontCollection(&fonts, g_refreshFontCollection.exchange(false))) || !fonts)
         return result;
 
     UINT32 index = 0;
     BOOL exists = FALSE;
     // Fast path: the input is already an actual family name.
     if (SUCCEEDED(fonts->FindFamilyName(requested.c_str(), &index, &exists)) &&
-        exists) return result;
+        exists) {
+        result.family = result.gdiFamily = requested;
+        return result;
+    }
 
     // Fast path for common "Family Style" inputs, such as Helvetica Light.
     // Check the longest family prefix first; only inspect that family's faces.
@@ -12469,7 +12598,7 @@ ResolvedManualFont ResolveManualFontSlow(const std::wstring& requested) {
         if (SUCCEEDED(fonts->GetFontFamily(i, &family)) &&
             MatchInstalledFace(family.Get(), requested, result)) return result;
     }
-    return result;
+    return {}; // Unknown/removed fonts fall back to the validated native font.
 }
 
 ResolvedManualFont ResolveManualFont(const std::wstring& requested) {
@@ -12512,6 +12641,8 @@ void ConfigureTextFormat(IDWriteTextFormat* format, bool rtl, bool trim) {
 bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
     if (!g_writeFactory) return false;
     const int dpi = ViewDpi(state);
+    if (!std::isfinite(state.fontPx) || state.fontPx < 1.f || state.fontPx > Scale96(96,dpi))
+        state.fontPx = static_cast<float>(Scale96(17,dpi));
     if (bodyOnly && state.textFormat && state.textFormatDpi == dpi) {
         // Bounds/zoom refresh only the body when its size/direction changes.
         // Preserve the resolved face and headers; no native font queries here.
@@ -12524,19 +12655,17 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         std::wstring locale(previous->GetLocaleNameLength() + 1, L'\0');
         ComPtr<IDWriteFontCollection> collection;
         ComPtr<IDWriteTextFormat> format;
-        if (FAILED(previous->GetFontFamilyName(family.data(), static_cast<UINT32>(family.size()))) ||
-            FAILED(previous->GetLocaleName(locale.data(), static_cast<UINT32>(locale.size()))) ||
-            FAILED(previous->GetFontCollection(&collection)) ||
-            FAILED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(),
+        if (SUCCEEDED(previous->GetFontFamilyName(family.data(), static_cast<UINT32>(family.size()))) &&
+            SUCCEEDED(previous->GetLocaleName(locale.data(), static_cast<UINT32>(locale.size()))) &&
+            SUCCEEDED(previous->GetFontCollection(&collection)) &&
+            SUCCEEDED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(),
                 previous->GetFontWeight(), previous->GetFontStyle(), previous->GetFontStretch(),
-                state.fontPx, locale.c_str(), &format))) return false;
-        ConfigureTextFormat(format.Get(), state.rtlLayout, true);
-        state.textFormat = std::move(format);
-        return true;
+                state.fontPx, locale.c_str(), &format))) {
+            ConfigureTextFormat(format.Get(), state.rtlLayout, true);
+            state.textFormat = std::move(format);
+            return true;
+        }
     }
-    state.textFormat.Reset();
-    state.headerFormat.Reset();
-    state.sortedHeaderFormat.Reset();
     const LOGFONTW uiFont = NativeHeaderFont(state);
     if(!state.presentationOnly) {
         state.presentationFont=uiFont; state.presentationDpi=dpi;
@@ -12544,9 +12673,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
     }
     // LOGFONT heights are device pixels; this swap-chain's coordinates are
     // physical pixels at D2D's 96-DPI default. Never apply DPI a second time.
-    const float uiFontSize = uiFont.lfHeight != 0 ?
-        static_cast<float>(uiFont.lfHeight < 0 ? -uiFont.lfHeight : uiFont.lfHeight) :
-        static_cast<float>(std::max(1.f, state.fontPx));
+    const float uiFontSize = static_cast<float>(std::abs(static_cast<double>(uiFont.lfHeight)));
     // Use the same user-selected family for body, metadata and headers.
     // An empty setting preserves the original native-font behavior; sizes
     // still follow their independent header and row-height metrics.
@@ -12564,30 +12691,36 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         chosen.style : DWRITE_FONT_STYLE_NORMAL;
     const DWRITE_FONT_STRETCH fontStretch = chosen.exactFace ?
         chosen.stretch : DWRITE_FONT_STRETCH_NORMAL;
-    const HRESULT a = g_writeFactory->CreateTextFormat(
-        uiFontFamily, nullptr, bodyWeight, fontStyle,
-        fontStretch, static_cast<float>(state.fontPx),
-        L"", state.textFormat.GetAddressOf());
-    const HRESULT b = g_writeFactory->CreateTextFormat(
-        uiFontFamily, nullptr, headerWeight, fontStyle,
-        fontStretch, uiFontSize,
-        L"", state.headerFormat.GetAddressOf());
-    if (SUCCEEDED(a) && SUCCEEDED(b)) {
+    const auto tryFamily = [&](const WCHAR* family, bool preferred) {
+        ComPtr<IDWriteTextFormat> body, header, sorted;
+        ComPtr<IDWriteFontCollection> fonts;
+        UINT32 index = 0; BOOL exists = FALSE;
+        if (FAILED(g_writeFactory->GetSystemFontCollection(&fonts, g_refreshFontCollection.exchange(false))) || !fonts ||
+            FAILED(fonts->FindFamilyName(family,&index,&exists)) || !exists) return false;
+        const auto bodyW = preferred ? bodyWeight : DWRITE_FONT_WEIGHT_NORMAL;
+        const auto headerW = preferred ? headerWeight : DWRITE_FONT_WEIGHT_NORMAL;
+        const auto style = preferred ? fontStyle : DWRITE_FONT_STYLE_NORMAL;
+        const auto stretch = preferred ? fontStretch : DWRITE_FONT_STRETCH_NORMAL;
+        if (FAILED(g_writeFactory->CreateTextFormat(family, nullptr, bodyW, style, stretch,
+                state.fontPx, L"", &body)) ||
+            FAILED(g_writeFactory->CreateTextFormat(family, nullptr, headerW, style, stretch,
+                uiFontSize, L"", &header))) return false;
+        ConfigureTextFormat(body.Get(), state.rtlLayout, true);
+        ConfigureTextFormat(header.Get(), state.rtlLayout, false);
+        const auto sortedWeight = headerW < DWRITE_FONT_WEIGHT_BOLD ? DWRITE_FONT_WEIGHT_BOLD : headerW;
+        if (SUCCEEDED(g_writeFactory->CreateTextFormat(family, nullptr, sortedWeight, style, stretch,
+                uiFontSize, L"", &sorted))) ConfigureTextFormat(sorted.Get(), state.rtlLayout, false);
+        else sorted = header;
+        // Commit a complete set only. Failed refreshes retain usable formats.
+        state.textFormat = std::move(body);
+        state.headerFormat = std::move(header);
+        state.sortedHeaderFormat = std::move(sorted);
         state.textFormatDpi = dpi;
-        ConfigureTextFormat(state.textFormat.Get(), state.rtlLayout, true);
-        ConfigureTextFormat(state.headerFormat.Get(), state.rtlLayout, false);
-        // A separate weight in the very same family, size, style and stretch.
-        // Headers that aren't sorted keep the existing native header format.
-        const DWRITE_FONT_WEIGHT sortedWeight = headerWeight < DWRITE_FONT_WEIGHT_BOLD ?
-            DWRITE_FONT_WEIGHT_BOLD : headerWeight;
-        if (SUCCEEDED(g_writeFactory->CreateTextFormat(
-                uiFontFamily, nullptr, sortedWeight, fontStyle, fontStretch,
-                uiFontSize, L"", state.sortedHeaderFormat.GetAddressOf()))) {
-            ConfigureTextFormat(state.sortedHeaderFormat.Get(), state.rtlLayout, false);
-        }
         return true;
-    }
-    return false;
+    };
+    return tryFamily(uiFontFamily,true) ||
+        (!chosen.family.empty() && tryFamily(uiFont.lfFaceName,false)) ||
+        tryFamily(L"Segoe UI",false) || tryFamily(L"Arial",false);
 }
 
 void ScheduleVisibleIconUploads(ViewState& state);
@@ -12983,7 +13116,7 @@ void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
         g_writeFactory->CreateRenderingParams(&native);
     state.textRenderingParams=native;
     BOOL smoothing=TRUE;
-    SystemParametersInfoW(SPI_GETFONTSMOOTHING,0,&smoothing,0);
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING,0,&smoothing,0)) smoothing=TRUE;
     state.textAntialiasMode=mode==TextAntialiasing::Aliased || (mode==TextAntialiasing::System && !smoothing) ?
         D2D1_TEXT_ANTIALIAS_MODE_ALIASED : mode==TextAntialiasing::System ?
         D2D1_TEXT_ANTIALIAS_MODE_DEFAULT : D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
@@ -19860,19 +19993,9 @@ void UpdateDirectory(ViewState& state) {
     if (!state.folderView || !state.inScope ||
         !IsWindow(state.nativeHwnd) || !NativeViewAvailable(state.nativeHwnd)) return;
     const ULONGLONG tick = GetTickCount64();
-    if (tick - state.lastVisibilityProbe >= kVisibilityFallbackProbeMs)
-        ReconcileShellVisibility(state);
     // Empty folders use the same GPU presentation and directory-watch path
     // as populated folders; exposing the native empty-state HWND would also
     // expose its loading placeholder during navigation.
-    if (tick - state.lastThemeCheck >= 2500) {
-        state.lastThemeCheck = tick;
-        const COLORREF old = g_selectionRgb.load(std::memory_order_relaxed);
-        RefreshThemeColor();
-        const bool themeChanged = RefreshNativePalette(state);
-        if (themeChanged || old != g_selectionRgb.load(std::memory_order_relaxed))
-            Redraw(state);
-    }
     // The active view is rebound by Shell window create/show/hide events and
     // an infrequent frame-level recovery scan. Never call GetFolderPath on the
     // UI thread in every directory timer tick: it adds COM latency, and a
@@ -21763,10 +21886,14 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         for (HWND overlay : FrameOverlays(hwnd))
             if (auto* state=State(overlay); state && state->nativeSelectionRecoveryPending)
                 QueueNativeSelectionHint(*state);
-    if (msg == WM_THEMECHANGED || msg == WM_SYSCOLORCHANGE || msg == WM_SETTINGCHANGE)
+    if (const auto changes=SystemStyleChangeMask(msg,wp,lp))
         for (HWND overlay : FrameOverlays(hwnd))
-            if (auto state = State(overlay); state && IsWindow(state->viewToggle))
-                PostMessageW(state->viewToggle, WM_THEMECHANGED, 0, 0);
+            if (auto state = State(overlay)) QueueStyleChange(*state,changes);
+    // Broadcast settings changes are normally sent to top-level windows;
+    // DispatchHook sees only posted messages. Reuse the coalesced tab queue.
+    if (msg == WM_SETTINGCHANGE && !g_unloading.load(std::memory_order_relaxed))
+        for (HWND overlay : FrameOverlays(hwnd))
+            if (auto state = State(overlay)) PostShellVisibilityProbe(*state);
     if (changed && !g_unloading.load(std::memory_order_relaxed)) {
         for (HWND overlay : FrameOverlays(hwnd))
             PostMessageW(overlay, kMsgFrameStateChanged, 0, 0);
@@ -23344,16 +23471,35 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
     case WM_THEMECHANGED:
     case WM_SYSCOLORCHANGE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
     case WM_SETTINGCHANGE:
     case WM_FONTCHANGE:
         if (s) {
-            ++g_textRenderingRevision;
-            if (msg == WM_SETTINGCHANGE) ReconcileShellVisibility(*s);
-            StopKeyboardSelectionAnimation(*s);
-            RefreshNativePalette(*s);
-            // Windows can change message/header fonts without changing their
-            // foreground color, so never condition text format refresh on it.
-            if (s->target || s->presenter) MakeTextFormats(*s);
+            if (msg == WM_SETTINGCHANGE) PostShellVisibilityProbe(*s);
+            QueueStyleChange(*s,SystemStyleChangeMask(msg,wParam,lParam));
+        }
+        return 0;
+    case kMsgStyleChanged:
+        if (s && wParam==WPARAM(s->lifetimeToken)) {
+            s->styleChangeQueued=false;
+            const unsigned changes=std::exchange(s->pendingStyleChanges,0u);
+            if (!changes) return 0;
+            if (changes & kStyleColors) {
+                RefreshThemeColor();
+                s->viewTogglePaletteDirty=true;
+                RefreshNativePalette(*s,true);
+            }
+            if (changes & kStyleFontCollection) {
+                AcquireSRWLockExclusive(&g_resolvedFontLock);
+                g_resolvedFontValid = false;
+                g_refreshFontCollection = true;
+                ReleaseSRWLockExclusive(&g_resolvedFontLock);
+            }
+            if (changes & kStyleFonts) {
+                ++g_textRenderingRevision;
+                StopKeyboardSelectionAnimation(*s);
+                if (s->target || s->presenter) MakeTextFormats(*s);
+            }
             Redraw(*s);
         }
         return 0;
@@ -23612,6 +23758,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (IsIconic(s->frameHwnd) || !TabOwnsActiveView(*s)) return 0;
             if (LayoutAnimationActive(*s, true)) return 0;
             s->nativeSettingsHintPending = false;
+            if (!g_unloading.load(std::memory_order_relaxed)) ReconcileShellVisibility(*s);
         }
         if (s && s->thisPcGpu) {
             // The native client reordered (including Group by changes).
@@ -23630,7 +23777,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     s->visible && s->inScope && s->loaded)
                     SyncNativeSelection(*s);
             } else {
-                ReconcileShellVisibility(*s);
                 ReconcileShellGrouping(*s);
             }
         }
@@ -24019,11 +24165,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (!s->directoryPending &&
                     timerNow - s->driveCapacityRequestedAt >= kDriveSpaceRefreshMs) {
                     s->driveCapacityRequestedAt = timerNow;
-                    // Also resample Shell item identities in case a portable
-                    // device appeared without a native WinEvent notification.
-                    QueueNativeRows(*s);
-                    RefreshThisPcRows(*s);
-                    if (!s->directoryPending) QueueDirectoryRefresh(*s);
+                    // Capacity can change without a Shell free-space hint.
+                    // Device membership uses native reorder/drive/media events.
+                    QueueDirectoryRefresh(*s);
+                    // Without a reorder subscription, portable devices have
+                    // no drive/media signal. Retain discovery only in that case.
+                    if (!s->viewEvents) PostShellVisibilityProbe(*s);
                 }
                 if (s->thisPcRowsDirty) RefreshThisPcRows(*s);
                 if (s->columnsView) RefreshExplorerColumns(*s);
@@ -25106,7 +25253,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 StopTouchpad(*s);
             else if (!s->manipulationManager)
                 StartTouchpad(*s);
-            RefreshNativePalette(*s);
+            QueueStyleChange(*s,kStyleColors);
             s->rtlLayout = ShellUiIsRtl(*s);
             StopHoverAnimation(*s);
             StopKeyboardSelectionAnimation(*s);
@@ -25866,7 +26013,6 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     CacheDepartingFolder(state);
     RetireCachedEntries(state, state.namespaceIdentities);
     state.visibility = ReadShellVisibilityPolicy();
-    state.lastVisibilityProbe = GetTickCount64();
     state.visibilitySelectionSyncPending = false;
     // Fresh visits have no sorting preference in the GPU overlay. A previously
     // visited folder may restore the explicit sort chosen there, along with
@@ -27027,10 +27173,9 @@ void PrepareInitialOverlay(ViewState& state) {
         return;
     }
     state.visibility = ReadShellVisibilityPolicy();
-    state.lastVisibilityProbe = state.attachedAt;
     UpdateMetrics(state);
     UpdateColumns(state);
-    RefreshNativePalette(state);
+    if (!state.nativePaletteResolved) RefreshNativePalette(state);
     if(!StartPresentation(state)) {
         state.visible=false; RestoreNativeContent(state); return;
     }
@@ -28638,10 +28783,7 @@ LRESULT CALLBACK ViewToggleSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
         }
-        if (msg == WM_THEMECHANGED || msg == WM_SYSCOLORCHANGE || msg == WM_SETTINGCHANGE) {
-            state->viewTogglePaletteDirty = true;
-            RefreshNativePalette(*state);
-        }
+        if (const auto changes=SystemStyleChangeMask(msg,wp,lp)) QueueStyleChange(*state,changes);
     }
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, ViewToggleSubclass, id);
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
@@ -28750,8 +28892,9 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred) {
             }
             state->viewToggleHot = false;
             state->viewToggleBufferedPaint = SUCCEEDED(BufferedPaintInit());
-            state->viewTogglePaletteDirty = true;
-            RefreshNativePalette(*state);
+            // Creating/restoring chrome reuses the event-resolved tab palette.
+            // Navigation and layout must not become color probes.
+            if (!state->nativePaletteResolved) RefreshNativePalette(*state);
             INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
             InitCommonControlsEx(&controls);
             state->viewToggleTooltip = CreateWindowExW(WS_EX_NOACTIVATE, TOOLTIPS_CLASSW,

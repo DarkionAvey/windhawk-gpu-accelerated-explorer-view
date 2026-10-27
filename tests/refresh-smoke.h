@@ -1,3 +1,68 @@
+static void TestPeriodicCapacityRefresh() {
+    CapacityFixture::Session volume;
+    std::weak_ptr<TabBackground> lifetime;
+    {
+    PresentationFixture::Tab tab(L"capacity maintenance",1);
+    auto& state=tab.state;
+    lifetime=state.background;
+    FocusFixture::Session focus(tab.frame,state.hwnd);
+    state.nativeHwnd=CreateWindowExW(0,L"STATIC",L"private native capacity view",WS_CHILD|WS_VISIBLE,
+        0,0,640,480,tab.frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+    Check(state.nativeHwnd!=nullptr,"capacity maintenance native view");
+    SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
+    state.folderPath=kThisPcLocation; state.thisPcGpu=true;
+    state.directoryModePinned=true;
+    ApplyViewLayout(state,{FVM_LIST,48},false);
+    // Names already exist; icons/presentation need not be ready for capacity.
+    state.loaded=false;
+    state.nativeRowsComplete=true; state.nativeRowsNeedCapture=false;
+    // A subscribed view takes the event path; no OS hook is installed here.
+    state.viewEvents=reinterpret_cast<HWINEVENTHOOK>(UINT_PTR(1));
+    state.nativeRowsViewToken=state.token;
+    auto& drive=state.entries.front(); drive.path=L"Z:\\"; drive.name=L"Synthetic volume";
+    auto empty=static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(sizeof(USHORT)));
+    Check(empty!=nullptr,"capacity maintenance synthetic identity"); empty->mkid.cb=0;
+    drive.shellIdentity=SharedPidl(empty,TaskMemDeleter{});
+    state.nativeRows=state.entries;
+    state.lastActiveViewProbe=GetTickCount64();
+    state.driveCapacityRequestedAt=GetTickCount64()-kDriveSpaceRefreshMs;
+    ResetEvent(CapacityFixture::gate);
+    OverlayProc(state.hwnd,WM_TIMER,kTimerId,0);
+    Check(Eventually([&]{return CapacityFixture::calls==1;}),"due capacity maintenance did not start its worker");
+    Check(state.directoryPending && CapacityFixture::uiCalls==0 && !state.nativeRowsNeedCapture &&
+        !state.nativeRowsMessageQueued && !state.nativeRowsPending && !state.thisPcRowsDirty &&
+        state.background->nativeRowsJobs.empty(),"capacity maintenance also enumerated devices or blocked the UI");
+    // A real membership hint still takes the identity lane, independently of
+    // the blocked capacity request. No actual device or volume is touched.
+    QueueSystemShellChange(state,SHCNE_DRIVEADD);
+    FlushShellChangeHints(state,GetTickCount64()+kShellVisualCoalesceMs);
+    Check(state.nativeRowsNeedCapture && state.nativeRowsMessageQueued,
+        "drive membership event no longer requested replacement identities");
+    SetEvent(CapacityFixture::gate);
+    Check(Eventually([&]{ReceiveDirectoryResults(state); return !state.directoryPending;}),
+        "periodic capacity result did not settle");
+    // Only a missing native subscription admits the old discovery recovery.
+    state.viewEvents=nullptr; state.loaded=false; state.thisPcRowsDirty=false;
+    state.nativeRowsNeedCapture=state.nativeRowsMessageQueued=false;
+    state.nativeSettingsHintPending=state.visibilitySignalQueued=false;
+    state.driveCapacityRequestedAt=GetTickCount64()-kDriveSpaceRefreshMs;
+    state.lastActiveViewProbe=GetTickCount64();
+    OverlayProc(state.hwnd,WM_TIMER,kTimerId,0);
+    Check(state.nativeSettingsHintPending && state.visibilitySignalQueued,
+        "missing native subscription lost portable-device discovery recovery");
+    MSG hint{};
+    Check(PeekMessageW(&hint,state.hwnd,kMsgShellVisibilityChanged,kMsgShellVisibilityChanged,PM_REMOVE),
+        "missing-subscription recovery did not queue its owner hint");
+    OverlayProc(state.hwnd,hint.message,hint.wParam,hint.lParam);
+    Check(state.nativeRowsNeedCapture && state.nativeRowsMessageQueued,
+        "missing-subscription owner hint did not request identities");
+    Check(Eventually([&]{ReceiveDirectoryResults(state); return !state.directoryPending;}),
+        "missing-subscription capacity result did not settle");
+    }
+    Check(Eventually([&]{return lifetime.expired();}),"capacity maintenance workers did not retire");
+    std::cout<<"PASS: subscribed capacity timer uses only the background volume lane; drive events and missing-subscription recovery still request identities\n";
+}
+
 static void TestDriveSpaceRefresh() {
     CapacityFixture::Session volume;
     Check(CapacityFixture::gate!=nullptr,"synthetic volume gate");

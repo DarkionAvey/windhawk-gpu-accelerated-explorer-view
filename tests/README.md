@@ -103,6 +103,27 @@ clipping measurements and real asynchronous resize fitting; see the
 selected-source header rather than shell-escaped macro strings, so source
 selection works in Windows PowerShell 5.1 and PowerShell 7.
 
+`--styles` checks native foreground precedence when theme/app backgrounds
+disagree, repeated maintenance/settings refreshes, transient/invalid lookups,
+high contrast, independent tab caches, malformed fonts, invalid sizes/DPI and
+real offscreen text/chrome pixels. `--options` also checks failed accent and
+wheel lookups. See the [foreground correction](../docs/style-fallbacks-0.9.252.md)
+and [original style audit](../docs/style-fallbacks-0.9.251.md).
+
+It also counts color-provider calls during six real private directory jobs and
+48 maintenance passes, checks coalesced system/theme/accent/dark-mode and mod
+settings events, and verifies tabs update with the toggle button disabled.
+See [event-driven style resolution](../docs/style-events-0.9.253.md).
+
+It also asserts no periodic Shell visibility queries, coalesced sent settings
+broadcasts, deferred inactive/animating tab updates and This PC visibility
+reconciliation. A due production capacity timer uses a blocked synthetic volume
+to check that capacity work stays off the UI and does not request device
+identities on subscribed views; drive events and missing-subscription recovery
+still request them. Rename focus-restoration checks use substituted state and
+do not depend on the desktop foreground window staying unchanged. See the
+[polling and retry audit](../docs/polling-audit-0.9.254.md) for remaining findings.
+
 `--column-bridge` checks cold/delayed native column acquisition, per-directory
 content acknowledgements, unchanged scan publication and native frame/host
 resizing through actual attachment. See the

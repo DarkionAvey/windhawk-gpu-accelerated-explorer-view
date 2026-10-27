@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.254
+
+- Replace periodic hidden/protected-item settings checks with coalesced settings
+  and native-view notifications, including sent Explorer frame broadcasts.
+- Keep periodic This PC capacity updates on the background volume lane. Device
+  identities use drive/media and native reorder events; retain discovery
+  recovery only when the native reorder subscription is unavailable.
+
+## 0.9.253
+
+- Refresh colors at attachment and on relevant mod settings, theme, system
+  color, dark-mode and accent events. Remove periodic color checks while browsing.
+- Coalesce related notifications per tab and update tabs even when the native
+  view toggle button is disabled. Font-only and unrelated settings skip color checks.
+
+## 0.9.252
+
+- Fix 0.9.251 changing correct text and control colors when theme background
+  resources disagree with Explorer's visible background.
+- Preserve valid native foreground colors and retain them through temporary
+  lookup failures. Apply fallbacks only when native colors are unavailable.
+
+## 0.9.251
+
+- Keep text and matching controls visible when theme colors are invalid or
+  indistinguishable from the resolved background. Preserve usable theme colors
+  and Windows high-contrast colors.
+- Fall back safely for missing fonts, malformed font metrics and invalid text
+  sizes; keep existing text formats if replacement creation fails.
+- Restore a system accent when accent lookup fails, and validate DPI, scrolling
+  and display timing values.
+
 ## 0.9.250
 
 - Prevent repeated Paste commands when Ctrl+V is handled with Explorer frame

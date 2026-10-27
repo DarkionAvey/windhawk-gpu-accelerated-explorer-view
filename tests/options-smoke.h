@@ -242,12 +242,31 @@ static void TestUserOptions() {
     set(L"Appearance.fontFamily",L" \tSegoe UI\r\n ");
     Check(ConfiguredFontFamily()==L"Segoe UI","font family trimming/binding");
     set(L"Appearance.fontFamily",L" \t\r\n"); Check(ConfiguredFontFamily().empty(),"blank font family fallback");
-    for(const auto* value:{L"#12aBef",L"12aBef",L" \t#12aBef"}) {
+    for(const auto* value:{L"#12aBef",L"12aBef",L" \t#12aBef",L" #12aBef\r\n "}) {
         set(L"Selection.selectionColor",value);
         Check(!g_dynamicAccent && g_selectionRgb==RGB(0x12,0xAB,0xEF),"custom selection RGB parsing/binding");
     }
     for(const auto* value:{L"accent",L"ACCENT",L"",L"#xyzxyz",L"#12345",L"#1234567"}) {
         set(L"Selection.selectionColor",value); Check(g_dynamicAccent,"invalid/custom color failed to restore accent");
+    }
+    {
+        StyleFixture::Session faults;
+        set(L"Selection.selectionColor",L"#C08040");
+        StyleFixture::accentStatus=E_FAIL;
+        set(L"Selection.selectionColor",L"invalid");
+        Check(g_dynamicAccent && g_selectionRgb==RGB(12,110,210),
+            "failed accent lookup retained the previous custom color");
+        StyleFixture::accentStatus=S_OK; StyleFixture::accent=0;
+        set(L"Selection.selectionColor",L"accent");
+        Check(g_selectionRgb==RGB(12,110,210),"transparent/uninitialized accent accepted");
+        StyleFixture::accent=0xFFAACC11;
+        set(L"Selection.selectionColor",L" accent\t");
+        Check(g_dynamicAccent && g_selectionRgb==RGB(0xAA,0xCC,0x11),"valid DWM accent conversion/trim");
+        StyleFixture::wheel=WHEEL_PAGESCROLL; LoadSettings();
+        Check(g_wheelLines==WHEEL_PAGESCROLL,"page-scroll sentinel rejected");
+        StyleFixture::wheel=0; LoadSettings(); Check(g_wheelLines==0,"disabled wheel scrolling rejected");
+        StyleFixture::wheel=UINT_MAX-1; LoadSettings(); Check(g_wheelLines==3,"unusable wheel metric accepted");
+        StyleFixture::failSystem=true; LoadSettings(); Check(g_wheelLines==3,"failed wheel lookup retained old value");
     }
     values=schema; LoadSettings(); TestOptionConsumers(set);
     Check(!SettingsFixture::strings,"settings string ownership leaked");

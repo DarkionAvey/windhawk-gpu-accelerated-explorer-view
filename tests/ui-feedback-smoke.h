@@ -255,7 +255,7 @@ static void TestUiFeedbackAudit(const std::wstring& directory) {
     state.lastNativeModeProbe=1; state.lastActiveViewProbe=0;
     state.nativeSelectionDirty=state.nativeSelectionMessageQueued=state.nativeSelectionImportPending=false;
     state.nativeSelectionLastProbe=0; state.nativeSelectionObservedCount=1;
-    state.lastThemeCheck=state.lastVisibilityProbe=state.lastRefresh=GetTickCount64();
+    state.lastRefresh=GetTickCount64();
     state.nativeSelectionWarmUntil=GetTickCount64()+5000;
     for (int i=0;i<12;++i) {
         state.nativeSelectionLastProbe=0;

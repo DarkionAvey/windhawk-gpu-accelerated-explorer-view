@@ -1,5 +1,39 @@
 # Repository instructions
 
+## General approach 
+- Do not hardcode solutions just to satisfy the user requests. You should 
+  investigate the issue in the broader sense and not just to say I fixed the
+  exact behavior that the user talked about. You should also assess other similar
+  situations where related bugs could arise. Do not implement weak and nonsenesical 
+  approaches like timers with emperical intervals or assumed ui sizes; these should
+  be wired to known broadcast events and dynamic retreval.
+- If you do not have enough evidence of the cause of the issue, do not guess 
+  and simply indicate to the user that you need further details or log dumps.
+- When implementing new feature, assess what other aspects could be implemented
+  along with it, to either improve stability or the usability to the user.
+- Be conservative and smart with implementing code. Not every little request 
+  needs a 100-line code change.
+- Assess entangled messages and queues. Do not assume your regression tests cover
+  real life usage scenarios.
+- Implement best code practices. Do not wait for the user to spell it out for you.
+- Prioritize immediate names/layout and responsive input. Resolve optional
+  metadata/icons on existing tab-owned lanes. Keep cold provider calls, waiting,
+  cache cleanup and unbounded work off the UI thread.
+- Tabs own their state, queues, caches and workers independently. Shared
+  lifetime regulation manages teardown; it does not serialize tabs' work.
+- Preserve native-host suppression before layout and restore native visibility
+  on fallback/unload. Never expose both native and GPU lists.
+- Adapt shared geometry, input, animation and enrichment paths before adding
+  parallel implementations. Preserve continuous input and concurrent scrolling.
+- Respect owner STA/COM boundaries, cancellation generations and callback
+  draining before DLL unload. Do not forcibly terminate provider threads.
+- Preserve RTL/LTR, DPI, focus, clipboard, selection and cached-data behavior.
+  Tests use private temporary fixtures and substituted clipboard/focus APIs;
+  they must not depend on user folders or change the user's clipboard/focus.
+- Only intentional read-only OS/Shell integration probes may use real system
+  resources; discover those locations through Windows APIs. Synthetic drive
+  strings used as identities must not become filesystem assumptions.
+
 ## Source and release workflow
 
 - `latest.cpp` is the current published Windhawk source. Read its `@version`
@@ -42,22 +76,3 @@
 - Distinguish offscreen component tests and CPU submission measurements from
   live Explorer behavior and actual displayed frame rates.
 
-## Runtime and test invariants
-
-- Prioritize immediate names/layout and responsive input. Resolve optional
-  metadata/icons on existing tab-owned lanes. Keep cold provider calls, waiting,
-  cache cleanup and unbounded work off the UI thread.
-- Tabs own their state, queues, caches and workers independently. Shared
-  lifetime regulation manages teardown; it does not serialize tabs' work.
-- Preserve native-host suppression before layout and restore native visibility
-  on fallback/unload. Never expose both native and GPU lists.
-- Adapt shared geometry, input, animation and enrichment paths before adding
-  parallel implementations. Preserve continuous input and concurrent scrolling.
-- Respect owner STA/COM boundaries, cancellation generations and callback
-  draining before DLL unload. Do not forcibly terminate provider threads.
-- Preserve RTL/LTR, DPI, focus, clipboard, selection and cached-data behavior.
-  Tests use private temporary fixtures and substituted clipboard/focus APIs;
-  they must not depend on user folders or change the user's clipboard/focus.
-- Only intentional read-only OS/Shell integration probes may use real system
-  resources; discover those locations through Windows APIs. Synthetic drive
-  strings used as identities must not become filesystem assumptions.

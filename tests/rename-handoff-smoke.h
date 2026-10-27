@@ -55,7 +55,8 @@ static void TestEditorSelectionOwnership(const std::wstring& directory) {
     auto factory=g_writeFactory;
     if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
         __uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"editor ownership fonts");
-    const HWND actualFocus=GetFocus(),actualForeground=GetForegroundWindow();
+    const bool previousFocusEnabled=FocusFixture::enabled;
+    const HWND previousFocus=FocusFixture::focus,previousForeground=FocusFixture::foreground;
     for(bool rtl:{false,true}) for(bool grid:{false,true}) for(bool folderItem:{false,true}) for(unsigned route=0;route<3;++route) {
         PresentationFixture::Tab tab(L"editor selection ownership",12,rtl,grid);
         auto& state=tab.state;
@@ -161,7 +162,8 @@ static void TestEditorSelectionOwnership(const std::wstring& directory) {
         RemovePropW(native,kOverlayProperty);
     }
     g_writeFactory=factory;
-    Check(GetFocus()==actualFocus && GetForegroundWindow()==actualForeground,"ownership tests changed desktop focus");
+    Check(FocusFixture::enabled==previousFocusEnabled && FocusFixture::focus==previousFocus &&
+        FocusFixture::foreground==previousForeground,"ownership tests leaked substituted focus state");
     std::cout<<"PASS: shared editor/list focus and selection ownership; address/modal/background guards and hidden-host fallback; native cancellation echoes, stale imports, indexed rename/reorder and routed arrows across all New file/folder routes in LTR/RTL list/grid\n";
 }
 
@@ -171,7 +173,8 @@ static void TestRenameHandoff(const std::wstring& directory) {
         __uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"rename fonts");
     WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
     cls.lpszClassName=L"CabinetWClass"; RegisterClassW(&cls);
-    const HWND actualFocus=GetFocus(),actualForeground=GetForegroundWindow();
+    const bool previousFocusEnabled=FocusFixture::enabled;
+    const HWND previousFocus=FocusFixture::focus,previousForeground=FocusFixture::foreground;
     for(bool rtl:{false,true}) for(bool grid:{false,true}) {
         PresentationFixture::Tab tab(L"rename handoff",1,rtl,grid,false,800,480,cls.lpszClassName);
         auto& state=tab.state;
@@ -278,6 +281,7 @@ static void TestRenameHandoff(const std::wstring& directory) {
         CancelRename(state); ClearInteractiveCreation(state);
     }
     g_writeFactory=factory;
-    Check(GetFocus()==actualFocus && GetForegroundWindow()==actualForeground,"rename tests changed user focus");
+    Check(FocusFixture::enabled==previousFocusEnabled && FocusFixture::focus==previousFocus &&
+        FocusFixture::foreground==previousForeground,"rename tests leaked substituted focus state");
     std::cout<<"PASS: rename click handoff precedes Shell work; native adoption preserves text/caret, accelerator MSG ownership and exactly one translated character; Z order, stale-name protection and rollback in LTR/RTL list/grid\n";
 }
