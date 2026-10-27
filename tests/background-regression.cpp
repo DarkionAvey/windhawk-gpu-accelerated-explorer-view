@@ -16,7 +16,9 @@
 #include "settings-fixture.h"
 #include "selection-log-fixture.h"
 #include "animation-clock-fixture.h"
+#include "menu-fixture.h"
 #include GPU_OVERLAY_SOURCE
+#undef TrackPopupMenuEx
 #undef QueryPerformanceCounter
 #undef Wh_Log
 #undef CoCreateInstance
@@ -1749,6 +1751,9 @@ static void TestPreviewInput() {
 #include "adaptive-image-smoke.h"
 #include "large-tile-smoke.h"
 #include "icon-alpha-smoke.h"
+#include "shell-provider-smoke.h"
+#include "provider-selection-smoke.h"
+#include "provider-navigation-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1860,7 +1865,14 @@ int wmain(int argc,wchar_t** argv) {
             TestNativeSuppression();
             TestNativeUiaBatch();
             TestRealNativeUiaPressure(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--provider-selection")==0) {
+            TestProviderSelection(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--provider-navigation")==0) {
+            TestProviderNavigation(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--shell-provider")==0) {
+            TestShellProviderContents(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--filesystem")==0) {
+            TestShellProviderContents(fixture.wstring());
             TestFilesystemMutationDelivery(fixture.wstring());
             TestBurstRowContinuity(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--timing")==0) {
@@ -1921,6 +1933,9 @@ int wmain(int argc,wchar_t** argv) {
         TestPreviewAndLayout(fixture.wstring());
         TestLayoutWatchAndCache(fixture.wstring());
         TestFilesystemMutationDelivery(fixture.wstring());
+        TestShellProviderContents(fixture.wstring());
+        TestProviderSelection(fixture.wstring());
+        TestProviderNavigation(fixture.wstring());
         TestBurstRowContinuity(fixture.wstring());
         TestSortDetails(fixture.wstring());
         TestRealNativeViewport(fixture.wstring());

@@ -14,7 +14,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetFindData(WIN32_FIND_DATAW* value) override { *value=data; return S_OK; }
 };
 
-static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& native) {
+static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& native, bool delegated = false) {
     const auto entries=state.entries;
     const auto index=state.entryPathIndex;
     const auto originalFolder=state.folderPath;
@@ -27,7 +27,8 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     PIDLIST_ABSOLUTE rawParent=nullptr;
     Check(SUCCEEDED(SHGetIDListFromObject(state.folder.Get(),&rawParent)) && rawParent,"namespace selection parent");
     state.directoryFolderIdentity=SharedPidl(rawParent,TaskMemDeleter{});
-    state.folderPath=kRecycleBinLocation; state.gridView=true; state.cachedNativeMode=FVM_ICON;
+    state.folderPath=delegated ? originalFolder : kRecycleBinLocation;
+    state.gridView=true; state.cachedNativeMode=FVM_ICON;
     state.nativeIconSize=256;
     auto identities=std::make_shared<NamespaceIdentities>();
     const auto alternate=[&](int row,DWORD size) {
@@ -50,7 +51,7 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
         auto& entry=state.entries[row];
         entry.shellChild=SharedPidl(raw,TaskMemDeleter{});
         entry.shellIdentity=SharedPidl(ILCombine(rawParent,raw),TaskMemDeleter{});
-        entry.path=NamespaceItemKey(entry.shellIdentity.get());
+        entry.path=delegated && row!=70 ? entries[row].path : NamespaceItemKey(entry.shellIdentity.get());
         entry.name=L"duplicate photo.jpg"; // Display text must never decide identity.
         identities->emplace(entry.path,entry.shellChild);
     }
@@ -99,12 +100,14 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     }
     Check(native.commits==commits && native.itemArrayReads==arrays && state.columnEpoch==columnEpoch &&
         state.propertyEpoch==propertyEpoch,"namespace import echoed commands or used the UI item-array/provider path");
-    CacheDepartingFolder(state);
-    Check(state.entries.empty() && !state.namespaceIdentities &&
-        RestoreCachedFolder(state) && state.namespaceIdentities==identities,
-        "cached namespace revisit lost its canonical selection snapshot");
-    Check(CaptureNativeSelection(state,true),"cached namespace selection setup"); pump();
-    Check(state.visible && state.selectedFlags[7] && state.selectedFlags[70],"cached revisit detached after selection import");
+    if (!delegated) {
+        CacheDepartingFolder(state);
+        Check(state.entries.empty() && !state.namespaceIdentities &&
+            RestoreCachedFolder(state) && state.namespaceIdentities==identities,
+            "cached namespace revisit lost its canonical selection snapshot");
+        Check(CaptureNativeSelection(state,true),"cached namespace selection setup"); pump();
+        Check(state.visible && state.selectedFlags[7] && state.selectedFlags[70],"cached revisit detached after selection import");
+    }
     // A completion computed against an obsolete row snapshot retries rather
     // than applying keys to a later publication or revealing native Explorer.
     Check(CaptureNativeSelection(state,true),"stale namespace snapshot setup");
@@ -132,5 +135,6 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     state.nativeSelectionObservedCount=-1; state.nativeSelectionObservedPaths.clear();
     state.selectedFlags.assign(state.total,0); state.selected=state.anchor=-1;
     UpdateMetrics(state); state.scrollNow=state.scrollTarget=0; g_smooth=smooth;
-    std::cout<<"PASS: large Recycle Bin grid zoom with binary-different canonical selection/focus PIDLs, duplicate labels, small selection echoes, shared background import, stale snapshots and cancellation; private fixtures only\n";
+    std::cout<<"PASS: "<<(delegated ? "filesystem-addressed provider with mixed path/opaque keys" : "Recycle Bin")
+        <<" grid zoom, binary-different canonical selection/focus PIDLs, duplicate labels, small echoes, background import, stale snapshots and cancellation; private fixtures only\n";
 }

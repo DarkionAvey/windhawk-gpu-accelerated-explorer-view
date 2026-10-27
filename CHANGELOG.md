@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.248
+
+- Use the native default action for Shell-provider items, including nested
+  archives and folders inside containers.
+- Keep the GPU view available in provider subfolders without filesystem paths,
+  including after switching to native view and back.
+- Preserve provider folder identities through refresh, columns and change watching.
+
+## 0.9.247
+
+- Keep selection and focus stable in ZIP and other Shell-provider folders
+  when Explorer reports the selected items back to the GPU view.
+- Restore item context menus by matching provider identities instead of
+  assuming every item has a filesystem path.
+
+## 0.9.246
+
+- Show the Shell provider's contents for folders that delegate their view,
+  instead of listing the physical wrapper directory's files.
+- Preserve native item identities and watch the delegated target for changes.
+
 ## 0.9.245
 
 - Fix rapid scrollbar track clicks followed by thumb dragging, including

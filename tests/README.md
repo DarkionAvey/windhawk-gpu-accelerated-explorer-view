@@ -54,6 +54,20 @@ with native HICON pixels and transparent PNG references, plus GPU edge pixels
 on dark/light backgrounds, RTL/LTR, Cut opacity and 24..256px sizes. Set
 `GPU_OVERLAY_ICON_ALPHA_PREVIEW` to a PNG output path for a comparison image.
 See the [alpha investigation](../docs/icon-alpha-0.9.240.md).
+`--shell-provider` compares a private folder shortcut's items with its Shell
+provider, including native identities, metadata, selection, hidden and empty
+targets, sorting, and target change watching. It also runs under `--filesystem`.
+`--provider-navigation` exercises real private provider hierarchies, including
+nested archives, deep and empty folders, Unicode, return navigation, native/GPU
+toggles, refresh, column catalogs, PIDL watches, and stale selection cancellation.
+Default menus are native; command invocation is captured. Deeper archive roots
+use private materialized copies so no associated application is launched.
+
+`--provider-selection` uses real offscreen ExplorerBrowser views of private
+archives, delegated folders and ordinary directories. It checks selection and
+focus in Details/List/grid, repeated echoes, external and bulk selection, and
+GPU context-menu preparation with popup tracking intercepted. `--selection`
+also checks mixed path/opaque provider keys and alternate canonical PIDLs.
 `--drive-bars` checks remaining-space inline tracks, wide/narrow resizing,
 intrinsic label/font updates, fitting at standard/custom DPI, canonical
 source versus live column bounds, moved Name columns, LTR/RTL, reversal and the

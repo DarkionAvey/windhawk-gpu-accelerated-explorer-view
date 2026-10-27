@@ -297,6 +297,7 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
     state.folderView.Attach(native);
     if (!entireDirectory) {
         TestRecycleSelectionZoom(state,*native);
+        TestRecycleSelectionZoom(state,*native,true);
         TestSelectionRecovery(state,*native);
         TestModalSelectionTransaction(state,*native);
         TestSelectionGestures(state, *native);
