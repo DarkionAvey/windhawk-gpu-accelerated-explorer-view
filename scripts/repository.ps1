@@ -169,7 +169,7 @@ function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
             $history += Get-Item -LiteralPath $archivedLegacy
         }
         foreach ($obsolete in ($history | Sort-Object { Get-ModVersion $_.FullName } -Descending |
-            Select-Object -Skip 5)) {
+            Select-Object -Skip 15)) {
             Remove-Item -LiteralPath $obsolete.FullName
         }
     } finally {

@@ -1,11 +1,5 @@
 # Changelog
 
-## 0.9.246
-
-- Open item context menus through Explorer's own Shell view, preserving its
-  commands, installed menu customizations and submenu handling for single and
-  multiple selections, including Rename when Explorer offers it.
-
 ## 0.9.245
 
 - Fix rapid scrollbar track clicks followed by thumb dragging, including

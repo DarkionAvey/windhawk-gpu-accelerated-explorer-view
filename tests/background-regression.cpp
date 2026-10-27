@@ -631,7 +631,6 @@ static void TestSortDetails(const std::wstring& directory) {
             const auto& entry = state.entries[i];
             for (size_t k = 0; k < keys.size(); ++k) {
                 const auto* value = ColumnCellText(entry, keys[k], state.columnEpoch, state.propertyEpoch);
-                if(!value || *value!=expected(entry,k)) std::wcout<<L"DETAIL mismatch name="<<entry.name<<L" key="<<k<<L" actual="<<(value ? *value : L"<null>")<<L" expected="<<expected(entry,k)<<L" cells="<<entry.cells.size()<<L" epoch="<<state.columnEpoch<<L" property="<<state.propertyEpoch<<std::endl;
                 Check(value && *value == expected(entry, k),
                       "sort discarded a previously resolved property before the first paint");
             }
@@ -721,7 +720,6 @@ static void TestSortDetails(const std::wstring& directory) {
         for(int i : VisibleItemRows(state,12.f))
             for(size_t k=0;k<keys.size();++k) {
                 const auto* text=ColumnCellText(state.entries[i],keys[k],state.columnEpoch,state.propertyEpoch);
-                if(!text || *text!=expected(state.entries[i],k)) std::wcout<<L"REFRESH mismatch name="<<state.entries[i].name<<L" key="<<k<<L" actual="<<(text ? *text : L"<null>")<<L" expected="<<expected(state.entries[i],k)<<L" cells="<<state.entries[i].cells.size()<<std::endl;
                 Check(text && *text==expected(state.entries[i],k),"smart refresh blanked or replaced a displayed cell before revalidation");
             }
     };
@@ -1751,7 +1749,6 @@ static void TestPreviewInput() {
 #include "adaptive-image-smoke.h"
 #include "large-tile-smoke.h"
 #include "icon-alpha-smoke.h"
-#include "context-menu-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1840,8 +1837,6 @@ int wmain(int argc,wchar_t** argv) {
             Check(frame!=nullptr,"live sort frame");
             TestLiveSorting(frame,fixture.wstring());
             DestroyWindow(frame);
-        } else if (argc>1 && wcscmp(argv[1],L"--context-menu")==0) {
-            TestNativeItemMenus(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--selection")==0) {
             TestNativeSuppression();
             WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
@@ -1900,7 +1895,6 @@ int wmain(int argc,wchar_t** argv) {
         TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
         TestStatusButtonLayout();
         TestUserOptions();
-        TestNativeItemMenus(fixture.wstring());
         TestClippingPreflight();
         TestResizeAutoRefit();
         TestColumnMinimumWidths();

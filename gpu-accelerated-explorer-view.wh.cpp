@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.246
+// @version         0.9.245
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -404,6 +404,7 @@ constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
+constexpr UINT kMsgBeginRename = WM_APP + 48;
 // Safety net for builds that update the native list without a WinEvent or
 // posted settings broadcast. Runs on the existing idle timer, not a new timer.
 constexpr ULONGLONG kVisibilityFallbackProbeMs = 1200;
@@ -1501,9 +1502,9 @@ struct CallbackObjectLifetime {
 // API hooks can remain inside Explorer/USER after every overlay has gone.
 // Drain these only AFTER Windhawk removes detours, in Wh_ModUninit. Waiting
 // before removal would admit new calls indefinitely (including modal loops).
-enum class ApiHook { Dispatch, Accelerator, Show, ShowAsync, Position, DeferredPosition, StructureEvent, Popup, PopupEx, Count };
+enum class ApiHook { Dispatch, Accelerator, Show, ShowAsync, Position, DeferredPosition, StructureEvent, Count };
 constexpr const wchar_t* kApiHookNames[]{L"DispatchMessageW",L"TranslateAcceleratorW",
-    L"ShowWindow",L"ShowWindowAsync",L"SetWindowPos",L"DeferWindowPos",L"UiaRaiseStructureChangedEvent",L"TrackPopupMenu",L"TrackPopupMenuEx"};
+    L"ShowWindow",L"ShowWindowAsync",L"SetWindowPos",L"DeferWindowPos",L"UiaRaiseStructureChangedEvent"};
 std::array<std::atomic<unsigned>,static_cast<size_t>(ApiHook::Count)> g_apiCallbacks{};
 struct ApiCallbackGuard {
     std::atomic<unsigned>& count;
@@ -19489,112 +19490,167 @@ void ClearSelectionForFolderMenu(ViewState& state) {
     Redraw(state);
 }
 
-// Explorer owns item menu construction, flags, site services, popup messages
-// and invocation. Request its selection menu without hit-testing the suppressed
-// native viewport; supply only the visible GPU anchor to its root popup.
-struct NativeItemMenuAnchor;
-thread_local NativeItemMenuAnchor* t_nativeItemMenuAnchor=nullptr;
-decltype(&TrackPopupMenu) g_trackPopupMenuOriginal=TrackPopupMenu;
-decltype(&TrackPopupMenuEx) g_trackPopupMenuExOriginal=TrackPopupMenuEx;
-struct NativeItemMenuAnchor {
-    HWND owner, native;
-    unsigned long long lifetime, token;
-    POINT screen;
-    bool tracked=false;
-    NativeItemMenuAnchor* previous=t_nativeItemMenuAnchor;
-    NativeItemMenuAnchor(const ViewState& s,POINT p) : owner(s.hwnd),native(s.nativeHwnd),
-        lifetime(s.lifetimeToken),token(s.token),screen(p) { t_nativeItemMenuAnchor=this; }
-    ~NativeItemMenuAnchor() { t_nativeItemMenuAnchor=previous; }
-    bool Current() const {
-        const auto* s=State(owner);
-        return s && s->lifetimeToken==lifetime && s->token==token && s->nativeHwnd==native &&
-            s->visible && s->inScope && !s->optimisticStartedAt && TabOwnsActiveView(*s) &&
-            !g_unloading.load(std::memory_order_acquire);
+// Get *relative* PIDLs from the Shell folder actually shown by this tab.
+// The previous code mixed absolute SHParseDisplayName PIDLs with ILFindLastID,
+// and left Explorer's native selection unsynchronized. Certain commands then
+// acted on the parent folder instead of the selected files.
+void ContextMenu(ViewState& state, int index, POINT screen) {
+    if (!state.folder || !state.folderView || index < 0 || index >= state.total) return;
+    const bool clickedSelected = index < static_cast<int>(state.selectedFlags.size()) &&
+        state.selectedFlags[static_cast<size_t>(index)] != 0;
+    if (!clickedSelected) Select(state, index); // Context-menu mouse selection fades.
+    if (state.pendingNativeSelection) {
+        state.pendingSelectionContextMenu = true;
+        state.pendingSelectionContextPoint = MAKELPARAM(screen.x, screen.y);
+        return;
     }
-};
-bool AnchorNativeItemMenu(HWND owner,int& x,int& y) {
-    auto* anchor=t_nativeItemMenuAnchor;
-    // Do not reposition submenus, later extension popups, or other owners.
-    if (!anchor || anchor->native!=owner || anchor->tracked) return true;
-    if (!anchor->Current()) return false;
-    anchor->tracked=true; x=anchor->screen.x; y=anchor->screen.y;
-    return true;
-}
-BOOL WINAPI NativeTrackPopupMenuHook(HMENU menu,UINT flags,int x,int y,int reserved,HWND owner,const RECT* exclude) {
-    ApiCallbackGuard callback(ApiHook::Popup);
-    if (!AnchorNativeItemMenu(owner,x,y)) return FALSE;
-    return g_trackPopupMenuOriginal(menu,flags,x,y,reserved,owner,exclude);
-}
-BOOL WINAPI NativeTrackPopupMenuExHook(HMENU menu,UINT flags,int x,int y,HWND owner,LPTPMPARAMS parameters) {
-    ApiCallbackGuard callback(ApiHook::PopupEx);
-    if (!AnchorNativeItemMenu(owner,x,y)) return FALSE;
-    return g_trackPopupMenuExOriginal(menu,flags,x,y,owner,parameters);
-}
-
-void ContextMenu(ViewState& state,int index,POINT screen) {
-    if (!state.folder || !state.folderView || !state.shellBrowser || index<0 || index>=state.total ||
-        !state.visible || !state.inScope || !state.loaded || state.namesPreview ||
-        !TabOwnsActiveView(state) || !IsWindow(state.nativeHwnd)) return;
-    const HWND owner=state.hwnd,target=state.nativeHwnd;
-    const auto lifetime=state.lifetimeToken,token=state.token;
-    const auto view=state.folderView;
-    const auto browser=state.shellBrowser;
-    const std::wstring directory=state.folderPath;
-    const auto current=[&] {
-        const auto* live=State(owner);
-        return live==&state && live->lifetimeToken==lifetime && live->token==token &&
-            live->nativeHwnd==target && live->folderView.Get()==view.Get() && live->visible && live->inScope &&
-            !live->optimisticStartedAt && TabOwnsActiveView(*live) && !g_unloading.load(std::memory_order_acquire);
-    };
-    const auto defer=[&] {
-        state.pendingSelectionContextMenu=true;
-        state.pendingSelectionContextPoint=MAKELPARAM(screen.x,screen.y);
-    };
-    if (index>=static_cast<int>(state.selectedFlags.size()) || !state.selectedFlags[size_t(index)]) Select(state,index);
-    if (!current()) return;
-    if (state.pendingNativeSelection) { defer(); return; }
     if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
-    ComPtr<IShellView> native;
-    HWND active=nullptr;
-    if (FAILED(browser->QueryActiveShellView(&native)) || !current() || !native ||
-        FAILED(native->GetWindow(&active)) || !current() || active!=target) return;
-    std::wstring path;
-    ComPtr<IShellFolder> folder;
-    if (!GetFolderPath(view.Get(),path,folder) || !current() ||
-        _wcsicmp(path.c_str(),directory.c_str()) || !IsSupportedLocation(path)) return;
-    const auto selectedCount=static_cast<size_t>(std::count_if(state.selectedFlags.begin(),state.selectedFlags.end(),
-        [](unsigned char flag) { return flag!=0; }));
-    if (!selectedCount) return; // A failed selection must never become a folder menu.
-    if (selectedCount<=kMaxDirectNativeSelectionItems) {
-        if (!SyncNativeSelection(state) || !current()) return;
-        // The filesystem commit already verifies exact identities. This PC's
-        // best-effort synchronization also needs proof before a native menu.
-        if (state.thisPcGpu) {
-            PidlSelection expected;
-            if (!CollectSelectedPidls(state,expected) || !current() ||
-                !VerifyNativeSelection(state,expected) || !current()) return;
-        }
-    } else {
-        // Ctrl+A and prepared marquee groups already own native selection.
-        // Never resolve thousands of filenames again on the UI thread.
-        int count=-1;
-        const auto hr=view->ItemCount(SVGIO_SELECTION,&count);
-        if (!current()) return;
-        if (FAILED(hr) || count<0 || static_cast<size_t>(count)!=selectedCount) {
+
+    // A native Ctrl+A can select tens of thousands of items without ever
+    // enumerating their PIDLs in the GPU overlay. Never undo that by parsing
+    // every filename just because the user right-clicked one selected row.
+    const size_t selectedCount = static_cast<size_t>(std::count_if(
+        state.selectedFlags.begin(), state.selectedFlags.end(),
+        [](unsigned char flag) { return flag != 0; }));
+    if (selectedCount > kMaxDirectNativeSelectionItems) {
+        int nativeCount = -1;
+        ComPtr<IShellView> nativeView;
+        ComPtr<IContextMenu> nativeMenu;
+        if (SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount)) &&
+            nativeCount >= 0 && static_cast<size_t>(nativeCount) == selectedCount &&
+            state.shellBrowser && SUCCEEDED(state.shellBrowser->QueryActiveShellView(
+                nativeView.GetAddressOf())) && nativeView &&
+            SUCCEEDED(nativeView->GetItemObject(SVGIO_SELECTION,
+                IID_PPV_ARGS(&nativeMenu))) && nativeMenu) {
+            HMENU popup = CreatePopupMenu();
+            if (popup) {
+                if (SUCCEEDED(nativeMenu->QueryContextMenu(
+                        popup, 0, 1, 0x7FFF, CMF_NORMAL))) {
+                    const UINT command = TrackPopupMenuEx(popup,
+                        ShellMenuFlags(state),
+                        screen.x, screen.y, state.hwnd, nullptr);
+                    if (command) {
+                        CMINVOKECOMMANDINFOEX invoke{};
+                        invoke.cbSize = sizeof(invoke);
+                        invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+                        invoke.hwnd = state.nativeHwnd;
+                        invoke.lpVerb = MAKEINTRESOURCEA(command - 1);
+                        invoke.lpVerbW = MAKEINTRESOURCEW(command - 1);
+                        invoke.nShow = SW_SHOWNORMAL;
+                        invoke.ptInvoke = screen;
+                        TabTraceSlowScope commandTrace(L"Shell selected-item command", state.hwnd);
+                        const HRESULT hr = InvokeShellSelectionCommand(state,nativeMenu.Get(),
+                            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
+                        if (FAILED(hr)) Wh_Log(
+                            L"[GPU selection] bulk context command failed hr=0x%08X",
+                            static_cast<unsigned>(hr));
+                    }
+                }
+                DestroyMenu(popup);
+            }
+        } else {
+            // If the native selection is not verified, do not expose a context
+            // menu whose Delete/Properties could apply to a different group.
+            Wh_Log(L"[GPU selection] bulk context menu refused: gpu=%zu native=%d",
+                selectedCount, nativeCount);
             ReconcileFailedNativeSelection(state);
-            if (current() && state.pendingNativeSelection) defer();
-            return;
+            if (state.pendingNativeSelection) {
+                state.pendingSelectionContextMenu=true;
+                state.pendingSelectionContextPoint=MAKELPARAM(screen.x,screen.y);
+            }
+        }
+        return;
+    }
+
+    std::vector<PITEMID_CHILD> ownedPidls;
+    std::vector<PCUITEMID_CHILD> children;
+    std::wstring current;
+    ComPtr<IShellFolder> actualFolder;
+    if (!GetFolderPath(state.folderView.Get(), current, actualFolder) ||
+        _wcsicmp(current.c_str(), state.folderPath.c_str()) != 0 ||
+        !IsSupportedLocation(current)) return;
+    for (int i = 0; i < state.total; ++i) {
+        if (i >= static_cast<int>(state.selectedFlags.size()) ||
+            !state.selectedFlags[static_cast<size_t>(i)]) continue;
+        PITEMID_CHILD child = nullptr;
+        EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
+        if (child) {
+            ownedPidls.push_back(child);
+            children.push_back(child);
         }
     }
-    if (!current() || state.pendingNativeSelection || state.nativeSelectionUnsafe ||
-        state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
-    TabTraceSlowScope trace(L"native selected-item menu",owner);
-    NativeFileCommandScope command(&state);
-    if (!current()) return;
-    NativeItemMenuAnchor anchor(state,screen);
-    SendMessageW(target,WM_CONTEXTMENU,reinterpret_cast<WPARAM>(target),-1);
-    // Existing editor handoff also covers extension commands entering Rename.
-    if (current() && NativeRenameEditor(state,GetFocus())) AdoptNativeRenameEditor(state,GetFocus());
+    if (children.empty()) return;
+
+    // Sync the native selection even if the user never opened a menu before.
+    // The overlay's marquee and Ctrl-selection already call this on commit.
+    if (!state.thisPcGpu && !SyncNativeSelection(state)) {
+        // Never invoke a native command on a possibly stale selection. This
+        // could otherwise run Properties/Delete on the containing folder.
+        Wh_Log(L"[GPU overlay] context menu refused: native selection not synchronized");
+        for (auto p : ownedPidls) CoTaskMemFree(p);
+        return;
+    }
+
+    ComPtr<IContextMenu> menu;
+    if (SUCCEEDED(actualFolder->GetUIObjectOf(state.nativeHwnd,
+        static_cast<UINT>(children.size()), children.data(),
+        IID_IContextMenu, nullptr,
+        reinterpret_cast<void**>(menu.GetAddressOf()))) && menu) {
+        HMENU popup = CreatePopupMenu();
+        if (popup) {
+            if (SUCCEEDED(menu->QueryContextMenu(popup, 0, 1, 0x7FFF, CMF_NORMAL))) {
+                const UINT command = TrackPopupMenuEx(popup,
+                    ShellMenuFlags(state),
+                    screen.x, screen.y, state.hwnd, nullptr);
+                if (command) {
+                    // Property sheets use the selected files' IDataObject
+                    // explicitly, avoiding Explorer's parent-folder fallback.
+                    wchar_t verb[80]{};
+                    const HRESULT verbHr = menu->GetCommandString(
+                        command - 1, GCS_VERBW, nullptr,
+                        reinterpret_cast<LPSTR>(verb), ARRAYSIZE(verb));
+                    bool handled = false;
+                    if (SUCCEEDED(verbHr) && _wcsicmp(verb, L"rename") == 0 &&
+                        children.size() == 1 && !state.thisPcGpu) {
+                        // The native list content remains suppressed. Queue
+                        // only this item's GPU editor AFTER the popup exits.
+                        handled = PostMessageW(state.hwnd, kMsgBeginRename,
+                            static_cast<WPARAM>(index),
+                            static_cast<LPARAM>(state.mouseFolderEpoch)) != FALSE;
+                    }
+                    if (!handled && SUCCEEDED(verbHr) &&
+                        _wcsicmp(verb, L"properties") == 0) {
+                        ComPtr<IDataObject> data;
+                        if (SUCCEEDED(actualFolder->GetUIObjectOf(state.nativeHwnd,
+                            static_cast<UINT>(children.size()), children.data(),
+                            IID_IDataObject, nullptr,
+                            reinterpret_cast<void**>(data.GetAddressOf()))) && data) {
+                            const HRESULT result = SHMultiFileProperties(data.Get(), 0);
+                            handled = true; // no fallback to parent-folder Properties
+                            if (FAILED(result)) Wh_Log(L"[GPU overlay] file Properties failed: 0x%08X", result);
+                        }
+                    }
+                    if (!handled) {
+                        CMINVOKECOMMANDINFOEX invoke{};
+                        invoke.cbSize = sizeof(invoke);
+                        invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+                        invoke.hwnd = state.nativeHwnd;
+                        invoke.lpVerb = MAKEINTRESOURCEA(command - 1);
+                        invoke.lpVerbW = MAKEINTRESOURCEW(command - 1);
+                        invoke.nShow = SW_SHOWNORMAL;
+                        invoke.ptInvoke = screen;
+                        TabTraceSlowScope commandTrace(L"Shell selected-item command", state.hwnd);
+                        const HRESULT result = InvokeShellSelectionCommand(state,menu.Get(),
+                            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
+                        if (FAILED(result))
+                            Wh_Log(L"[GPU overlay] context command failed: 0x%08X", result);
+                    }
+                }
+            }
+            DestroyMenu(popup);
+        }
+    }
+    for (auto p : ownedPidls) CoTaskMemFree(p);
 }
 
 // Explorer-style incremental prefix search. No filesystem reads on keystrokes.
@@ -24610,6 +24666,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             QueueVisibleDataFrame(*s);
         }
         return 0;
+    case kMsgBeginRename:
+        if (s && s->mouseFolderEpoch == static_cast<ULONGLONG>(lParam) &&
+            TabOwnsActiveView(*s))
+            BeginRename(*s, static_cast<int>(wParam));
+        return 0;
     case kMsgNativeRenameEditor:
         if (s && s->token == static_cast<unsigned long long>(lParam))
             AdoptNativeRenameEditor(*s, reinterpret_cast<HWND>(wParam));
@@ -28719,9 +28780,6 @@ BOOL Wh_ModInit() {
         !WindhawkUtils::SetFunctionHook(DeferWindowPos, NativeDeferWindowPosHook, &g_deferWindowPosOriginal))
         return failedInitialization();
     if (!WindhawkUtils::SetFunctionHook(DispatchMessageW,DispatchHook,&g_dispatchOriginal))
-        return failedInitialization();
-    if (!WindhawkUtils::SetFunctionHook(TrackPopupMenu,NativeTrackPopupMenuHook,&g_trackPopupMenuOriginal) ||
-        !WindhawkUtils::SetFunctionHook(TrackPopupMenuEx,NativeTrackPopupMenuExHook,&g_trackPopupMenuExOriginal))
         return failedInitialization();
     // Some Explorer builds implement list accelerators before DispatchMessage;
     // this small fallback activates only for Ctrl+A on the active native list.
