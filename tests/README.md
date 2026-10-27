@@ -63,6 +63,16 @@ toggles, refresh, column catalogs, PIDL watches, and stale selection cancellatio
 Default menus are native; command invocation is captured. Deeper archive roots
 use private materialized copies so no associated application is launched.
 
+`--paste-focus` routes archive Copy and frame/GPU Paste through a private
+clipboard stand-in backed by a real virtual Shell data object and stream.
+It asserts one command for a queued key across repeated accelerator tables,
+dispatch, WndProc and reentrant menu resolution/invocation. Release/repress in
+one tick, dispatch-only input, pending command deduplication, independent tabs,
+empty/loading destinations, selected folders and editor/modal/stale-view guards
+are covered without changing the user's clipboard or focus. Native command
+invocations are intercepted. The corrected 0.9.250 test fails on 0.9.249;
+the old test incorrectly expected duplicate invocations for the same message.
+
 `--provider-selection` uses real offscreen ExplorerBrowser views of private
 archives, delegated folders and ordinary directories. It checks selection and
 focus in Details/List/grid, repeated echoes, external and bulk selection, and

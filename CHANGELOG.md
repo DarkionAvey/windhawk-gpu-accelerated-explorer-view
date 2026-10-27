@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.250
+
+- Prevent repeated Paste commands when Ctrl+V is handled with Explorer frame
+  focus. Repeated accelerator checks and dispatch share one command per keypress.
+- Apply the same input ownership to recovered Cut, Copy and Delete shortcuts.
+
+## 0.9.249
+
+- Restore Ctrl+V when the Explorer frame or GPU list owns focus, including
+  empty destinations and files copied from archives or other Shell providers.
+- Paste into the active folder without requiring an item selection or changing focus.
+
 ## 0.9.248
 
 - Use the native default action for Shell-provider items, including nested

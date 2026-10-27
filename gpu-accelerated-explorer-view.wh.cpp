@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.248
+// @version         0.9.250
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -2778,6 +2778,10 @@ struct ViewState {
     bool nativeSelectionCommitting = false;
     bool nativeSelectionRecoveryPending = false;
     unsigned nativeFileCommandDepth = 0;
+    // Keep consumption across accelerator tables, dispatch and directory
+    // generations. A key release admits a new press even in the same tick.
+    struct FileKeyInput { MSG message{}; bool consumed = false; };
+    std::array<FileKeyInput,4> nativeFileKeyInputs{};
     // Local selection commits and scrolling own the viewport. Observational
     // Shell echoes cannot re-reveal an unchanged item after the user leaves it.
     bool nativeSelectionViewportOwned = false;
@@ -3240,8 +3244,28 @@ void DrawViewToggle(const ViewState& state, const DRAWITEMSTRUCT& item);
 bool SyncNativeSelection(ViewState& state,
     std::shared_ptr<PreparedNativeSelection> prepared = {});
 void CancelNativeSelectionPreparation(ViewState& state);
-bool IsNativeSelectionKey(const MSG& msg);
-bool HandleNativeSelectionKey(const MSG& msg, ViewState* owner = nullptr);
+bool IsNativeFileKey(const MSG& msg);
+bool HandleNativeFileKey(const MSG& msg, ViewState* owner = nullptr);
+// A forwarded WndProc has no MSG::time, and Shell calls can pump another
+// message before returning. Preserve the original queued input on this stack.
+thread_local const MSG* t_nativeFileKeyMessage = nullptr;
+struct NativeFileKeyMessageScope {
+    MSG message{};
+    const MSG* previous = t_nativeFileKeyMessage;
+    explicit NativeFileKeyMessageScope(const MSG* input) {
+        if (input) message = *input;
+        t_nativeFileKeyMessage = input ? &message : nullptr;
+    }
+    ~NativeFileKeyMessageScope() { t_nativeFileKeyMessage = previous; }
+};
+MSG NativeFileWindowKey(HWND hwnd, UINT message, WPARAM key, LPARAM detail) {
+    if (const auto* input = t_nativeFileKeyMessage;
+        input && input->message == message && input->wParam == key && input->lParam == detail &&
+        GetAncestor(input->hwnd,GA_ROOT) == GetAncestor(hwnd,GA_ROOT)) return *input;
+    MSG input{}; input.hwnd=hwnd; input.message=message; input.wParam=key; input.lParam=detail;
+    input.time=static_cast<DWORD>(GetMessageTime());
+    return input;
+}
 void QueueNativeSelectionHint(ViewState& state, bool revealUnchanged = false);
 void TrySyncLastFolderSelection(ViewState& state);
 void CancelNativeSelectionRestore(ViewState& state) {
@@ -18161,9 +18185,9 @@ HRESULT InvokeShellSelectionCommand(ViewState& state,IContextMenu* menu,LPCMINVO
     return menu->InvokeCommand(invoke);
 }
 
-// Both immediate GPU/frame shortcuts and prepared large selections invoke
-// the same Shell verbs with captured modifiers. No focus change is required.
-HRESULT InvokeNativeSelectionKey(ViewState& state, IShellView* native,
+// Immediate GPU/frame shortcuts and prepared selections share native verbs.
+// Paste belongs to the active folder, independently of any selected items.
+HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
                                  const ViewState::DeferredSelectionKey& key) {
     if (!native) return E_NOINTERFACE;
     PipelineScope pipeline(state.background,L"file.selection.key",key.key,state.token);
@@ -18178,7 +18202,8 @@ HRESULT InvokeNativeSelectionKey(ViewState& state, IShellView* native,
     HRESULT resolved;
     {
         PipelineScope resolve(state.background,L"file.selection.contextMenu",key.key,state.token);
-        resolved=native->GetItemObject(SVGIO_SELECTION,IID_PPV_ARGS(&command));
+        resolved=native->GetItemObject(key.key=='V' ? SVGIO_BACKGROUND : SVGIO_SELECTION,
+            IID_PPV_ARGS(&command));
     }
     if (FAILED(resolved) || !command) return FAILED(resolved) ? resolved : E_NOINTERFACE;
     auto* live=State(owner);
@@ -18189,8 +18214,8 @@ HRESULT InvokeNativeSelectionKey(ViewState& state, IShellView* native,
     CMINVOKECOMMANDINFOEX invoke{};
     invoke.cbSize=sizeof(invoke); invoke.fMask=CMIC_MASK_UNICODE|key.modifiers;
     invoke.hwnd=frame;
-    invoke.lpVerb=key.key==VK_DELETE ? "delete" : key.key=='X' ? "cut" : "copy";
-    invoke.lpVerbW=key.key==VK_DELETE ? L"delete" : key.key=='X' ? L"cut" : L"copy";
+    invoke.lpVerb=key.key==VK_DELETE ? "delete" : key.key=='X' ? "cut" : key.key=='V' ? "paste" : "copy";
+    invoke.lpVerbW=key.key==VK_DELETE ? L"delete" : key.key=='X' ? L"cut" : key.key=='V' ? L"paste" : L"copy";
     invoke.nShow=SW_SHOWNORMAL;
     if (key.key == VK_RETURN) {
         // Ask the selected Shell group for its default command: it may be
@@ -18211,7 +18236,7 @@ HRESULT InvokeNativeSelectionKey(ViewState& state, IShellView* native,
         invoke.lpDirectoryW=IsTargetPath(directory) && !live->namespaceIdentities ? directory.c_str() : nullptr;
         return command->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
     }
-    TabTraceSlowScope trace(L"Shell selected-file shortcut",owner);
+    TabTraceSlowScope trace(L"Shell file shortcut",owner);
     PipelineScope invocation(live->background,L"file.selection.invoke",key.key,viewToken);
     return command->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
 }
@@ -19171,7 +19196,7 @@ void Open(ViewState& state, int index) {
             state.shellBrowser->QueryActiveShellView(&native);
         auto* live=State(owner);
         if (!live || live->token!=token || live->lifetimeToken!=lifetime) return;
-        const HRESULT hr=InvokeNativeSelectionKey(*live,native.Get(),key);
+        const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
         if (FAILED(hr)) Wh_Log(L"[GPU selection] default command failed hr=0x%08X",static_cast<unsigned>(hr));
         return;
     }
@@ -23085,7 +23110,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         ForceRefresh(*s);
         return 0;
     }
-    // Provisional rows never commit native selection or file mutations. A
+    if (s && (msg == WM_KEYUP || msg == WM_SYSKEYUP))
+        HandleNativeFileKey(NativeFileWindowKey(hwnd,msg,wParam,lParam),s);
+    // Folder Paste needs a confirmed view, but no completed row/selection
+    // snapshot. Reuse the file-command handler before the row input gate.
+    if (s && msg == WM_KEYDOWN && wParam == 'V') {
+        const MSG key=NativeFileWindowKey(hwnd,msg,wParam,lParam);
+        if (IsNativeFileKey(key)) {
+            DiscardCompletedMouseClick(*s);
+            if (HandleNativeFileKey(key,s)) return 0;
+        }
+    }
+    // Provisional rows never commit native selection or row-based mutations. A
     // folder double-click uses the same completed-click validator as full rows.
     const bool preview = s && ((s->namesPreview && !s->loaded) ||
         (s->thisPcGpu && !ShellRowsInteractive(*s)));
@@ -23481,7 +23517,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (!native || !IsWindow(target) || !live ||
                         live->token != viewToken || live->nativeHwnd != target ||
                         !GpuSelectionMatches(*live, *prepared)) break;
-                    const HRESULT hr = InvokeNativeSelectionKey(*live,native.Get(),key);
+                    const HRESULT hr = InvokeNativeFileKey(*live,native.Get(),key);
                     if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred native command failed hr=0x%08X",
                         static_cast<unsigned>(hr));
                 }
@@ -25010,8 +25046,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         if (s) {
-            MSG key{}; key.hwnd=hwnd; key.message=msg; key.wParam=wParam; key.lParam=lParam;
-            if (HandleNativeSelectionKey(key,s)) return 0;
+            const MSG key=NativeFileWindowKey(hwnd,msg,wParam,lParam);
+            if (HandleNativeFileKey(key,s)) return 0;
             const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             // File Explorer's selection accelerators must operate on the GPU
@@ -27591,7 +27627,7 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
     }
     if (msg.message != WM_KEYDOWN) return false;
     if (GetKeyState(VK_MENU) & 0x8000) return false;
-    if (IsNativeSelectionKey(msg)) return true;
+    if (IsNativeFileKey(msg)) return true;
     if (IsKeyboardMovementKey(static_cast<UINT>(msg.wParam), grid))
         return true; // Includes Shift ranges and Ctrl focus-only movement.
     switch (msg.wParam) {
@@ -27640,7 +27676,7 @@ HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
         if (frameOnly) return nullptr;
         // A genuinely focused native list keeps its own file-command path.
         // Only frame/GPU focus requires our selection-verb fallback.
-        if (IsNativeSelectionKey(msg)) return nullptr;
+        if (IsNativeFileKey(msg)) return nullptr;
         for (int depth = 0; native && depth < 8; ++depth) {
             overlay = reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty));
             if (overlay) break;
@@ -27697,34 +27733,78 @@ void NoteNativeNewFolderShortcut(const MSG& msg) {
     ArmInteractiveCreation(*state, 1, L"Ctrl+Shift+N");
 }
 
-// Native-owned shortcuts remain native; frame/GPU-owned shortcuts invoke the
-// same selected-group verbs. Both retain commands until pending PIDLs commit.
-bool IsNativeSelectionKey(const MSG& msg) {
+// Native-owned shortcuts remain native. Frame/GPU shortcuts use the active
+// view's selected group or folder, without moving focus or reading clipboard
+// formats. The Shell retains deferred/virtual data such as archive contents.
+bool IsNativeFileKey(const MSG& msg) {
     if (msg.message != WM_KEYDOWN) return false;
     if (GetKeyState(VK_MENU) & 0x8000) return false;
     const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     return msg.wParam==VK_DELETE || (control && !(GetKeyState(VK_SHIFT)&0x8000) &&
-        (msg.wParam=='C' || msg.wParam=='X'));
+        (msg.wParam=='C' || msg.wParam=='X' || msg.wParam=='V'));
 }
 
-bool HandleNativeSelectionKey(const MSG& msg, ViewState* owner) {
-    if (g_unloading.load(std::memory_order_relaxed) || !IsNativeSelectionKey(msg)) return false;
-    wchar_t cls[32]{};
-    if (GetClassNameW(msg.hwnd, cls, ARRAYSIZE(cls)) && _wcsicmp(cls, L"Edit") == 0)
-        return false;
-    const auto handle = [&](ViewState& state, bool direct) {
-        if (!state.visible || state.optimisticStartedAt || !ShellRowsInteractive(state) ||
+int NativeFileKeyIndex(WPARAM key) {
+    switch (key) { case VK_DELETE: return 0; case 'C': return 1; case 'X': return 2; case 'V': return 3; }
+    return -1;
+}
+bool SameNativeFileKeyInput(const MSG& a, const MSG& b) {
+    return a.message==b.message && a.wParam==b.wParam && a.lParam==b.lParam && a.time==b.time;
+}
+struct NativeFileKeyClaim;
+thread_local const NativeFileKeyClaim* t_nativeFileKeyClaim = nullptr;
+struct NativeFileKeyClaim {
+    HWND owner;
+    unsigned long long lifetime;
+    MSG input;
+    const NativeFileKeyClaim* previous = t_nativeFileKeyClaim;
+    NativeFileKeyClaim(ViewState& state, const MSG& msg, int index) :
+        owner(state.hwnd), lifetime(state.lifetimeToken), input(msg) {
+        state.nativeFileKeyInputs[index]={msg,true};
+        t_nativeFileKeyClaim=this; // Reserve before ANY Shell call can reenter.
+    }
+    ~NativeFileKeyClaim() { t_nativeFileKeyClaim=previous; }
+};
+bool NativeFileKeyConsumed(const ViewState& state, const MSG& msg, int index) {
+    const auto& last=state.nativeFileKeyInputs[index];
+    if (last.consumed && SameNativeFileKeyInput(last.message,msg)) return true;
+    // A modal loop can release/repress the key and replace the last input
+    // while the earlier command is still on the stack.
+    for (auto* active=t_nativeFileKeyClaim; active; active=active->previous)
+        if (active->owner==state.hwnd && active->lifetime==state.lifetimeToken &&
+            SameNativeFileKeyInput(active->input,msg)) return true;
+    return false;
+}
+bool HandleNativeFileKey(const MSG& msg, ViewState* owner) {
+    if (g_unloading.load(std::memory_order_relaxed)) return false;
+    const int index=NativeFileKeyIndex(msg.wParam);
+    const bool released=msg.message==WM_KEYUP || msg.message==WM_SYSKEYUP;
+    if (index<0 || (msg.message!=WM_KEYDOWN && !released)) return false;
+    const bool paste = msg.wParam=='V';
+    const auto handle = [&](ViewState& state, bool direct, bool frame = false) {
+        if (released) { state.nativeFileKeyInputs[index].consumed=false; return false; }
+        // Consumption survives focus/modifier/navigation changes made inside
+        // the command. Letting a replay fall through could invoke native Paste.
+        if (NativeFileKeyConsumed(state,msg,index)) return true;
+        if (!IsNativeFileKey(msg)) return false;
+        wchar_t cls[32]{};
+        if (GetClassNameW(msg.hwnd,cls,ARRAYSIZE(cls)) && _wcsicmp(cls,L"Edit")==0) return false;
+        if (frame && OverlayKeyboardTarget(msg,true)!=state.hwnd) return false;
+        if (!state.visible || state.optimisticStartedAt || (!paste && !ShellRowsInteractive(state)) ||
             (direct && (!OverlayHasInputFocus(state) || !TabOwnsActiveView(state)))) return false;
-        if (!state.pendingNativeSelection && (state.nativeSelectionUnsafe ||
-            state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh)) return true;
-        if (!direct && !state.pendingNativeSelection) return false;
+        if (paste && !direct) return false; // Focused native lists keep their Paste accelerator.
+        if (!paste && !direct && !state.pendingNativeSelection && !state.nativeSelectionUnsafe &&
+            !state.nativeSelectionImportPending && !state.nativeSelectionAwaitingRefresh) return false;
         if (msg.lParam & (1LL<<30)) return true;
+        NativeFileKeyClaim claim(state,msg,index);
+        if (!paste && !state.pendingNativeSelection && (state.nativeSelectionUnsafe ||
+            state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh)) return true;
         ViewState::DeferredSelectionKey key;
         key.key=msg.wParam;
         if (GetKeyState(VK_CONTROL)&0x8000) key.modifiers|=CMIC_MASK_CONTROL_DOWN;
         if (GetKeyState(VK_SHIFT)&0x8000) key.modifiers|=CMIC_MASK_SHIFT_DOWN;
-        if (state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(key); return true; }
-        if (std::none_of(state.selectedFlags.begin(),state.selectedFlags.end(),
+        if (!paste && state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(key); return true; }
+        if (!paste && std::none_of(state.selectedFlags.begin(),state.selectedFlags.end(),
             [](unsigned char flag) { return flag!=0; })) return true;
         ComPtr<IShellView> native;
         const HWND hwnd=state.hwnd, target=state.nativeHwnd;
@@ -27734,11 +27814,16 @@ bool HandleNativeSelectionKey(const MSG& msg, ViewState* owner) {
         auto* live=State(hwnd);
         if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
             live->nativeHwnd!=target) return true;
-        const HRESULT hr=InvokeNativeSelectionKey(*live,native.Get(),key);
+        const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
         if (FAILED(hr)) Wh_Log(L"[GPU selection] file shortcut failed key=0x%X hr=0x%08X",key.key,static_cast<unsigned>(hr));
         return true;
     };
     if (owner) return handle(*owner,true);
+    // Resolve GPU HWNDs only through the trusted tab registry. An arbitrary
+    // control's USERDATA must never be interpreted as a ViewState.
+    const HWND gpu = OverlayUnder(GetAncestor(msg.hwnd,GA_ROOT));
+    if (gpu && (gpu==msg.hwnd || IsExplorerFrame(msg.hwnd)))
+        if (auto* state=State(gpu)) return handle(*state,true,msg.hwnd!=gpu);
     for (HWND window = msg.hwnd; window; window = GetParent(window)) {
         HWND overlay = reinterpret_cast<HWND>(GetPropW(window, kOverlayProperty));
         ViewState* state = overlay && IsWindow(overlay) ? State(overlay) : nullptr;
@@ -27812,7 +27897,7 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
         DispatchMessageW(&renamedInput);
         return TRUE; // Consumed exactly once; Explorer's MSG stays untouched.
     }
-    if (msg && HandleNativeSelectionKey(*msg)) return TRUE;
+    if (msg && HandleNativeFileKey(*msg)) return TRUE;
     if (msg) NoteNativeNewFolderShortcut(*msg);
     // Frame-targeted list keys may be consumed before DispatchMessage. Use the
     // same resolver there as a fallback for message loops without accelerators.
@@ -27912,6 +27997,7 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
 
 int WINAPI TranslateAcceleratorHook(HWND hwnd, HACCEL accelerator, LPMSG msg) {
     ApiCallbackGuard callback(ApiHook::Accelerator);
+    NativeFileKeyMessageScope input(msg);
     InputFrameCompletion completion(msg);
     const int result = TranslateAcceleratorInput(hwnd,accelerator,msg);
     completion.completed = result != 0;
@@ -27980,6 +28066,7 @@ DispatchThreadState* CurrentDispatchThreadState() {
 
 LRESULT WINAPI DispatchHook(const MSG* msg) {
     ApiCallbackGuard callback(ApiHook::Dispatch);
+    NativeFileKeyMessageScope input(msg);
     if (g_unloading.load(std::memory_order_acquire)) return g_dispatchOriginal(msg);
     MSG renamedInput{};
     if (msg && RouteNativeRenameMessage(*msg, renamedInput)) return g_dispatchOriginal(&renamedInput);
@@ -27998,7 +28085,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     if (pipelineOwner) pipelineDispatch.emplace(pipelineOwner,L"dispatch.total",msg->message,reinterpret_cast<ULONG_PTR>(msg->hwnd));
     MessageProfileScope profileMessage(L"dispatch",msg ? msg->hwnd : nullptr,
         msg ? msg->message : 0,msg ? msg->wParam : 0);
-    if (msg && HandleNativeSelectionKey(*msg)) return 0;
+    if (msg && HandleNativeFileKey(*msg)) return 0;
     if (msg) NoteNativeNewFolderShortcut(*msg);
     // Posted by the process-local cold-start WinEvent observer, including
     // external "Show in folder" windows which have not yet received input.

@@ -449,7 +449,7 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
             key.hwnd = state.nativeHwnd; key.message = WM_KEYDOWN; key.wParam = VK_DELETE;
             BYTE savedKeys[256]{}, plainKeys[256]{};
             Check(GetKeyboardState(savedKeys) && SetKeyboardState(plainKeys), "synthetic plain-key setup");
-            const bool deferred = HandleNativeSelectionKey(key);
+            const bool deferred = HandleNativeFileKey(key);
             Check(SetKeyboardState(savedKeys), "synthetic plain-key restoration");
             Check(deferred && state.deferredSelectionKeys.size() == 1,
                   "native command was not deferred behind selection preparation");

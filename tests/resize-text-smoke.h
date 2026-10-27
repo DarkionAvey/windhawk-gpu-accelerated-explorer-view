@@ -1,4 +1,6 @@
 static void TestResizeText(HWND frame) {
+    // The generated Ctrl+wheel/pinch input must not inherit desktop Shift.
+    ModifierFixture::Session modifiers;
     const bool refit = g_autoRefitColumns.exchange(false);
     for(bool rtl : {false,true}) {
         ViewState state;

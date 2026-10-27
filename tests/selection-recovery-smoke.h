@@ -34,7 +34,7 @@ static void TestSelectionRecovery(ViewState& state,SelectionFolderView& native) 
         state.directoryPending=true;
     };
     ViewState::DeferredSelectionKey deletion; deletion.key=VK_DELETE;
-    Check(SUCCEEDED(InvokeNativeSelectionKey(state,shell.Get(),deletion)) && menu->calls.size()==1 &&
+    Check(SUCCEEDED(InvokeNativeFileKey(state,shell.Get(),deletion)) && menu->calls.size()==1 &&
         !state.nativeFileCommandDepth && state.nativeSelectionRecoveryPending,"Delete command did not return with recovery retained");
     menu->duringInvoke={};
     MaybeRecoverNativeSelection(state);
@@ -62,7 +62,7 @@ static void TestSelectionRecovery(ViewState& state,SelectionFolderView& native) 
             "transient empty-selection failure detached or abandoned recovery");
     }
     MSG key{}; key.hwnd=state.hwnd; key.message=WM_KEYDOWN; key.wParam=VK_DELETE;
-    Check(HandleNativeSelectionKey(key,&state) && menu->calls.size()==calls,
+    Check(HandleNativeFileKey(key,&state) && menu->calls.size()==calls,
         "unverified selection recovery authorized a file operation");
     native.rejectSelection=false;
     MaybeRecoverNativeSelection(state);

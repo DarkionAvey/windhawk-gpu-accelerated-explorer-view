@@ -626,8 +626,7 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         SetScrollImmediate(state, state.scrollNow);
         MoveScroll(state, state.scrollTarget);
         Check(state.rowTransitionActive, "no-op viewport update cancelled deletion movement");
-        BYTE savedKeys[256]{}, neutralKeys[256]{};
-        Check(GetKeyboardState(savedKeys) && SetKeyboardState(neutralKeys), "isolated input state");
+        ModifierFixture::Session modifiers;
         if constexpr (requires { state.framePaintPending; }) {
             FrameInputFixture::Session inputQueue;
             const bool perf = g_perf.exchange(true);
@@ -715,11 +714,16 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         SetScrollImmediate(state, 0.f);
         Select(state, 1);
         for (int repeat = 0; repeat < 8; ++repeat) {
-            const float beforeKey = AnimatedSelectionRow(state);
-            OverlayProc(state.hwnd, WM_KEYDOWN, VK_DOWN, 0);
-            Check(state.selected == repeat+2 && state.keyboardSelectionAnimating &&
-                  fabsf(state.keyboardSelectionFromRow-beforeKey) < .04f,
-                  "repeated arrow key restarted the selection from an obsolete position");
+            {
+                // Compare retarget continuity at one instant; thread scheduling
+                // between the sample and input must not advance the old curve.
+                AnimationClockFixture::Freeze instant;
+                const float beforeKey = AnimatedSelectionRow(state);
+                OverlayProc(state.hwnd, WM_KEYDOWN, VK_DOWN, 0);
+                Check(state.selected == repeat+2 && state.keyboardSelectionAnimating &&
+                      fabsf(state.keyboardSelectionFromRow-beforeKey) < .04f,
+                      "repeated arrow key restarted the selection from an obsolete position");
+            }
             state.keyboardSelectionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.012);
             frame();
         }
@@ -770,7 +774,6 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
               "completed segment jumped to its replacement target during retarget");
         StopScrollAnimation(state);
         g_instantScrub = instantScrub;
-        SetKeyboardState(savedKeys);
         SetWindowLongPtrW(state.hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
         SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, 0);
         ShowWindow(state.hwnd, SW_HIDE); ShowWindow(state.frameHwnd, SW_HIDE);

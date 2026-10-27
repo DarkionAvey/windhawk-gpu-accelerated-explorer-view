@@ -38,9 +38,12 @@ class SelectionCommandView final : public IShellView {
     ULONG refs=1;
 public:
     ComPtr<IContextMenu> menu;
+    ComPtr<IContextMenu> backgroundMenu;
+    std::vector<UINT> objects;
     HWND window=nullptr;
     unsigned resolves=0;
     ViewState* navigateDuringResolve=nullptr;
+    std::function<void()> duringResolve;
     explicit SelectionCommandView(IContextMenu* value) : menu(value) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         *out=nullptr; if(iid!=IID_IUnknown && iid!=IID_IShellView && iid!=IID_IOleWindow) return E_NOINTERFACE;
@@ -50,9 +53,11 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { const auto n=--refs; if(!n) delete this; return n; }
     HRESULT STDMETHODCALLTYPE GetWindow(HWND* out) override { *out=window; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetItemObject(UINT flags,REFIID iid,void** out) override {
-        Check(flags==SVGIO_SELECTION,"shortcut did not use the native selected group"); ++resolves;
+        Check(flags==SVGIO_SELECTION || (flags==SVGIO_BACKGROUND && backgroundMenu),"shortcut used an unexpected native command scope");
+        ++resolves; objects.push_back(flags);
+        if(duringResolve) duringResolve();
         if(navigateDuringResolve) ++navigateDuringResolve->token;
-        return menu->QueryInterface(iid,out);
+        return (flags==SVGIO_BACKGROUND ? backgroundMenu : menu)->QueryInterface(iid,out);
     }
 #define UNUSED_VIEW(name,...) HRESULT STDMETHODCALLTYPE name(__VA_ARGS__) override { return E_NOTIMPL; }
     UNUSED_VIEW(ContextSensitiveHelp,BOOL)
@@ -88,7 +93,7 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
             AcknowledgeAnimationFrame(hwnd);
             return 0;
         }
-        if(msg==WM_KEYDOWN || msg==WM_CAPTURECHANGED) return OverlayProc(hwnd,msg,wp,lp);
+        if(msg==WM_KEYDOWN || msg==WM_KEYUP || msg==WM_CAPTURECHANGED) return OverlayProc(hwnd,msg,wp,lp);
         return DefWindowProcW(hwnd,msg,wp,lp);
     }));
     RegisterTabOverlay(frame,frame,gpu);
@@ -112,12 +117,12 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
             key.wParam=VK_DOWN; DispatchHook(&key); key.wParam=VK_UP;
             Check(state.selected==7 && state.selectedFlags[7] && native.selected.size()==1,
                 "frame-targeted dispatch did not select the following Shell item");
-            BYTE plain[256]{};
+            ModifierFixture::Session fileModifiers;
+            auto& plain=fileModifiers.keys;
             for(auto [code,modifier] : {std::pair{UINT(VK_DELETE),UINT(0)},
                     {UINT(VK_DELETE),UINT(VK_SHIFT)},{UINT('C'),UINT(VK_CONTROL)},{UINT('X'),UINT(VK_CONTROL)}}) {
                 if(modifier) plain[modifier]=0x80;
-                Check(SetKeyboardState(plain),"file shortcut modifiers");
-                key.wParam=code;
+                key.wParam=code; ++key.time;
                 const auto count=commands->calls.size();
                 Check(TranslateAcceleratorHook(frame,nullptr,&key)==TRUE && commands->calls.size()==count+1,
                     "title-bar/frame shortcut was highlighted but never reached the Shell");
@@ -125,12 +130,13 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
                     bool(commands->calls.back().second&CMIC_MASK_SHIFT_DOWN)==(modifier==VK_SHIFT),
                     "file shortcut changed its verb or Shift+Delete policy");
                 DispatchHook(&key);
-                Check(commands->calls.size()==count+2,"dispatch fallback lost a frame file shortcut");
+                Check(commands->calls.size()==count+1,"same frame key repeated a file command at dispatch");
                 key.lParam=1LL<<30; TranslateAcceleratorHook(frame,nullptr,&key); key.lParam=0;
-                Check(commands->calls.size()==count+2,"held shortcut repeated a destructive/native command");
+                Check(commands->calls.size()==count+1,"held shortcut repeated a destructive/native command");
+                ++key.time; DispatchHook(&key);
+                Check(commands->calls.size()==count+2,"dispatch-only frame key lost its file command");
                 plain[modifier]=0;
             }
-            Check(SetKeyboardState(plain),"clear file shortcut modifiers");
             commands->defaultSelection=true;
             const auto beforeDefault=commands->calls.size();
             state.selectedFlags[6]=state.selectedFlags[7]=1; state.selected=state.anchor=7;
@@ -171,7 +177,7 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
         Check(commands->calls.size()==count+1,"editor focus invoked a file command");
         FocusFixture::focus=frame; FocusFixture::foreground=edit; untouched();
         FocusFixture::foreground=frame;
-        const auto token=state.token; commandView->navigateDuringResolve=&state;
+        const auto token=state.token; commandView->navigateDuringResolve=&state; ++key.time;
         TranslateAcceleratorHook(frame,nullptr,&key); commandView->navigateDuringResolve=nullptr;
         Check(commands->calls.size()==count+1,"native menu resolution invoked a stale directory's command");
         state.token=token;

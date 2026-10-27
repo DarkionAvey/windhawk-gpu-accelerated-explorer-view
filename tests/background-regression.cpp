@@ -718,16 +718,21 @@ static void TestSortDetails(const std::wstring& directory) {
         return ReceiveDirectoryResults(state);
     };
     seedDetails(); SetScrollImmediate(state,0);
+    int refreshStage = 0;
     const auto checkDisplayed = [&] {
         for(int i : VisibleItemRows(state,12.f))
             for(size_t k=0;k<keys.size();++k) {
                 const auto* text=ColumnCellText(state.entries[i],keys[k],state.columnEpoch,state.propertyEpoch);
+                if (!text || *text!=expected(state.entries[i],k))
+                    std::wcout << L"SMART REFRESH stage=" << refreshStage << L" row=" << i << L" key=" << k
+                        << L" name=" << state.entries[i].name << L" value=" << (text ? *text : L"<missing>") << std::endl;
                 Check(text && *text==expected(state.entries[i],k),"smart refresh blanked or replaced a displayed cell before revalidation");
             }
     };
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     ModifierFixture::Session modifiers;
     for(int mode=0;mode<4;++mode) {
+        refreshStage = mode*10;
         state.gridView=mode==1; state.columnsView=mode==0;
         state.selected=17; state.selectedFlags.assign(state.total,0); state.selectedFlags[17]=1;
         const auto refreshEpoch=state.detailsRefreshEpoch, propertyEpoch=state.propertyEpoch;
@@ -748,12 +753,14 @@ static void TestSortDetails(const std::wstring& directory) {
             "F5/Ctrl+R/menu refresh did not separate freshness from displayed values");
         checkDisplayed();
         Check(!GetUpdateRect(state.hwnd,nullptr,FALSE),"smart refresh invalidated unchanged content at invocation");
+        refreshStage = mode*10+1;
         auto refreshed=WaitForComplete(*state.background,state.directoryToken);
         PublishDirectoryResult(*state.background,std::move(refreshed)); ReceiveDirectoryResults(state);
         state.columnsView=true; QueueVisibleDetails(state);
         Check(state.selected==17 && state.selectedFlags[17],"smart refresh lost selection");
         checkDisplayed();
         if(mode==3) {
+            refreshStage = mode*10+2;
             ForceRefresh(state); // Repeat while the modified row's provider is still blocked.
             auto repeated=WaitForComplete(*state.background,state.directoryToken);
             PublishDirectoryResult(*state.background,std::move(repeated)); ReceiveDirectoryResults(state);
@@ -763,6 +770,7 @@ static void TestSortDetails(const std::wstring& directory) {
             Check(req.missingKeys.size()==4,"smart refresh trusted unverified cached property values");
         },"unchanged names blocked forced metadata retrieval");
         DirectoryResult stale; stale.kind=DirectoryResult::Details; stale.token=state.directoryToken;
+        refreshStage = mode*10+3;
         DetailValue old; old.index=0; old.columnEpoch=previousColumnEpoch;
         old.cells={{PKEY_Author,L"obsolete result"}}; stale.details.push_back(std::move(old));
         PublishDirectoryResult(*state.background,std::move(stale)); ReceiveDirectoryResults(state);
@@ -1754,6 +1762,7 @@ static void TestPreviewInput() {
 #include "shell-provider-smoke.h"
 #include "provider-selection-smoke.h"
 #include "provider-navigation-smoke.h"
+#include "paste-focus-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1869,6 +1878,8 @@ int wmain(int argc,wchar_t** argv) {
             TestProviderSelection(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--provider-navigation")==0) {
             TestProviderNavigation(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--paste-focus")==0) {
+            TestPasteFocus(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--shell-provider")==0) {
             TestShellProviderContents(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--filesystem")==0) {
@@ -1936,6 +1947,7 @@ int wmain(int argc,wchar_t** argv) {
         TestShellProviderContents(fixture.wstring());
         TestProviderSelection(fixture.wstring());
         TestProviderNavigation(fixture.wstring());
+        TestPasteFocus(fixture.wstring());
         TestBurstRowContinuity(fixture.wstring());
         TestSortDetails(fixture.wstring());
         TestRealNativeViewport(fixture.wstring());
