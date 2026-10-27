@@ -132,6 +132,16 @@ resizing through actual attachment. See the
 read-only inspection of running overlay column/readiness state. It requires a
 matching loaded DLL version and never injects or sends input/window messages.
 
+`--selection-ui` checks 1/2/64-item native selection resolution on tab-owned
+workers, blocked-tab independence, silent equal-count replacement, deferred
+Delete, navigation cancellation, immediate empty selection and unchanged idle
+imports without repaint. It also measures duplicate mode reads and checks
+pinned layouts and reentrant view replacement. `--selection-ui-mode` runs the
+mode checks alone.
+`--selection-ui-navigation` follows these checks with real private provider
+navigation to expose interactions between queues and fixtures.
+See the [UI Shell call refinement](../docs/selection-ui-0.9.255.md).
+
 Tests do not install the mod or inject into Explorer. They create private
 temporary fixtures and offscreen windows, substitute clipboard/focus APIs, and
 never implicitly inspect a local D: drive or user folder. OS icon/SysWOW64 and

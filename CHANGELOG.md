@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.255
+
+- Resolve small native selections on the existing per-tab selection worker,
+  with identity checks before applying results or continuing file commands.
+- Avoid an extra initial selection-count query and duplicate successful
+  post-command view-mode reads. Keep empty selection immediate and unchanged
+  idle selections free of extra repaint.
+
 ## 0.9.254
 
 - Replace periodic hidden/protected-item settings checks with coalesced settings

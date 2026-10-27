@@ -35,12 +35,13 @@ public:
     ViewState* state = nullptr;
     std::vector<OwnedPidl> selected;
     OwnedPidl focused;
-    unsigned commits = 0, selectionEnumerations = 0, itemArrayReads = 0;
+    unsigned commits = 0, selectionEnumerations = 0, itemArrayReads = 0, selectionCountReads = 0;
     int allCountOverride=-1;
     bool failSelectionCount=false;
     bool collapseBatches = false, collapseDeselectBatch = false, reenterCapture = true, rejectSelection = false;
     std::function<void()> duringClear;
     HRESULT STDMETHODCALLTYPE ItemCount(UINT flags, int* count) override {
+        if(flags==SVGIO_SELECTION) ++selectionCountReads;
         if(flags==SVGIO_SELECTION && failSelectionCount) return E_PENDING;
         *count = flags == SVGIO_SELECTION ? static_cast<int>(selected.size()) :
             allCountOverride>=0 ? allCountOverride : state->total;
@@ -98,6 +99,15 @@ public:
         return *out ? S_OK : E_FAIL;
     }
 };
+
+static void WaitForPreparedSelection(ViewState& state) {
+    Check(Eventually([&] {
+        MSG message{};
+        while(PeekMessageW(&message,state.hwnd,kMsgPreparedSelection,kMsgPreparedSelection,PM_REMOVE))
+            OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
+        return !state.pendingNativeSelection;
+    },30000),"native selection preparation did not settle");
+}
 
 #include "modal-selection-smoke.h"
 #include "recycle-selection-smoke.h"

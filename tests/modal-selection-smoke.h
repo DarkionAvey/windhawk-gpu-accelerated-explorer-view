@@ -105,7 +105,8 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
     ComPtr<SelectionCommandView> commandView; commandView.Attach(new SelectionCommandView(commands.Get()));
     commandView->window=state.nativeHwnd;
     native.commandView=commandView;
-    const HWND actualForeground=GetForegroundWindow(),actualFocus=GetFocus();
+    const bool previousFocusEnabled=FocusFixture::enabled;
+    const HWND previousForeground=FocusFixture::foreground,previousFocus=FocusFixture::focus;
     {
         FocusFixture::Session session(frame,frame);
         MSG key{}; key.hwnd=frame; key.message=WM_KEYDOWN; key.wParam=VK_UP; key.time=GetTickCount();
@@ -224,7 +225,8 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
         state.framePaintPending=pending; state.frameInputDeferred=deferred;
         state.frameInputDeferredAt=deferredAt;
     }
-    Check(GetForegroundWindow()==actualForeground && GetFocus()==actualFocus,"frame keyboard fixture changed user activation/focus");
+    Check(FocusFixture::enabled==previousFocusEnabled && FocusFixture::foreground==previousForeground &&
+        FocusFixture::focus==previousFocus,"frame keyboard fixture leaked substituted activation/focus");
     native.commandView.Reset();
     g_dispatchOriginal=oldDispatch; g_translateAcceleratorOriginal=oldAccelerator;
     UnregisterTabOverlay(frame,frame,gpu); StopTabVisibilityObserver();
@@ -237,8 +239,7 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
 // Selection callbacks really run during this simulated modal transaction.
 // PIDLs/selection commits are real; no Shell file command is invoked.
 static void TestModalSelectionTransaction(ViewState& state, SelectionFolderView& native) {
-    BYTE keys[256]{}, plain[256]{};
-    Check(GetKeyboardState(keys) && SetKeyboardState(plain),"modal selection keyboard fixture");
+    ModifierFixture::Session modifiers;
     TestFrameKeyboardReturn(state,native);
     FocusFixture::Session modal(state.frameHwnd,state.nativeHwnd);
     const auto original=state.entries;
@@ -301,6 +302,5 @@ static void TestModalSelectionTransaction(ViewState& state, SelectionFolderView&
     publish(original,7); // Restore the private fixture's names, like an Undo snapshot.
     Check(state.entries.size()==original.size() && state.entryPathIndex==originalIndex,"modal selection fixture did not restore its snapshot");
     state.nativeSelectionDirty=false; Select(state,0);
-    SetKeyboardState(keys);
     std::cout<<"PASS: modal native-selection deferral, Cancel retains index, late empty import retains keyboard identity, Delete maps the vacancy and real Up/Down commits reach Shell selection\n";
 }

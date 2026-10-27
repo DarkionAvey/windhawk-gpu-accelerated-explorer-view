@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.254
+// @version         0.9.255
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1446,6 +1446,7 @@ struct PreparedNativeSelection {
     std::vector<Entry> entries;
     std::vector<OwnedPidl> children;
     bool imported = false, revealUnchanged = false, preserveViewport = false;
+    bool compareObserved = false;
     int expectedCount = 0;
     std::wstring folderPath;
     std::shared_ptr<const NamespaceIdentities> namespaceIdentities;
@@ -8743,13 +8744,18 @@ void PostShellVisibilityProbe(ViewState& state, bool modeOnly = false, bool comm
 // One raw observation path for startup and actual user input. Observation is
 // separate from accepting a layout: provider/reorder hints cannot authorize it.
 bool ReadNativeViewMode(ViewState& state, FolderViewMode& result) {
+    PipelineScope query(state.background,L"shell.view.mode",state.token);
     const auto view=state.folderView;
+    const auto token=state.token;
+    const HWND native=state.nativeHwnd;
+    const auto current=[&] {return state.token==token && state.nativeHwnd==native && state.folderView.Get()==view.Get();};
     FOLDERVIEWMODE mode = FVM_AUTO;
     int size = 0;
     HRESULT hr = view ? view->GetViewModeAndIconSize(&mode,&size) : E_POINTER;
+    if (!current()) return false;
     UINT value = static_cast<UINT>(mode);
     if (FAILED(hr) && view) hr=view->GetCurrentViewMode(&value);
-    if (FAILED(hr) || value<FVM_FIRST || value>FVM_LAST) return false;
+    if (!current() || FAILED(hr) || value<FVM_FIRST || value>FVM_LAST) return false;
     result.mode=value;
     result.iconSize=size>=16 && size<=512 ? size : value==FVM_SMALLICON ? 16 : value==FVM_THUMBNAIL ? 96 : 48;
     return true;
@@ -8862,6 +8868,7 @@ void ReconcileShellVisibility(ViewState& state) {
 // guarantee. Actual resorting and property enrichment run on the worker.
 bool ReadShellSort(ViewState& state, SortSpec& out) {
     if (!state.folderView) return false;
+    PipelineScope query(state.background,L"shell.view.sort",state.token);
     SORTCOLUMN column{};
     if (FAILED(state.folderView->GetSortColumns(&column, 1))) return false;
     if (IsEqualGUID(column.propkey.fmtid, GUID_NULL) || !column.propkey.pid)
@@ -8879,6 +8886,7 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
 // or unexpectedly discarding the user's collapsed-group state.
 bool TryReadShellGrouping(ViewState& state, ShellGroupSpec& next) {
     if (!state.folderView) return false;
+    PipelineScope query(state.background,L"shell.view.group",state.token);
     PROPERTYKEY key{};
     BOOL ascending = TRUE;
     const HRESULT hr = state.folderView->GetGroupBy(&key, &ascending);
@@ -16579,7 +16587,7 @@ void BorrowPreparedSelection(PidlSelection& pidls, const PreparedNativeSelection
 
 bool VerifyNativeSelection(ViewState& state, const PidlSelection& expected);
 bool QueueNativeSelectionPreparation(ViewState& state, int importCount = -1, bool revealUnchanged = false,
-    bool preserveViewport = false);
+    bool preserveViewport = false, bool compareObserved = false);
 
 // Only the selection worker calls this: CompareIDs can enter a namespace
 // provider. Binary absolute PIDLs are cache keys, not canonical Shell equality.
@@ -17186,12 +17194,17 @@ bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool comm
         if (FAILED(state.folderView->ItemCount(SVGIO_ALLVIEW, &nativeTotal)) || nativeTotal == 0)
             return false; // An unpopulated hidden native model is not a deselect-all event.
     }
-    // Before GetSelection(): even constructing an IShellItemArray for 17,000
-    // selected items may be expensive on the Shell view's STA. Overlay-owned
-    // large groups use prepared identities; native Select All uses counts.
+    // Only raw identities leave this STA. No live IShellItemArray or path/name
+    // provider runs here, including for a single filesystem selection.
     int nativeSelected = -1;
-    if (FAILED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeSelected)) ||
-        nativeSelected < 0) return false;
+    {
+        PipelineScope query(state.background,L"shell.selection.count.capture",state.token,eventDriven);
+        if (FAILED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeSelected)) ||
+            nativeSelected < 0) return false;
+    }
+    if (!eventDriven && !state.nativeSelectionUnsafe && nativeSelected==0 &&
+        state.nativeSelectionObservedCount==0 && state.selected<0 &&
+        !state.nativeSelectionImportPending) return true;
     if (static_cast<size_t>(nativeSelected) > kMaxDirectNativeSelectionItems) {
         // Check unchanged idle counts BEFORE the full committed-set verifier.
         // Event-driven imports and the original command commit still verify;
@@ -17230,89 +17243,18 @@ bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool comm
         }
         return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven);
     }
-    // Provider rows can have no filesystem path, a delegated path, or alternate
-    // PIDL encodings. Their immutable row snapshot is the identity authority;
-    // parsing/display names are not interchangeable with its keys. Capture
-    // relative PIDLs here and resolve them on the existing selection worker.
-    if (nativeSelected && state.namespaceIdentities)
-        return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven);
-    // Bounded small selection: the live IShellItemArray and its folder-owned
-    // objects cannot safely be moved to an arbitrary MTA directory worker.
+    if (nativeSelected)
+        return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven,false,
+            !eventDriven && !commitFailure && !state.nativeSelectionUnsafe && !state.nativeSelectionImportPending);
     // An authoritative zero count needs no item identities. Some providers
     // fail to construct an empty array even though deselection succeeded.
-    ComPtr<IShellItemArray> selected;
-    const HRESULT hr = nativeSelected ? state.folderView->GetSelection(FALSE, selected.GetAddressOf()) : S_OK;
-    if (FAILED(hr)) return false;
-    std::vector<std::wstring> paths;
-    DWORD count = 0;
-    if (selected && SUCCEEDED(selected->GetCount(&count))) {
-        if (count > kMaxDirectNativeSelectionItems ||
-            count != static_cast<DWORD>(nativeSelected)) {
-            // Count/GetSelection may straddle Delete/Undo on the same STA.
-            // The raw-PIDL snapshot retries drift without changing presentation.
-            return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven);
-        }
-        paths.reserve(count);
-        for (DWORD i = 0; i < count; ++i) {
-            ComPtr<IShellItem> item;
-            if (FAILED(selected->GetItemAt(i, item.GetAddressOf())) || !item) {
-                return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven);
-            }
-            PWSTR text = nullptr;
-            const HRESULT nameHr = item->GetDisplayName(SIGDN_FILESYSPATH, &text);
-            std::wstring key = text ? text : L"";
-            if (FAILED(nameHr) || key.empty()) {
-                if (text) CoTaskMemFree(text);
-                return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven);
-            }
-            paths.push_back(std::move(key));
-            CoTaskMemFree(text);
-        }
-    } else if (nativeSelected != 0) {
-        return QueueNativeSelectionPreparation(state,nativeSelected,eventDriven);
-    }
-    // Selection is a SET, not a Shell enumeration order. Canonicalizing at
-    // most 64 paths also lets the idle monitor recognize our own native
-    // selection transaction without repainting or re-centering the viewport.
-    if (paths.size() > 1)
-        std::sort(paths.begin(), paths.end(),
-            [](const std::wstring& a, const std::wstring& b) {
-                return _wcsicmp(a.c_str(), b.c_str()) < 0;
-            });
-    // No need to resolve the focused native PIDL for an unchanged periodic
-    // sample. Besides avoiding extra STA work, this makes the steady-state
-    // monitor O(selected items) instead of O(folder size).
-    if (!eventDriven && !state.nativeSelectionUnsafe && !state.nativeSelectionImportPending &&
-        state.nativeSelectionObservedCount == nativeSelected &&
-        state.nativeSelectionObservedPaths.size() == paths.size() &&
-        std::equal(paths.begin(), paths.end(),
-            state.nativeSelectionObservedPaths.begin(),
-            [](const std::wstring& a, const std::wstring& b) {
-                return _wcsicmp(a.c_str(), b.c_str()) == 0;
-            })) return true;
-    std::wstring focused;
-    if (!paths.empty() && state.folder) {
-        int index = -1;
-        PITEMID_CHILD child = nullptr;
-        if (SUCCEEDED(state.folderView->GetFocusedItem(&index)) && index >= 0 &&
-            SUCCEEDED(state.folderView->Item(index, &child)) && child) {
-            STRRET display{};
-            wchar_t buffer[MAX_PATH]{};
-            if (SUCCEEDED(state.folder->GetDisplayNameOf(child,
-                    SHGDN_FORPARSING, &display)) &&
-                SUCCEEDED(StrRetToBufW(&display, child, buffer, ARRAYSIZE(buffer))))
-                focused = buffer;
-        }
-        if (child) CoTaskMemFree(child);
-    }
-    // Update the last authoritative identities only after complete capture.
     state.nativeSelectionObservedCount = nativeSelected;
-    state.nativeSelectionObservedPaths = paths;
+    state.nativeSelectionObservedPaths.clear();
     state.nativeSelectionAllPending = false;
     state.nativeSelectionAllCount = -1;
     state.nativeSelectionUnsafe = false;
-    state.nativeSelectionPaths = std::move(paths);
-    state.nativeFocusedPath = std::move(focused);
+    state.nativeSelectionPaths.clear();
+    state.nativeFocusedPath.clear();
     state.nativeSelectionImportPreserveViewport=false;
     state.nativeSelectionImportPending = true;
     if (state.loaded)
@@ -17540,7 +17482,8 @@ void MaybeRecoverNativeSelection(ViewState& state) {
     Redraw(state);
 }
 
-bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool revealUnchanged, bool preserveViewport) {
+bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool revealUnchanged, bool preserveViewport,
+    bool compareObserved) {
     CancelNativeSelectionPreparation(state);
     auto job = std::make_shared<PreparedNativeSelection>();
     PIDLIST_ABSOLUTE folder = state.directoryFolderIdentity ? ILCloneFull(state.directoryFolderIdentity.get()) : nullptr;
@@ -17553,6 +17496,7 @@ bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool rev
     job->imported=importCount>=0; job->expectedCount=importCount;
     job->revealUnchanged=revealUnchanged; job->folderPath=state.folderPath;
     job->preserveViewport=preserveViewport;
+    job->compareObserved=compareObserved;
     job->namespaceIdentities=state.namespaceIdentities;
     auto& work = *state.background;
     if (job->imported) {
@@ -17656,7 +17600,11 @@ void AdvanceNativeSelectionCapture(ViewState& state) {
         return;
     }
     int count=-1;
-    const HRESULT hr=view->ItemCount(SVGIO_SELECTION,&count);
+    HRESULT hr;
+    {
+        PipelineScope query(state.background,L"shell.selection.count.snapshot",state.token,job->generation);
+        hr=view->ItemCount(SVGIO_SELECTION,&count);
+    }
     if (!current()) return;
     if (FAILED(hr) || count!=job->expectedCount || job->children.size()!=static_cast<size_t>(count)) { retry(); return; }
     auto& work=*state.background;
@@ -17667,6 +17615,38 @@ void AdvanceNativeSelectionCapture(ViewState& state) {
         work.selectionJob=job;
     }
     SetEvent(work.selection.wake);
+}
+
+// A worker can outlive a silent, equal-count selection replacement. Compare
+// only bounded raw PIDLs here; provider/name/canonical resolution stays on the
+// selection lane. Byte drift conservatively retries a fresh observation.
+bool CapturedSelectionStillCurrent(ViewState& state, const PreparedNativeSelection& job) {
+    if (job.namespaceIdentities || job.children.empty() || job.children.size()>kMaxDirectNativeSelectionItems) return true;
+    PipelineScope query(state.background,L"shell.selection.identities.verify",state.token,job.children.size());
+    const auto view=state.folderView;
+    const auto current=[&] {return state.token==job.viewToken && state.nativeHwnd==job.native &&
+        state.folderView.Get()==view.Get() && state.pendingNativeSelection==job.generation;};
+    ComPtr<IEnumIDList> selected;
+    if (!view || FAILED(view->Items(SVGIO_SELECTION,IID_PPV_ARGS(&selected))) || !selected || !current()) return false;
+    std::array<bool,kMaxDirectNativeSelectionItems> matched{};
+    size_t remaining=job.children.size();
+    while (remaining) {
+        PITEMID_CHILD raw[16]{}; ULONG fetched=0;
+        const ULONG wanted=static_cast<ULONG>(std::min<size_t>(remaining,ARRAYSIZE(raw)));
+        const HRESULT hr=selected->Next(wanted,raw,&fetched);
+        bool valid=ValidPidlBatch(hr,wanted,fetched,raw) && fetched==wanted && current();
+        const ULONG owned=SUCCEEDED(hr) ? std::min<ULONG>(fetched,wanted) : 0;
+        for (ULONG n=0;n<owned;++n) {
+            OwnedPidl item(raw[n]);
+            size_t i=0;
+            while (i<job.children.size() && (matched[i] || !item || !PidlBytesEqual(item.get(),job.children[i].get()))) ++i;
+            if (i==job.children.size()) valid=false;
+            else matched[i]=true;
+        }
+        if (!valid) return false;
+        remaining-=fetched;
+    }
+    return current();
 }
 
 bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelection> prepared) {
@@ -22031,13 +22011,6 @@ void ProbeNativeSelectionOnIdle(ViewState& state, ULONGLONG now) {
     if (state.nativeSelectionLastProbe &&
         now - state.nativeSelectionLastProbe < interval) return;
     state.nativeSelectionLastProbe = now;
-    int actual = -1;
-    if (FAILED(state.folderView->ItemCount(SVGIO_SELECTION, &actual)) ||
-        actual < 0) return;
-    // A zero-item native selection should never allocate an IShellItemArray
-    // or touch the 100k-row GPU flag vector merely to confirm "still empty".
-    if (actual == 0 && state.nativeSelectionObservedCount == 0 &&
-        state.selected < 0 && !state.nativeSelectionImportPending) return;
     // Native count changes are cheap to detect; equal nonzero counts still
     // require identity verification (Firefox can replace 1 selected file
     // with a different 1 selected file). CaptureNativeSelection skips the
@@ -22052,11 +22025,11 @@ void ProbeNativeSelectionOnIdle(ViewState& state, ULONGLONG now) {
         state.nativeSelectionLastProbe = 0;
     } else if (g_perf.load(std::memory_order_relaxed) &&
         (previousCount != state.nativeSelectionObservedCount ||
-         (actual == 1 && state.nativeSelectionObservedPaths.size() == 1 &&
+         (state.nativeSelectionObservedCount == 1 && state.nativeSelectionObservedPaths.size() == 1 &&
           _wcsicmp(previousSingle.c_str(),
               state.nativeSelectionObservedPaths.front().c_str()) != 0))) {
         Wh_Log(L"[GPU selection] AUTHORITATIVE_POLL native=%p count=%d rows=%d",
-            state.nativeHwnd, actual, state.total);
+            state.nativeHwnd, state.nativeSelectionObservedCount, state.total);
     }
 }
 
@@ -23603,14 +23576,24 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (prepared->imported) {
                 const auto view=s->folderView;
                 int count=-1;
-                const HRESULT hr=view ? view->ItemCount(SVGIO_SELECTION,&count) : E_POINTER;
+                HRESULT hr=E_POINTER;
+                {
+                    PipelineScope query(s->background,L"shell.selection.count.complete",s->token,prepared->generation);
+                    if (view) hr=view->ItemCount(SVGIO_SELECTION,&count);
+                }
                 if (!IsWindow(hwnd) || State(hwnd)!=s) return 0;
+                if (s->pendingNativeSelection!=prepared->generation) return 0;
                 if (s->token!=prepared->viewToken || s->nativeHwnd!=prepared->native ||
-                    s->pendingNativeSelection!=prepared->generation || !s->visible || !s->inScope ||
+                    s->folderView.Get()!=view.Get() || !s->visible || !s->inScope ||
                     s->optimisticStartedAt || !TabOwnsActiveView(*s)) {
                     CancelNativeSelectionPreparation(*s); return 0;
                 }
+                const bool identitiesCurrent=FAILED(hr) || FAILED(prepared->result) ? false :
+                    CapturedSelectionStillCurrent(*s,*prepared);
+                if (!IsWindow(hwnd) || State(hwnd)!=s) return 0;
+                if (s->pendingNativeSelection!=prepared->generation) return 0;
                 if (FAILED(hr) || FAILED(prepared->result) || count!=prepared->expectedCount ||
+                    !identitiesCurrent || s->folderView.Get()!=view.Get() ||
                     s->namespaceIdentities!=prepared->namespaceIdentities ||
                     s->nativeSelectionDirty || prepared->entries.size()!=prepared->children.size()) {
                     PipelineEvent(*s->background,{.operation=L"selection.import.retry",.a=prepared->generation,.b=static_cast<unsigned>(count),
@@ -23621,11 +23604,26 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     s->nativeSelectionDirty=true; s->nativeSelectionSignalView=s->nativeHwnd;
                     return 0; // Retry a changing Shell transaction on the existing idle path.
                 }
+                std::vector<std::wstring> observed;
+                if (!prepared->namespaceIdentities && prepared->entries.size()<=kMaxDirectNativeSelectionItems) {
+                    for (const auto& entry:prepared->entries) observed.push_back(entry.path);
+                    std::sort(observed.begin(),observed.end(),[](const auto& a,const auto& b) {return _wcsicmp(a.c_str(),b.c_str())<0;});
+                    if (prepared->compareObserved && s->nativeSelectionObservedCount==count &&
+                        observed.size()==s->nativeSelectionObservedPaths.size() &&
+                        std::equal(observed.begin(),observed.end(),s->nativeSelectionObservedPaths.begin(),
+                            [](const auto& a,const auto& b) {return !_wcsicmp(a.c_str(),b.c_str());}) &&
+                        s->deferredSelectionKeys.empty() && !s->pendingSelectionContextMenu) {
+                        s->pendingNativeSelection=0; s->pendingNativeSelectionImport=false;
+                        s->nativeSelectionUnsafe=false; s->confirmedNativeSelection=prepared;
+                        PipelineEvent(*s->background,{.operation=L"selection.import.unchanged",.a=prepared->generation,.b=observed.size()});
+                        return 0; // Preserve hover/selection animation and avoid an idle repaint.
+                    }
+                }
                 s->pendingNativeSelectionImport=false;
                 s->nativeSelectionPaths.clear();
                 for (const auto& entry:prepared->entries) s->nativeSelectionPaths.push_back(entry.path);
                 s->nativeFocusedPath=prepared->focused>=0 ? prepared->entries[prepared->focused].path : L"";
-                s->nativeSelectionObservedCount=count; s->nativeSelectionObservedPaths.clear();
+                s->nativeSelectionObservedCount=count; s->nativeSelectionObservedPaths=std::move(observed);
                 s->nativeSelectionAllPending=false; s->nativeSelectionAllCount=-1;
                 s->nativeSelectionUnsafe=false; s->nativeSelectionImportPending=true;
                 s->nativeSelectionImportPreserveViewport=prepared->preserveViewport;
@@ -23713,30 +23711,43 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ScopedFlag applying(s->nativeModeApplying);
                 s->nativeModeHintPending = s->nativeViewCommandPending = false;
                 const auto before=std::exchange(s->nativeModeBeforeCommand,{});
-                bool requested=false;
+                const auto sourceView=s->folderView;
+                const auto sourceToken=s->token;
+                const HWND sourceNative=s->nativeHwnd;
+                const bool allowRefresh=command || !IsRecycleBinLocation(s->folderPath) || !s->lastNativeModeProbe;
+                bool sampled=false,requested=false;
                 if (before && s->visible && s->inScope && !s->optimisticStartedAt) {
                     FolderViewMode observed;
-                    if (ReadNativeViewMode(*s,observed) && (observed.mode!=before->mode ||
-                        (IsIconViewMode(observed.mode,s->thisPcGpu) && observed.iconSize!=before->iconSize))) {
-                        s->cachedNativeMode=observed.mode;
-                        if (IsIconViewMode(observed.mode,s->thisPcGpu)) s->nativeIconSize=observed.iconSize;
-                        s->lastNativeModeProbe=GetTickCount64(); requested=true;
-                        PipelineEvent(*s->background,{.operation=L"view.mode.input",.a=s->token,.b=observed.mode,
-                            .v={static_cast<double>(before->mode),static_cast<double>(observed.iconSize)}});
+                    if (ReadNativeViewMode(*s,observed)) {
+                        sampled=true;
+                        requested=observed.mode!=before->mode ||
+                            (IsIconViewMode(observed.mode,s->thisPcGpu) && observed.iconSize!=before->iconSize);
+                        // A successful observation is not permission to adopt
+                        // an ignored provider mode during unrelated input.
+                        if (requested || (allowRefresh && !s->directoryModePinned)) {
+                            s->cachedNativeMode=observed.mode;
+                            if (IsIconViewMode(observed.mode,s->thisPcGpu)) s->nativeIconSize=observed.iconSize;
+                            s->lastNativeModeProbe=GetTickCount64();
+                        }
+                        if (requested)
+                            PipelineEvent(*s->background,{.operation=L"view.mode.input",.a=s->token,.b=observed.mode,
+                                .v={static_cast<double>(before->mode),static_cast<double>(observed.iconSize)}});
                     }
                 }
+                if (!IsWindow(hwnd) || State(hwnd)!=s || s->token!=sourceToken ||
+                    s->nativeHwnd!=sourceNative || s->folderView.Get()!=sourceView.Get()) return 0;
                 // Explicit commands bypass the safety cache. Recycle Bin provider
                 // reorders retain the known mode instead of interrogating its
                 // live Shell view again as cold images/properties complete.
                 if (!g_unloading.load(std::memory_order_relaxed) && s->visible &&
                     s->inScope && !s->optimisticStartedAt && !IsIconic(s->frameHwnd) &&
                     TabOwnsActiveView(*s) &&
-                    (requested || ((command || !IsRecycleBinLocation(s->folderPath) || !s->lastNativeModeProbe) &&
-                    RefreshNativeViewMode(*s, true))) &&
+                    (requested || (allowRefresh && (sampled || RefreshNativeViewMode(*s, true)))) &&
                     (s->layoutNativeMode != s->cachedNativeMode ||
                      (IsIconViewMode(s->cachedNativeMode,s->thisPcGpu) && s->layoutIconSize != s->nativeIconSize)))
                     ApplyNativePresentation(*s);
-                if (command && IsWindow(hwnd) && State(hwnd) == s && s->visible && s->inScope &&
+                if (command && IsWindow(hwnd) && State(hwnd) == s && s->token==sourceToken &&
+                    s->nativeHwnd==sourceNative && s->folderView.Get()==sourceView.Get() && s->visible && s->inScope &&
                     !s->optimisticStartedAt && !IsIconic(s->frameHwnd) && TabOwnsActiveView(*s)) {
                     s->nativeColumnsDirty = true;
                     RefreshSortFromExplorer(*s, true, true);

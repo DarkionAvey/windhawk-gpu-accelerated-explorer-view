@@ -1431,9 +1431,14 @@ static void TestNativeStartupPipeline(const std::wstring& directory) {
     Check(state.loaded && state.total == 2, "metadata projection reopened the native view");
     state.firstContentSubmittedAt = GetTickCount64();
     RefreshThisPcRows(state); // Same rows, now across the first-content boundary.
-    Check(state.directoryPending &&
-          state.thisPcSpaceRequestedPaths.size() == 2 && !state.nativeRowsPending,
-          "deferred capacity work on unchanged rows waited for the maintenance timer");
+    Check(state.directoryPending || state.driveSpaceRefreshPending,
+          "first content lost its deferred capacity request");
+    // The UI submission uses a try-lock. A names publisher can still own it
+    // as its completion is received; preserve intent and retry the same path.
+    Check(Eventually([&] {
+        if (!state.directoryPending) RefreshThisPcRows(state,false);
+        return state.directoryPending && state.thisPcSpaceRequestedPaths.size()==2 && !state.nativeRowsPending;
+    }), "retained first-content capacity request did not submit");
 
     PITEMID_CHILD selectedChild = nullptr;
     Check(SUCCEEDED(EntryChildPidl(state, state.entries[0], &selectedChild)) && selectedChild &&
@@ -1778,6 +1783,7 @@ static void TestPreviewInput() {
 #include "provider-selection-smoke.h"
 #include "provider-navigation-smoke.h"
 #include "paste-focus-smoke.h"
+#include "selection-ui-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1870,6 +1876,13 @@ int wmain(int argc,wchar_t** argv) {
             Check(frame!=nullptr,"live sort frame");
             TestLiveSorting(frame,fixture.wstring());
             DestroyWindow(frame);
+        } else if (argc>1 && wcscmp(argv[1],L"--selection-ui")==0) {
+            TestSelectionUiWork(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--selection-ui-mode")==0) {
+            TestSelectionUiModeReads();
+        } else if (argc>1 && wcscmp(argv[1],L"--selection-ui-navigation")==0) {
+            TestSelectionUiWork(fixture.wstring());
+            TestProviderNavigation(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--selection")==0) {
             TestNativeSuppression();
             WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
@@ -1968,6 +1981,7 @@ int wmain(int argc,wchar_t** argv) {
         TestFilesystemMutationDelivery(fixture.wstring());
         TestShellProviderContents(fixture.wstring());
         TestProviderSelection(fixture.wstring());
+        TestSelectionUiWork(fixture.wstring());
         TestProviderNavigation(fixture.wstring());
         TestPasteFocus(fixture.wstring());
         TestBurstRowContinuity(fixture.wstring());

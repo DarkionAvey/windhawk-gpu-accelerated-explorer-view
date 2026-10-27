@@ -96,6 +96,13 @@ void Activate(ProviderSelectionFixture::Browser& host, int row, bool selected) {
     if (selected) OverlayProc(state.hwnd, WM_KEYDOWN, VK_RETURN, 0);
     else Open(state, row);
     Check(Eventually([&] { host.Pump(); return !state.pendingNativeSelection; }, 30000), "provider default action preparation stalled");
+    if(capture->menu->calls!=1 || !state.selectedFlags[row] || state.nativeSelectionUnsafe)
+        std::wcout<<L"PROVIDER ACTIVATE folder="<<state.folderPath<<L" row="<<row<<L" selected-route="<<selected
+            <<L" item="<<state.entries[row].name<<L" calls="<<capture->menu->calls<<L" gpu="<<state.selected
+            <<L" flag="<<int(state.selectedFlags[row])<<L" unsafe="<<state.nativeSelectionUnsafe
+            <<L" dirty="<<state.nativeSelectionDirty<<L" importing="<<state.nativeSelectionImportPending
+            <<L" recovering="<<state.nativeSelectionRecoveryPending<<L" pending="<<state.pendingNativeSelection
+            <<L" keys="<<state.deferredSelectionKeys.size()<<L" provider="<<bool(state.namespaceIdentities)<<std::endl;
     Check(capture->menu->calls == 1 && state.selectedFlags[row] && !state.nativeSelectionUnsafe,
         "provider folder/stream activation never reached its selected native default command");
     Check(CaptureNativeSelection(state, true), "provider activation selection echo");
@@ -164,11 +171,9 @@ void Destination(ProviderSelectionFixture::Browser& host, int expected) {
 static void TestProviderNavigation(const std::wstring& fixture) {
     using namespace ProviderSelectionFixture;
     using namespace ProviderNavigationFixture;
-    struct Keyboard {
-        BYTE saved[256]{};
-        Keyboard() { BYTE plain[256]{}; Check(GetKeyboardState(saved) && SetKeyboardState(plain), "provider Enter keyboard fixture"); }
-        ~Keyboard() { SetKeyboardState(saved); }
-    } keyboard;
+    // Nested Shell pumps can replace SetKeyboardState's queue snapshot.
+    // Keep synthetic Enter modifiers stable without touching desktop input.
+    ModifierFixture::Session keyboard;
     for (const auto* known : {&FOLDERID_ComputerFolder, &FOLDERID_RecycleBinFolder, &FOLDERID_ControlPanelFolder}) {
         PIDLIST_ABSOLUTE raw = nullptr;
         Check(SUCCEEDED(SHGetKnownFolderIDList(*known, 0, nullptr, &raw)), "read-only namespace scope probe");
