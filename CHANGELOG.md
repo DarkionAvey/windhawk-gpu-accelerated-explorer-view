@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.263
+
+- Also refresh the active tab when returning to an Explorer window, including
+  side-by-side windows. Coalesce window activation with tab resume, and skip
+  control-only focus changes and departed windows.
+
+## 0.9.262
+
+- Refresh a background tab when returning to it, using the same asynchronous
+  refresh as F5 and the context menu after showing its cached contents.
+- Keep unchanged names, values, selection and viewport in place; avoid content
+  repaint for identical refresh results, including This PC devices and capacity.
+
 ## 0.9.261
 
 - Reduce compositor work during streamed file insertions, deletions and grid

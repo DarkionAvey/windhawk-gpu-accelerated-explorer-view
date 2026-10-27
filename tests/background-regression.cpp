@@ -1870,6 +1870,7 @@ int wmain(int argc,wchar_t** argv) {
         } else if (argc>1 && wcscmp(argv[1],L"--drive-refresh")==0) {
             TestDriveSpaceRefresh();
         } else if (argc>1 && wcscmp(argv[1],L"--smart-refresh")==0) {
+            TestTabResumeRefresh(fixture.wstring()); TestWindowResumeRefresh(); TestUnchangedRefreshPresentation();
             TestSortDetails(fixture.wstring()); TestDriveSpaceRefresh();
         } else if (argc>1 && wcscmp(argv[1],L"--column-minimum")==0) {
             TestColumnMinimumWidths();
@@ -1967,6 +1968,7 @@ int wmain(int argc,wchar_t** argv) {
         TestResolvedStyles();
         TestStyleEvents(fixture.wstring());
         TestPeriodicCapacityRefresh();
+        TestTabResumeRefresh(fixture.wstring()); TestWindowResumeRefresh(); TestUnchangedRefreshPresentation();
         TestClippingPreflight();
         TestResizeAutoRefit();
         TestColumnMinimumWidths();

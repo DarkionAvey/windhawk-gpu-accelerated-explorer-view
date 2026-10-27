@@ -63,6 +63,25 @@ inline void Pump() {
     MSG msg{};
     while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&msg); DispatchMessageW(&msg);}
 }
+// Generation-only acknowledgements can be produced and consumed within one
+// Pump. Observe owner dispatch as well as sampling between message batches.
+struct Receipts {
+    HWND hwnd;
+    std::shared_ptr<const PresentationReceipt> latest;
+    static LRESULT CALLBACK Capture(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR context) {
+        auto& self=*reinterpret_cast<Receipts*>(context);
+        if(auto* state=State(hwnd); state && state->presenter) {
+            std::lock_guard lock(state->presenter->mutex);
+            if(state->presenter->receipt) self.latest=state->presenter->receipt;
+        }
+        return DefSubclassProc(hwnd,msg,wp,lp);
+    }
+    explicit Receipts(HWND window):hwnd(window) {
+        Check(SetWindowSubclass(hwnd,Capture,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this)),
+            "column receipt observer");
+    }
+    ~Receipts() {RemoveWindowSubclass(hwnd,Capture,reinterpret_cast<UINT_PTR>(this));}
+};
 inline void Diagnose(ViewState& state,const char* stage) {
     std::cout<<"COLUMN BRIDGE "<<stage<<" columns="<<state.columns.size()<<" mode="<<state.columnsView
         <<" header="<<state.headerPx<<" step="<<state.featureInitializationStep<<" queued="<<state.featureInitializationQueued
@@ -144,7 +163,8 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
         AttachView(native,view,response->folder,browser,directory);
         const HWND overlay=OverlayForTab(frame); auto* state=State(overlay);
         Check(state && state->presenter,"cold column bridge attachment"); cleanup.work=state->background;
-        std::shared_ptr<const PresentationReceipt> lastReceipt;
+        ColumnBridgeFixture::Receipts receipts(overlay);
+        auto& lastReceipt=receipts.latest;
         const auto wait=[&](auto predicate,const char* phase) {
             const bool done=Eventually([&] {
                 {std::lock_guard lock(state->presenter->mutex); if(state->presenter->receipt) lastReceipt=state->presenter->receipt;}

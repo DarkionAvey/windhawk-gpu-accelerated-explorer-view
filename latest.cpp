@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.261
+// @version         0.9.263
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -406,6 +406,7 @@ bool RegisterFrameHookReleaseMessage() {
 }
 constexpr UINT kMsgNativeRenameEditor = WM_APP + 74;
 constexpr UINT kMsgStyleChanged = WM_APP + 75;
+constexpr UINT kMsgTabResumeRefresh = WM_APP + 76;
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
@@ -2487,6 +2488,11 @@ struct ViewState {
     bool draggingHorizontal = false;
     float horizontalGrabOffset = 0.f;
     ULONGLONG lastActiveViewProbe = 0;
+    // Remember the background tab's folder generation, not incidental focus or
+    // repeated SHOW/activation hints. A new navigation supplies its own snapshot.
+    unsigned long long tabResumeRefreshToken = 0;
+    bool tabResumeRefreshQueued = false;
+    bool frameResumeRefreshPending = false;
     // Instrument only an activated tab until the first submitted GPU paint.
     // This is diagnostic state, never used to gate visibility or navigation.
     ULONGLONG tabActivationPendingAt = 0;
@@ -3239,6 +3245,10 @@ struct PresentationLane {
     std::mutex mutex;
     std::shared_ptr<const PresentationModel> pending;
     std::shared_ptr<const PresentationReceipt> receipt;
+    // Cancellation-only acknowledgement. Its sequence cannot supersede a
+    // newer paint packet when the owner and renderer advance concurrently.
+    struct ValidatedGeneration { unsigned long long sequence, token, directoryToken; };
+    std::optional<ValidatedGeneration> validatedGeneration;
     HANDLE wake=nullptr;
     HWND hwnd=nullptr;
     unsigned long long lifetime=0;
@@ -3285,6 +3295,7 @@ int ModelGroup(const ViewState& state,int index) {
 }
 bool StartPresentation(ViewState& state);
 void SubmitPresentation(ViewState& state);
+void SynchronizePresentationGeneration(ViewState& state);
 void ConsumePresentation(ViewState& state);
 void ReleasePresentation(ViewState& state,bool stop=false);
 
@@ -8736,6 +8747,18 @@ void ForceRefresh(ViewState& state) {
     QueueVisibleDataFrame(state);
 }
 
+// Tab presentation and frame activation share one owner-queue refresh. Keep
+// the frame intent separate: it expires if another window wins foreground.
+void QueueResumeRefresh(ViewState& state, bool frameActivated = false) {
+    if (g_unloading.load(std::memory_order_acquire)) return;
+    state.frameResumeRefreshPending |= frameActivated;
+    if (state.tabResumeRefreshToken && state.tabResumeRefreshToken != state.token)
+        state.tabResumeRefreshToken = 0;
+    if ((state.tabResumeRefreshToken || state.frameResumeRefreshPending) && !state.tabResumeRefreshQueued)
+        state.tabResumeRefreshQueued = PostMessageW(state.hwnd, kMsgTabResumeRefresh,
+            state.token, 0) != FALSE;
+}
+
 // File notifications are change *hints*, not an atomic operation boundary.
 // Explorer may remove several selected files in separate filesystem steps.
 void QueueDirectoryChangeFlush(ViewState& state) {
@@ -9622,7 +9645,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     return true;
 }
 
-void RefreshThisPcRows(ViewState& state, bool requestData = true);
+bool RefreshThisPcRows(ViewState& state, bool requestData = true);
 
 enum class DirectoryDelivery { All, Structure, Details };
 
@@ -9733,7 +9756,6 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 continue;
             }
             if (state.loaded && !result.nativeRowsComplete && result.error == ERROR_SUCCESS) continue;
-            contentChanged = true;
             if (result.error != ERROR_SUCCESS) {
                 state.nativeRowsPending = false;
                 state.nativeRowsNeedCapture = false; // New native hints/refresh own retries of a failed provider.
@@ -9745,7 +9767,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
             }
             state.nativeRows = std::move(result.entries);
             state.thisPcRowsDirty = true;
-            RefreshThisPcRows(state);
+            contentChanged |= RefreshThisPcRows(state);
             if (refreshAfterCompletion) QueueNativeRows(state);
             else if (state.nativeRowsNeedCapture && !state.nativeRowsPending) QueueNativeRows(state);
             continue;
@@ -9790,7 +9812,6 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
         }
         if (result.kind == DirectoryResult::DriveSpace) {
             if (!state.thisPcGpu) continue;
-            contentChanged = true;
             // The final callback may publish before an earlier partial one.
             // Completion is sticky within this generation.
             if (result.driveSpaceComplete) state.directoryPending = false;
@@ -9910,11 +9931,9 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
         state.deferredDetails.swap(available);
         state.detailResultsPending = true;
     }
-    // Even identical revalidation advances directoryToken. Publish that
-    // completed generation to the independent presenter so its subsequent
-    // acknowledgements can pass the owner-side cancellation checks. The old
-    // unchanged fast path otherwise left only obsolete receipts forever.
-    if(completedNames && state.presenter && !contentChanged) Redraw(state);
+    // An identical snapshot advances cancellation, not pixels. Acknowledge
+    // the submitted model's new generation without repainting its contents.
+    if(completedNames && !contentChanged) SynchronizePresentationGeneration(state);
     // One viewport scan/refit per delivered burst, rather than one for every
     // single-row property completion in that burst. No timer/debounce delay.
     if (detailsChanged) {
@@ -20384,7 +20403,7 @@ void BeginDirectoryViewMode(ViewState& state, bool nativeReady) {
 
 void ClearSwipeFeedback(ViewState& state);
 
-void RefreshThisPcRows(ViewState& state, bool requestData);
+bool RefreshThisPcRows(ViewState& state, bool requestData);
 
 void SetActive(HWND hwnd, bool on) {
     ViewState* s = State(hwnd);
@@ -22019,6 +22038,9 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         RefreshViewToggleForFrame(hwnd, true);
     if (msg == WM_ACTIVATE || msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
         for (HWND overlay : FrameOverlays(hwnd)) QueueInputFocusUpdate(overlay);
+    if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE)
+        if (auto* state = State(OverlayUnder(hwnd)); state && state->visible && state->inScope)
+            QueueResumeRefresh(*state, true);
     if (msg == WM_ENABLE && wp)
         for (HWND overlay : FrameOverlays(hwnd))
             if (auto* state=State(overlay); state && state->nativeSelectionRecoveryPending)
@@ -22746,6 +22768,14 @@ void SubmitPresentation(ViewState& state) {
         .v={double(state.total),double(state.presentationActive)}},true);
 }
 
+void SynchronizePresentationGeneration(ViewState& state) {
+    if(!state.presenter || state.presentationOnly || state.presenter->stopping.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(state.presenter->mutex);
+    state.presenter->validatedGeneration = {state.presentationSequence,state.token,state.directoryToken};
+    SetEvent(state.presenter->wake);
+}
+
 bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,const std::shared_ptr<PresentationLane>& lane) {
     auto oldDirectory=state.presentationEntries;
     const bool sameFolder=state.folderPath==model.folderPath;
@@ -23061,9 +23091,11 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         if(WaitForSingleObject(worker.wake,INFINITE)!=WAIT_OBJECT_0) break;
         if(work.stopping.load(std::memory_order_acquire) || lane->stopping.load(std::memory_order_acquire)) break;
         std::shared_ptr<const PresentationModel> model;
+        std::optional<PresentationLane::ValidatedGeneration> validated;
         {
             std::lock_guard lock(lane->mutex);
             model=std::exchange(lane->pending,{});
+            validated=std::exchange(lane->validatedGeneration,{});
             ResetEvent(worker.wake);
         }
         if(lane->release.exchange(false,std::memory_order_acq_rel)) {
@@ -23084,6 +23116,14 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             if(!ApplyPresentationModel(state,*model,lane)) {
                 {ExclusiveSrwLock lock(work.directoryLock); work.retiredEntries.emplace_back(std::move(model));}
                 SetEvent(work.properties.wake); continue;
+            }
+        }
+        if(validated) {
+            const bool current=validated->sequence==state.presentationSequence && validated->token==state.token;
+            if(current) state.directoryToken=validated->directoryToken;
+            if(!model && !lane->animating.load(std::memory_order_acquire)) {
+                if(current) PublishPresentationReceipt(state,lane,!state.graphicsReady);
+                continue;
             }
         }
         if(!state.hwnd) continue;
@@ -23963,6 +24003,21 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else EnsureOverlayTop(*s);
         }
         return 0;
+    case kMsgTabResumeRefresh:
+        if (s) {
+            s->tabResumeRefreshQueued = false;
+            const bool frameResume = std::exchange(s->frameResumeRefreshPending, false) &&
+                ExplorerFrameHasForeground(s->frameHwnd);
+            const bool tabResume = s->tabResumeRefreshToken && s->tabResumeRefreshToken == s->token;
+            if (!g_unloading.load() && wParam == s->token && (tabResume || frameResume) &&
+                s->visible && s->inScope && s->detailsViewActive && !s->optimisticStartedAt &&
+                !PresentationMinimized(*s) && TabOwnsActiveView(*s) &&
+                (!s->pendingShellView || s->pendingShellView == s->nativeHwnd)) {
+                s->tabResumeRefreshToken = 0;
+                ForceRefresh(*s);
+            }
+        }
+        return 0;
     case kMsgTabActivated:
         // Existing tabs have independent, already-presented surfaces. No
         // synchronous Shell COM or directory scan is permitted on activation.
@@ -24248,6 +24303,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
             QueuePendingDriveSpaceRefresh(*s, GetTickCount64());
             if (!TabOwnsActiveView(*s)) {
+                s->tabResumeRefreshToken = s->token;
                 if (s->rename.editor) CancelRename(*s);
                 if (IsWindowVisible(hwnd)) SetPresentationVisibility(hwnd, false);
                 // Preserve the original inactive-tab frame shutdown except
@@ -25770,6 +25826,9 @@ void PresentCachedTabSurface(ViewState& state) {
     const ULONGLONG afterTop = GetTickCount64();
     if (NeedsAnimationFrames(state)) RegisterViewAnimation(state);
     Redraw(state);
+    // Present cached pixels first. The owner message then uses exactly the
+    // F5/menu path; duplicate activation hints cannot restart provider work.
+    QueueResumeRefresh(state);
     if (trace)
         Wh_Log(L"[GPU tabs] PRESENT tick=%llu tab=%p gpu=%p native=%p was-visible=%d now-visible=%d loaded=%d rows=%d position=%llu ms show=%llu ms top=%llu ms total=%llu ms folder=%s",
             static_cast<unsigned long long>(started), state.activeTabHost, state.hwnd,
@@ -25811,6 +25870,7 @@ void SynchronizeTabSurfaces(HWND frame, bool activate) {
         ViewState* state = State(hwnd);
         if (!state) continue;
         if (state->activeTabHost != active) {
+            state->tabResumeRefreshToken = state->token;
             if (state->manipulationFrameActive) StopTouchpad(*state, false);
             state->columnMenuPending = false;
             if (state->rename.editor) CancelRename(*state);
@@ -26988,13 +27048,13 @@ void BindTabPresentation(ViewState& state, HWND tabHost) {
 // and column changes reuse these identities without reopening native items.
 // Directory enumeration and virtual-name providers run on the tab's namespace
 // worker. Native view readiness and row indices do not gate these GPU rows.
-void RefreshThisPcRows(ViewState& state, bool requestData) {
+bool RefreshThisPcRows(ViewState& state, bool requestData) {
     TabTraceSlowScope trace(L"This PC row projection", state.hwnd);
     state.thisPcRowsDirty = false;
-    if (!state.thisPcGpu) return;
+    if (!state.thisPcGpu) return false;
     if (state.nativeRowsNeedCapture && !state.nativeRowsPending) RequestNativeRows(state);
-    if (state.nativeRows.empty() && !state.nativeRowsComplete) return;
-    if (state.loaded && state.nativeRowsPending) return;
+    if (state.nativeRows.empty() && !state.nativeRowsComplete) return false;
+    if (state.loaded && state.nativeRowsPending) return false;
     const bool complete = state.nativeRowsComplete;
     const int count = static_cast<int>(state.nativeRows.size());
     const bool needsExtraProperties = std::any_of(state.columns.begin(),
@@ -27148,6 +27208,8 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
                     a.driveUsedPercent == b.driveUsedPercent &&
                     a.sortValueKind == b.sortValueKind && a.sortNumber == b.sortNumber && a.sortText == b.sortText &&
                     a.groupKey == b.groupKey && a.groupTitle == b.groupTitle &&
+                    std::equal(a.cells.begin(), a.cells.end(), b.cells.begin(), b.cells.end(),
+                        [](const ColumnCell& x, const ColumnCell& y) { return SameKey(x.key,y.key) && x.text==y.text; }) &&
                     a.columnEpoch == b.columnEpoch;
             });
     const bool sameRows=state.loaded==complete && SameShellGroup(state.displayedGrouping,state.grouping) &&
@@ -27207,6 +27269,7 @@ void RefreshThisPcRows(ViewState& state, bool requestData) {
         !SameThisPcCapacityTargets(capacityTargets, state.thisPcSpaceRequestedPaths))
         QueueDirectoryRefresh(state, true);
     if (!unchanged) Redraw(state);
+    return !unchanged;
 }
 
 void InitializeFrameShellEvents(ViewState& state) {
