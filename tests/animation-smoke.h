@@ -608,21 +608,27 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         state.rowTransitionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.045);
         Check(Eventually([&] { frame(); return state.rowTransitionPresentedProgress > 0.f; }),
               "deletion has no intermediate submitted frame");
-        const std::wstring survivor = state.entries[0].path;
-        const auto before = LayoutRowVisual(state, 0, state.rowTransitionPresentedProgress);
-        const float ghostHeight = state.disappearingRows[0].oldHeight *
-            (1.f-state.rowTransitionPresentedProgress);
-        removeRows(1, 4);
-        const int row = GpuRowForNativePath(state, survivor);
-        const auto after = LayoutRowVisual(state, row, 0.f);
-        Check(row >= 0 && after.top <= before.top+.01f &&
-              after.top >= state.headerPx-.01f &&
-              fabsf(before.opacity-after.opacity) < .001f,
-              "overlapping batch moved backwards instead of sampling current motion");
-        Check(state.disappearingRows.size() == 8 &&
-              state.disappearingRows[4].oldHeight <= ghostHeight+.01f &&
-              state.disappearingRows[4].oldHeight > 0.f && state.rowTransitionStartedQpc.QuadPart,
-              "next batch dropped or reset the preceding outgoing rows");
+        const int row = [&] {
+            // Sample one overlap instant. Private filesystem/provider latency
+            // must not expire the scene while this retarget assertion waits.
+            AnimationClockFixture::Freeze instant;
+            const std::wstring survivor = state.entries[0].path;
+            const auto before = LayoutRowVisual(state, 0, state.rowTransitionPresentedProgress);
+            const float ghostHeight = state.disappearingRows[0].oldHeight *
+                (1.f-state.rowTransitionPresentedProgress);
+            removeRows(1, 4);
+            const int row = GpuRowForNativePath(state, survivor);
+            const auto after = LayoutRowVisual(state, row, 0.f);
+            Check(row >= 0 && after.top <= before.top+.01f &&
+                  after.top >= state.headerPx-.01f &&
+                  fabsf(before.opacity-after.opacity) < .001f,
+                  "overlapping batch moved backwards instead of sampling current motion");
+            Check(state.disappearingRows.size() == 8 &&
+                  state.disappearingRows[4].oldHeight <= ghostHeight+.01f &&
+                  state.disappearingRows[4].oldHeight > 0.f && state.rowTransitionStartedQpc.QuadPart,
+                  "next batch dropped or reset the preceding outgoing rows");
+            return row;
+        }();
         SetScrollImmediate(state, state.scrollNow);
         MoveScroll(state, state.scrollTarget);
         Check(state.rowTransitionActive, "no-op viewport update cancelled deletion movement");

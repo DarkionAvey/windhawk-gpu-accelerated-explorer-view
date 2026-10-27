@@ -56,7 +56,28 @@ static void TestIconAlphaQuality(const std::wstring& fixture) {
     ComPtr<IImageList> list; HICON rawIcon=nullptr;
     Check(SUCCEEDED(SHGetImageList(SHIL_JUMBO,IID_PPV_ARGS(&list))) &&
         SUCCEEDED(list->GetIcon(info.iIcon,ILD_TRANSPARENT,&rawIcon)),"native folder HICON");
-    auto native=DecodeShellIcon(wic.Get(),rawIcon); DestroyIcon(rawIcon); Valid(native);
+    const auto nativeIcon=DecodeShellIcon(wic.Get(),rawIcon); DestroyIcon(rawIcon); Valid(nativeIcon);
+    // Factory/list artwork can differ after other Shell requests. Validate
+    // conversion against independent GDI bytes of the factory's own HBITMAP,
+    // rather than assuming two providers selected identical artwork.
+    ComPtr<IShellItemImageFactory> referenceFactory; HBITMAP referenceBitmap=nullptr;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(empty.c_str(),nullptr,IID_PPV_ARGS(&referenceFactory))) &&
+        SUCCEEDED(referenceFactory->GetImage({256,256},SIIGBF(SIIGBF_ICONONLY|SIIGBF_BIGGERSIZEOK),&referenceBitmap)),
+        "native bitmap alpha reference");
+    BITMAP dimensions{};
+    Check(GetObjectW(referenceBitmap,sizeof(dimensions),&dimensions)==sizeof(dimensions),"native bitmap dimensions");
+    IconPixels native; native.width=UINT(dimensions.bmWidth); native.height=UINT(abs(dimensions.bmHeight));native.stride=native.width*4;
+    native.data.resize(size_t(native.stride)*native.height);
+    BITMAPINFO bitmapInfo{};bitmapInfo.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth=LONG(native.width);bitmapInfo.bmiHeader.biHeight=-LONG(native.height);
+    bitmapInfo.bmiHeader.biPlanes=1;bitmapInfo.bmiHeader.biBitCount=32;
+    HDC dc=CreateCompatibleDC(nullptr);
+    const auto lines=GetDIBits(dc,referenceBitmap,0,native.height,native.data.data(),&bitmapInfo,DIB_RGB_COLORS);
+    DeleteDC(dc);DeleteObject(referenceBitmap);Check(lines==int(native.height),"native bitmap bytes");
+    auto* bytes=native.data.data();
+    for(size_t i=0;i<native.data.size();i+=4) for(int c=0;c<3;++c)
+        bytes[i+c]=BYTE((UINT(bytes[i+c])*bytes[i+3]+127)/255);
+    Valid(native);
     Check(actual.width==native.width && actual.height==native.height,"native folder comparison dimensions");
     size_t partial=0;
     for(UINT y=0;y<actual.height;++y) for(UINT x=0;x<actual.width;++x) {
@@ -121,7 +142,7 @@ static void TestIconAlphaQuality(const std::wstring& fixture) {
                 Check(abs(int(a.data[i])-int(b.data[i]))<=1,"GPU icon edges differ from native source on dark/light/Cut/DPI sizes");
         }
     // Optional review artifact: actual old interpretation, corrected loader,
-    // and independent native HICON, with the same geometry and GPU filter.
+    // and independent native bitmap, with the same geometry and GPU filter.
     wchar_t preview[MAX_PATH]{};
     if(GetEnvironmentVariableW(L"GPU_OVERLAY_ICON_ALPHA_PREVIEW",preview,ARRAYSIZE(preview))) {
         ComPtr<IShellItemImageFactory> item; HBITMAP raw=nullptr; ComPtr<IWICBitmap> wrong;
@@ -135,7 +156,7 @@ static void TestIconAlphaQuality(const std::wstring& fixture) {
         Check(SUCCEEDED(g_writeFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,20,L"en-US",&label)),"alpha preview labels");
         state.target->BeginDraw(); state.target->Clear(Packed(0x181818)); state.brush->SetColor(Packed(0xFFFFFF));
-        const wchar_t* labels[]={L"Before",L"Corrected",L"Native HICON reference"};
+        const wchar_t* labels[]={L"Before",L"Corrected",L"Native bitmap reference"};
         IconRecord* records[]={&old,&loaded,&reference};
         for(int column=0;column<3;++column) {
             const auto box=D2D1::RectF(float(column*256+12),8,float((column+1)*256),40);
@@ -147,5 +168,5 @@ static void TestIconAlphaQuality(const std::wstring& fixture) {
     DropTarget(state); DestroyWindow(state.hwnd); g_writeFactory=factoryBefore;
     frame.Reset(); decoder.Reset(); list.Reset();
     Check(DeleteFileW(png.c_str()) && RemoveDirectoryW(empty.c_str()),"private icon alpha fixture cleanup");
-    std::cout<<"PASS: real Shell straight-alpha icons match native HICON texels; transparent PNG alpha is applied once; GPU dark/light, LTR/RTL, Cut and 24..256px edges\n";
+    std::cout<<"PASS: real Shell straight-alpha icons match independent native bitmap texels; HICON alpha valid; transparent PNG alpha applied once; GPU dark/light, LTR/RTL, Cut and 24..256px edges\n";
 }

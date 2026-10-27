@@ -92,7 +92,7 @@ static void TestLargeTileBackpressure() {
 static void TestLargeTileSampling() {
     Check(IconInterpolation(256,256,256,256,0)==D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR &&
         IconInterpolation(96,96,256,256,0)==D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC &&
-        IconInterpolation(384,384,256,256,0)==D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC &&
+        IconInterpolation(384,384,256,256,0)==D2D1_INTERPOLATION_MODE_LINEAR &&
         IconInterpolation(2048,2048,256,256,0)==D2D1_INTERPOLATION_MODE_LINEAR &&
         IconInterpolation(2048,1024,256,128,5)==D2D1_INTERPOLATION_MODE_LINEAR &&
         IconInterpolation(2048,1024,4096,2048,0)==D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,

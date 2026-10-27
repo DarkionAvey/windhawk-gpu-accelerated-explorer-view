@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.255
+// @version         0.9.257
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -5379,13 +5379,41 @@ IconPixels DecodeIconPixels(IWICImagingFactory* factory, IWICBitmapSource* sourc
     return result;
 }
 
+// Image-list HICONs are unframed, but their canvas can exceed the available
+// resource. Compact visible pixels once on the worker, before GPU upload.
+IconPixels FitShellIconPixels(IconPixels pixels) {
+    if (!pixels.Ready()) return {};
+    UINT left=pixels.width,top=pixels.height,right=0,bottom=0;
+    const BYTE* data=std::as_const(pixels.data).data();
+    for(UINT y=0;y<pixels.height;++y) for(UINT x=0;x<pixels.width;++x)
+        if(data[size_t(y)*pixels.stride+x*4+3]) {
+            left=std::min(left,x); top=std::min(top,y);
+            right=std::max(right,x+1); bottom=y+1;
+        }
+    // A successfully decoded but empty icon must not suppress its fallback.
+    if(right<=left || bottom<=top) return {};
+    if(left==0 && top==0 && right==pixels.width && bottom==pixels.height) return pixels;
+    IconPixels fitted; fitted.width=right-left; fitted.height=bottom-top; fitted.stride=fitted.width*4;
+    try {fitted.data.resize(size_t(fitted.stride)*fitted.height);}
+    catch(const std::bad_alloc&) {return pixels;}
+    BYTE* destination=fitted.data.data();
+    for(UINT y=0;y<fitted.height;++y)
+        memcpy(destination+size_t(y)*fitted.stride,data+size_t(top+y)*pixels.stride+left*4,fitted.stride);
+    return fitted;
+}
+
 IconPixels DecodeShellIcon(IWICImagingFactory* factory, HICON icon, HRESULT* status = nullptr,
-                          UINT maxDimension = kPlatformImageDimension) {
+                          UINT maxDimension = kPlatformImageDimension, bool fit = false) {
     if (!factory || !icon) { if (status) *status = E_POINTER; return {}; }
     ComPtr<IWICBitmap> source;
     const HRESULT hr = factory->CreateBitmapFromHICON(icon, source.GetAddressOf());
     if (FAILED(hr)) { if (status) *status = hr; return {}; }
-    return DecodeIconPixels(factory, source.Get(), status, maxDimension);
+    auto pixels=DecodeIconPixels(factory, source.Get(), status, maxDimension);
+    if(fit) {
+        pixels=FitShellIconPixels(std::move(pixels));
+        if(!pixels.Ready() && status && SUCCEEDED(*status)) *status=E_FAIL;
+    }
+    return pixels;
 }
 
 // These are renderer adornments, not alterations to the Windows thumbnail
@@ -5545,7 +5573,7 @@ void RefreshImageMemoryAllowance(TabBackground& work) {
 // Details/Small Icons request icons only; large grids allow Shell thumbnails
 // on this same background lane and retain the shared association as fallback.
 IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
-                             TabBackground::Worker& lane, HRESULT* status) {
+                             TabBackground::Worker& lane, HRESULT* status, bool thumbnailOnly = false) {
     if (!factory) return {};
     ComPtr<IShellItemImageFactory> item;
     HRESULT hr = job.shellIdentity ? SHCreateItemFromIDList(job.shellIdentity.get(), IID_PPV_ARGS(&item)) :
@@ -5559,6 +5587,7 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
             thumbnail = SUCCEEDED(hr) && raw;
             if (!thumbnail && raw) { DeleteObject(raw); raw=nullptr; }
         }
+        if (!thumbnail && thumbnailOnly) { if(status) *status=hr; return {}; }
         if (!thumbnail) hr = item->GetImage(size,
             static_cast<SIIGBF>(SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK),&raw);
     }
@@ -5639,8 +5668,11 @@ DWORD WINAPI IconWorkerProc(LPVOID context) {
         const ULONGLONG began = GetTickCount64();
         IconPixels pixels;
         HRESULT decodeResult = memoryReady ? S_OK : HRESULT_FROM_WIN32(ERROR_RETRY);
-        if (memoryReady && (job.pixelSize > 32 || job.allowThumbnail) && !job.useAttributes && IconJobCurrent(work, job))
-            pixels = LoadShellItemIcon(factory.Get(), job, lane, &decodeResult);
+        // Ask the factory for genuine thumbnails only. Some icon-only results
+        // contain a provider-drawn frame around tiny centered artwork; alpha
+        // bounds cannot distinguish that frame from the icon. Prefer HICONs.
+        if (memoryReady && job.allowThumbnail && !job.useAttributes && IconJobCurrent(work, job))
+            pixels = LoadShellItemIcon(factory.Get(), job, lane, &decodeResult, true);
         SHFILEINFOW info{};
         bool haveIndex = false;
         UINT flags = SHGFI_ICON | (job.pixelSize > 32 ? SHGFI_SYSICONINDEX : 0);
@@ -5651,17 +5683,24 @@ DWORD WINAPI IconWorkerProc(LPVOID context) {
                 job.useAttributes ? job.attributes : 0, &info, sizeof(info),
                 flags | (job.shellIdentity && !job.useAttributes ? SHGFI_PIDL : 0)) != 0;
         std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)> icon(info.hIcon, DestroyIcon);
+        UINT decodeSize=job.pixelSize;
         if (memoryReady && !pixels.Ready() && haveIndex && job.pixelSize > 32 && IconJobCurrent(work, job)) {
             ComPtr<IImageList> images;
             HICON large = nullptr;
             if (SUCCEEDED(SHGetImageList(job.pixelSize > 48 ? SHIL_JUMBO : SHIL_EXTRALARGE,
-                IID_PPV_ARGS(&images))) && SUCCEEDED(images->GetIcon(info.iIcon, ILD_TRANSPARENT, &large)))
+                IID_PPV_ARGS(&images))) && SUCCEEDED(images->GetIcon(info.iIcon, ILD_TRANSPARENT, &large))) {
                 icon.reset(large);
+                int width=0,height=0;
+                if(SUCCEEDED(images->GetIconSize(&width,&height)) && width>0 && height>0)
+                    decodeSize=std::max(decodeSize,UINT(std::max(width,height)));
+            }
         }
         if (memoryReady && !pixels.Ready() && IconJobCurrent(work, job))
-            pixels = DecodeShellIcon(factory.Get(), icon.get(), &decodeResult, job.pixelSize);
-        if (memoryReady && !pixels.Ready() && !job.useAttributes && IconJobCurrent(work, job))
-            pixels = LoadShellItemIcon(factory.Get(), job, lane, &decodeResult);
+            pixels = DecodeShellIcon(factory.Get(), icon.get(), &decodeResult, decodeSize, true);
+        if (memoryReady && !pixels.Ready() && !job.useAttributes && IconJobCurrent(work, job)) {
+            auto fallback=job; fallback.allowThumbnail=false;
+            pixels = LoadShellItemIcon(factory.Get(), fallback, lane, &decodeResult);
+        }
         IconResult result{job.hwnd, job.token, job.key, job.requestId, std::move(pixels), job.useAttributes,
             initializeResult, decodeResult, icon != nullptr};
         PipelineEvent(work,{.operation=L"worker.icon.publish[w,h,bytes,decodeHR]",.a=job.requestId,.b=job.token,
@@ -13531,11 +13570,11 @@ std::vector<IconRecord*> VisibleIconUploads(ViewState& state) {
         const Entry& entry = ModelEntry(state,i);
         std::wstring path;
         bool attributes = false;
-        auto record = FindIconRecord(state, IconKey(state, entry, path, attributes), state.gridView);
+        auto record = FindIconRecord(state, IconKey(state, entry, path, attributes), true);
         if (record && record->bitmap) continue;
         if ((!record || !record->pixels.Ready() || record->bitmapAttempted) &&
             (!entry.folder || !IsDriveRoot(entry.path)))
-            record = FindIconRecord(state, IconKey(state, entry, path, attributes, true), state.gridView);
+            record = FindIconRecord(state, IconKey(state, entry, path, attributes, true), true);
         if (record && record->pixels.Ready() && !record->bitmap &&
             !record->bitmapAttempted && included.insert(record).second)
             pending.push_back(record);
@@ -13836,10 +13875,9 @@ D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
     float sourceWidth, float sourceHeight, float angle) {
     if (fabsf(width-sourceWidth)<.001f && fabsf(height-sourceHeight)<.001f && angle==0.f)
         return D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
-    // Magnifying a small Shell icon over a large tile cannot recover detail.
-    // Use hardware bilinear sampling there, as for thumbnails; keep cubic's
-    // prefilter for minification and its reconstruction for ordinary sizes.
-    if (std::max(width,height)>=512.f && width>=2.f*sourceWidth && height>=2.f*sourceHeight)
+    // Native resources stop growing; magnify the cached texture in hardware.
+    // Retain cubic's prefilter for minification.
+    if (width>=sourceWidth && height>=sourceHeight)
         return D2D1_INTERPOLATION_MODE_LINEAR;
     return D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
 }

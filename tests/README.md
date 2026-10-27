@@ -50,10 +50,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/repository-regression.
 ```
 
 The default source is latest.cpp. `--icon-alpha` compares real Shell icon decoding
-with native HICON pixels and transparent PNG references, plus GPU edge pixels
+with independent native bitmap bytes and transparent PNG references, plus GPU edge pixels
 on dark/light backgrounds, RTL/LTR, Cut opacity and 24..256px sizes. Set
 `GPU_OVERLAY_ICON_ALPHA_PREVIEW` to a PNG output path for a comparison image.
 See the [alpha investigation](../docs/icon-alpha-0.9.240.md).
+`--icon-sizing` exercises a private native ICO through the actual image-list
+worker while its image factory supplies a framed fallback. It checks list zoom
+cache reuse, presentation handoff, GPU target recreation and offscreen grid/list
+fitting. Manual read-only `icon-source-probe.cpp` and `icon-pipeline-probe.cpp`
+accept an explicit source item and private output location; normal tests never
+read user folders. See the [sizing investigation](../docs/icon-sizing-0.9.257.md).
 `--shell-provider` compares a private folder shortcut's items with its Shell
 provider, including native identities, metadata, selection, hidden and empty
 targets, sorting, and target change watching. It also runs under `--filesystem`.

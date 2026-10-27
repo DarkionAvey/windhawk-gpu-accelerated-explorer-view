@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.257
+
+- Replace the withdrawn 0.9.256 sizing change. Load unframed Shell icons and
+  fit their artwork to grid/list slots, using cached GPU scaling when zooming.
+- Fix missing list icons when reusing a cached image at another zoom size,
+  including after the GPU target is recreated. Preserve thumbnail framing.
+
 ## 0.9.255
 
 - Resolve small native selections on the existing per-tab selection worker,

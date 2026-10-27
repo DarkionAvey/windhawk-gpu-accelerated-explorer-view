@@ -89,6 +89,39 @@ struct Session {
 };
 }
 
+// Only the private ICO used by the sizing regression is intercepted. Real
+// image-list extraction remains intact; the factory emulates a framed icon.
+namespace FramedIconFixture {
+inline std::wstring path;
+inline std::atomic<unsigned> icons{0},thumbnails{0};
+class Factory final : public IShellItemImageFactory {
+    std::atomic<ULONG> refs{1};
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** output) override {
+        if(!output) return E_POINTER; *output=nullptr;
+        if(iid!=IID_IUnknown && iid!=IID_IShellItemImageFactory) return E_NOINTERFACE;
+        *output=static_cast<IShellItemImageFactory*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {return ++refs;}
+    ULONG STDMETHODCALLTYPE Release() override {const auto n=--refs; if(!n) delete this; return n;}
+    HRESULT STDMETHODCALLTYPE GetImage(SIZE size,SIIGBF flags,HBITMAP* output) override {
+        if(!output) return E_POINTER; *output=nullptr;
+        if(flags&SIIGBF_THUMBNAILONLY) {++thumbnails;return E_FAIL;}
+        ++icons; if(size.cx<=0 || size.cy<=0) return E_INVALIDARG;
+        BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth=size.cx; info.bmiHeader.biHeight=-size.cy;
+        info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32;
+        void* bits=nullptr; *output=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+        if(!*output || !bits) return E_OUTOFMEMORY;
+        auto* pixels=static_cast<DWORD*>(bits); std::fill_n(pixels,size_t(size.cx)*size.cy,0);
+        for(int y=0;y<size.cy;++y) for(int x=0;x<size.cx;++x)
+            if(x==0 || y==0 || x==size.cx-1 || y==size.cy-1 ||
+                (abs(x-size.cx/2)<8 && abs(y-size.cy/2)<6)) pixels[size_t(y)*size.cx+x]=0xFF7090C0;
+        return S_OK;
+    }
+};
+}
+
 namespace IconFixture {
 inline HANDLE gate = nullptr;
 inline std::atomic<unsigned> blocked{0};
@@ -120,6 +153,10 @@ struct Session {
     ~Session() { enabled = false; if (gate) SetEvent(gate); }
 };
 inline HRESULT WINAPI CreateItem(PCWSTR path, IBindCtx* context, REFIID iid, void** output) {
+    if(path && !FramedIconFixture::path.empty() && FramedIconFixture::path==path) {
+        auto* factory=new FramedIconFixture::Factory;
+        const auto hr=factory->QueryInterface(iid,output); factory->Release(); return hr;
+    }
     if(AdaptiveImageFixture::enabled && path && std::wstring_view(path).starts_with(L"wh-adaptive-image:")) {
         auto* factory=new AdaptiveImageFixture::Factory(std::wstring_view(path).find(L"slow")!=std::wstring_view::npos);
         const HRESULT hr=factory->QueryInterface(iid,output); factory->Release(); return hr;

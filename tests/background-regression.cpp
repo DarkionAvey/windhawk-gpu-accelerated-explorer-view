@@ -1779,6 +1779,7 @@ static void TestPreviewInput() {
 #include "adaptive-image-smoke.h"
 #include "large-tile-smoke.h"
 #include "icon-alpha-smoke.h"
+#include "icon-sizing-smoke.h"
 #include "shell-provider-smoke.h"
 #include "provider-selection-smoke.h"
 #include "provider-navigation-smoke.h"
@@ -1815,7 +1816,9 @@ int wmain(int argc,wchar_t** argv) {
             CloseHandle(file);
         }
         const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--icon-alpha")==0) {
+        if (argc>1 && wcscmp(argv[1],L"--icon-sizing")==0) {
+            TestNativeIconSizing(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--icon-alpha")==0) {
             TestIconAlphaQuality(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--animation-continuity")==0) {
             Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
@@ -1973,6 +1976,7 @@ int wmain(int argc,wchar_t** argv) {
         TestFrameBudgets();
         TestLargeTileBackpressure(); TestLargeTileSampling();
         TestIconAlphaQuality(fixture.wstring());
+        TestNativeIconSizing(fixture.wstring());
         TestPipelineTrace();
         TestPropertyPoolIsolation(fixture.wstring());
         TestDriveSpaceRefresh();
