@@ -187,6 +187,12 @@ static void TestProviderSelection(const std::wstring& fixture) {
         auto& state = host.state;
         FocusFixture::Session focus(host.frame, state.hwnd);
         host.Navigate(path.wstring(), 99);
+        PIDLIST_ABSOLUTE boundRoot=nullptr;
+        Check(SUCCEEDED(SHGetIDListFromObject(state.folder.Get(),&boundRoot)) && boundRoot,
+            "native provider root capture");
+        OwnedPidl nativeRoot(boundRoot);
+        Check(state.directoryFolderIdentity && PidlBytesEqual(nativeRoot.get(),state.directoryFolderIdentity.get()),
+            "directory/watch/selection workers did not retain their native provider binding");
         const bool provider = path != target;
         Check(bool(state.namespaceIdentities) == provider &&
             bool(state.entries.front().shellIdentity) == provider, "provider row identity authority");

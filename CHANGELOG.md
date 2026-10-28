@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.271
+
+- Fix folders failing to open and selections being cleared in user profile
+  directories when Windows exposes different Shell providers for the same path.
+- Preserve the active Explorer folder's identity through background refresh,
+  change watching and cached returns.
+
 ## 0.9.270
 
 - Keep the view-toggle button aligned with native status controls during touch

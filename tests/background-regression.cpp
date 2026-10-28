@@ -1812,6 +1812,7 @@ static void TestPreviewInput() {
 #include "icon-sizing-smoke.h"
 #include "shell-provider-smoke.h"
 #include "provider-selection-smoke.h"
+#include "profile-identity-smoke.h"
 #include "provider-navigation-smoke.h"
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
@@ -1945,6 +1946,8 @@ int wmain(int argc,wchar_t** argv) {
             TestNativeSuppression();
             TestNativeUiaBatch();
             TestRealNativeUiaPressure(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--profile-identity-probe")==0) {
+            TestProfileIdentityProbe();
         } else if (argc>1 && wcscmp(argv[1],L"--provider-selection")==0) {
             TestProviderSelection(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--provider-navigation")==0) {

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.270
+// @version         0.9.271
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -998,6 +998,7 @@ struct FolderChangeStamp {
 };
 struct CachedFolderSnapshot {
     std::shared_ptr<const std::vector<Entry>> presentationEntries;
+    SharedPidl folderIdentity;
     std::wstring path;
     SortSpec sort;
     ShellVisibilityPolicy visibility;
@@ -1379,6 +1380,7 @@ struct DirectoryJob {
     bool checkSort = false; // Observe keys without invalidating the displayed snapshot.
     unsigned long long checkOrderHash = 0;
     std::vector<Entry> sortChecks; // Bounded changed identities; empty means verify overflow order.
+    SharedPidl folderIdentity; // Native binding, including filesystem-addressed providers.
     SharedPidl namespaceFolder; // Immutable; rebound only by the names worker.
     std::shared_ptr<const NamespaceIdentities> verifyIdentities;
     std::shared_ptr<std::atomic<size_t>> capacityRemaining;
@@ -1453,7 +1455,7 @@ struct FolderWatch {
 struct DirectoryWatchJob {
     std::wstring path;
     unsigned long long token = 0;
-    SharedPidl namespaceFolder;
+    SharedPidl folderIdentity;
 };
 struct NativeRowIdentity {
     OwnedPidl absolute;
@@ -6410,6 +6412,20 @@ void ArmInteractiveCreation(ViewState& state, unsigned mask,
 bool EnsureDirectoryWorker(ViewState& state, bool properties);
 DWORD WINAPI DirectoryWorkerProc(LPVOID context);
 
+bool EnsureDirectoryFolderIdentity(ViewState& state) {
+    if (state.directoryFolderIdentity) return true;
+    // Optimistic navigation still holds the departing native folder. Only
+    // confirmed bindings may supply an identity for the destination worker.
+    if (state.optimisticStartedAt) return true;
+    if (!state.folder) return !UsesNamespaceFolderIdentity(state.folderPath);
+    PIDLIST_ABSOLUTE root = nullptr;
+    const HRESULT hr = SHGetIDListFromObject(state.folder.Get(), &root);
+    OwnedPidl owned(root);
+    if (FAILED(hr) || !owned) return false;
+    state.directoryFolderIdentity = SharedPidl(owned.release(), TaskMemDeleter{});
+    return true;
+}
+
 void WatchDirectory(ViewState& state) {
     // Recreating the watcher in the same view must not expire a slow New
     // command. A different folder/view generation explicitly cancels it.
@@ -6422,14 +6438,8 @@ void WatchDirectory(ViewState& state) {
         !StartTabWorker(state.background, work.watch, DirectoryWorkerProc, THREAD_PRIORITY_NORMAL)) return;
     state.watchToken = g_nextToken.fetch_add(1);
     DirectoryWatchJob job{state.folderPath, state.watchToken};
-    if (UsesNamespaceFolderIdentity(state.folderPath)) {
-        if (!state.directoryFolderIdentity) {
-            PIDLIST_ABSOLUTE root = nullptr;
-            if (!state.folder || FAILED(SHGetIDListFromObject(state.folder.Get(), &root)) || !root) return;
-            state.directoryFolderIdentity = SharedPidl(root, TaskMemDeleter{});
-        }
-        job.namespaceFolder = state.directoryFolderIdentity;
-    }
+    if (!EnsureDirectoryFolderIdentity(state)) return;
+    job.folderIdentity = state.directoryFolderIdentity;
     ExclusiveSrwLock lock(work.directoryLock);
     work.watchGeneration.store(state.watchToken, std::memory_order_release);
     work.watchJobs.clear();
@@ -7194,9 +7204,14 @@ void ResolveNativeRowsJob(TabBackground& work, NativeRowsJob& job, Resolver&& re
 
 // Resolve the provider on the tab's worker. A filesystem-shaped navigation
 // PIDL does not imply filesystem contents: Shell providers can delegate views.
-HRESULT BindDirectoryProvider(const std::wstring& path, ComPtr<IShellFolder>& folder) {
+HRESULT BindDirectoryProvider(const std::wstring& path, ComPtr<IShellFolder>& folder,
+                              PCIDLIST_ABSOLUTE identity = nullptr) {
     ComPtr<IShellItem> item;
-    HRESULT hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item));
+    // Reparsing a filesystem path can select a different provider (e.g. User
+    // Files instead of Explorer's filesystem view of the same profile path).
+    // Its child PIDLs cannot be sent to the original native view.
+    HRESULT hr = identity ? SHCreateItemFromIDList(identity, IID_PPV_ARGS(&item)) :
+        SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item));
     if (SUCCEEDED(hr)) hr = item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder));
     return hr;
 }
@@ -7719,7 +7734,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             result.watch->stamp = std::make_shared<FolderChangeStamp>();
             const bool namespaceFolder = UsesNamespaceFolderIdentity(watch.path);
             ComPtr<IShellFolder> provider;
-            result.watch->path = !namespaceFolder && SUCCEEDED(BindDirectoryProvider(watch.path, provider)) ?
+            result.watch->path = !namespaceFolder && SUCCEEDED(BindDirectoryProvider(watch.path, provider,
+                watch.folderIdentity.get())) ?
                 DirectoryProviderPath(provider.Get(), watch.path) : watch.path;
             if (!namespaceFolder)
                 result.watch->change = FindFirstChangeNotificationW(result.watch->path.c_str(), FALSE,
@@ -7730,7 +7746,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             if (work.watchGeneration.load(std::memory_order_acquire) != watch.token) continue;
             PIDLIST_ABSOLUTE pidl = nullptr;
             HRESULT observed = S_OK;
-            if (watch.namespaceFolder) pidl = ILCloneFull(watch.namespaceFolder.get());
+            if (watch.folderIdentity) pidl = ILCloneFull(watch.folderIdentity.get());
             else if (IsRecycleBinLocation(watch.path))
                 observed = SHGetKnownFolderIDList(FOLDERID_RecycleBinFolder, 0, nullptr, &pidl);
             else if (!namespaceFolder)
@@ -7802,7 +7818,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             }
             ComPtr<IShellFolder> provider;
             if (!directory.enumerated && !directory.namespaceFolder && !IsThisPcLocation(directory.path)) {
-                HRESULT hr = BindDirectoryProvider(directory.path, provider);
+                HRESULT hr = BindDirectoryProvider(directory.path, provider, directory.folderIdentity.get());
                 if (SUCCEEDED(hr) && !PlainFilesystemProvider(provider.Get(), directory.path)) {
                     PIDLIST_ABSOLUTE root = nullptr;
                     hr = SHGetIDListFromObject(provider.Get(), &root);
@@ -8408,6 +8424,7 @@ void CacheDepartingFolder(ViewState& state) {
     FolderCache& cache = state.folderCache;
     CachedFolderSnapshot snapshot;
     snapshot.path = state.folderPath;
+    snapshot.folderIdentity = state.directoryFolderIdentity;
     snapshot.sort = state.displayedSort;
     snapshot.grouping = state.displayedGrouping;
     snapshot.visibility = state.visibility;
@@ -8518,6 +8535,9 @@ bool RestoreCachedFolder(ViewState& state) {
         it->second.visibility != state.visibility)
         return false;
     CachedFolderSnapshot& snapshot = it->second;
+    if (state.directoryFolderIdentity && snapshot.folderIdentity &&
+        !PidlBytesEqual(state.directoryFolderIdentity.get(), snapshot.folderIdentity.get()))
+        return false;
     auto changeStamp = snapshot.changeStamp.lock();
     // A zero-time kernel-event check performs no directory/provider I/O.
     // Never flash a saved filesystem list while async enumeration discovers
@@ -8729,7 +8749,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         if (state.directoryPending) EnsureProviderWorkers(state, TabBackground::Lane::Capacity);
         return;
     }
-    if (!EnsureDirectoryWorker(state) ||
+    if (!EnsureDirectoryFolderIdentity(state) || !EnsureDirectoryWorker(state) ||
         ((state.sort.explicitOrder || state.grouping.enabled) &&
          !StartTabWorker(state.background, state.background->layout,
                          DirectoryWorkerProc, THREAD_PRIORITY_BELOW_NORMAL))) {
@@ -8793,20 +8813,13 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     newJob.hwnd = state.hwnd;
     newJob.token = state.directoryToken;
     newJob.path = state.folderPath;
+    newJob.folderIdentity = state.directoryFolderIdentity;
     newJob.previousOrderHash=state.displayedOrderHash;
     newJob.previousMetadataHash=state.displayedMetadataHash;
     newJob.sortRevealPath=std::move(state.sortRevealPath);
     newJob.sortRevealOldIndex=state.sortRevealOldIndex;
     state.sortRevealPath.clear(); state.sortRevealOldIndex=-1;
     if (UsesNamespaceFolderIdentity(state.folderPath)) {
-        PIDLIST_ABSOLUTE pidl = nullptr;
-        if (!state.directoryFolderIdentity) {
-            if (FAILED(SHGetIDListFromObject(state.folder.Get(), &pidl)) || !pidl) {
-                state.directoryPending = false;
-                return;
-            }
-            state.directoryFolderIdentity = SharedPidl(pidl, TaskMemDeleter{});
-        }
         newJob.namespaceFolder = state.directoryFolderIdentity;
     }
     newJob.allowInitialPreview = !state.loaded;
@@ -8873,6 +8886,7 @@ void RevalidateActiveSort(ViewState& state, const std::vector<std::wstring>* ite
         DirectoryWorkerProc,THREAD_PRIORITY_BELOW_NORMAL)) return;
     DirectoryJob job;
     job.hwnd=state.hwnd; job.token=state.directoryToken; job.path=state.folderPath;
+    job.folderIdentity=state.directoryFolderIdentity;
     job.checkSort=true; job.checkOrderHash=state.displayedOrderHash;
     job.sort=state.sort.explicitOrder ? state.sort : DefaultSort();
     job.grouping=state.grouping; job.visibility=state.visibility;
@@ -27308,7 +27322,6 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.capacityToken = 0;
     state.driveSpaceRefreshPending = false;
     CancelNativeRows(state);
-    state.directoryFolderIdentity.reset();
     state.namespaceCheckPending = false;
     state.nativeColumnsDirty = true;
     state.nativeModeHintPending = state.nativeSettingsHintPending = state.nativeViewCommandPending = false;
@@ -27329,6 +27342,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.lastFolderNativeAfterPaint = false;
     state.lastFolderNativePresentAfter = 0;
     CacheDepartingFolder(state);
+    state.directoryFolderIdentity.reset();
     RetireCachedEntries(state, state.namespaceIdentities);
     state.visibility = ReadShellVisibilityPolicy();
     state.clickPolicy = ReadShellClickPolicy();
@@ -28551,6 +28565,14 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         const bool changedPath = _wcsicmp(s->folderPath.c_str(), path.c_str()) != 0;
         const bool wasOutside = !s->inScope;
         const bool optimistic = s->optimisticStartedAt != 0;
+        bool changedBinding = false;
+        if (changedView && !changedPath && !optimistic && s->directoryFolderIdentity) {
+            PIDLIST_ABSOLUTE root = nullptr;
+            const HRESULT hr = SHGetIDListFromObject(folder.Get(), &root);
+            OwnedPidl identity(root);
+            changedBinding = FAILED(hr) || !identity ||
+                !PidlBytesEqual(identity.get(), s->directoryFolderIdentity.get());
+        }
         const std::wstring optimisticOrigin = optimistic ? s->optimisticFromPath : L"";
         const std::wstring navigationOrigin = optimistic ? optimisticOrigin : s->folderPath;
         const bool optimisticMatch = optimistic && !changedPath &&
@@ -28699,20 +28721,12 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // KEEP it. Resetting it here would recreate the 200ms blank wait.
             s->folder = folder;
             WatchDirectory(*s);
-            // A cold provisional preview already has a worker running. When
-            // the Shell announces different grouping, cancel that worker's
-            // generation: a plain enumeration prefix cannot become grouped
-            // rows. The queued token rejects its stale preview/full result.
-            const bool changedGrouping = !SameShellGroup(
-                s->queuedDirectoryGrouping, s->grouping);
-            if (changedGrouping && (s->directoryPending || !s->loaded)) {
-                // Keep existing provisional rows visible until the full
-                // correctly grouped replacement is ready, but never allow
-                // selection against those preview indices.
-                QueueDirectoryRefresh(*s, true, s->loaded);
-            } else if (!s->directoryPending) {
-                QueueDirectoryRefresh(*s, false, s->loaded);
-            }
+            // A speculative worker had only a parsing path. Replace its
+            // generation with the confirmed binding even when names/grouping
+            // agree: identical paths can expose incompatible child PIDLs.
+            // Keep painted names; provider command identities await this job.
+            if (s->namespaceIdentities) s->loaded = false;
+            QueueDirectoryRefresh(*s, true, s->loaded);
             ArmAutoRefit(*s);
             if (!s->lastFolderNativePending.empty()) {
                 PostMessageW(overlay,kMsgLastFolderSelection,0,0);
@@ -28720,7 +28734,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             if (g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU overlay] optimistic display confirmed: native ready after %llu ms (%s)",
                     static_cast<unsigned long long>(optimisticElapsed), path.c_str());
-        } else if (changedPath || wasOutside || s->folderPath.empty() || optimistic) {
+        } else if (changedPath || changedBinding || wasOutside || s->folderPath.empty() || optimistic) {
             // A redirected/failed prediction is never allowed to remain visible
             // after Explorer reports its actual folder.
             s->pendingNavigationPaint = GetTickCount64();

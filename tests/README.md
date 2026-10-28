@@ -114,6 +114,12 @@ are covered without changing the user's clipboard or focus. Native command
 invocations are intercepted. The corrected 0.9.250 test fails on 0.9.249;
 the old test incorrectly expected duplicate invocations for the same message.
 
+`--profile-identity-probe` is an explicit read-only OS integration probe of an
+already-open Explorer profile view, discovered through Windows APIs. It checks
+the actual names worker against the native provider and performs no selection,
+navigation, focus changes or commands in that view. It is excluded from the
+default private-fixture suite. See the [binding investigation](../docs/profile-provider-0.9.271.md).
+
 `--provider-selection` uses real offscreen ExplorerBrowser views of private
 archives, delegated folders and ordinary directories. It checks selection and
 focus in Details/List/grid, repeated echoes, external and bulk selection, and
