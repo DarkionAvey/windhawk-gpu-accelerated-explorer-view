@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.272
+
+- Automatically refit columns when switching from grid or List view to Details,
+  using the existing readiness and clipping checks.
+
 ## 0.9.271
 
 - Fix folders failing to open and selections being cleared in user profile

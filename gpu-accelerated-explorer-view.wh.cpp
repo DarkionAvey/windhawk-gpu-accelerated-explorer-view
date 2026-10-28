@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.271
+// @version         0.9.272
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -155,7 +155,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
         - mixed: Mix folders with files
     - autoRefitColumns: true
       $name: Automatically fit columns
-      $description: Fit when folder data and layout are ready, after window resizing, and after zooming. Folder changes preserve columns when text already fits.
+      $description: Fit when folder data and layout are ready, when switching to Details, after window resizing, and after zooming. Folder and view changes preserve columns when text already fits.
   $name: Columns and sorting
 - enableLogging: false
   $name: Enable logging
@@ -20519,6 +20519,7 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     const UINT mode=requested.mode;
     const bool supported=IsGpuViewMode(mode,state.thisPcGpu), columns=mode==FVM_DETAILS;
     const bool grid=IsIconViewMode(mode,state.thisPcGpu);
+    const bool enteringColumns=columns && !state.columnsView;
     if (grid) state.nativeIconSize=requested.iconSize;
     state.cachedNativeMode=mode;
     const bool changed=state.layoutNativeMode!=mode ||
@@ -20548,6 +20549,7 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         SetColumnViewMode(state,columns,animate && supported && state.detailsViewActive && state.graphicsReady);
     }
     state.detailsViewActive=supported;
+    if (enteringColumns) ArmAutoRefit(state);
     if (changed) TraceUiState(state,L"ui.layout.after[layout,native,header,selected]");
     return changed;
 }

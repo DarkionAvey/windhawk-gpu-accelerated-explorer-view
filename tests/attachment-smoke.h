@@ -1016,22 +1016,20 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             "Recycle Bin native item menu could not bind the enumerated child identity");
     }
     const auto recyclePropertyEpoch=state->detailsRefreshEpoch;
-    // This is an unmodified synthetic F5, independent of the user's Alt state
-    // (including state retained by earlier test message pumps). Like the other
-    // key fixtures, change only this private thread's keyboard-state table.
-    BYTE savedRefreshKeys[256]{},refreshKeys[256]{};
-    Check(GetKeyboardState(savedRefreshKeys) && SetKeyboardState(refreshKeys),"Recycle Bin refresh key fixture");
-    const auto refreshAlt=GetKeyState(VK_MENU);
+    // Keep F5 unmodified across nested Shell message pumps, which can replace
+    // a SetKeyboardState snapshot with the user's actual modifier state.
     const auto refreshOptimistic=state->optimisticStartedAt;
-    SendMessageW(overlay,WM_KEYDOWN,VK_F5,0);
-    const bool refreshAccepted=state->detailsRefreshEpoch!=recyclePropertyEpoch;
-    Check(SetKeyboardState(savedRefreshKeys),"Recycle Bin refresh key restoration");
+    const bool refreshAccepted=[&] {
+        ModifierFixture::Session modifiers;
+        SendMessageW(overlay,WM_KEYDOWN,VK_F5,0);
+        return state->detailsRefreshEpoch!=recyclePropertyEpoch;
+    }();
     const bool recycleRefreshed=refreshAccepted && settled();
     if(!recycleRefreshed) std::cerr<<"RECYCLE F5 epoch="<<recyclePropertyEpoch<<"->"<<state->detailsRefreshEpoch
         <<" loaded="<<state->loaded<<" pending="<<state->directoryPending<<" native-pending="<<state->nativeRowsPending
         <<" optimistic="<<state->optimisticStartedAt<<" in-scope="<<state->inScope<<" visible="<<state->visible
         <<" active="<<state->detailsViewActive<<" token="<<state->token<<" preview="<<state->namesPreview
-        <<" before-alt="<<refreshAlt<<" before-optimistic="<<refreshOptimistic
+        <<" before-optimistic="<<refreshOptimistic
         <<" alt="<<GetKeyState(VK_MENU)<<" control="<<GetKeyState(VK_CONTROL)
         <<" clipboard-items="<<state->clipboardPaths.size()<<" clipboard-visible="<<state->clipboardIconsVisible<<"\n";
     Check(recycleRefreshed,
