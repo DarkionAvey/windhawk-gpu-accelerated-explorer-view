@@ -43,6 +43,41 @@ contain spaces or Unicode. Relative source paths are rooted at the repository.
 
 ## Focused or historical tests
 
+`--touch` feeds calibrated contacts through the production input boundary into
+the real Windows Interaction Context recognizer. A private synthetic digitizer
+supplies calibration; it never injects input into the desktop. No gesture
+outputs or Windows input messages are manufactured. Coverage includes taps,
+six double-tap activation cycles (varied system-relative intervals, positions,
+press durations and delayed owner dispatch), timed and delayed-delivery holds,
+Shell drag identities, bulk-selection release races, vertical pan with
+1/2/3/5 contacts, one-finger marquee commit/rollback and contact changes,
+two-finger column scrolling followed by edge-only history navigation through
+the owning Shell browser, reversal before release, staggered/unequal two-finger
+swipes, radial pinch/expand at different separations and orientations, exclusive
+pinch anchoring across layouts/DPIs/RTL, contact replacement/rotation rejection,
+vertical marquee in fitting directories, native inertia, coalesced frames, capture
+loss, divider fitting, animated scrollbar targets, persistent input ownership
+and Explorer click/underline preferences. Offscreen text checks also compare
+underlined/plain mask variants with DirectWrite. Desktop feedback, modal
+dragging, clipboard and focus are
+substituted. DLL-unload tests also retire an actual native recognizer with a
+hold deadline armed. OS message delivery and visual/device parity with live
+Explorer require hardware validation; these are component tests.
+
+Touch rendering checks also capture the real immutable presentation model and
+paint it into a GPU target. They read marquee pixels in empty content starting
+with focus on Explorer chrome, including perfectly vertical drags and foreground
+loss. Gradual pinch checks require identical row/icon/text pixels at recognition
+and fractional scaling only after further movement; list/grid and RTL are covered.
+Scrollbar checks cover independent growth/reversal, large idle hit targets,
+track leave, captured drags outside the track, capture loss and exact return to
+idle pixels through the presentation model at 96/192 DPI in LTR/RTL.
+
+`--status-buttons` checks measured native/virtual controls, pending and warm
+frame translations, actual Windows boundary feedback when enabled, stale resize
+results and hidden/restored anchors. `--rtl-windows` also checks actual toggle
+placement and measurement reuse through native moves in mirrored/LTR hosts.
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-regressions.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-regressions.ps1 -SourceFile previous-versions/0.9.195.cpp -TestArguments --selection
@@ -152,7 +187,9 @@ do not depend on the desktop foreground window staying unchanged. See the
 
 `--column-bridge` checks cold/delayed native column acquisition, per-directory
 content acknowledgements, unchanged scan publication and native frame/host
-resizing through actual attachment. See the
+resizing through actual attachment. Published-model checks reject provisional
+horizontal overflow while native column discovery/fitting settles; the vertical
+geometry remains available. See the
 [bridge investigation](../docs/column-readiness-0.9.219.md). The separate
 `run-column-probe.ps1 -SourceFile <matching source>` performs an intentional
 read-only inspection of running overlay column/readiness state. It requires a

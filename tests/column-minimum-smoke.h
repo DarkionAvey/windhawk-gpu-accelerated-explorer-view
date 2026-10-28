@@ -1,5 +1,6 @@
 // Exercise the production fitter and scrollbar geometry with real DirectWrite
-// formats at different densities. No Explorer windows, providers or user files.
+// formats at different densities. A private owner window supplies real geometry
+// and horizontal-bar admission; no Explorer providers or user files are used.
 namespace ColumnMinimumFixture {
 float Measure(IDWriteTextFormat* format,const std::wstring& text) {
     ComPtr<IDWriteTextLayout> layout; DWRITE_TEXT_METRICS metrics{};
@@ -32,14 +33,21 @@ static void TestColumnMinimumWidths() {
     const bool scrollbar=g_scrollbar.exchange(true);
     const int font=g_fontPercent.exchange(52),edge=g_edgeMargin96.exchange(10);
     for(int dpi:{96,144,192}) for(bool rtl:{false,true}) for(int fontPercent:{20,52,80}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=UINT(dpi);
+        StyleFixture::themeFont.lfHeight=-Scale96(12,dpi); StyleFixture::themeFont.lfWeight=FW_NORMAL;
+        wcscpy_s(StyleFixture::themeFont.lfFaceName,L"Segoe UI");
         ViewState state;
-        struct Drain {ViewState& state; ~Drain() {Stop(state.background);}} drain{state};
-        state.presentationOnly=true; state.presentationDpi=dpi; state.rtlLayout=rtl;
+        state.hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"column minimum owner",WS_POPUP,
+            -32000,-32000,1,1,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        Check(state.hwnd!=nullptr,"column minimum owner window");
+        struct Drain {ViewState& state; ~Drain() {DestroyWindow(state.hwnd); Stop(state.background);}} drain{state};
+        state.frameHwnd=state.activeTabHost=state.hwnd; state.rtlLayout=rtl;
         state.visible=state.inScope=state.loaded=state.detailsViewActive=state.columnsView=true;
-        state.presentationFont.lfHeight=-Scale96(12,dpi); state.presentationFont.lfWeight=FW_NORMAL;
-        wcscpy_s(state.presentationFont.lfFaceName,L"Segoe UI");
         g_fontPercent=fontPercent;
-        const auto resize=[&](int width) {state.presentationClient={0,0,width,Scale96(400,dpi)};};
+        const auto resize=[&](int width) {
+            Check(SetWindowPos(state.hwnd,nullptr,0,0,width,Scale96(400,dpi),
+                SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"column minimum private resize");
+        };
         resize(Scale96(560,dpi));
         state.total=200; state.entries.resize(state.total);
         for(auto& entry:state.entries) {
@@ -94,7 +102,7 @@ static void TestColumnMinimumWidths() {
         // Deliberate manual sizing continues to follow the existing divider
         // constraints; the readability rule belongs to automatic fitting.
         state.dragDivider=0; state.dragStartX=0; state.dragStartPos=Scale96(55,dpi);
-        DragDivider(state,rtl ? state.presentationClient.right : 0);
+        DragDivider(state,LogicalX(state,0));
         Check(state.columns.front().width==Scale96(55,dpi),"auto-fit readability floor overrode a deliberate divider drag");
         if(!rtl && dpi==96) std::cout<<"COLUMN MINIMUM font="<<fontPercent<<"% name="<<narrowName
             <<" metadata="<<narrowMetadata<<" narrow horizontal range="<<bar.scrollRange<<" px\n";

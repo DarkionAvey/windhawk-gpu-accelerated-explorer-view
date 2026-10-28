@@ -157,6 +157,12 @@ static void TestSelectionGestures(ViewState& state, SelectionFolderView& native)
           state.selectedFlags[2] && native.selected.size() == 1,
           "clicking a member no longer collapsed a multi-selection");
     auto expectSingle = [&](int row) {
+        if(state.selected!=row || state.anchor!=row || !state.selectedFlags[row] ||
+            std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)!=1 || native.selected.size()!=1)
+            std::cerr<<"BULK EXIT expected="<<row<<" selected="<<state.selected<<" anchor="<<state.anchor
+                <<" gpu="<<std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)
+                <<" native="<<native.selected.size()<<" pending="<<state.pendingNativeSelection
+                <<" unsafe="<<state.nativeSelectionUnsafe<<" grid="<<state.gridView<<" columns="<<state.itemsPerRow<<"\n";
         Check(state.selected==row && state.anchor==row && state.selectedFlags[row] &&
             std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==1 && native.selected.size()==1,
             "plain arrow did not collapse the bulk at its directional edge");

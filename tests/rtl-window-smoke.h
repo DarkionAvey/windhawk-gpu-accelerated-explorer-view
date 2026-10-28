@@ -71,6 +71,17 @@ static void TestMirroredWindowCoordinates(const std::wstring& directory) {
             (rtl ? button.left>=neighbor.right : button.right<=neighbor.left),
             "RTL status switch double-mirrored its parent placement or mismatched native button size");
         Check(!(GetWindowLongPtrW(state->viewToggle,GWL_EXSTYLE)&WS_EX_LAYOUTRTL),"status switch retained mirrored GDI coordinates");
+        const int separation=rtl ? button.left-neighbor.right : neighbor.left-button.right;
+        const auto statusToken=state->viewToggleGeometryToken;
+        for(const POINT offset:{POINT{24,0},POINT{0,28},POINT{-24,-28},POINT{0,0}}) {
+            Check(SetWindowPos(frame,nullptr,-31000+offset.x,-30000+offset.y,0,0,
+                SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"RTL status frame translation");
+            pump(); RefreshViewToggleForFrame(frame);
+            button=screenRect(state->viewToggle); neighbor=screenRect(nativeButton);
+            Check(button.top==neighbor.top && (rtl ? button.left-neighbor.right : neighbor.left-button.right)==separation &&
+                state->viewToggleGeometryToken==statusToken && !state->viewToggleGeometryPending,
+                "window movement restarted status discovery or changed native-peer placement");
+        }
         // Also cover the fallback when a mod hides the native controls.
         ShowWindow(nativeButton,SW_HIDE); RefreshViewToggleForFrame(frame);
         button=screenRect(state->viewToggle); const auto frameBounds=screenRect(frame);
@@ -231,9 +242,9 @@ static void TestMirroredWindowCoordinates(const std::wstring& directory) {
         // DirectManipulation supplies physical finger deltas.
         g_touchpadSwipeNavigation=true;
         for(const int direction : {1,-1}) {
-            ClearSwipeFeedback(*state); state->touchpadPanX=state->touchpadPanY=0;
             state->manipulationEnabled=state->manipulationFrameActive=true;
-            state->swipeReleased=false; state->touchpadPinching=false;
+            ApplyManipulationStatus(*state,1);
+            SetHorizontalScroll(*state,direction>0 ? 0.f : state->columnContentWidth);
             const LONG physical=static_cast<LONG>(SwipeCommitDistance(*state)*1.2f*direction*(rtl ? -1 : 1)*256);
             OverlayProc(overlay,kMsgManipulationPan,static_cast<WPARAM>(physical),0);
             Check(state->swipeHorizontal && state->swipeFeedbackDirection==direction,"RTL swipe feedback used the wrong history direction");

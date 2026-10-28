@@ -27,7 +27,7 @@ $flags = @(
 )
 $libraries = @('-ldcomp', '-ld3d11', '-ldxgi', '-ld2d1', '-ldwrite', '-lshell32',
     '-lole32', '-loleaut32', '-luuid', '-lshlwapi', '-luser32', '-lgdi32',
-    '-lwindowscodecs', '-ldwmapi', '-luxtheme', '-lpropsys', '-lcomctl32', '-lruntimeobject')
+    '-lwindowscodecs', '-ldwmapi', '-luxtheme', '-lpropsys', '-lcomctl32', '-lruntimeobject', '-lninput')
 # A forced header avoids native command-line quote stripping in Windows
 # PowerShell 5.1, including repository paths containing spaces or Unicode.
 $configuration = Join-Path $outputDirectory 'selected-source.h'

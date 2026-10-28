@@ -83,6 +83,12 @@ static void TestStatusButtonLayout() {
     {ExclusiveSrwLock lock(state.background->directoryLock);
         Check(state.background->statusButtonJob && state.background->statusButtonJob->token==state.viewToggleGeometryToken,
             "status mailbox retained obsolete resize requests");}
+    const auto pending=state.viewToggleGeometryToken;
+    Check(SetWindowPos(frame,nullptr,-30880,-29880,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),
+        "status pending-provider translation");
+    RequestStatusButtonGeometry(state,query());
+    Check(state.viewToggleGeometryToken==pending && state.viewToggleGeometryPending,
+        "pure movement canceled an otherwise-current pending status measurement");
     SetEvent(StatusButtonFixture::released); await();
     if(state.viewToggleGeometry.buttons.size()!=2)
     {
@@ -102,6 +108,7 @@ static void TestStatusButtonLayout() {
     SendMessageW(toolbar,TB_GETITEMRECT,2,reinterpret_cast<LPARAM>(&second));
     MapWindowPoints(toolbar,nullptr,reinterpret_cast<POINT*>(&first),2);
     MapWindowPoints(toolbar,nullptr,reinterpret_cast<POINT*>(&second),2);
+    StatusRectToFrame(frame,first); StatusRectToFrame(frame,second);
     RECT placed{}; HWND neighbor=nullptr; int gap=-1;
     Check(StatusTogglePlacement(state.viewToggleGeometry,placed,neighbor,gap) && !neighbor &&
         placed.right-placed.left==first.right-first.left && placed.bottom-placed.top==first.bottom-first.top &&
@@ -110,6 +117,32 @@ static void TestStatusButtonLayout() {
     const auto completed=state.viewToggleGeometryToken;
     RequestStatusButtonGeometry(state,query());
     Check(state.viewToggleGeometryToken==completed && !state.viewToggleGeometryPending,"unchanged status layout restarted accessibility discovery");
+    const auto settledQuery=query(); const RECT settledPlacement=placed;
+    const auto translated=[&] {
+        Check(SameStatusButtonQuery(settledQuery,query()),"frame translation invalidated status layout geometry");
+        RequestStatusButtonGeometry(state,query());
+        RECT current{}; HWND peer=nullptr; int spacing=0;
+        Check(state.viewToggleGeometryToken==completed && !state.viewToggleGeometryPending &&
+            StatusTogglePlacement(state.viewToggleGeometry,current,peer,spacing) && EqualRect(&current,&settledPlacement),
+            "frame translation discarded the native anchor or restarted accessibility discovery");
+    };
+    // Real USER moves exercise the same position changes as boundary feedback,
+    // including while optional provider discovery would otherwise lag behind.
+    for(const POINT offset:{POINT{24,0},POINT{0,28},POINT{-24,-28},POINT{0,0}}) {
+        Check(SetWindowPos(frame,nullptr,-30900+offset.x,-29900+offset.y,0,0,
+            SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"status frame translation");
+        pump(); translated();
+    }
+    // Exercise the actual OS boundary-feedback implementation when enabled;
+    // never manufacture gesture outputs or replace it with a guessed offset.
+    const bool nativeFeedback=BeginPanningFeedback(frame)!=FALSE;
+    if(nativeFeedback) {
+        for(int direction:{1,-1,0}) {
+            UpdatePanningFeedback(frame,0,direction*GetSystemMetricsForDpi(SM_CYVSCROLL,120),FALSE);
+            DwmFlush(); pump(); translated();
+        }
+        EndPanningFeedback(frame,TRUE); DwmFlush(); pump(); translated();
+    }
     state.viewToggleGeometryPending=true;
     {ExclusiveSrwLock lock(state.background->directoryLock);
         state.background->statusButtonResult=state.viewToggleGeometry;
@@ -134,5 +167,5 @@ static void TestStatusButtonLayout() {
         "hidden status host retained an obsolete anchor");
     UnregisterAnimationWindow(state.hwnd); Stop(state.background);
     hold.Close(); SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0); DestroyWindow(state.hwnd); DestroyWindow(frame);
-    std::cout<<"PASS: measured status-button size/gap/placement at 96/120/144/192 DPI, LTR/RTL; actual virtual toolbar accessibility, coalesced/stale resize, cached reuse and hidden/restored controls\n";
+    std::cout<<"PASS: measured status-button size/gap/placement at 96/120/144/192 DPI, LTR/RTL; actual virtual toolbar accessibility, coalesced/stale resize, pending/warm frame translation, cached reuse, hidden/restored controls; native boundary feedback="<<nativeFeedback<<"\n";
 }

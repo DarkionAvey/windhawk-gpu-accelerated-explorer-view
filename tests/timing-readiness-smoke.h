@@ -10,6 +10,7 @@ public:
     void (*duringQuery)(void*)=nullptr;
     void* queryContext=nullptr;
     unsigned queries=0;
+    std::vector<UINT> browseFlags;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         *out=nullptr;
         if(iid==IID_IExplorerBrowser) return destinationReadiness;
@@ -32,7 +33,9 @@ public:
     UNUSED_BROWSER(SetStatusTextSB,LPCWSTR)
     UNUSED_BROWSER(EnableModelessSB,BOOL)
     UNUSED_BROWSER(TranslateAcceleratorSB,MSG*,WORD)
-    UNUSED_BROWSER(BrowseObject,PCUIDLIST_RELATIVE,UINT)
+    HRESULT STDMETHODCALLTYPE BrowseObject(PCUIDLIST_RELATIVE,UINT flags) override {
+        browseFlags.push_back(flags); return E_NOTIMPL;
+    }
     UNUSED_BROWSER(GetViewStateStream,DWORD,IStream**)
     UNUSED_BROWSER(GetControlWindow,UINT,HWND*)
     UNUSED_BROWSER(SendControlMsg,UINT,UINT,WPARAM,LPARAM,LRESULT*)

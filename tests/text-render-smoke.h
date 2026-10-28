@@ -11,16 +11,19 @@ static void TestTextRaster(State& state) {
     props.bitmapOptions=D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
     Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(360,160),nullptr,0,&props,&readback)),"text readback");
     state.target->SetTarget(surface.Get()); state.paintWidth=360;
-    auto capture=[&](const std::wstring& text,bool cached,bool wrapped,float width,unsigned color,float opacity,bool deferred=false,bool filename=false) {
+    auto capture=[&](const std::wstring& text,bool cached,bool wrapped,float width,unsigned color,float opacity,bool deferred=false,bool filename=false,bool underline=false) {
         state.target->BeginDraw(); ConfigureTextTarget(state,state.target.Get());
         state.target->Clear(D2D1::ColorF(0,0.f));
         if (cached) {
-            if constexpr (requires { state.frameProfile.textDeferred; })
+            if constexpr (requires { state.clickPolicy; })
+                Text(state,text,20,20,20+width,120,color,false,opacity,false,wrapped,0,deferred,filename,underline);
+            else if constexpr (requires { state.frameProfile.textDeferred; })
                 Text(state,text,20,20,20+width,120,color,false,opacity,false,wrapped,0,deferred,filename);
             else Text(state,text,20,20,20+width,120,color,false,opacity,false,wrapped);
         }
         else {
             auto layout=ResolveTextLayout(state,text,width,100,false,false,nullptr,wrapped,filename);
+            layout->SetUnderline(underline,{0,static_cast<UINT32>(text.size())});
             state.brush->SetColor(Packed(color,opacity));
             const float x=state.rtlLayout ? 340-width : 20;
             state.target->DrawTextLayout(D2D1::Point2F(x,20),layout,state.brush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -55,6 +58,22 @@ static void TestTextRaster(State& state) {
         }
     }
     state.rtlLayout=false; Check(MakeTextFormats(state),"restore text direction");
+    if constexpr (requires { state.clickPolicy; }) {
+        for(bool direction:{false,true}) for(bool wrapped:{false,true}) {
+            state.rtlLayout=direction; Check(MakeTextFormats(state),"underline text direction");
+            const std::wstring name=direction ? L"زهرة في الحديقة.jpg" : L"A filename with underlined text.jpg";
+            const auto cold=capture(name,true,wrapped,120,0xFFFFFF,1,false,true,false);
+            const auto hot=capture(name,true,wrapped,120,0xFFFFFF,1,false,true,true);
+            const auto reference=capture(name,false,wrapped,120,0xFFFFFF,1,false,true,true);
+            size_t error=0,coverage=0;
+            for(size_t i=3;i<hot.size();i+=4) {error+=abs(int(hot[i])-reference[i]); coverage+=reference[i];}
+            Check(hot!=cold && coverage>0 && error<coverage*.12,"cached underline differs from DirectWrite or reused a non-underlined mask");
+            Check(hot==capture(name,true,wrapped,120,0xFFFFFF,1,false,true,true) &&
+                cold==capture(name,true,wrapped,120,0xFFFFFF,1,false,true,false),
+                "hover underline changed cached pixels or contaminated the cold label");
+        }
+        state.rtlLayout=false; Check(MakeTextFormats(state),"restore underline direction");
+    }
     const std::wstring shared=L"20/10/2026 00:43";
     capture(shared,true,false,120,0xFFFFFF,1); capture(shared,true,false,210,0xFFFFFF,1);
     auto& variants=state.textLayouts[0].layouts.at(shared).rasters;

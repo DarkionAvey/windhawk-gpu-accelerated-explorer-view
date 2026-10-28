@@ -68,13 +68,30 @@ inline void Pump() {
 struct Receipts {
     HWND hwnd;
     std::shared_ptr<const PresentationReceipt> latest;
+    unsigned long long modelSequence=0,directory=0;
+    unsigned deferredOverflow=0;
+    bool admitted=false,premature=false;
     static LRESULT CALLBACK Capture(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR context) {
         auto& self=*reinterpret_cast<Receipts*>(context);
         if(auto* state=State(hwnd); state && state->presenter) {
             std::lock_guard lock(state->presenter->mutex);
             if(state->presenter->receipt) self.latest=state->presenter->receipt;
         }
-        return DefSubclassProc(hwnd,msg,wp,lp);
+        const auto result=DefSubclassProc(hwnd,msg,wp,lp);
+        if(auto* state=State(hwnd); state && state->presenter) {
+            std::shared_ptr<const PresentationModel> model;
+            {std::lock_guard lock(state->presenter->mutex); model=state->presenter->pending;}
+            if(model && model->sequence>self.modelSequence) {
+                self.modelSequence=model->sequence;
+                if(self.directory!=model->directoryToken) {self.directory=model->directoryToken; self.admitted=false;}
+                if(!model->horizontalScrollbarAdmitted && model->columnContentWidth>model->client.right) ++self.deferredOverflow;
+                if(!self.admitted && model->horizontalScrollbarAdmitted && !state->horizontalScroll &&
+                    (state->nativeColumnsDirty || state->deferColumnProviders || state->autoRefitPending ||
+                     model->columnTransitionActive || model->columnPresentationPending)) self.premature=true;
+                self.admitted|=model->horizontalScrollbarAdmitted;
+            }
+        }
+        return result;
     }
     explicit Receipts(HWND window):hwnd(window) {
         Check(SetWindowSubclass(hwnd,Capture,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this)),
@@ -141,10 +158,10 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
         cls.lpszClassName=L"CabinetWClass"; RegisterClassW(&cls);
         cls.lpfnWndProc=OverlayProc; cls.lpszClassName=kOverlayClass; RegisterClassW(&cls);
         HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"CabinetWClass",L"cold column bridge",
-            WS_POPUP|WS_VISIBLE,-32000,-32000,700,500,nullptr,nullptr,cls.hInstance,nullptr);
+            WS_POPUP|WS_VISIBLE,-32000,-32000,1000,500,nullptr,nullptr,cls.hInstance,nullptr);
         SetWindowLongPtrW(frame,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(ColumnBridgeFixture::FrameProc));
-        HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,0,0,700,500,frame,nullptr,cls.hInstance,nullptr);
-        HWND native=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,700,500,host,nullptr,cls.hInstance,nullptr);
+        HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,0,0,1000,500,frame,nullptr,cls.hInstance,nullptr);
+        HWND native=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,1000,500,host,nullptr,cls.hInstance,nullptr);
         Check(frame && host && native,"column bridge native hierarchy");
         ColumnBridgeFixture::contentHost=host;
         FocusFixture::Session focus(frame,nullptr);
@@ -235,6 +252,8 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
                 for(size_t i=0;i<before.size();++i) Check(state->columns[i].width==before[i].width,"disabled fitting changed native widths");
             }
         }
+        Check(!receipts.premature,"horizontal scrollbar entered a published model before native columns/fitting settled");
+        if(enabled) Check(receipts.deferredOverflow>0,"cold column bridge did not exercise deferred provisional overflow");
     }
     std::filesystem::remove(empty);
     ShutDownFrames(); g_frameStopping=false; g_autoRefitColumns=automatic; g_writeFactory=factory;

@@ -7,7 +7,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 
 - Replicates explorer views using hardware accelerated graphics: Details list and icons grid, including thumbnails, sorting and grouping.
 - Animated interactions: grouping, sorting, selecting/cutting/copying files, and many more.
-- Smooth scrolling, touchpad gestures and inertia scrolling.
+- Smooth scrolling, touchscreen and touchpad gestures, and inertia scrolling.
 - RTL language support.
 - Optional button to switch back to native Explorer view; **Ctrl+Alt+F9** also works when the button is hidden.
 - Prioritizes responsiveness and animations over efficiency.
@@ -18,6 +18,8 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
+- **Touchscreen Input** — Swipe vertically to scroll with any finger count. When the directory fits vertically, one-finger swipes select by marquee. Move horizontally with one finger for marquee selection, or two fingers to scroll columns. With swipe navigation enabled, movement beyond either column edge starts Back or Forward. Pinch to resize, tap to select, and double-tap to open. Hold and release for the Shell menu, or hold and move to drag files. Scrollbars stay small when idle, retain large touch hit areas, and grow smoothly while engaged.
+- **Explorer Click Preferences** — Honors Windows' double-click speed and File Explorer's single-click activation, point-to-select, and icon-title underline settings.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
 

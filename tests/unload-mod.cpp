@@ -6,6 +6,7 @@
 #define GPU_OVERLAY_SOURCE "../latest.cpp"
 #endif
 #include GPU_OVERLAY_SOURCE
+#include "touch-calibration.h"
 
 extern "C" __declspec(dllexport) BOOL PrepareMessages() {return RegisterFrameHookReleaseMessage();}
 
@@ -145,9 +146,28 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     if(!presented) return FALSE;
     MoveScroll(*state,std::min(200.f,MaxScrollPx(*state))); SubmitPresentation(*state);
 #endif
+    // Own a real Ninput callback and an armed system-threshold hold deadline
+    // when the DLL is disabled. The private digitizer never injects desktop IO.
+    TouchCalibration digitizer;
+    if(!digitizer.device || !StartTouchRecognizer(*state)) return FALSE;
+    POINT screen{100,100};
+    MapUiPoint(overlay,nullptr,screen);
+    POINTER_INFO contact{};
+    contact.pointerType=PT_TOUCH; contact.pointerId=1; contact.frameId=1;
+    contact.sourceDevice=digitizer.device; contact.hwndTarget=overlay; contact.historyCount=1;
+    contact.pointerFlags=POINTER_FLAG_DOWN|POINTER_FLAG_NEW|POINTER_FLAG_INRANGE|
+        POINTER_FLAG_INCONTACT|POINTER_FLAG_PRIMARY|POINTER_FLAG_CONFIDENCE|POINTER_FLAG_FIRSTBUTTON;
+    contact.ptPixelLocation=contact.ptPixelLocationRaw=screen;
+    contact.ptHimetricLocation=contact.ptHimetricLocationRaw=digitizer.Himetric(screen);
+    contact.dwTime=GetTickCount();
+    LARGE_INTEGER touchClock{}; QueryPerformanceCounter(&touchClock); contact.PerformanceCount=touchClock.QuadPart;
+    contact.ButtonChangeType=POINTER_CHANGE_FIRSTBUTTON_DOWN;
+    FeedTouchFrames(*state,state->touchRecognizer,1,1,&contact);
+    const bool touchArmed=state->touch.active && state->touch.holdDeadline && g_callbackObjects.load()!=0;
     Wh_ModBeforeUninit(); // Exercise actual disable, not just direct HWND destruction.
     RECT bounds{}; GetClientRect(list,&bounds);
-    const bool retired=g_shellViewHooks.empty() && g_windowCallbacks.load()==0 && !g_instances.load() &&
+    const bool retired=touchArmed && g_callbackObjects.load()==0 &&
+        g_shellViewHooks.empty() && g_windowCallbacks.load()==0 && !g_instances.load() &&
         !GetPropW(host,kSuppressedHostProperty) && (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE) &&
         !GetPropW(list,kNativeViewportProperty) && bounds.right==320 && bounds.bottom==240;
     if(!blocked || !retired) printf("BARRIER DLL blocked=%d installed=%d retired=%d hooks=%zu callbacks=%u instances=%d host=%p view=%p prop=%p style=0x%llx\n",

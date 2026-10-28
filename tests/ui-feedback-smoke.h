@@ -171,6 +171,9 @@ static void TestUiFeedbackAudit(const std::wstring& directory) {
         status(DIRECTMANIPULATION_RUNNING,DIRECTMANIPULATION_READY);
         pan(distance,0);
         status(DIRECTMANIPULATION_INERTIA,DIRECTMANIPULATION_RUNNING);
+        Sleep(kUiTransitionDurationMs+USER_TIMER_MINIMUM);
+        AdvanceAnimationFrame(state,false);
+        Check(!state.swipeFeedbackFading,"history preview did not finish its release fade");
         pan(1000,-100); // Cannot complete a short swipe or move/revive its fading arrow.
         status(DIRECTMANIPULATION_READY,DIRECTMANIPULATION_INERTIA);
         Check(historyActions==(distance==1000 ? 1 : 0) && state.scrollNow==settled &&

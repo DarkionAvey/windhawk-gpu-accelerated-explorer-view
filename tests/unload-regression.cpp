@@ -158,7 +158,7 @@ int wmain(int argc,wchar_t** argv) {
             }
             Check(VirtualQuery(barrier,&memory,sizeof(memory)) && memory.AllocationBase!=barrier,
                 "synchronous native barrier retained its DLL after teardown");
-            std::cout<<"PASS: actual disable restores host visibility and nonempty native list geometry after zero-size echoes, before verified DLL unmapping\n";
+            std::cout<<"PASS: actual disable retires a native touch recognizer/hold deadline, restores native visibility/geometry and permits verified DLL unmapping\n";
         }
         HMODULE module=Load(argv[1]);
         Check(Export<BOOL(*)()>(module,"FailedInitialization")(),"module-owned class conflict or initialization unwind failed");

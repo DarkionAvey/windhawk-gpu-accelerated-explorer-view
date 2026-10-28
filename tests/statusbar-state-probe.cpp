@@ -34,7 +34,7 @@ int wmain() {
         if(snapshot.buttons.empty()) ReadVirtualStatusButtons(snapshot,context.automation,[] {return true;});
         RECT placed{}; HWND neighbor=nullptr; int gap=0;
         const bool native=StatusTogglePlacement(snapshot,placed,neighbor,gap);
-        std::wcout<<L"STATUS frame="<<frame<<L" dpi="<<query.dpi<<L" source="<<
+        std::wcout<<L"STATUS frame="<<frame<<L" coordinates=frame-client dpi="<<query.dpi<<L" source="<<
             (native ? (snapshot.accessible ? L"accessibility" : L"HWND") : L"fallback")<<
             L" host="<<snapshot.providerHost<<L" buttons="<<snapshot.buttons.size()<<L" gap="<<gap<<
             L" result=0x"<<std::hex<<snapshot.result<<std::dec<<L"\n";

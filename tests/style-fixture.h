@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <uxtheme.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <vssym32.h>
 #include <dwmapi.h>
 #include <roapi.h>
@@ -17,11 +18,28 @@ inline thread_local unsigned activations=0, fontQueries=0, fillQueries=0;
 inline thread_local unsigned themeQueries=0, systemColorQueries=0, accentQueries=0;
 inline thread_local unsigned visibilityQueries=0;
 inline thread_local bool showHidden=false, showProtected=false;
+inline thread_local bool singleClick=false;
+inline thread_local DWORD iconUnderline=2;
+inline thread_local std::wstring browserUnderline=L"yes";
+inline thread_local unsigned clickQueries=0;
 inline void WINAPI ShellSettings(LPSHELLSTATE value,DWORD mask,BOOL set) {
     if(!enabled || set) {::SHGetSetSettings(value,mask,set); return;}
-    ++visibilityQueries;
+    if(mask & (SSF_SHOWALLOBJECTS|SSF_SHOWSUPERHIDDEN)) ++visibilityQueries;
+    if(mask & SSF_DOUBLECLICKINWEBVIEW) {++clickQueries; value->fDoubleClickInWebView=singleClick ? 0:-1;}
     if(mask & SSF_SHOWALLOBJECTS) value->fShowAllObjects=showHidden;
     if(mask & SSF_SHOWSUPERHIDDEN) value->fShowSuperHidden=showProtected;
+}
+inline LONG WINAPI ShellRegistry(LPCWSTR path,LPCWSTR name,LPDWORD type,void* value,
+        LPDWORD bytes,BOOL ignore,void* fallback,DWORD fallbackBytes) {
+    if(!enabled) return ::SHRegGetUSValueW(path,name,type,value,bytes,ignore,fallback,fallbackBytes);
+    const void* source=nullptr; DWORD size=0,kind=0;
+    if(wcscmp(name,L"IconUnderline")==0) {source=&iconUnderline; size=sizeof(iconUnderline); kind=REG_DWORD;}
+    else if(wcscmp(name,L"Anchor Underline")==0) {source=browserUnderline.c_str(); size=DWORD((browserUnderline.size()+1)*sizeof(wchar_t)); kind=REG_SZ;}
+    else return ::SHRegGetUSValueW(path,name,type,value,bytes,ignore,fallback,fallbackBytes);
+    if(type) *type=kind;
+    const auto capacity=*bytes; *bytes=size;
+    if(capacity<size) return ERROR_MORE_DATA;
+    memcpy(value,source,size); return ERROR_SUCCESS;
 }
 inline thread_local HRESULT accentStatus=S_OK;
 inline thread_local DWORD accent=0xFF0078D7;
@@ -111,7 +129,8 @@ struct Session {
     Session() {enabled=true; highContrast=failApp=failSystem=false; dpi=96; wheel=3;
         activations=fontQueries=fillQueries=0; accentStatus=S_OK; accent=0xFF0078D7;
         themeQueries=systemColorQueries=accentQueries=0;
-        visibilityQueries=0; showHidden=showProtected=false;
+        visibilityQueries=clickQueries=0; showHidden=showProtected=singleClick=false;
+        iconUnderline=2; browserUnderline=L"yes";
         window=RGB(255,255,255); text=RGB(0,0,0);
         appBg={255,24,24,24}; appFg={255,240,240,240};
         themeFont={}; systemFont={}; colors.clear();}
@@ -130,3 +149,4 @@ struct Session {
 #define DwmGetColorizationColor StyleFixture::Accent
 #define RoActivateInstance StyleFixture::Activate
 #define SHGetSetSettings StyleFixture::ShellSettings
+#define SHRegGetUSValueW StyleFixture::ShellRegistry

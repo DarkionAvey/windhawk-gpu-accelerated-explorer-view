@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.9.270
+
+- Keep the view-toggle button aligned with native status controls during touch
+  overscroll and ordinary window moves, without repeatedly falling back to an
+  estimated position while native control measurements reload.
+
+## 0.9.269
+
+- Keep idle scrollbars small, retaining the full touch hit area. Enlarge only
+  the bar a finger engages, animate back on release/leave, and preserve thumb
+  capture outside the track. Prevent a first-touch scroll jump at high DPI.
+- Defer new horizontal scrollbars until column discovery, fitting and layout
+  settle, avoiding temporary overflow flashes. Keep vertical scrolling immediate
+  and reveal horizontal scrolling when actively needed.
+
+## 0.9.268
+
+- Give touch marquee selection the same list-focus handoff as mouse input,
+  so its outline appears without first clicking an item. Draw a visible line
+  for perfectly vertical or horizontal marquee drags.
+- Start pinch scaling from the contacts' span when recognition commits,
+  preventing the initial zoom jump. Subsequent scaling follows the measured
+  span without inheriting old scale from replaced contacts.
+
+## 0.9.267
+
+- Distinguish two-finger scrolling from pinch using both contacts' movement
+  relative to their initial center and radius. Allow staggered fingers,
+  unequal swipe paths and spacing variation without switching into zoom.
+- Commit touch gestures to scrolling or zooming. Pinch keeps its initial
+  anchor; contact changes cannot reopen a committed scroll as pinch.
+- Use one-finger vertical movement for marquee selection when the whole
+  directory fits vertically; retain scrolling and overscroll in longer views.
+
+## 0.9.266
+
+- Use vertical touch movement for scrolling with any finger count, one-finger
+  horizontal movement for marquee selection, and two-finger horizontal movement
+  for column scrolling.
+- Start Back/Forward previews only after available column scrolling is consumed.
+  Reverse through the preview before returning to columns, commit on release,
+  and clear canceled previews from the rendered view.
+- Pair taps using Windows' configured double-click speed and item identity,
+  including varied contact positions and delayed dispatch.
+- Keep touch ownership between contacts so a resting mouse cannot steal
+  hover or selection. Resume mouse/pen input on deliberate movement or clicks.
+- Resolve pinch and pan intent separately, keeping spacing variation from
+  turning two-finger scrolling into zoom.
+- Preserve hold-to-drag when movement arrives before a delayed hold timer.
+- Honor Explorer's single-click activation, point-to-select and both title
+  underline preferences without adding mod settings.
+
+## 0.9.265
+
+- Replace the blocked touch gesture path with direct pointer input and Windows'
+  native recognizer for scrolling, inertia, pinch, taps and hold menus.
+- Add hold-then-move Shell file dragging, preserving multi-selection and
+  canceling deferred drags when the finger lifts or the tab changes.
+- Support touch scrollbar dragging and divider double-tap fitting; preserve
+  animated touch sizing, boundary feedback and optional Back/Forward swipes.
+
+## 0.9.264
+
+- Handle touchscreen swipes as scrolling, with Windows gesture recognition,
+  inertia and boundary feedback. Preserve tap selection, double-tap activation
+  and press-and-hold Shell menus.
+- Follow pinch distance directly, keeping the touched item anchored through
+  list/grid resizing. Support the existing optional Back/Forward swipes on touch.
+- Animate larger touch scrollbar targets without reflowing file layouts;
+  restore mouse sizing on mouse or touchpad input.
+
 ## 0.9.263
 
 - Also refresh the active tab when returning to an Explorer window, including

@@ -18,7 +18,17 @@
 #include "animation-clock-fixture.h"
 #include "menu-fixture.h"
 #include "style-fixture.h"
+#include "touch-packet-fixture.h"
 #include GPU_OVERLAY_SOURCE
+#undef CreateInteractionContext
+#undef RegisterOutputCallbackInteractionContext2
+#undef DestroyInteractionContext
+#undef ProcessPointerFramesInteractionContext
+#undef GetProcAddress
+#undef SHDoDragDrop
+#undef BeginPanningFeedback
+#undef UpdatePanningFeedback
+#undef EndPanningFeedback
 #undef OpenThemeData
 #undef GetWindowTheme
 #undef CloseThemeData
@@ -31,6 +41,7 @@
 #undef DwmGetColorizationColor
 #undef RoActivateInstance
 #undef SHGetSetSettings
+#undef SHRegGetUSValueW
 #undef TrackPopupMenuEx
 #undef QueryPerformanceCounter
 #undef Wh_Log
@@ -662,6 +673,18 @@ static void TestSortDetails(const std::wstring& directory) {
     auto refresh = [&] {
         QueueDirectoryRefresh(state, true, true);
         auto complete = WaitForComplete(*state.background, state.directoryToken);
+        for (const auto& fresh : complete.entries) {
+            const int oldIndex=GpuRowForNativePath(state,fresh.path);
+            if(oldIndex<0) continue;
+            const auto& old=state.entries[size_t(oldIndex)];
+            if(!old.cells.empty() && !SameEntryMetadata(old,fresh)) {
+                const auto ticks=[](FILETIME t){return (ULONGLONG(t.dwHighDateTime)<<32)|t.dwLowDateTime;};
+                std::wcout<<L"SORT METADATA name="<<fresh.name<<L" size="<<old.byteSize<<L"/"<<fresh.byteSize
+                    <<L" written="<<ticks(old.lastWrite)<<L"/"<<ticks(fresh.lastWrite)
+                    <<L" created="<<ticks(old.created)<<L"/"<<ticks(fresh.created)
+                    <<L" accessed="<<ticks(old.accessed)<<L"/"<<ticks(fresh.accessed)<<std::endl;
+            }
+        }
         PublishDirectoryResult(*state.background, std::move(complete));
         ReceiveDirectoryResults(state);
     };
@@ -1792,6 +1815,7 @@ static void TestPreviewInput() {
 #include "provider-navigation-smoke.h"
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
+#include "touch-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1952,6 +1976,8 @@ int wmain(int argc,wchar_t** argv) {
             TestRenameReorderReadiness(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--scrollbar-input")==0) {
             TestScrollbarPressRouting();
+        } else if (argc>1 && wcscmp(argv[1],L"--touch")==0) {
+            TestTouchInput(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {
             TestNativeSuppression();
             TestGraphicsIsolation(fixture.wstring());
@@ -1965,6 +1991,7 @@ int wmain(int argc,wchar_t** argv) {
         TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
         TestStatusButtonLayout();
         TestUserOptions();
+        TestTouchInput(fixture.wstring());
         TestResolvedStyles();
         TestStyleEvents(fixture.wstring());
         TestPeriodicCapacityRefresh();

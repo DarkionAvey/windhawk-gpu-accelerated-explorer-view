@@ -15,6 +15,9 @@
   needs a 100-line code change.
 - Assess entangled messages and queues. Do not assume your regression tests cover
   real life usage scenarios.
+- Do not create manufactured messages for regression tests. Use Windows’ default 
+  handler and existing APIs to emulate IO. The unit tests often create artificial 
+  settings that are not capturing the true behavior of the system.
 - Implement best code practices. Do not wait for the user to spell it out for you.
 - Prioritize immediate names/layout and responsive input. Resolve optional
   metadata/icons on existing tab-owned lanes. Keep cold provider calls, waiting,
