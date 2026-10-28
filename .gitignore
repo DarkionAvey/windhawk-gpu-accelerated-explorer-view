@@ -6,3 +6,4 @@
 *.whl
 latest.*.tmp
 tests/.symbol-cache/
+tests/.build/

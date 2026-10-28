@@ -123,7 +123,10 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
         state.loaded=false; state.deferColumnProviders=true;
         state.firstContentSubmittedAt=123; state.directoryModePinned=false;
         tab.Start();
-        PresentationFixture::Await(state,[](const auto& r) {return r.accepted;}); ConsumePresentation(state);
+        const auto loading=PresentationFixture::Await(state,[](const auto& r) {return r.control && !r.accepted;});
+        ConsumePresentation(state);
+        Check(!ColumnBridgeFixture::Content(*loading) && !loading->frames,
+            "loading-only packet painted a placeholder or claimed accepted content");
         Check(state.deferColumnProviders && !state.directoryModePinned,
             "loading-only acceptance released providers or pinned the native mode");
         state.loaded=true; SubmitPresentation(state);

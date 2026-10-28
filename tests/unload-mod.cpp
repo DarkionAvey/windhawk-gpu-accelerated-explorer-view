@@ -134,7 +134,7 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     state->presentationModelGrouping=state->displayedGrouping;
     UpdateMetrics(*state); UpdateColumns(*state); UpdateRefreshRate(*state);
     ShowWindow(overlay,SW_SHOWNOACTIVATE);
-    if(!StartPresentation(*state)) return FALSE;
+    if(!StartPresentation(*state)) {printf("BARRIER DLL presentation startup failed\n"); return FALSE;}
     SubmitPresentation(*state);
     bool presented=false;
     const ULONGLONG deadline=GetTickCount64()+10000;
@@ -143,13 +143,22 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
             presented=state->presenter->receipt && state->presenter->receipt->accepted && state->presenter->receipt->ready;}
         if(!presented) Sleep(1);
     }
-    if(!presented) return FALSE;
+    if(!presented) {
+        std::lock_guard lock(state->presenter->mutex);
+        const auto receipt=state->presenter->receipt;
+        printf("BARRIER DLL presentation timeout receipt=%d ready=%d accepted=%d frames=%llu failure=0x%08lx stage=%u\n",
+            bool(receipt),receipt && receipt->ready,receipt && receipt->accepted,
+            receipt ? receipt->frames : 0,receipt ? receipt->failure : S_OK,receipt ? receipt->failureStage : 0);
+        return FALSE;
+    }
     MoveScroll(*state,std::min(200.f,MaxScrollPx(*state))); SubmitPresentation(*state);
 #endif
     // Own a real Ninput callback and an armed system-threshold hold deadline
     // when the DLL is disabled. The private digitizer never injects desktop IO.
     TouchCalibration digitizer;
-    if(!digitizer.device || !StartTouchRecognizer(*state)) return FALSE;
+    if(!digitizer.device || !StartTouchRecognizer(*state)) {
+        printf("BARRIER DLL touch startup failed digitizer=%d\n",bool(digitizer.device)); return FALSE;
+    }
     POINT screen{100,100};
     MapUiPoint(overlay,nullptr,screen);
     POINTER_INFO contact{};

@@ -29,17 +29,18 @@ static void TestFrameBudgets() {
         unrelated.pending=true; unrelated.pendingToken=18; unrelated.pendingRequestId=42;
         InvalidateShellIconKey(cancelled,L"changed");
         Check(cancelled.background->iconGeneration==18 && unrelated.pending &&
-            unrelated.pendingRequestId==42 && !cancelled.icons.contains(L"@256|changed") &&
+            unrelated.pendingRequestId==42 && record.needsRefresh && record.pixels.data.data()==cached &&
             cancelled.background->iconResults.size()==1 &&
             std::any_of(cancelled.retiredIconPixels.begin(),cancelled.retiredIconPixels.end(),
                 [&](const auto& image) { return image.data.data()==obsolete; }) &&
-            std::any_of(cancelled.retiredIconPixels.begin(),cancelled.retiredIconPixels.end(),
+            std::none_of(cancelled.retiredIconPixels.begin(),cancelled.retiredIconPixels.end(),
                 [&](const auto& image) { return image.data.data()==cached; }),
-            "item invalidation freed pixels synchronously or changed unrelated request ownership");
+            "item invalidation discarded cached artwork or changed unrelated request ownership");
         InvalidateShellIcons(cancelled);
-        Check(cancelled.background->iconResults.empty() && cancelled.icons.empty() &&
-            cancelled.retiredIconPixels.size()==4 && cancelled.iconResultsPending,
-            "global icon invalidation bypassed deferred pixel reclamation");
+        Check(cancelled.background->iconResults.empty() && cancelled.icons.size()==2 &&
+            record.needsRefresh && !unrelated.pending && record.pixels.data.data()==cached &&
+            cancelled.retiredIconPixels.size()==3 && cancelled.iconResultsPending,
+            "global icon invalidation discarded cached artwork or bypassed obsolete-result reclamation");
         ReceiveIcons(cancelled,false);
         Check(cancelled.retiredIconPixels.empty(),"cancelled pixels did not reach background reclamation");
         Stop(cancelled.background); UnregisterAnimationWindow(cancelled.hwnd); DestroyWindow(cancelled.hwnd);

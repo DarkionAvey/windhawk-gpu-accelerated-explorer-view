@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.273
+
+- Keep the accepted list image visible through resizing and cold navigation
+  until its replacement is ready; confirmed empty folders still update normally.
+- Retain icons, thumbnails and property text during Shell refreshes and failed
+  provider reads. Replace GPU artwork only after its new texture uploads.
+- Preserve usable fonts and rendering resources when replacement allocation
+  fails, and retry through the existing presentation path.
+
 ## 0.9.272
 
 - Automatically refit columns when switching from grid or List view to Details,

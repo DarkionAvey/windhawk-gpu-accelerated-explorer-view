@@ -80,6 +80,23 @@ static void TestNativeIconSizing(const std::wstring& fixture) {
         }
         Check(record->pixels.data.Identity()==pixelsId && record->bitmap.Get()==bitmap,
             "zoom changed CPU pixels or reuploaded a texture");
+        // Refresh the real private ICO through the normal worker. Invalidation
+        // and CPU delivery must both retain the old GPU artwork until upload.
+        state.gridView=true; state.rtlLayout=false; state.iconPx=512;
+        InvalidateShellIconKey(state,item.path);
+        Check(record->pixels.data.Identity()==pixelsId && record->bitmap.Get()==bitmap && record->needsRefresh,
+            "item icon invalidation discarded ready artwork");
+        const auto refreshed=request();
+        record=FindIconRecord(state,refreshed);
+        Check(record && record->pixels.data.Identity()!=pixelsId && record->bitmap.Get()==bitmap &&
+            record->bitmapPixels.data.Identity()==pixelsId,"CPU icon delivery discarded the displayed texture");
+        Check(UploadIconBitmap(state,*record) && record->bitmap.Get()!=bitmap &&
+            record->bitmapPixels.data.Identity()==record->pixels.data.Identity(),"ready replacement icon was not published");
+        const auto freshPixels=record->pixels.data.Identity(); const auto freshBitmap=record->bitmap.Get();
+        const bool visible=state.visible; state.visible=false;
+        InvalidateShellIcons(state); state.visible=visible;
+        Check(record->pixels.data.Identity()==freshPixels && record->bitmap.Get()==freshBitmap && record->needsRefresh,
+            "global icon invalidation discarded ready artwork");
         surface.Reset(); DropTarget(state); state.gridView=false; state.rtlLayout=false;state.iconPx=900;
         Check(EnsureTarget(state),"recreated sizing target"); state.iconUploadsPending=true; UploadVisibleIcons(state);
         Check(FindIconRecord(state,fallbackKey,true,true)->bitmap!=nullptr,"target recreation lost a list size fallback");
@@ -89,5 +106,5 @@ static void TestNativeIconSizing(const std::wstring& fixture) {
     Check(DeleteFileW(iconPath.c_str()),"native ICO cleanup");
     IconPixels blank; blank.width=blank.height=8;blank.stride=32;blank.data.assign(256,0);
     Check(!FitShellIconPixels(std::move(blank)).Ready(),"empty icon suppressed its association fallback");
-    std::cout<<"PASS: native ICO worker avoids framed factory icons, preserves jumbo artwork, cached list zoom/target recreation uploads, presentation fallback and GPU grid/list/RTL 32..512px fitting\n";
+    std::cout<<"PASS: native ICO worker preserves artwork through item/global invalidation and CPU/GPU replacement; cached zoom/target recreation, fallback and grid/list/RTL 32..512px fitting\n";
 }

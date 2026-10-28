@@ -184,8 +184,9 @@ static void TestAdaptiveImagePipeline() {
             AdaptiveImageFixture::requests==probed && !state.icons.contains(biggest),
             "repeatedly confirmed lower-resolution artwork was extracted again");
         InvalidateShellIconKey(state,state.entries[0].path);
-        Check(!state.icons.contains(key) && !state.icons.contains(larger),
-            "Shell item updates retained stale high-resolution artwork or its learned source ceiling");
+        Check(state.icons.at(key).needsRefresh && state.icons.at(larger).needsRefresh &&
+            !state.icons.at(larger).sourceLimited && state.icons.at(larger).pixels.Ready(),
+            "Shell item updates discarded fallback artwork or retained its learned source ceiling");
         state.entries[0].path=L"wh-adaptive-image:warming.png"; state.iconPx=700;
         const auto cold=IconKey(state,state.entries[0],path,attrs);
         Check(RequestEntryIcon(state,state.entries[0],false,{{cold,0}}),"cold undersized provider request");

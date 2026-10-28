@@ -611,6 +611,13 @@ static void TestLayoutWatchAndCache(const std::wstring& directory) {
 #include "filesystem-mutation-smoke.h"
 
 static void TestSortDetails(const std::wstring& directory) {
+    ComPtr<IPropertyStore> emptyStore;
+    Check(SUCCEEDED(PSCreateMemoryPropertyStore(IID_PPV_ARGS(&emptyStore))),"empty property store");
+    bool resolved=true;
+    Check(FormatShellDetail(nullptr,PKEY_Comment,nullptr,&resolved).empty() && !resolved,
+        "missing property provider was accepted as an empty replacement");
+    Check(FormatShellDetail(emptyStore.Get(),PKEY_Comment,nullptr,&resolved).empty() && resolved,
+        "successfully empty property was not authoritative");
     ViewState state;
     state.hwnd = MessageWindow();
     SetWindowPos(state.hwnd, nullptr, 0, 0, 640, 240, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -743,10 +750,13 @@ static void TestSortDetails(const std::wstring& directory) {
     },"changed file reused stale cached properties");
     // A Shell UPDATEITEM can change a property without changing size/timestamps.
     const auto updated = state.entries[1].path;
+    const auto displayedCells=state.entries[1].cells;
     QueueShellItemUpdate(state, updated);
     FlushShellChangeHints(state, GetTickCount64() + kShellVisualCoalesceMs);
     refresh();
-    Check(state.entries[1].cells.empty(), "UPDATEITEM resurrected an invalidated cached property");
+    Check(!state.entries[1].cells.empty() && state.entries[1].cells.size()==displayedCells.size() &&
+        state.entries[1].detailsRefreshEpoch!=state.detailsRefreshEpoch,
+        "UPDATEITEM erased displayed properties or marked stale values fresh before replacement");
     const auto seedDetails = [&](bool viewportOnly=false) {
         DirectoryResult values; values.kind=DirectoryResult::Details; values.token=state.directoryToken;
         const auto visible=VisibleItemRows(state,12.f);
@@ -1333,6 +1343,7 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
         TestZoomPresentation(a, b);
         ProfileAnimatedText(a);
         TestTextRaster(a);
+        TestResizePresentation(frame,fixture);
         TestResizeText(frame);
         TestAppearanceRefinements(frame, fixture);
         TestHighlightLayering(frame);
@@ -1360,6 +1371,9 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
     DropTarget(b);
     g_writeFactory.Reset();
     DestroyWindow(frame);
+    // This fixture now also starts an actual presentation lane. Drain its
+    // shared scheduler before subsequent fixtures exercise scheduler startup.
+    ShutDownFrames(); g_frameStopping=false;
 }
 
 static HANDLE nativeProviderEntered = nullptr;

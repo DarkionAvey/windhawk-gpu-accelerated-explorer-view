@@ -450,9 +450,11 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                     "GPU-ready image did not replace the scaled fallback");
                 state.iconPx=previousSize;
                 state.icons.try_emplace(larger).first->second.pending=true;
+                const auto* previous=FindIconRecord(state,key);
                 InvalidateShellIconKey(state,state.entries[0].path);
-                Check(!FindIconRecord(state,key) && !FindIconRecord(state,larger),
-                    "item update left stale image-size variants in the cache");
+                Check((!previous || (FindIconRecord(state,key)==previous && previous->needsRefresh)) &&
+                    FindIconRecord(state,larger)==&replacement && replacement.needsRefresh && !replacement.pending &&
+                    replacement.bitmap,"item update discarded ready image tiers or retained an obsolete request");
             }
             if (size==16 || size==96) TestGridFilenameSelection(state);
         }

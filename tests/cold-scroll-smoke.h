@@ -51,7 +51,7 @@ static void TestColdScrollDelivery() {
     state.columnFitPendingEpoch = state.columnEpoch;
     for (int i = 0; i < 160; ++i) publish(i);
     MSG message{};
-    Check(PeekMessageW(&message, state.hwnd, WM_APP+31, WM_APP+64, PM_REMOVE), "metadata notification");
+    Check(PeekMessageW(&message, state.hwnd, kMsgDetailsReady, kMsgDetailsReady, PM_REMOVE), "metadata notification");
     const auto beforePaint = coldScrollPaints;
     const float beforeScroll = state.scrollNow, beforeTarget = state.scrollTarget;
     OverlayProc(state.hwnd, message.message, message.wParam, message.lParam);
@@ -60,7 +60,9 @@ static void TestColdScrollDelivery() {
     Check(state.scrollNow == beforeScroll && state.scrollTarget == beforeTarget &&
           state.columnFitPendingEpoch == state.columnEpoch, "metadata changed the active grab");
     for (int i = 160; i < 180; ++i) publish(i);
-    Check(!PeekMessageW(&message, state.hwnd, WM_APP+31, WM_APP+64, PM_REMOVE),
+    // Frame/style/initialization messages can legitimately share this window's
+    // queue. Check the provider's actual notification, not their numeric range.
+    Check(!PeekMessageW(&message, state.hwnd, kMsgDetailsReady, kMsgDetailsReady, PM_REMOVE),
           "provider wake latch reopened before its paced delivery");
     // Structural data has an independent wake even while metadata is held.
     DirectoryResult preview; preview.kind = DirectoryResult::Preview; preview.token = state.directoryToken;

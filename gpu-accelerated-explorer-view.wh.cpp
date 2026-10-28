@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.272
+// @version         0.9.273
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1078,6 +1078,7 @@ struct ThumbnailStyle {
 };
 struct IconRecord {
     IconPixels pixels;
+    IconPixels bitmapPixels; // Geometry/bytes belonging to the accepted GPU texture.
     ComPtr<ID2D1Bitmap> bitmap;
     bool pending = false;
     // Distinguish an in-flight job from the same path on a previous visit.
@@ -1090,6 +1091,7 @@ struct IconRecord {
     unsigned long long painted = 0;
     bool association = false;
     bool resolved = false; // Includes a failed lookup; cancelled queued work is not resolved.
+    bool needsRefresh = false; // Invalidated artwork remains a fallback until replacement succeeds.
     unsigned failures = 0;
     size_t cacheBytes = 0;
     UINT requestedSize = 32;
@@ -1439,6 +1441,7 @@ struct DetailValue {
     int index = -1;
     std::wstring path; // Identity guard if the native This PC rows reorder in flight.
     bool thisPc = false;
+    bool failed = false;
     std::wstring date, type, size;
     std::vector<ColumnCell> cells;
     unsigned long long columnEpoch = 0;
@@ -3162,8 +3165,10 @@ struct ViewState {
     ComPtr<ID2D1Device> d2dDevice;
     bool presentPending = false;
     HANDLE frameLatencyWaitable = nullptr; // Owned by this tab's GPU lane; zero-time readiness probes only.
+    ComPtr<IDXGISwapChain1> presentedSwapChain; // Keep accepted pixels attached while preparing resized buffers.
     LARGE_INTEGER rejectedPresentQpc{};
     bool graphicsReady = false;
+    bool textFormatsDirty = false;
     bool graphicsInitializing = false;
     bool graphicsReleaseQueued = false, graphicsSuspended = false, gpuDeviceCounted = false;
     bool graphicsStandby = false, graphicsStandbyPending = false, graphicsStandbyTrimmed = false;
@@ -6485,7 +6490,7 @@ const wchar_t* EntryExtension(const Entry& e) {
     return ext ? ext : L"";
 }
 std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
-                              const PROPVARIANT* value = nullptr);
+                              const PROPVARIANT* value = nullptr,bool* resolved = nullptr);
 HRESULT EntryPropertyStore(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
                            GETPROPERTYSTOREFLAGS flags, IPropertyStore** out) {
     *out = nullptr;
@@ -6793,15 +6798,19 @@ unsigned long long DirectoryMetadataHash(const std::vector<Entry>& entries) {
 // Shared Shell property formatting for filesystem and This PC detail jobs.
 // Call only from a directory worker, never from an input or paint callback.
 std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
-                              const PROPVARIANT* value) {
+                              const PROPVARIANT* value,bool* resolved) {
+    if(resolved) *resolved=false;
     if (!store && !value) return {};
     PROPVARIANT pv{};
     PropVariantInit(&pv);
     std::wstring result;
     if (value || SUCCEEDED(store->GetValue(key, &pv))) {
+        const auto& property=value ? *value : pv;
         PWSTR formatted = nullptr;
-        if (SUCCEEDED(PSFormatForDisplayAlloc(key, value ? *value : pv,
-                PDFF_DEFAULT, &formatted)) && formatted)
+        const bool empty=property.vt==VT_EMPTY || property.vt==VT_NULL;
+        const HRESULT hr=empty ? S_OK : PSFormatForDisplayAlloc(key,property,PDFF_DEFAULT,&formatted);
+        if(resolved) *resolved=SUCCEEDED(hr);
+        if (SUCCEEDED(hr) && formatted)
             result = formatted;
         if (formatted) CoTaskMemFree(formatted);
     }
@@ -8019,7 +8028,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     for (const auto& key : req.missingKeys) {
                         if (detail.thisPc && ThisPcSeededColumn(key)) continue;
                         ColumnCell cell; cell.key = key;
-                        cell.text = FormatShellDetail(store.Get(), key);
+                        bool resolved=false;
+                        cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                        if(!resolved) {v.failed=true; continue;}
                         if (SameKey(key, PKEY_DateModified)) v.date = cell.text;
                         else if (SameKey(key, PKEY_Size)) v.size = cell.text;
                         v.cells.push_back(std::move(cell));
@@ -8060,7 +8071,11 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                             if (SameKey(key, PKEY_DateModified)) cell.text = v.date;
                             else if (SameKey(key, PKEY_ItemTypeText)) cell.text = v.type;
                             else if (SameKey(key, PKEY_Size)) cell.text = v.size;
-                            else cell.text = FormatShellDetail(store.Get(), key);
+                            else {
+                                bool resolved=false;
+                                cell.text=FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                                if(!resolved) {v.failed=true; continue;}
+                            }
                             v.cells.push_back(std::move(cell));
                     }
                 }
@@ -9340,11 +9355,8 @@ void QueueVisibleDetails(ViewState& state) {
         // Association changes are genuine property invalidations. Do this
         // lazily per visible row, not across an entire 100k-item directory.
         if (e.propertyEpoch != state.propertyEpoch) {
-            e.cells.clear();
-            e.date.clear();
-            e.type.clear();
-            e.size.clear();
             e.propertyEpoch = state.propertyEpoch;
+            e.detailsRefreshEpoch=~state.detailsRefreshEpoch;
             e.detailsReady = false;
             e.detailsPending = false;
             e.columnEpoch = 0;
@@ -10046,7 +10058,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 e.detailsReady = true;
                 PipelineEvent(*state.background,{.operation=L"metadata.apply[index,cells]",.a=state.directoryToken,.b=v.columnEpoch,
                     .v={static_cast<double>(v.index),static_cast<double>(e.cells.size())}});
-                CacheRowDetails(state, e, true);
+                if(!v.failed) CacheRowDetails(state, e, true);
                 if (v.columnEpoch == e.detailsPendingEpoch)
                     e.detailsPending = false;
             }
@@ -11841,7 +11853,9 @@ const std::wstring* ColumnCellText(const Entry& entry,
                                    unsigned long long epoch,
                                    unsigned long long propertyEpoch) {
     if (ClassifySort(key) == SortKind::Name) return &entry.name;
-    if (entry.propertyEpoch != propertyEpoch) return nullptr;
+    // Freshness controls demand and result acceptance, not whether the last
+    // resolved value stays visible while its replacement is being requested.
+    (void)propertyEpoch;
     if (SameKey(key, PKEY_DateModified)) return &entry.date;
     if (SameKey(key, PKEY_ItemTypeText)) return &entry.type;
     if (SameKey(key, PKEY_Size)) return &entry.size;
@@ -12962,6 +12976,8 @@ void ConfigureTextFormat(IDWriteTextFormat* format, bool rtl, bool trim) {
 }
 
 bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
+    bodyOnly=bodyOnly && !state.textFormatsDirty;
+    state.textFormatsDirty=true;
     if (!g_writeFactory) return false;
     const int dpi = ViewDpi(state);
     if (!std::isfinite(state.fontPx) || state.fontPx < 1.f || state.fontPx > Scale96(96,dpi))
@@ -12973,7 +12989,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         if (previous->GetFontSize() == state.fontPx &&
             previous->GetReadingDirection() == (state.rtlLayout ?
                 DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT))
-            return true;
+            {state.textFormatsDirty=false; return true;}
         std::wstring family(previous->GetFontFamilyNameLength() + 1, L'\0');
         std::wstring locale(previous->GetLocaleNameLength() + 1, L'\0');
         ComPtr<IDWriteFontCollection> collection;
@@ -12987,6 +13003,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
             ConfigureTextFormat(format.Get(), state.rtlLayout, true);
             if(previous->GetReadingDirection()!=format->GetReadingDirection()) ++state.textFaceSerial;
             state.textFormat = std::move(format);
+            state.textFormatsDirty=false;
             return true;
         }
     }
@@ -13040,6 +13057,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         state.headerFormat = std::move(header);
         state.sortedHeaderFormat = std::move(sorted);
         state.textFormatDpi = dpi;
+        state.textFormatsDirty=false;
         ++state.textFaceSerial;
         return true;
     };
@@ -13049,6 +13067,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
 }
 
 void ScheduleVisibleIconUploads(ViewState& state);
+void AccountIconCache(ViewState& state,const std::wstring& key,IconRecord& record);
 
 ComPtr<IDXGIAdapter3> MemoryAdapter(const ViewState& state) {
     ComPtr<IDXGIAdapter> adapter;
@@ -13075,7 +13094,12 @@ void ProfileGpuMemory(ViewState& state, const wchar_t* reason, bool force=false,
     for (const auto* p : {&scene.background,&scene.names,&scene.metadata,&scene.groups,&scene.chrome,&scene.feedback}) planes+=p->estimatedBytes;
     for (const auto& p : scene.fitted) planes+=p.content.estimatedBytes+p.trailing.estimatedBytes;
     const auto size=state.backbuffer ? state.backbuffer->GetPixelSize() : D2D1_SIZE_U{};
-    const size_t buffers=static_cast<size_t>(size.width)*size.height*4*2;
+    size_t buffers=static_cast<size_t>(size.width)*size.height*4*2;
+    if(state.presentedSwapChain && state.presentedSwapChain!=state.swapChain) {
+        DXGI_SWAP_CHAIN_DESC1 shown{};
+        if(SUCCEEDED(state.presentedSwapChain->GetDesc1(&shown)))
+            buffers+=size_t(shown.Width)*shown.Height*4*shown.BufferCount;
+    }
     // No cache walks or per-frame formatting when disabled. All category totals
     // above use existing counters; process usage includes other Explorer GPUs.
     Wh_Log(L"[GPU memory] reason=%s hwnd=%p tab=%p lifetime=%llu devices=%u visible=%d suspended=%d "
@@ -13173,10 +13197,13 @@ void DropTarget(ViewState& state) {
     state.thumbnailBrush.Reset();
     state.brush.Reset();
     state.defaultFolderIcon.bitmap.Reset();
+    state.defaultFolderIcon.bitmapPixels={};
     state.defaultFolderIcon.bitmapAttempted = false;
     for (auto& icon : state.icons) {
         icon.second.bitmap.Reset();
+        icon.second.bitmapPixels={};
         icon.second.bitmapAttempted = false;
+        AccountIconCache(state,icon.first,icon.second);
     }
     if (state.target) state.target->SetTarget(nullptr);
     state.backbuffer.Reset();
@@ -13189,6 +13216,7 @@ void DropTarget(ViewState& state) {
     state.compTarget.Reset();
     if (state.frameLatencyWaitable) CloseHandle(std::exchange(state.frameLatencyWaitable,nullptr));
     state.swapChain.Reset();
+    state.presentedSwapChain.Reset();
     state.presentPending = false;
     state.rejectedPresentQpc = {};
     state.graphicsReady = false;
@@ -13214,18 +13242,33 @@ void DropTarget(ViewState& state) {
     ProfileGpuMemory(state,L"release.end.deferred-driver-cleanup-possible",true,memoryAdapter.Get());
 }
 
-bool BindBackbuffer(ViewState& state) {
+HRESULT CreatePresentationBuffers(ViewState& state,UINT width,UINT height) {
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width=width; desc.Height=height; desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count=1; desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount=2; desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.Scaling=DXGI_SCALING_STRETCH; desc.AlphaMode=DXGI_ALPHA_MODE_PREMULTIPLIED;
+    desc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    ComPtr<IDXGISwapChain1> next;
+    HRESULT hr=state.dxgiFactory->CreateSwapChainForComposition(state.d3d.Get(),&desc,nullptr,&next);
+    ComPtr<IDXGISwapChain2> paced;
+    if(SUCCEEDED(hr)) hr=next.As(&paced);
+    if(SUCCEEDED(hr)) hr=paced->SetMaximumFrameLatency(1);
     ComPtr<IDXGISurface> surface;
-    if (!state.swapChain || !state.target ||
-        FAILED(state.swapChain->GetBuffer(0, IID_PPV_ARGS(&surface)))) return false;
-    const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
-        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                           D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
-    if (FAILED(state.target->CreateBitmapFromDxgiSurface(
-        surface.Get(), &props, state.backbuffer.GetAddressOf()))) return false;
-    state.target->SetTarget(state.backbuffer.Get());
-    return true;
+    ComPtr<ID2D1Bitmap1> bitmap;
+    if(SUCCEEDED(hr)) hr=next->GetBuffer(0,IID_PPV_ARGS(&surface));
+    const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+    if(SUCCEEDED(hr)) hr=state.target->CreateBitmapFromDxgiSurface(surface.Get(),&props,&bitmap);
+    if(FAILED(hr)) return hr;
+    HANDLE ready=paced->GetFrameLatencyWaitableObject();
+    if(!ready) return E_FAIL;
+    state.target->SetTarget(bitmap.Get()); state.backbuffer=std::move(bitmap);
+    state.swapChain=std::move(next);
+    if(state.frameLatencyWaitable) CloseHandle(state.frameLatencyWaitable);
+    state.frameLatencyWaitable=ready;
+    state.presentPending=false; state.rejectedPresentQpc={};
+    return S_OK;
 }
 
 bool ResizeTarget(ViewState& state, UINT width, UINT height) {
@@ -13238,27 +13281,36 @@ bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if (!state.swapChain || !state.target) return true;
     if (width == 0 || height == 0) return true;
     const auto current = state.backbuffer ? state.backbuffer->GetPixelSize() : D2D1_SIZE_U{};
-    if (current.width == width && current.height == height) return true;
+    if (current.width == width && current.height == height) {state.resizeDeferred=false; return true;}
     // Shell view replacement/top-order repairs can send WM_SIZE during a
     // mode reversal. The swap chain still contains the last ordinary frame,
     // with its old header offset. Keep the committed scene until Paint has
     // published replacement pixels and geometry together (or a normal frame
     // has actually been accepted). Rebuilding buffers is not presentation.
     ClearModeComposition(state, false);
-    state.target->SetTarget(nullptr);
-    state.backbuffer.Reset();
-    const HRESULT hr = state.swapChain->ResizeBuffers(2, width, height,
-        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
-    if (FAILED(hr) || !BindBackbuffer(state)) {
-        DropTarget(state);
+    // ResizeBuffers would destroy the image DWM is still displaying. Build a
+    // separate chain; SetContent/Commit publishes it only after Present succeeds.
+    // Unaccepted intermediate sizes can be discarded without touching that image.
+    const HRESULT hr=CreatePresentationBuffers(state,width,height);
+    PipelineEvent(*state.background,{.operation=L"presentation.resize[width,height,retained,pending]",
+        .a=static_cast<unsigned>(hr),.v={double(width),double(height),
+            double(bool(state.presentedSwapChain)),double(state.presentedSwapChain!=state.swapChain)}});
+    if (FAILED(hr)) {
+        state.graphicsFailure=hr;
+        // Allocation failure is not proof that the accepted image/device was
+        // lost. Keep it visible and retry on the existing presentation pulse.
+        state.resizeDeferred=true; state.presentPending=true;
+        if(FAILED(state.d3d->GetDeviceRemovedReason())) DropTarget(state);
+        else RegisterViewAnimation(state);
         return false;
     }
+    state.resizeDeferred=false;
     return true;
 }
 
 bool EnsureTarget(ViewState& state) {
     if(state.presenter && !state.presentationOnly) {
-        if(!state.textFormat || !state.headerFormat) MakeTextFormats(state);
+        if(state.textFormatsDirty || !state.textFormat || !state.headerFormat) MakeTextFormats(state);
         if(state.presenter->stopping.load(std::memory_order_acquire)) return false;
         state.graphicsReady=true; state.graphicsSuspended=false;
         return true;
@@ -13266,8 +13318,10 @@ bool EnsureTarget(ViewState& state) {
     if (state.graphicsInitializing) return false;
     GraphicsContinuation continuation(state);
     ScopedFlag initializing(state.graphicsInitializing);
-    if (state.target && state.brush)
-        return state.textFormat && state.headerFormat ? true : MakeTextFormats(state);
+    if (state.target && state.brush) {
+        if(state.textFormatsDirty || !state.textFormat || !state.headerFormat) MakeTextFormats(state);
+        return state.textFormat && state.headerFormat;
+    }
     if (!g_writeFactory) return false;
     TabTraceSlowScope trace(L"GPU target creation", state.hwnd);
     state.graphicsFailure=S_OK; state.graphicsFailureStage=1;
@@ -13307,28 +13361,9 @@ bool EnsureTarget(ViewState& state) {
     if (FAILED(hr)) goto failed;
     state.imageTextureLimit=std::min(kPlatformImageDimension,state.target->GetMaximumBitmapSize());
     {
-        DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = width;
-        desc.Height = height;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 2;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        desc.Scaling = DXGI_SCALING_STRETCH;
-        desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         state.graphicsFailureStage=3;
-        hr = state.dxgiFactory->CreateSwapChainForComposition(state.d3d.Get(),
-            &desc, nullptr, state.swapChain.GetAddressOf());
-        if (FAILED(hr)) goto failed;
-        ComPtr<IDXGISwapChain2> paced;
-        hr = state.swapChain.As(&paced);
-        if (FAILED(hr)) goto failed;
-        hr = paced->SetMaximumFrameLatency(1);
-        if (FAILED(hr)) goto failed;
-        state.frameLatencyWaitable = paced->GetFrameLatencyWaitableObject();
-        if (!state.frameLatencyWaitable) { hr = E_FAIL; goto failed; }
+        hr=CreatePresentationBuffers(state,width,height);
+        if(FAILED(hr)) goto failed;
     }
     state.graphicsFailureStage=4;
     hr = state.composition->CreateTargetForHwnd(state.hwnd, TRUE,
@@ -13337,16 +13372,13 @@ bool EnsureTarget(ViewState& state) {
     state.graphicsFailureStage=5;
     hr = CreatePixelAlignedVisual(state.composition.Get(),state.visual.GetAddressOf());
     if (FAILED(hr)) goto failed;
-    hr = state.visual->SetContent(state.swapChain.Get());
-    if (FAILED(hr)) goto failed;
     hr = state.compTarget->SetRoot(state.visual.Get());
     if (FAILED(hr)) goto failed;
     hr = state.composition->Commit();
     if (FAILED(hr)) goto failed;
-    if (!BindBackbuffer(state)) goto failed;
     hr = state.target->CreateSolidColorBrush(Packed(0xFFFFFF),
                                               state.brush.GetAddressOf());
-    if (FAILED(hr) || ((!state.textFormat || !state.headerFormat || state.textFormatDpi!=ViewDpi(state)) &&
+    if (FAILED(hr) || ((state.textFormatsDirty || !state.textFormat || !state.headerFormat || state.textFormatDpi!=ViewDpi(state)) &&
         !MakeTextFormats(state))) goto failed;
     hr = state.target->CreateBitmapBrush(nullptr, state.thumbnailBrush.GetAddressOf());
     if (FAILED(hr)) goto failed;
@@ -13439,6 +13471,7 @@ void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
     ComPtr<IDWriteRenderingParams> native;
     if(g_writeFactory && FAILED(g_writeFactory->CreateMonitorRenderingParams(monitor,&native)))
         g_writeFactory->CreateRenderingParams(&native);
+    if(!native && state.textRenderingParams) return;
     state.textRenderingParams=native;
     BOOL smoothing=TRUE;
     if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING,0,&smoothing,0)) smoothing=TRUE;
@@ -13756,8 +13789,14 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
 // Cheap GPU upload from an already decoded CPU buffer. Only called from
 // kMsgFrame (and never WM_PAINT/ReceiveIcons). Failure is remembered until
 // the D2D target is recreated, avoiding a retry storm.
+size_t RetainedIconBytes(const IconRecord& rec) {
+    if(!rec.bitmapPixels.Ready() || rec.bitmapPixels.data.Identity()==rec.pixels.data.Identity()) return 0;
+    return rec.bitmapPixels.data.capacity()+
+        ((size_t(rec.bitmapPixels.width)*rec.bitmapPixels.height*4+65535)/65536)*65536;
+}
 bool UploadIconBitmap(ViewState& state, IconRecord& rec) {
-    if (!state.target || rec.bitmap || rec.bitmapAttempted || !rec.pixels.Ready())
+    if (!state.target || (rec.bitmap && rec.bitmapPixels.data.Identity()==rec.pixels.data.Identity()) ||
+        rec.bitmapAttempted || !rec.pixels.Ready())
         return false;
     rec.bitmapAttempted = true;
     const auto maximum=state.target->GetMaximumBitmapSize();
@@ -13765,9 +13804,21 @@ bool UploadIconBitmap(ViewState& state, IconRecord& rec) {
     const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                           D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
-    return SUCCEEDED(state.target->CreateBitmap(
+    ComPtr<ID2D1Bitmap> replacement;
+    if(FAILED(state.target->CreateBitmap(
         D2D1::SizeU(rec.pixels.width, rec.pixels.height), std::as_const(rec.pixels.data).data(),
-        rec.pixels.stride, &props, rec.bitmap.GetAddressOf()));
+        rec.pixels.stride, &props, &replacement))) return false;
+    const size_t retained=RetainedIconBytes(rec);
+    if(rec.cacheBytes && retained<=rec.cacheBytes) {
+        rec.cacheBytes-=retained; state.iconCacheBytes-=retained;
+    }
+    if(rec.bitmap) {
+        const auto size=rec.bitmap->GetPixelSize(); const size_t bytes=size_t(size.width)*size.height*4;
+        state.retiredIconBitmaps.push_back({std::move(rec.bitmap),bytes}); state.retiredIconBitmapBytes+=bytes;
+    }
+    if(!state.presentationOnly) RetireIconPixels(state,rec.bitmapPixels);
+    rec.bitmap=std::move(replacement); rec.bitmapPixels=rec.pixels;
+    return true;
 }
 
 // Scheduling accepts CPU pixels; presentation accepts GPU bitmaps only.
@@ -13781,7 +13832,7 @@ void AccountIconCache(ViewState& state, const std::wstring& key, IconRecord& rec
     const size_t pixels = record.pending && record.pixels.data.empty() ?
         4ULL*record.requestedSize*record.requestedSize + gpu :
         record.pixels.data.capacity()+gpu;
-    const size_t bytes = sizeof(IconRecord) + 4*sizeof(void*) + 2*key.size()*sizeof(wchar_t) + pixels;
+    const size_t bytes = sizeof(IconRecord) + 4*sizeof(void*) + 2*key.size()*sizeof(wchar_t) + pixels+RetainedIconBytes(record);
     state.iconCacheBytes = state.iconCacheBytes - record.cacheBytes + bytes;
     record.cacheBytes = bytes;
 }
@@ -13803,9 +13854,10 @@ IconRecord* FindIconRecord(ViewState& state, const std::wstring& key,
     const IconCacheLookup query(key);
     auto* exact = lookup(query).first;
     if(!sizeFallback) {if(exact && resolvedKey) *resolvedKey=key; return exact;}
-    const auto extent=[](const IconRecord& record) {
-        return std::max(record.pixels.thumbnailWidth ? record.pixels.thumbnailWidth : record.pixels.width,
-            record.pixels.thumbnailHeight ? record.pixels.thumbnailHeight : record.pixels.height);
+    const auto extent=[bitmapOnly](const IconRecord& record) {
+        const auto& pixels=bitmapOnly && record.bitmapPixels.Ready() ? record.bitmapPixels : record.pixels;
+        return std::max(pixels.thumbnailWidth ? pixels.thumbnailWidth : pixels.width,
+            pixels.thumbnailHeight ? pixels.thumbnailHeight : pixels.height);
     };
     const UINT requested=ImageKeySize(key);
     if(!skipExact && usable(exact) && extent(*exact)>=requested) {
@@ -13876,11 +13928,11 @@ std::vector<IconRecord*> VisibleIconUploads(ViewState& state) {
         std::wstring path;
         bool attributes = false;
         auto record = FindIconRecord(state, IconKey(state, entry, path, attributes), true);
-        if (record && record->bitmap) continue;
+        if (record && record->bitmap && record->bitmapPixels.data.Identity()==record->pixels.data.Identity()) continue;
         if ((!record || !record->pixels.Ready() || record->bitmapAttempted) &&
             (!entry.folder || !IsDriveRoot(entry.path)))
             record = FindIconRecord(state, IconKey(state, entry, path, attributes, true), true);
-        if (record && record->pixels.Ready() && !record->bitmap &&
+        if (record && record->pixels.Ready() &&
             !record->bitmapAttempted && included.insert(record).second)
             pending.push_back(record);
     }
@@ -13938,7 +13990,7 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
     bool attributes = false;
     const std::wstring key = IconKey(state, entry, path, attributes, associationOnly,preview ? 256 : 0);
     auto record = FindIconRecord(state, key);
-    if (record && (record->resolved || record->pixels.Ready() || record->bitmap ||
+    if (record && ((!record->needsRefresh && (record->resolved || record->pixels.Ready() || record->bitmap)) ||
         (record->pending && (attributes || record->pendingToken == state.iconToken)))) return true;
     // Budget decoded pixels plus a GPU copy instead of forcing every namespace
     // through a 256-item cliff. A 790-item folder of small icons fits cheaply;
@@ -13946,7 +13998,8 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
     const bool thumbnail = !associationOnly && UsesThumbnails(state,entry);
     const size_t side = ImageKeySize(key);
     auto* cached=FindIconRecord(state,key,true);
-    if(cached && cached->pixels.Ready() && cached->pixels.width<=state.imageTextureLimit &&
+    if(cached && !cached->needsRefresh && (!record || !record->needsRefresh) &&
+        cached->pixels.Ready() && cached->pixels.width<=state.imageTextureLimit &&
         cached->pixels.height<=state.imageTextureLimit) {
         const UINT native=std::max(cached->pixels.thumbnailWidth ? cached->pixels.thumbnailWidth : cached->pixels.width,
             cached->pixels.thumbnailHeight ? cached->pixels.thumbnailHeight : cached->pixels.height);
@@ -13982,6 +14035,7 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
         victim = candidates.back(); candidates.pop_back();
         state.iconCacheBytes -= victim->second.cacheBytes;
         RetireIconPixels(state,victim->second.pixels);
+        RetireIconPixels(state,victim->second.bitmapPixels);
         state.icons.erase(victim->first);
         QueryPerformanceCounter(&now);
         if (state.iconCacheBytes + bytes > budget &&
@@ -14118,10 +14172,12 @@ void ReceiveIcons(ViewState& state, bool requestMore) {
             found!=state.pendingImages.end() && found->second.request==result.requestId) state.pendingImages.erase(found);
         if (record && record->pending && record->pendingToken == result.token &&
             record->pendingRequestId == result.requestId) {
-            record->bitmap.Reset();
-            record->bitmapAttempted = false;
-            RetireIconPixels(state,record->pixels);
-            record->pixels = std::move(result.pixels);
+            const bool ready=result.pixels.Ready();
+            if(ready) {
+                record->bitmapAttempted = false;
+                RetireIconPixels(state,record->pixels);
+                record->pixels = std::move(result.pixels);
+            }
             record->pending = false;
             record->sourceLimited=false;
             if(record->pixels.Ready()) {
@@ -14140,13 +14196,14 @@ void ReceiveIcons(ViewState& state, bool requestMore) {
             // Retry a transient empty Shell response once without a timer.
             // A permanently broken handler cannot create an unbounded loop.
             record->resolved = result.decodeResult!=HRESULT_FROM_WIN32(ERROR_RETRY) &&
-                (record->pixels.Ready() || ++record->failures >= 2);
+                (ready || ++record->failures >= 2);
+            record->needsRefresh=!record->resolved;
             AccountIconCache(state, result.key, *record);
-            if (!record->pixels.Ready() && g_perf.load(std::memory_order_relaxed))
+            if (!ready && g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU icons] EMPTY init=0x%08X decode=0x%08X legacy-icon=%d attempt=%u path=%s",
                     static_cast<unsigned>(result.initializeResult), static_cast<unsigned>(result.decodeResult),
                     result.hadIcon ? 1 : 0, record->failures, result.key.c_str());
-            if (record->pixels.Ready()) ++state.iconsResolved;
+            if (ready) ++state.iconsResolved;
         }
         // A fast thumb leaves completed thumbnails behind. Releasing many MB
         // of obsolete pixels belongs on the existing cleanup lane, not input.
@@ -14201,11 +14258,13 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     }
     const float side = static_cast<float>(IconPixelSize(state));
     const auto pixels = icon.bitmap->GetSize();
-    const bool image = icon.pixels.thumbnailWidth && icon.pixels.thumbnailHeight;
+    const auto& artwork=icon.bitmapPixels.Ready() && icon.bitmapPixels.data.Identity()!=icon.pixels.data.Identity() ?
+        icon.bitmapPixels : icon.pixels;
+    const bool image = artwork.thumbnailWidth && artwork.thumbnailHeight;
     const bool thumbnail = image && state.thumbnailBrush &&
         (state.gridView || g_listThumbnails.load(std::memory_order_relaxed));
-    const float sourceWidth = image ? icon.pixels.thumbnailWidth : pixels.width;
-    const float sourceHeight = image ? icon.pixels.thumbnailHeight : pixels.height;
+    const float sourceWidth = image ? artwork.thumbnailWidth : pixels.width;
+    const float sourceHeight = image ? artwork.thumbnailHeight : pixels.height;
     const float scale = side / std::max(1.f, std::max(sourceWidth,sourceHeight));
     const float width = sourceWidth * scale, height = sourceHeight * scale;
     x += (side-width)*.5f; y += (side-height)*.5f;
@@ -14247,12 +14306,12 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
             state.thumbnailBrush.Get());
         // The reusable brush must not pin an evicted bitmap or obsolete device.
         state.thumbnailBrush->SetBitmap(nullptr);
-        if (icon.pixels.badgeSize) {
+        if (artwork.badgeSize) {
             const float badge = std::min({state.gridView ?
                 std::clamp(side*.25f,16*dpi,32*dpi) : side*.25f,width,height});
             const float left = state.rtlLayout ? rect.left : rect.right-badge;
-            const float top = static_cast<float>(icon.pixels.thumbnailHeight+2);
-            const float size = static_cast<float>(icon.pixels.badgeSize);
+            const float top = static_cast<float>(artwork.thumbnailHeight+2);
+            const float size = static_cast<float>(artwork.badgeSize);
             const auto badgeRect=SnapDrawRect(state.target.Get(),D2D1::RectF(left,rect.bottom-badge,left+badge,rect.bottom));
             const auto source=D2D1::RectF(0,top,size,top+size);
             state.target->DrawBitmap(icon.bitmap.Get(),&badgeRect,opacity,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
@@ -15899,6 +15958,9 @@ bool PresentationFrameReady(ViewState& state);
 
 void Paint(ViewState& state) {
     if(state.presenter && !state.presentationOnly) { SubmitPresentation(state); return; }
+    // A cold navigation has no replacement names yet. Keep the accepted image;
+    // confirmed empty folders (loaded=true) still replace it immediately.
+    if(!state.loaded && !state.total) return;
     GraphicsContinuation continuation(state);
     // D3D/DComp creation may dispatch nested window messages. A nested paint
     // is pending work, not a device failure or a request to show native view.
@@ -15915,6 +15977,10 @@ void Paint(ViewState& state) {
         if (IsWindow(state.nativeHwnd) && ExplorerFrameHasForeground(state.frameHwnd))
             SetFocus(state.nativeHwnd);
         return;
+    }
+    if(state.resizeDeferred) {
+        RECT latest{}; ViewClientRect(state,&latest);
+        if(!ResizeTarget(state,UINT(std::max<LONG>(1,latest.right)),UINT(std::max<LONG>(1,latest.bottom)))) return;
     }
     ScopedFlag rasterPainting(state.textRasterPainting);
     RefreshTextRendering(state,true);
@@ -16791,7 +16857,19 @@ void Paint(ViewState& state) {
                     compositionFrame.Rows() ? L"rows" : state.modeComposition.widths ? L"fit" : L"mode");
                 state.modeComposition.published=true;
             }
-        } else present=state.swapChain->Present(0,DXGI_PRESENT_DO_NOT_WAIT);
+        } else {
+            present=state.swapChain->Present(0,DXGI_PRESENT_DO_NOT_WAIT);
+            if(SUCCEEDED(present) && state.presentedSwapChain!=state.swapChain) {
+                present=state.visual->SetContent(state.swapChain.Get());
+                if(SUCCEEDED(present) && state.modeRootAttached)
+                    present=state.compTarget->SetRoot(state.visual.Get());
+                if(SUCCEEDED(present)) present=state.composition->Commit();
+                if(SUCCEEDED(present)) {
+                    state.presentedSwapChain=state.swapChain;
+                    state.modeRootAttached=false;
+                }
+            }
+        }
         PipelineEvent(*state.background,{.operation=L"render.present[pos,target]",.a=static_cast<unsigned>(present),
             .b=PipelineFlags(state),.v={state.scrollNow,state.scrollTarget}});
         state.presentPending = present == DXGI_ERROR_WAS_STILL_DRAWING;
@@ -16932,6 +17010,8 @@ void TrimStandbyCaches(ViewState& state) {
         const size_t bytes=GlyphAllocationEstimate(size.width*4,size.height);
         state.retiredIconBitmapBytes+=bytes;
         state.retiredIconBitmaps.push_back({std::move(icon.bitmap),bytes});
+        icon.bitmapPixels={};
+        AccountIconCache(state,key,icon);
         icon.bitmapAttempted=false;
     }
     state.textRasterPending=false; state.iconUploadsPending=false;
@@ -16947,7 +17027,7 @@ void RecycleStandbyComposition(ViewState& state) {
     ComPtr<IDCompositionDevice> replacement;
     ComPtr<IDCompositionVisual> visual;
     if (FAILED(DCompositionCreateDevice(state.dxgiDevice.Get(),IID_PPV_ARGS(&replacement))) ||
-        FAILED(CreatePixelAlignedVisual(replacement.Get(),&visual)) || FAILED(visual->SetContent(state.swapChain.Get())))
+        FAILED(CreatePixelAlignedVisual(replacement.Get(),&visual)) || FAILED(visual->SetContent(state.presentedSwapChain.Get())))
         return; // Keep the ready image if allocation fails; retry on a later hide.
     // Device creation can dispatch activation. Never detach a resumed tab's
     // ready composition target; its caller resumes presentation after setup.
@@ -20538,7 +20618,7 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         UpdateMetrics(state);
         if (state.fontPx!=font) {
             state.measuredNameIndex=-1; state.widthCache.clear();
-            if ((!state.target && !state.presenter) || !MakeTextFormats(state,true)) state.textFormat.Reset();
+            if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
         }
         if (state.columnsView!=columns) state.headerPx=header;
         UpdateColumns(state); ClampScroll(state); QueueVisibleDataFrame(state);
@@ -20893,7 +20973,7 @@ bool AdvanceRowHeight(ViewState& state, bool finish) {
     if (state.fontPx != beforeFont) {
         state.measuredNameIndex = -1;
         state.widthCache.clear();
-        if ((!state.target && !state.presenter) || !MakeTextFormats(state, true)) state.textFormat.Reset();
+        if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
     }
     RefreshHoverUnderCursor(state);
     RepositionRenameEdit(state);
@@ -20943,7 +21023,7 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         ClampScroll(state);
         state.measuredNameIndex = -1;
         state.widthCache.clear();
-        if ((!state.target && !state.presenter) || !MakeTextFormats(state, true)) state.textFormat.Reset();
+        if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
         RepositionRenameEdit(state);
         QueueVisibleDataFrame(state);
         ScheduleZoomAutoRefit(state, true);
@@ -22715,12 +22795,11 @@ void ProbeNativeSelectionOnIdle(ViewState& state, ULONGLONG now) {
 // which rows use that system index. This only schedules VISIBLE icon jobs.
 void InvalidateShellIcons(ViewState& state) {
     CancelDepartedIconJobs(state, ++state.iconToken, true);
-    for (auto& [key,record] : state.icons) RetireIconPixels(state,record.pixels);
-    RetireIconPixels(state,state.defaultFolderIcon.pixels);
-    state.icons.clear();
-    state.iconCacheBytes = 0;
-    state.defaultFolderIcon = {};
-    state.iconUploadsPending = false;
+    for (auto& [key,record] : state.icons) {
+        record.needsRefresh=true; record.resolved=false; record.failures=0; record.sourceLimited=false;
+    }
+    state.defaultFolderIcon.needsRefresh=true; state.defaultFolderIcon.resolved=false;
+    state.defaultFolderIcon.failures=0;
     if (state.visible && state.inScope && PresentationVisible(state)) {
         RequestVisibleIcons(state);
         Redraw(state);
@@ -22737,9 +22816,9 @@ void InvalidateShellIconKey(ViewState& state, const std::wstring& key) {
         const auto variant=SizedImageKey(base,size);
         const auto found = state.icons.find(variant);
         if (found != state.icons.end()) {
-            state.iconCacheBytes -= found->second.cacheBytes;
-            RetireIconPixels(state,found->second.pixels);
-            state.icons.erase(found);
+            auto& record=found->second;
+            record.pending=false; record.resolved=false; record.needsRefresh=true;
+            record.failures=0; record.sourceLimited=false;
         }
         return true;
     });
@@ -22883,11 +22962,8 @@ void FlushShellChangeHints(ViewState& state, ULONGLONG now) {
             entry.detailsReady = false;
             entry.detailsPending = false;
             entry.columnEpoch = 0;
-            entry.cells.clear(); // UPDATEITEM is real invalidation, not a column toggle.
+            entry.detailsRefreshEpoch=~state.detailsRefreshEpoch;
             state.rowDetails.Erase(entry.path);
-            entry.date.clear();
-            entry.type.clear();
-            entry.size.clear();
             std::wstring lookup;
             bool useAttrs = false;
             const auto key = IconKey(entry, lookup, useAttrs);
@@ -23423,10 +23499,6 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
             } else state.presentationIconRecent.splice(state.presentationIconRecent.begin(),state.presentationIconRecent,icon.presentationRecent);
         }
         if(icon.pixels.data.Identity()!=image.pixels.data.Identity()) {
-            if(icon.bitmap) {
-                const auto size=icon.bitmap->GetPixelSize(); const size_t bytes=size_t(size.width)*size.height*4;
-                state.retiredIconBitmaps.push_back({std::move(icon.bitmap),bytes}); state.retiredIconBitmapBytes+=bytes;
-            }
             icon.pixels=image.pixels; icon.requestedSize=image.requestedSize; icon.association=image.association;
             icon.bitmapAttempted=false; icon.resolved=true; state.iconUploadsPending=true;
             AccountIconCache(state,image.key,icon);
@@ -23579,6 +23651,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
     } apartment;
     ViewState state; state.presentationOnly=true; state.background=work.shared_from_this();
     std::shared_ptr<const PresentationModel> standbyControl;
+    bool awaitingNames=false;
     state.firstContentSubmittedAt=1; state.deferColumnProviders=false; state.featureInitializationStep=kOverlayFeatureSteps;
     struct Retirement {
         ViewState& state; const std::shared_ptr<PresentationLane>& lane;
@@ -23610,6 +23683,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             if(!model) continue;
         }
         if(model && !model->active) {
+            awaitingNames=false;
             standbyControl=model;
             state.presentationActive=false; state.inputFocusIndicators=false;
             if(!model->visible || !model->inScope || !model->detailsViewActive) DropTarget(state);
@@ -23618,7 +23692,18 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             PulsePresentation(lane,state.graphicsStandbyPending);
             continue;
         }
+        if(!model && awaitingNames) continue;
+        if(model && model->active && !model->loaded && !model->total) {
+            // Keep both the accepted model and its pixels until names arrive.
+            // This is a control acknowledgment, never acceptance of old pixels
+            // as the new directory. Visibility/fallback packets still run above.
+            PublishPresentationReceipt(state,lane,false,model.get());
+            awaitingNames=true;
+            PulsePresentation(lane,false);
+            continue;
+        }
         if(model) {
+            awaitingNames=false;
             standbyControl.reset();
             if(!ApplyPresentationModel(state,*model,lane)) {
                 {ExclusiveSrwLock lock(work.directoryLock); work.retiredEntries.emplace_back(std::move(model));}
@@ -25786,7 +25871,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             UpdateColumns(*s);
             UpdateRefreshRate(*s);
             s->measuredNameIndex = -1; s->widthCache.clear();
-            s->textFormat.Reset(); s->headerFormat.Reset(); s->sortedHeaderFormat.Reset();
+            s->textFormatsDirty=true;
             if (s->target || s->presenter) MakeTextFormats(*s);
             QueueVisibleDataFrame(*s);
             ClampScroll(*s);
@@ -26615,7 +26700,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // A settings change cancels animation; settle at the destination
             // instead of leaving the viewport frozen at an intermediate pixel.
             s->scrollNow = s->scrollTarget;
-            s->textFormat.Reset(); s->headerFormat.Reset(); s->sortedHeaderFormat.Reset();
+            s->textFormatsDirty=true;
             if (s->target || s->presenter) MakeTextFormats(*s);
             ClampScroll(*s);
             if (s->visible) ApplyNativePresentation(*s);
@@ -28134,9 +28219,7 @@ void BindTabPresentation(ViewState& state, HWND tabHost) {
         StopScrollAnimation(state);
         state.rowHeight96 = newZoom;
         UpdateMetrics(state);
-        state.textFormat.Reset();
-        state.headerFormat.Reset();
-        state.sortedHeaderFormat.Reset();
+        state.textFormatsDirty=true;
         if (state.target || state.presenter) MakeTextFormats(state);
         ClampScroll(state);
     }
@@ -28617,9 +28700,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         const bool rtl = ShellUiIsRtl(*s);
         if (s->rtlLayout != rtl) {
             s->rtlLayout = rtl;
-            s->textFormat.Reset();
-            s->headerFormat.Reset();
-            s->sortedHeaderFormat.Reset();
+            s->textFormatsDirty=true;
             if (s->target || s->presenter) MakeTextFormats(*s);
         }
         s->folderView = view;
