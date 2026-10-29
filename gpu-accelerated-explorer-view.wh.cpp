@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.278
+// @version         0.9.279
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -314,7 +314,7 @@ constexpr ULONGLONG kDriveSpaceRefreshMs = 60000;
 // Inline tracks fill the Name column after a shared measured label band. These values are
 // DPI-scaled in one place and used for both fitting and GPU drawing.
 constexpr int kDriveBarSideMargin96 = 20; // Same gap after label and before divider.
-constexpr int kDriveBarMinimumWidth96 = 72; // For fitting/ellipsis only.
+constexpr int kDriveBarMinimumWidth96 = 72; // Minimum usable inline track.
 constexpr int kDriveBarHeight96 = 7;
 bool IsThisPcLocation(const std::wstring& path) {
     return _wcsicmp(path.c_str(), kThisPcLocation) == 0;
@@ -10346,15 +10346,14 @@ float NameContentEnd(ViewState& state) {
     return std::min(ColumnsPresented(state) ? NameColumnEnd(state) : ListEndX(state),ListEndX(state));
 }
 
-float InlineDriveLabelWidth(float available, float label, int dpi) {
-    const float room=available-2.f*Scale96(kDriveBarSideMargin96,dpi);
-    const float minimum=float(Scale96(kDriveBarMinimumWidth96,dpi));
-    return std::max(0.f,std::min(std::ceil(label+1.f),room-minimum));
-}
-
 float InlineDriveContentWidth(float label, int dpi) {
     return std::ceil(label+1.f)+Scale96(kDriveBarMinimumWidth96,dpi)+
         2.f*Scale96(kDriveBarSideMargin96,dpi);
+}
+
+float InlineDriveLabelWidth(float available, float label, int dpi) {
+    // A track is optional; never shrink the shared label band to keep it.
+    return available >= InlineDriveContentWidth(label,dpi) ? std::ceil(label+1.f) : 0.f;
 }
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
@@ -12193,7 +12192,9 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
             float room = content.right - content.left - tolerance;
             if (name && state.thisPcGpu &&
                 (entry.driveTotal || entry.driveUsedPercent >= 0)) {
-                room = InlineDriveLabelWidth(room,driveLabel,dpi);
+                const float labelRoom=InlineDriveLabelWidth(content.right-content.left+8.f,driveLabel,dpi);
+                // A hidden optional track does not make a full label clipped.
+                if (labelRoom>0.f) room=std::min(room,labelRoom);
             }
             if (room <= 0.f) return true;
             const float measured = ColumnTextWidth(state, *cell, false);
@@ -15191,8 +15192,8 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     const float labelLimit = InlineDriveLabelWidth(columnRight-textLeft,SharedInlineDriveLabelWidth(state),dpi);
     if (labelLimit <= 0.f) return result; // Never draw across another column.
 
-    // All rows share the measured label band; the track takes everything
-    // after it. Narrow columns retain the existing filename trimming.
+    // All rows share the complete measured label band; only the remaining
+    // space belongs to the track. Hidden tracks leave all space to filenames.
     result.labelRight = textLeft + labelLimit;
     const float height = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
     const float top = (item.text.top + item.text.bottom - height) * .5f;

@@ -7,6 +7,8 @@ static void TestInlineDriveBars(HWND frame) {
             "inline bar fitting disagrees with the displayed label partition");
         Check(needed-InlineDriveLabelWidth(needed,label,dpi)-2.f*Scale96(kDriveBarSideMargin96,dpi)+.01f>=
             Scale96(kDriveBarMinimumWidth96,dpi),"custom DPI rounding made a fitted track too narrow to draw");
+        Check(InlineDriveLabelWidth(needed-.125f,label,dpi)==0.f,
+            "inline track took space from a complete drive label");
         Check(InlineDriveLabelWidth(float(Scale96(40,dpi)),label,dpi)==0.f,
             "narrow inline geometry crossed its column");
     }
@@ -79,6 +81,48 @@ static void TestInlineDriveBars(HWND frame) {
         SetWindowPos(state.hwnd,nullptr,0,0,900,400,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
         state.columns[nameIndex].width-=400; UpdateColumns(state);
         for(int i=0;i<3;++i) state.entries[i].name=labels[i];
+        Check(!LayoutDriveBar(state,2,LayoutItem(state,LayoutRowVisual(state,2,1.f))).visible,
+            "an ellipsizing drive label retained its inline track");
+        for(int i=0;i<3;++i) state.entries[i].name=shortLabels[i];
+        // Shrink the real Name column through both the bar and label cutoffs.
+        // DirectWrite, rather than a guessed character width, checks whether
+        // every label fits whenever a track is offered. Continue shrinking
+        // after ellipsis starts so minimum-width rounding cannot revive it.
+        const int originalWidth=state.columns[nameIndex].width;
+        bool hidden=false,trimmed=false;
+        for(int width=originalWidth;width>0;--width) {
+            state.columns[nameIndex].width=width; UpdateColumns(state);
+            for(int i=0;i<3;++i) {
+                const auto item=LayoutItem(state,LayoutRowVisual(state,i,1.f));
+                const auto bar=LayoutDriveBar(state,i,item);
+                if(!bar.visible) hidden=true;
+                Check(!hidden || !bar.visible,"drive track reappeared as the Name column shrank");
+                const float right=bar.visible ? bar.labelRight : item.text.right;
+                if(auto* text=ResolveTextLayout(state,state.entries[i].name,right-item.text.left,
+                        item.text.bottom-item.text.top,false,false,nullptr,false,true)) {
+                    DWRITE_LINE_METRICS line{}; UINT32 count=0;
+                    Check(SUCCEEDED(text->GetLineMetrics(&line,1,&count)) && count==1,
+                        "drive label line metrics");
+                    Check(!bar.visible || !line.isTrimmed,"visible track forced drive-label ellipsis");
+                    trimmed|=line.isTrimmed;
+                }
+            }
+        }
+        Check(hidden && trimmed,"shrinking Name column never exercised hidden tracks and ellipsis");
+        state.columns[nameIndex].width=originalWidth; UpdateColumns(state);
+        const auto savedColumns=state.columns;
+        state.columns={savedColumns[nameIndex]};
+        state.columns[0].width=Scale96(55,ViewDpi(state));
+        const int labelOnlyWidth=int(std::ceil(2.f*EdgeMarginPx(state)+
+            NameTextOrigin(state)-NameColumnStart(state)+measured+1.f+8.f+gap));
+        Check(SetWindowPos(state.hwnd,nullptr,0,0,labelOnlyWidth,400,
+            SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"label-only viewport");
+        UpdateColumns(state);
+        Check(!LayoutDriveBar(state,0,LayoutItem(state,LayoutRowVisual(state,0,1.f))).visible &&
+            !AutoRefitWouldImproveClipping(state),"hidden optional tracks caused a needless column refit");
+        state.columns=savedColumns;
+        SetWindowPos(state.hwnd,nullptr,0,0,900,400,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        UpdateColumns(state);
         const auto aligned=bars();
         g_filenameOnly=ViewOption::AlwaysOn;
         const auto selection=CurrentSelectionRect(state,2,false);
@@ -156,5 +200,5 @@ static void TestInlineDriveBars(HWND frame) {
         UnregisterAnimationWindow(state.hwnd); Stop(state.background); DropTarget(state); DestroyWindow(state.hwnd);
     }
     g_filenameOnly=filenameOnly;
-    std::cout<<"PASS: remaining-space aligned drive tracks, intrinsic label/font updates, wide/narrow resizing, filename feedback and standard/custom DPI; canonical/live geometry, moved Name columns, LTR/RTL, Details handoff/reversal and GPU source pixels\n";
+    std::cout<<"PASS: remaining-space aligned drive tracks, intrinsic label/font updates, monotonic hiding before ellipsis, optional-track clipping preflight, filename feedback and standard/custom DPI; canonical/live geometry, moved Name columns, LTR/RTL, Details handoff/reversal and GPU source pixels\n";
 }

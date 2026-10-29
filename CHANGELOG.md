@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.279
+
+- Hide inline storage bars in This PC when there is not enough room for full
+  drive labels and a bar, preventing bars from returning as labels ellipsize.
+
 ## 0.9.278
 
 - Join the navigation chevron into one continuous stroke, removing the gap and
