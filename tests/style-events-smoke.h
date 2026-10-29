@@ -6,11 +6,12 @@ static void TestStyleEvents(const std::wstring& fixture) {
     const bool accent=g_dynamicAccent.exchange(true);
     const bool touchpad=g_touchpadDirectManipulation.exchange(false);
     const auto selection=g_selectionRgb.load();
+    const auto swipePalette=g_swipePalette.load();
     struct Restore {
-        bool show,accent,touchpad; COLORREF selection;
+        bool show,accent,touchpad; COLORREF selection; unsigned long long swipePalette;
         ~Restore() {g_showNativeViewToggleButton=show; g_dynamicAccent=accent;
-            g_touchpadDirectManipulation=touchpad; g_selectionRgb=selection;}
-    } restore{showButton,accent,touchpad,selection};
+            g_touchpadDirectManipulation=touchpad; g_selectionRgb=selection; g_swipePalette=swipePalette;}
+    } restore{showButton,accent,touchpad,selection,swipePalette};
     const auto root=std::filesystem::path(fixture)/L"style-events";
     for(const auto* leaf:{L"a",L"b"}) {
         std::filesystem::create_directories(root/leaf);
@@ -90,6 +91,14 @@ static void TestStyleEvents(const std::wstring& fixture) {
         "coalesced frame events missed tabs without a toggle button");
     Check(StyleFixture::themeQueries==initial[0]+8 && StyleFixture::activations==initial[3]+2,
         "one event burst performed repeated palette resolutions");
+    const auto palette=g_swipePalette.load();
+    const COLORREF bubble=COLORREF(palette&0xFFFFFF),glyph=COLORREF((palette>>24)&0xFFFFFF);
+    const unsigned alpha=unsigned((palette>>48)&255);
+    const auto blend=RGB((GetRValue(bubble)*(255-alpha)+GetRValue(glyph)*alpha)/255,
+        (GetGValue(bubble)*(255-alpha)+GetGValue(glyph)*alpha)/255,
+        (GetBValue(bubble)*(255-alpha)+GetBValue(glyph)*alpha)/255);
+    Check(bubble==RGB(0x18,0xA0,0x60) && alpha>0 && alpha<255 && ColorContrast(blend,bubble)>=4.5,
+        "accent event missed the cached bubble or translucent contrasting glyph");
     const auto changed=probes();
     for(UINT action:{UINT(SPI_SETWORKAREA),UINT(SPI_SETWHEELSCROLLLINES)})
         SendMessageW(frame,WM_SETTINGCHANGE,action,0);

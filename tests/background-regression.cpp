@@ -629,14 +629,12 @@ static void TestSortDetails(const std::wstring& directory) {
     providerGate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     Check(FreezeDetailProviders(state), "sort detail provider gate");
     QueueDirectoryRefresh(state);
-    auto initial = WaitForComplete(*state.background, state.directoryToken);
-    state.entries = std::move(initial.entries);
-    state.entryPathIndex = std::move(initial.pathIndex);
-    state.total = static_cast<int>(state.entries.size());
-    state.loaded = true;
-    state.directoryPending = false;
-    state.displayedOrderHash = initial.orderHash;
-    state.displayedMetadataHash = initial.metadataHash;
+    // Establish the real names-completion boundary before seeding properties,
+    // rather than manually assigning rows and partial completion state.
+    Check(Eventually([&] {
+        ReceiveDirectoryResults(state);
+        return state.loaded && !state.directoryPending;
+    }),"sort fixture names completion");
     const std::vector<PROPERTYKEY> keys{PKEY_DateModified, PKEY_Size, PKEY_ItemTypeText, PKEY_Author};
     for (const auto& key : std::vector<PROPERTYKEY>{PKEY_FileName, PKEY_DateModified,
                                                   PKEY_Size, PKEY_ItemTypeText, PKEY_Author}) {
@@ -658,18 +656,49 @@ static void TestSortDetails(const std::wstring& directory) {
     }
     PublishDirectoryResult(*state.background, std::move(details));
     ReceiveDirectoryResults(state);
+    Check(std::all_of(state.entries.begin(),state.entries.end(),[&](const auto& e) {
+        return e.cells.size()==keys.size() && e.columnEpoch==state.columnEpoch;
+    }),"sort fixture rejected its initial resolved properties");
+    Check(state.rowDetails.entries.size()==state.entries.size(),"sort fixture did not cache all seeded property rows");
     state.columnsView = true;
+    {
+        // A newly published viewport can contain a names-only row whose
+        // properties are already cached. A busy provider queue must not hide it.
+        const int row=VisibleDemandRows(state,12.f).back();
+        auto& entry=state.entries[size_t(row)];
+        entry.cells.clear(); entry.date.clear(); entry.type.clear(); entry.size.clear();
+        entry.columnEpoch=0; entry.detailsReady=entry.detailsPending=false;
+        HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr),release=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        Check(entered && release,"property queue contention events");
+        bool expired=false;
+        std::thread worker([&] {
+            ExclusiveSrwLock lock(state.background->directoryLock);
+            SetEvent(entered); expired=WaitForSingleObject(release,5000)!=WAIT_OBJECT_0;
+        });
+        const bool held=WaitForSingleObject(entered,5000)==WAIT_OBJECT_0;
+        if(held) QueueVisibleDetails(state);
+        const auto* restored=ColumnCellText(entry,keys[0],state.columnEpoch,state.propertyEpoch);
+        const bool retained=restored && *restored==expected(entry,0);
+        SetEvent(release); worker.join(); CloseHandle(entered); CloseHandle(release);
+        Check(held && !expired && retained,"worker queue contention hid an already cached visible property");
+    }
     auto checkVisible = [&] {
         for (int i : VisibleItemRows(state, 12.f)) {
             const auto& entry = state.entries[i];
             for (size_t k = 0; k < keys.size(); ++k) {
                 const auto* value = ColumnCellText(entry, keys[k], state.columnEpoch, state.propertyEpoch);
                 if(!value || *value!=expected(entry,k))
+                {
+                    const auto cached=state.rowDetails.entries.find(entry.path);
                     std::wcout<<L"SORT CACHE row="<<i<<L" name="<<entry.name<<L" key="<<k
                         <<L" sort="<<int(state.sort.kind)<<L" direction="<<int(state.sort.direction)
                         <<L" column="<<entry.columnEpoch<<L"/"<<state.columnEpoch
                         <<L" property="<<entry.propertyEpoch<<L"/"<<state.propertyEpoch
-                        <<L" cells="<<entry.cells.size()<<L" value="<<(value ? *value : L"<missing>")<<std::endl;
+                        <<L" cells="<<entry.cells.size()<<L" value="<<(value ? *value : L"<missing>")
+                        <<L" cached="<<(cached!=state.rowDetails.entries.end())<<L" cache-count="<<state.rowDetails.entries.size()
+                        <<L" bytes/budget="<<state.rowDetails.usedBytes<<L"/"<<state.folderCache.budgetBytes
+                        <<L" generation="<<state.directoryToken<<L" pending="<<state.directoryPending<<std::endl;
+                }
                 Check(value && *value == expected(entry, k),
                       "sort discarded a previously resolved property before the first paint");
             }

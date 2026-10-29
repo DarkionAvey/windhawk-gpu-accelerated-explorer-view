@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.9.278
+
+- Join the navigation chevron into one continuous stroke, removing the gap and
+  uneven opacity where its segments meet during stretching and scaling.
+
+## 0.9.277
+
+- Replace the outlined swipe arrows with an accent-colored bubble and flexible
+  chevron using Android's spring/stretch behavior, with distinct commit and
+  cancel motion. Cache translucent contrasting glyph colors on accent changes.
+- Cap navigation distance at one third of the tab width and retain column-first
+  scrolling. Honor the touch recognizer's horizontal intent without a second
+  direction test, and let the commit animation finish through folder changes.
+- Restore cached visible properties before trying the worker queue lock,
+  preventing temporary blank cells when metadata work is busy.
+
+## 0.9.276
+
+- Drive touch flings from Windows' measured release velocity and system
+  deceleration, independently of drag distance and animation frame cadence.
+- Add remaining momentum to successive flings in the same direction. A new
+  touch catches the list immediately; reversal or an axis change starts fresh.
+
+## 0.9.275
+
+- Let swipe arrows track horizontal drag 1:1 through the navigation threshold,
+  then keep traveling with increasing logarithmic resistance and no distance cap.
+- Use constant linear resistance for vertical arrow movement.
+- Wake a touch scrollbar only when the gesture's original DOWN starts on it.
+  Multi-finger gestures and their remaining contact cannot acquire a scrollbar.
+
+## 0.9.274
+
+- Give Back/Forward swipe arrows a 1:1 start and progressive logarithmic
+  resistance, stopping their travel at the navigation threshold.
+- Let arrows follow vertical finger movement within half a circle height
+  above or below center, without affecting an established horizontal swipe.
+
 ## 0.9.273
 
 - Keep the accepted list image visible through resizing and cold navigation

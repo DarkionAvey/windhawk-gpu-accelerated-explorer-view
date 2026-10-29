@@ -53,16 +53,28 @@ Shell drag identities, bulk-selection release races, vertical pan with
 1/2/3/5 contacts, one-finger marquee commit/rollback and contact changes,
 two-finger column scrolling followed by edge-only history navigation through
 the owning Shell browser, reversal before release, staggered/unequal two-finger
-swipes, radial pinch/expand at different separations and orientations, exclusive
+swipes, spring-driven bubble/chevron stretch, threshold continuity and vertical
+follow without changing a locked history action, radial pinch/expand at different
+separations and orientations, exclusive
 pinch anchoring across layouts/DPIs/RTL, contact replacement/rotation rejection,
-vertical marquee in fitting directories, native inertia, coalesced frames, capture
+vertical marquee in fitting directories, release-velocity flings, coalesced frames, capture
 loss, divider fitting, animated scrollbar targets, persistent input ownership
-and Explorer click/underline preferences. Offscreen text checks also compare
+and Explorer click/underline preferences. Scrollbar eligibility stays with the
+original DOWN hit, including header/body entry, two-finger swipes, a remaining
+contact, and simultaneous/staggered starts on the bars. Offscreen text checks also compare
 underlined/plain mask variants with DirectWrite. Desktop feedback, modal
 dragging, clipboard and focus are
 substituted. DLL-unload tests also retire an actual native recognizer with a
 hold deadline armed. OS message delivery and visual/device parity with live
 Explorer require hardware validation; these are component tests.
+
+Fling trajectories use frame-paced contacts with real QPC timestamps, native
+release velocity and effective Windows deceleration. They run the real owner
+message queue, compositor clock and presentation lane through the full stopping
+distance, including renderer acknowledgement. A short fast flick must travel
+farther than a longer slow drag. Successive flings add decaying momentum in both
+vertical directions; new contact catches the list, and reversal/axis changes
+discard unrelated momentum. Checks cover 96/192 DPI and LTR/RTL column scrolling.
 
 Touch rendering checks also capture the real immutable presentation model and
 paint it into a GPU target. They read marquee pixels in empty content starting
@@ -72,6 +84,16 @@ and fractional scaling only after further movement; list/grid and RTL are covere
 Scrollbar checks cover independent growth/reversal, large idle hit targets,
 track leave, captured drags outside the track, capture loss and exact return to
 idle pixels through the presentation model at 96/192 DPI in LTR/RTL.
+
+Navigation panel checks keep both real-recognizer contacts inside 240-pixel-wide,
+1,000-pixel-tall private windows at 96/192 DPI in LTR/RTL. They verify the one-third
+commit cap, position continuity at activation, actual accent-colored GPU pixels,
+single-opacity chevron joints in fractional entry and active poses,
+zero color API calls during input/animation/paint, release-only navigation and
+animation completion through the folder-reset path. Spring checks compare
+different frame subdivisions, not a second implementation of the equation.
+The existing style-event checks verify the accent update and translucent glyph
+contrast. A private-fixture BMP records the active panel for visual inspection.
 
 `--status-buttons` checks measured native/virtual controls, pending and warm
 frame translations, actual Windows boundary feedback when enabled, stale resize

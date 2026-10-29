@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.273
+// @version         0.9.278
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -539,6 +539,8 @@ std::atomic<bool> g_listThumbnails{false};
 std::atomic<bool> g_animateHover{true};
 std::atomic<COLORREF> g_selectionRgb{RGB(0, 120, 215)};
 std::atomic<bool> g_dynamicAccent{true};
+// One coherent, event-refreshed COLORREF background/foreground/alpha tuple.
+std::atomic<unsigned long long> g_swipePalette{RGB(0,120,215) | (0xFFFFFFull<<24) | (255ull<<48)};
 std::atomic<int> g_selectionAlpha{60}, g_hoverAlpha{50};
 std::atomic<int> g_bothAlpha{100}, g_marqueeAlpha{30};
 std::atomic<int> g_selectionRadius{8};
@@ -664,6 +666,16 @@ struct ScrollbarMotion {
 };
 enum class TouchGesture { Pending, Vertical, Horizontal, Marquee, Pinch };
 enum class PointingDevice { Mouse, Touch, Pen, Touchpad };
+// Unit-mass damped springs in DIPs (scale/alpha are unitless). A common QPC
+// origin makes the immutable owner/render snapshots evaluate the same motion.
+struct SwipeSpring { double value=0., velocity=0., target=0.; float stiffness=450.f, damping=.65f; };
+struct SwipeIndicator {
+    enum Property { X, Y, Scale, Width, Height, Edge, Far, Length, ArrowHeight, Alpha, ArrowAlpha, Count };
+    std::array<SwipeSpring,Count> springs{};
+    LARGE_INTEGER origin{};
+    bool moving=false, armed=false, committed=false;
+};
+
 struct TouchInput {
     bool active = false, consumed = false, control = false, replaying = false;
     bool panningFeedback = false, holding = false, inertia = false, down = false;
@@ -681,11 +693,15 @@ struct TouchInput {
     POINT pinchOrigin{};
     bool pairTracked = false;
     int row = -1, doubleDivider = -1;
+    int scrollbarAxis = -1; // Latched from DOWN; content gestures cannot acquire a bar later.
     std::wstring item;
     POINT start{}, last{};
     ULONGLONG holdDeadline = 0;
     LARGE_INTEGER holdDeadlineQpc{};
     float overpanX = 0.f, overpanY = 0.f;
+    D2D1_POINT_2F flingVelocity{}, flingApplied{}, carriedVelocity{}; // Screen pixels/ms; never drag distance.
+    LARGE_INTEGER sampledAt{}, flingStarted{}, carriedAt{};
+    float flingDeceleration = 0.f; // Effective Windows translation deceleration, pixels/ms².
 };
 struct PendingColumnWidth {
     PROPERTYKEY key{};
@@ -1627,7 +1643,7 @@ struct TouchRecognizer {
     HINTERACTIONCONTEXT context = nullptr;
     std::array<INTERACTION_CONTEXT_OUTPUT2, 16> output{};
     unsigned outputCount = 0;
-    bool overflow = false, stopping = false, controls = false;
+    bool overflow = false, stopping = false;
     std::vector<POINTER_INFO> packets, contacts, normalized;
     LARGE_INTEGER packetClock{};
     ULONGLONG packetClockTick = 0;
@@ -3092,9 +3108,11 @@ struct ViewState {
     bool swipeReleased = false; // INERTIA begins on finger lift, not after inertia finishes.
     bool swipeFeedbackActive = false;
     bool swipeFeedbackFading = false;
-    float swipeFeedbackProgress = 0.f;
+    D2D1_POINT_2F swipeFeedbackDrag{}; // Contact displacement; frozen during release/inertia.
+    float swipeFeedbackThreshold = 0.f;
     int swipeFeedbackDirection = 0; // +1: Back, -1: Forward
-    ULONGLONG swipeFadeEndTick = 0;
+    float swipeFeedbackOriginY = 0.f;
+    SwipeIndicator swipeIndicator;
     DWORD manipulationCookie = 0;
     ComPtr<IDirectManipulationManager> manipulationManager;
     ComPtr<IDirectManipulationViewport> manipulationViewport;
@@ -3306,7 +3324,7 @@ struct ViewState {
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
     X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
-    X(swipeFeedbackActive) X(swipeFeedbackFading) X(swipeFeedbackProgress) X(swipeFeedbackDirection) X(swipeFadeEndTick) \
+    X(swipeFeedbackActive) X(swipeFeedbackFading) X(swipeFeedbackDrag) X(swipeFeedbackThreshold) X(swipeFeedbackDirection) X(swipeFeedbackOriginY) X(swipeIndicator) \
     X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
     X(nativeTextColor) X(nativeHeaderTextColor) X(cachedNativeMode) X(folderPath) X(selectedFlags) \
     X(presentationStyleRevision) X(presentationGroupIntents) X(lastInteractionTick) X(pipelineInputTime) X(uiTraceUntil)
@@ -3949,7 +3967,8 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true) 
             state.inScope && state.detailsViewActive && PresentationVisible(state) && !PresentationMinimized(state)) ||
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
-        state.hoverAnimationActive || state.marqueeFading || state.swipeFeedbackFading ||
+        state.hoverAnimationActive || state.marqueeFading ||
+        ((state.swipeFeedbackActive || state.swipeFeedbackFading) && state.swipeIndicator.moving) ||
         state.presentPending || (includeEnrichment && state.iconUploadsPending) ||
         (includeEnrichment && state.visible && state.inScope && state.detailsViewActive &&
             (state.iconResultsPending || state.detailResultsPending || state.viewportDemandPending ||
@@ -4264,22 +4283,24 @@ void StopSelectionFade(ViewState& state); // Selection visuals are folder-scoped
 void CancelColumnDrag(ViewState& state);
 void CancelTouchMarquee(ViewState& state);
 void UpdateTouchScrollbars(ViewState& state);
-void StopTouch(ViewState& state, bool animate = false) {
+void ClearSwipeFeedback(ViewState& state);
+void StopTouch(ViewState& state, bool retainCommittedFeedback = false) {
     const bool control = state.touch.control;
     const bool owned = state.touch.active || state.touch.primary;
-    const bool feedback = owned && (state.swipeFeedbackActive || state.swipeFeedbackFading);
+    const bool feedback = state.swipeFeedbackActive || state.swipeFeedbackFading;
+    const bool retain = retainCommittedFeedback && state.swipeFeedbackFading && state.swipeIndicator.committed;
     if (state.touch.gesture == TouchGesture::Marquee) CancelTouchMarquee(state);
     ++state.touchGeneration;
     KillTimer(state.hwnd, kTouchHoldTimerId);
     if (state.touchRecognizer) state.touchRecognizer->Stop();
-    if (state.touch.panningFeedback) EndPanningFeedback(state.hwnd, animate);
+    if (state.touch.panningFeedback) EndPanningFeedback(state.hwnd, FALSE);
     if (owned) {
         state.touchpadPinching = false;
         state.swipeReleased = true;
         state.swipeHorizontal = state.swipeVertical = false;
-        state.swipeFeedbackActive = state.swipeFeedbackFading = false;
         state.swipeEdgeX = 0.f;
     }
+    if(!retain) ClearSwipeFeedback(state);
     const bool replaying = state.touch.replaying;
     state.touch = {};
     state.touch.replaying = replaying;
@@ -4294,8 +4315,9 @@ void StopTouch(ViewState& state, bool animate = false) {
     UpdateTouchScrollbars(state);
     if (feedback) Redraw(state); // Retire the preview on the independent render owner too.
 }
-void ResetMouseGestureForNavigation(ViewState& state) {
-    StopTouch(state);
+void ResetMouseGestureForNavigation(ViewState& state,bool retainCommittedFeedback=false) {
+    StopTouch(state,retainCommittedFeedback);
+    if(!retainCommittedFeedback) ClearSwipeFeedback(state);
     CancelNativeSelectionPreparation(state);
     AdvanceRowHeight(state, true);
     StopSelectionFade(state);
@@ -4502,6 +4524,7 @@ static void StopTouchpad(ViewState& state, bool releaseResources = true) {
     state.manipulationFrameActive = false;
     state.touchpadPinching = false;
     state.swipeFeedbackActive = state.swipeFeedbackFading = false;
+    state.swipeIndicator = {};
     state.swipeHorizontal = state.swipeVertical = false;
     state.swipeEdgeX = 0.f;
     state.swipeReleased = true;
@@ -5276,14 +5299,38 @@ D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
 }
 
 void RefreshThemeColor() {
-    if (g_dynamicAccent.load(std::memory_order_relaxed)) {
-        DWORD dwm = 0; BOOL opaque = FALSE;
-        COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
-        if (!ValidRgb(accent)) accent = RGB(0,120,215);
-        if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
-            accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
-        g_selectionRgb.store(accent);
+    DWORD dwm = 0; BOOL opaque = FALSE;
+    COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
+    if (!ValidRgb(accent)) accent = RGB(0,120,215);
+    if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
+        accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
+    if (g_dynamicAccent.load(std::memory_order_relaxed)) g_selectionRgb.store(accent);
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
+        (contrast.dwFlags&HCF_HIGHCONTRASTON);
+    if(highContrast) accent=GetSysColor(COLOR_HIGHLIGHT);
+    COLORREF foreground=highContrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : 0;
+    const auto previous=g_swipePalette.load(std::memory_order_relaxed);
+    const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : 0) | accent;
+    if((previous & ((3ull<<62)|0xFFFFFF))==key &&
+        (!highContrast || COLORREF((previous>>24)&0xFFFFFF)==foreground)) return;
+    unsigned alpha=255;
+    if(!highContrast) {
+        foreground=ColorContrast(RGB(0,0,0),accent)>=ColorContrast(RGB(255,255,255),accent) ? RGB(0,0,0):RGB(255,255,255);
+        // Minimum translucent black/white that retains 4.5:1 contrast on the
+        // opaque accent surface. Compute only when the cached accent changes.
+        unsigned low=0,high=255;
+        while(low<high) {
+            const unsigned mid=(low+high)/2;
+            const COLORREF blended=RGB((GetRValue(accent)*(255-mid)+GetRValue(foreground)*mid)/255,
+                (GetGValue(accent)*(255-mid)+GetGValue(foreground)*mid)/255,
+                (GetBValue(accent)*(255-mid)+GetBValue(foreground)*mid)/255);
+            if(ColorContrast(blended,accent)>=4.5) high=mid; else low=mid+1;
+        }
+        alpha=high;
     }
+    g_swipePalette.store(key | (static_cast<unsigned long long>(foreground)<<24) |
+        (static_cast<unsigned long long>(alpha)<<48),std::memory_order_relaxed);
 }
 
 // Convert COLORREF (0x00BBGGRR) to the Direct2D 0x00RRGGBB convention.
@@ -9324,6 +9371,21 @@ void QueueVisibleDetails(ViewState& state) {
     }
     if (neededColumns.empty()) return;
     const auto visible = VisibleDemandRows(state, 12.f);
+    // Owner-only cached values must be drawable before a worker try-lock can
+    // defer this frame. Prune stale jobs before constructing replacement demand.
+    for(int i:visible) {
+        auto& e=state.entries[size_t(i)];
+        if(e.propertyEpoch!=state.propertyEpoch) {
+            e.propertyEpoch=state.propertyEpoch;
+            e.detailsRefreshEpoch=~state.detailsRefreshEpoch;
+            e.detailsReady=e.detailsPending=false; e.columnEpoch=0;
+        }
+        const bool ready=e.detailsReady && e.columnEpoch==state.columnEpoch &&
+            e.detailsRefreshEpoch==state.detailsRefreshEpoch;
+        const bool pending=e.detailsPending && e.detailsPendingEpoch==state.columnEpoch &&
+            e.detailsPendingToken==state.directoryToken;
+        if(!ready && (!pending || e.cells.empty())) CacheRowDetails(state,e,false);
+    }
     // A thumb can cross thousands of rows before providers finish. Discard
     // only queued demand outside the new viewport/overhang; in-flight work may
     // finish into the cache. Cancelled rows must be requestable on a return.
@@ -9352,20 +9414,10 @@ void QueueVisibleDetails(ViewState& state) {
     }
     for (int i : visible) {
         Entry& e = state.entries[static_cast<size_t>(i)];
-        // Association changes are genuine property invalidations. Do this
-        // lazily per visible row, not across an entire 100k-item directory.
-        if (e.propertyEpoch != state.propertyEpoch) {
-            e.propertyEpoch = state.propertyEpoch;
-            e.detailsRefreshEpoch=~state.detailsRefreshEpoch;
-            e.detailsReady = false;
-            e.detailsPending = false;
-            e.columnEpoch = 0;
-        }
         if ((e.detailsPending && e.detailsPendingEpoch == state.columnEpoch &&
              e.detailsPendingToken == state.directoryToken) ||
             (e.detailsReady && e.columnEpoch == state.columnEpoch &&
              e.detailsRefreshEpoch == state.detailsRefreshEpoch)) continue;
-        CacheRowDetails(state, e, false);
         // No full-directory walk: at most the displayed rows and the currently
         // enabled property keys are examined on Explorer's owning UI thread.
         DetailRequest req;
@@ -9666,7 +9718,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     // sort/group change must still invalidate a click on the old row order.
     const bool stablePreviewAppend = state.namesPreview &&
         (!complete || (!state.sort.explicitOrder && !state.grouping.enabled));
-    if (!stablePreviewAppend) ResetMouseGestureForNavigation(state);
+    if (!stablePreviewAppend) ResetMouseGestureForNavigation(state,true);
     state.entries.swap(incoming);
     // The lookup follows the full sorted row vector. A provisional viewport
     // preview remains noninteractive and never has a native-selection lookup.
@@ -13444,23 +13496,6 @@ void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBr
     if(rect.rect.right<=rect.rect.left || rect.rect.bottom<=rect.rect.top) return;
     static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawRoundedRectangle(rect,brush,width);
 }
-D2D1_ELLIPSE SnapDrawEllipse(ID2D1RenderTarget* target,D2D1_ELLIPSE ellipse) {
-    const auto rect=SnapDrawRect(target,D2D1::RectF(ellipse.point.x-ellipse.radiusX,ellipse.point.y-ellipse.radiusY,
-        ellipse.point.x+ellipse.radiusX,ellipse.point.y+ellipse.radiusY));
-    return D2D1::Ellipse(D2D1::Point2F((rect.left+rect.right)*.5f,(rect.top+rect.bottom)*.5f),
-        (rect.right-rect.left)*.5f,(rect.bottom-rect.top)*.5f);
-}
-void FillEllipsePrimitive(ViewState& state,D2D1_ELLIPSE ellipse,ID2D1SolidColorBrush* brush) {
-    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
-    static_cast<ID2D1RenderTarget*>(state.target.Get())->FillEllipse(SnapDrawEllipse(state.target.Get(),ellipse),brush);
-}
-void StrokeEllipse(ViewState& state,D2D1_ELLIPSE ellipse,ID2D1SolidColorBrush* brush,float width=1.f) {
-    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
-    ellipse=SnapDrawEllipse(state.target.Get(),ellipse); width=std::max(1.f,roundf(width));
-    ellipse.radiusX=std::max(0.f,ellipse.radiusX-width*.5f); ellipse.radiusY=std::max(0.f,ellipse.radiusY-width*.5f);
-    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawEllipse(ellipse,brush,width);
-}
-
 void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
     const auto revision=g_textRenderingRevision.load(std::memory_order_relaxed);
     const auto mode=g_textAntialiasing.load(std::memory_order_relaxed);
@@ -14536,12 +14571,12 @@ void UpdateTouchScrollbars(ViewState& state) {
     if (state.presentationOnly) return; // Raw contacts belong to the HWND owner.
     bool horizontal = false, vertical = false;
     const bool touch = state.pointingDevice == PointingDevice::Touch;
-    if (touch && state.touch.active && state.touch.down) {
+    if (touch && state.touch.active && state.touch.down && state.touch.scrollbarAxis >= 0 && state.touch.contacts == 1) {
         POINT point = state.touch.last;
         MapUiPoint(nullptr, state.hwnd, point);
-        horizontal = !state.draggingScrollbar &&
+        horizontal = state.touch.scrollbarAxis == 1 &&
             (state.draggingHorizontal || OnHorizontalBar(state, point.x, point.y));
-        vertical = !horizontal &&
+        vertical = state.touch.scrollbarAxis == 0 &&
             (state.draggingScrollbar || OnScrollbar(state, point.x, point.y));
     }
     const bool hotChanged = touch && (state.horizontalScrollbarHot != horizontal || state.verticalScrollbarHot != vertical);
@@ -15956,6 +15991,171 @@ void ClearBodyBand(ViewState& state, ID2D1Bitmap1* frame, float top, float botto
 
 bool PresentationFrameReady(ViewState& state);
 
+// Android SystemUI BackPanel/EdgePanelParams: independently evaluated damped
+// springs, entry/active stretch curves and threshold/release impulses. Source
+// revision and parameter mapping are documented in docs/swipe-panel-0.9.277.md.
+SwipeSpring SampleSwipeSpring(SwipeSpring spring,double seconds) {
+    const double omega=std::sqrt(spring.stiffness), gamma=omega*spring.damping;
+    const double offset=spring.value-spring.target, decay=std::exp(-gamma*seconds);
+    if(spring.damping<1.f) {
+        const double frequency=omega*std::sqrt(1.-double(spring.damping)*spring.damping);
+        const double b=(spring.velocity+gamma*offset)/frequency;
+        const double c=std::cos(frequency*seconds),s=std::sin(frequency*seconds);
+        spring.value=spring.target+decay*(offset*c+b*s);
+        spring.velocity=decay*(spring.velocity*c-(gamma*b+frequency*offset)*s);
+    } else {
+        const double b=spring.velocity+omega*offset;
+        spring.value=spring.target+decay*(offset+b*seconds);
+        spring.velocity=decay*(spring.velocity-omega*b*seconds);
+    }
+    return spring;
+}
+
+float SwipeCurve(float progress,float x1,float y1,float x2,float y2) {
+    if(progress<=0.f || progress>=1.f) return std::clamp(progress,0.f,1.f);
+    const auto bezier=[](float t,float a,float b) {return 3.f*(1.f-t)*t*((1.f-t)*a+t*b)+t*t*t;};
+    float low=0.f,high=1.f;
+    for(unsigned i=0;i<20;++i) {
+        const float t=(low+high)*.5f;
+        if(bezier(t,x1,x2)<progress) low=t; else high=t;
+    }
+    return bezier((low+high)*.5f,y1,y2);
+}
+
+double SwipeSeconds(const ViewState& state,LARGE_INTEGER now) {
+    return state.qpcFrequency>0. ? std::max(0.,(now.QuadPart-state.swipeIndicator.origin.QuadPart)/state.qpcFrequency):0.;
+}
+
+std::array<float,SwipeIndicator::Count> SwipePose(const ViewState& state,LARGE_INTEGER now) {
+    std::array<float,SwipeIndicator::Count> pose{};
+    for(unsigned i=0;i<pose.size();++i) {
+        const auto& spring=state.swipeIndicator.springs[i];
+        pose[i]=float(state.swipeIndicator.moving ? SampleSwipeSpring(spring,SwipeSeconds(state,now)).value:spring.target);
+    }
+    return pose;
+}
+
+void RetargetSwipeFeedback(ViewState& state,bool released=false,bool committed=false) {
+    using S=SwipeIndicator;
+    auto& motion=state.swipeIndicator;
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    if(state.qpcFrequency<=0.) {LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); state.qpcFrequency=double(f.QuadPart);}
+    if(!motion.origin.QuadPart) {
+        const std::array<float,S::Count> initial{-48.f,0.f,.98f,0.f,48.f,6.f,6.f,8.6f,5.f,1.f,0.f};
+        for(unsigned i=0;i<S::Count;++i) motion.springs[i].value=motion.springs[i].target=initial[i];
+    } else for(auto& spring:motion.springs) {
+        if(motion.moving) spring=SampleSwipeSpring(spring,SwipeSeconds(state,now));
+        else {spring.value=spring.target; spring.velocity=0.;}
+    }
+    motion.origin=now; motion.moving=true; motion.committed=committed;
+    const bool wasArmed=motion.armed;
+    const float distance=state.swipeFeedbackDrag.x, threshold=state.swipeFeedbackThreshold;
+    motion.armed=!released && threshold>0.f && distance>=threshold;
+    const float p=threshold>0.f ? std::clamp(distance/threshold,0.f,1.f):0.f;
+    const auto set=[&](S::Property i,float value,float stiffness,float damping) {
+        auto& spring=motion.springs[i]; spring.target=value; spring.stiffness=stiffness; spring.damping=damping;
+    };
+    if(released) {
+        state.swipeFeedbackActive=false; state.swipeFeedbackFading=true;
+        set(S::Alpha,0.f,committed ? 1400.f:450.f,1.f);
+        set(S::Scale,committed ? .86f:.98f,committed ? 5700.f:120.f,committed ? 1.f:.8f);
+        if(committed) motion.springs[S::Scale].velocity=3.f;
+        else {
+            set(S::Width,0.f,450.f,.65f); set(S::X,-48.f,800.f,.76f);
+            set(S::Length,12.f,600.f,.4f); set(S::ArrowHeight,0.f,600.f,.4f);
+            set(S::ArrowAlpha,0.f,450.f,1.f);
+        }
+    } else {
+        const float entry=SwipeCurve(p,.19f,1.27f,.71f,.86f);
+        const float post=std::clamp((distance-threshold)/std::max(threshold,1.f),0.f,1.f);
+        const float stretch=SwipeCurve(post,.19f,1.27f,.71f,.86f);
+        set(S::X,motion.armed ? 14.f+4.f*SwipeCurve(post,.2f,1.f,1.f,1.f):4.f,motion.armed ? 1000.f:800.f,motion.armed ? .8f:.76f);
+        set(S::Scale,motion.armed ? 1.f:.98f,motion.armed ? 325.f:120.f,motion.armed ? .55f:.8f);
+        set(S::Width,motion.armed ? 48.f+12.f*SwipeCurve(post,.7f,-.24f,.48f,1.21f):51.f*entry,motion.armed ? 850.f:450.f,motion.armed ? .75f:.65f);
+        set(S::Height,motion.armed ? 48.f:48.f-2.f*SwipeCurve(p,1.f,.05f,.9f,-.29f),motion.armed ? 10000.f:1500.f,motion.armed ? 1.f:.45f);
+        set(S::Edge,motion.armed ? 24.f:6.f+10.f*SwipeCurve(p,0.f,1.11f,.85f,.84f),motion.armed ? 2600.f:150.f,motion.armed ? .855f:.5f);
+        set(S::Far,motion.armed ? 24.f:6.f+14.f*SwipeCurve(p,.03f,.19f,.14f,1.09f),motion.armed ? 1200.f:300.f,motion.armed ? .3f:.5f);
+        set(S::Length,motion.armed ? 6.4f-.8f*stretch:8.6f-.6f*entry,motion.armed ? 1500.f:600.f,motion.armed ? .29f:.4f);
+        set(S::ArrowHeight,motion.armed ? 7.2f+.8f*stretch:5.f+.6f*entry,motion.armed ? 1500.f:600.f,motion.armed ? .29f:.4f);
+        set(S::Alpha,1.f,450.f,1.f);
+        const bool arrow=motion.armed || p>(motion.springs[S::ArrowAlpha].target>0. ? .165f/1.05f:.165f*1.05f);
+        set(S::ArrowAlpha,arrow ? 1.f:0.f,arrow ? 180.f:2000.f,arrow ? .9f:.6f);
+        RECT rc{}; ViewClientRect(state,&rc);
+        const float dpi=ViewDpi(state)/96.f;
+        const float maxY=std::max(0.f,std::min(110.f,(rc.bottom-state.headerPx)/dpi*.5f-24.f));
+        const float dy=state.swipeFeedbackDrag.y/dpi;
+        set(S::Y,maxY>0.f ? std::copysign(maxY*SwipeCurve(std::abs(dy)/(maxY*15.f),.5f,1.15f,.41f,.94f),dy):0.f,30000.f,1.f);
+        if(motion.armed!=wasArmed) {
+            const float impulse=motion.armed ? 4.5f:-1.5f;
+            motion.springs[S::X].velocity=impulse*200.f;
+            motion.springs[S::Scale].velocity=impulse*-.8f;
+        }
+    }
+    RegisterAnimationWindow(state.hwnd);
+}
+
+void AdvanceSwipeFeedback(ViewState& state) {
+    auto& motion=state.swipeIndicator;
+    if(!motion.moving) return;
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    const double seconds=SwipeSeconds(state,now);
+    for(unsigned i=0;i<SwipeIndicator::Count;++i) {
+        const auto sample=SampleSwipeSpring(motion.springs[i],seconds);
+        // Android DynamicAnimation's minimum visible change and equilibrium
+        // velocity criterion, scaled to this surface's actual device pixels.
+        const double epsilon=.75*(i==SwipeIndicator::Scale ? .002:
+            i>=SwipeIndicator::Alpha ? 1./256.:96./ViewDpi(state));
+        if(std::abs(sample.value-sample.target)>=epsilon || std::abs(sample.velocity)>=epsilon*62.5) return;
+    }
+    motion.moving=false;
+    if(state.swipeFeedbackFading) ClearSwipeFeedback(state);
+}
+
+void DrawSwipeFeedback(ViewState& state,float width,float top,float bottom) {
+    using S=SwipeIndicator;
+    if(!(state.swipeFeedbackActive || state.swipeFeedbackFading) || !state.swipeFeedbackDirection || width<=0.f || bottom<=top) return;
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    const auto pose=SwipePose(state,now);
+    const float alpha=std::clamp(pose[S::Alpha],0.f,1.f);
+    const float dpi=ViewDpi(state)/96.f;
+    const float unit=dpi*std::max(0.f,std::min({1.f,width/(156.f*dpi),(bottom-top)/(48.f*dpi)}));
+    const float scale=std::max(0.f,pose[S::Scale])*unit;
+    const float w=std::min(width,std::max(0.f,pose[S::Width])*scale);
+    const float h=std::min(bottom-top,std::max(0.f,pose[S::Height])*scale);
+    if(alpha<=0.f || w<=0.f || h<=0.f) return;
+    const bool left=(state.swipeFeedbackDirection>0)!=state.rtlLayout;
+    const float x=pose[S::X]*unit+(1.f-pose[S::Scale])*pose[S::Width]*unit;
+    const float cy=std::clamp(state.swipeFeedbackOriginY+pose[S::Y]*unit,top+h*.5f,bottom-h*.5f);
+    const float l=left ? x:width-x-w,r=l+w;
+    const float edge=std::clamp(pose[S::Edge]*scale,0.f,std::min(w,h)*.5f);
+    const float farRadius=std::clamp(pose[S::Far]*scale,0.f,std::min(w,h)*.5f);
+    const auto colors=g_swipePalette.load(std::memory_order_relaxed);
+    state.brush->SetColor(Packed(ThemeRgb(COLORREF(colors&0xFFFFFF)),alpha));
+    // Clip each half of the rounded surface to retain independent edge/far
+    // curvature without allocating a path geometry on every animation frame.
+    for(unsigned side=0;side<2;++side) {
+        const float radius=(bool(side)==left ? farRadius:edge);
+        state.target->PushAxisAlignedClip(D2D1::RectF(side ? (l+r)*.5f:l,cy-h*.5f,side ? r:(l+r)*.5f,cy+h*.5f),D2D1_ANTIALIAS_MODE_ALIASED);
+        state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(l,cy-h*.5f,r,cy+h*.5f),radius,radius),state.brush.Get());
+        state.target->PopAxisAlignedClip();
+    }
+    const float dx=pose[S::Length]*scale,dy=pose[S::ArrowHeight]*scale;
+    const float cx=(l+r)*.5f,tip=cx+(left ? -dx:dx)*.5f,tail=cx+(left ? dx:-dx)*.5f;
+    state.brush->SetColor(Packed(ThemeRgb(COLORREF((colors>>24)&0xFFFFFF)),
+        std::min(alpha,std::clamp(pose[S::ArrowAlpha],0.f,1.f))*float((colors>>48)&255)/255.f));
+    // Stroke one continuous figure: Direct2D joins the tip and applies the
+    // translucent foreground once, without flat-cap gaps or a brighter overlap.
+    ComPtr<ID2D1PathGeometry> arrow;
+    ComPtr<ID2D1GeometrySink> path;
+    if(SUCCEEDED(state.d2dFactory->CreatePathGeometry(&arrow)) && SUCCEEDED(arrow->Open(&path))) {
+        path->BeginFigure({tail,cy-dy},D2D1_FIGURE_BEGIN_HOLLOW);
+        path->AddLine({tip,cy});
+        path->AddLine({tail,cy+dy});
+        path->EndFigure(D2D1_FIGURE_END_OPEN);
+        if(SUCCEEDED(path->Close())) state.target->DrawGeometry(arrow.Get(),state.brush.Get(),4.f*scale);
+    }
+}
+
 void Paint(ViewState& state) {
     if(state.presenter && !state.presentationOnly) { SubmitPresentation(state); return; }
     // A cold navigation has no replacement names yet. Keep the accepted image;
@@ -16726,76 +16926,7 @@ void Paint(ViewState& state) {
         compositionFrame.Restore();
         state.target->SetTarget(state.modeComposition.chrome.bitmap.Get());
     }
-    // Chrom(e|ium)-inspired edge feedback, drawn above the list but not
-    // interactive. It follows finger movement and fades after release.
-    const float feedbackHeader = compositionFrame.active ? compositionFrame.header : header;
-    const float feedbackBottom = static_cast<float>(rect.bottom);
-    if ((state.swipeFeedbackActive || state.swipeFeedbackFading) &&
-        state.swipeFeedbackDirection && w > 0.f && feedbackBottom > feedbackHeader) {
-        const ULONGLONG tick = GetTickCount64();
-        const float fade = state.swipeFeedbackFading ? std::clamp(
-            static_cast<float>(state.swipeFadeEndTick > tick ?
-                state.swipeFadeEndTick - tick : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f) : 1.f;
-        if (fade > .001f) {
-            // Ring fill/opacity stop at the commit threshold, but horizontal
-            // travel continues with the fingers after that threshold. Never
-            // clamp the position to the ring's 100% progress.
-            const float travel = std::max(0.f, state.swipeFeedbackProgress);
-            const float p = std::clamp(travel, 0.f, 1.f);
-            const int dpi = ViewDpi(state);
-            const float radius = static_cast<float>(Scale96(23, dpi));
-            const float ringRadius = radius + static_cast<float>(Scale96(3, dpi));
-            // At 0% the ENTIRE circle and ring are outside the viewport.
-            // Finger progress slides the indicator into view from that edge,
-            // without a jump in position or alpha when direction is locked.
-            const float start = -ringRadius - static_cast<float>(Scale96(2, dpi));
-            const float finish = radius + static_cast<float>(Scale96(14, dpi));
-            const float edgePosition = start + (finish - start) * travel;
-            const bool back = state.swipeFeedbackDirection > 0;
-            const float logicalCx = back ? edgePosition : w - edgePosition;
-            const float cx = state.rtlLayout ? w - logicalCx : logicalCx;
-            const float cy = feedbackHeader + (feedbackBottom - feedbackHeader) * .5f;
-            const float reveal = std::clamp(p * 1.5f, 0.f, 1.f);
-            const float opacity = fade * reveal;
-            const D2D1_ELLIPSE circle = D2D1::Ellipse(
-                D2D1::Point2F(cx, cy), radius, radius);
-            state.brush->SetColor(Packed(nameColor,
-                opacity * (.15f + .13f * p)));
-            FillEllipsePrimitive(state,circle, state.brush.Get());
-            state.brush->SetColor(Packed(nameColor,
-                opacity * (.35f + .5f * p)));
-            StrokeEllipse(state,circle, state.brush.Get(),
-                static_cast<float>(Scale96(1, dpi)));
-            // The ring grows with progress and fades in with the body. At
-            // p=0 no part is visible; no minimum 1-segment stroke is drawn.
-            const float sweep = p * 6.2831853f;
-            const int segments = static_cast<int>(std::ceil(28.f * p));
-            state.brush->SetColor(Packed(nameColor, opacity * .88f));
-            for (int i = 0; i < segments; ++i) {
-                const float a = -1.5707963f + sweep * i / segments;
-                const float b = -1.5707963f + sweep * (i + 1) / segments;
-                StrokeLine(state,
-                    D2D1::Point2F(cx + ringRadius * cosf(a), cy + ringRadius * sinf(a)),
-                    D2D1::Point2F(cx + ringRadius * cosf(b), cy + ringRadius * sinf(b)),
-                    state.brush.Get(), static_cast<float>(Scale96(3, ViewDpi(state))));
-            }
-            // True vector arrow stays crisp at any row/monitor scale.
-            const float dir = (back ? -1.f : 1.f) * (state.rtlLayout ? -1.f : 1.f);
-            const float stem = radius * .36f;
-            const float tip = cx + dir * stem;
-            const float tail = cx - dir * stem;
-            const float stroke = static_cast<float>(Scale96(2, ViewDpi(state)));
-            state.brush->SetColor(Packed(nameColor, opacity));
-            StrokeLine(state,D2D1::Point2F(tail, cy),
-                D2D1::Point2F(tip, cy), state.brush.Get(), stroke);
-            StrokeLine(state,D2D1::Point2F(tip, cy),
-                D2D1::Point2F(tip - dir * radius * .28f, cy - radius * .28f),
-                state.brush.Get(), stroke);
-            StrokeLine(state,D2D1::Point2F(tip, cy),
-                D2D1::Point2F(tip - dir * radius * .28f, cy + radius * .28f),
-                state.brush.Get(), stroke);
-        }
-    }
+    DrawSwipeFeedback(state,w,compositionFrame.active ? compositionFrame.header:header,float(rect.bottom));
     DrawScrollbar(state, compositionFrame.active ? Scrollbar(state) : bar, nameColor,
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
     DrawScrollbar(state, HorizontalBar(state), nameColor,
@@ -21103,23 +21234,23 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
     return bounded96;
 }
 
-// A deliberately long swipe is necessary: on a wide Details view the user
-// must move at least 35% of the viewport; on a narrow window, 280 logical px.
-// This avoids mistaking ordinary diagonal/sideways touchpad panning for Back.
+// Keep the deliberate history gesture reachable on narrow/high-DPI tabs.
+// Column displacement is consumed separately and never counts toward commit.
 float SwipeCommitDistance(ViewState& state) {
     RECT rc{};
     ViewClientRect(state, &rc);
-    return std::max(static_cast<float>(Scale96(280, ViewDpi(state))),
-                    std::max(0.f, static_cast<float>(rc.right)) * .35f);
+    return std::min(static_cast<float>(Scale96(280, ViewDpi(state))),
+                    std::max(0.f, static_cast<float>(rc.right-rc.left)) / 3.f);
 }
 
 void ClearSwipeFeedback(ViewState& state) {
     // Visual completion must not reset contact intent or the release guard:
     // native inertia can outlive the arrow fade.
     state.swipeFeedbackActive = state.swipeFeedbackFading = false;
-    state.swipeFeedbackProgress = 0.f;
+    state.swipeFeedbackDrag = {};
+    state.swipeFeedbackThreshold = 0.f;
     state.swipeFeedbackDirection = 0;
-    state.swipeFadeEndTick = 0;
+    state.swipeIndicator = {};
 }
 
 // Validate that this view still belongs to the active Explorer tab. Do not
@@ -21150,7 +21281,7 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
 }
 
 // Touchscreens and touchpads share intent, history commits, scrolling and zoom.
-// Windows supplies recognition and inertia; no polling or velocity estimates.
+// Windows supplies recognition/release velocity and native touchpad inertia.
 void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
     state.lastManipulationActivity = GetTickCount64();
     if (wParam == 1) { // New genuine touchpad contact.
@@ -21160,6 +21291,12 @@ void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
         state.swipeHorizontal = state.swipeVertical = false;
         state.swipeEdgeX = 0.f;
         ClearSwipeFeedback(state);
+        RECT client{}; ViewClientRect(state,&client);
+        state.swipeFeedbackOriginY=state.headerPx+(client.bottom-state.headerPx)*.5f;
+        if(state.touch.active) {
+            POINT contact=state.touch.start;
+            if(MapUiPoint(nullptr,state.hwnd,contact)) state.swipeFeedbackOriginY=float(contact.y-Scale96(64,ViewDpi(state)));
+        }
         if (feedback) Redraw(state);
         state.swipeReleased = false;
         state.touchpadPinchHeight96 =
@@ -21173,28 +21310,26 @@ void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
             state.swipeReleased = true;
             const float x = state.swipeEdgeX;
             const float y = state.touchpadPanY;
+            const float threshold = SwipeCommitDistance(state);
             // Evaluate the *net* contact displacement at RELEASE,
             // not the largest distance reached earlier in the pan.
             // A reverse/cancel before finger-up is always respected.
+            // Horizontal intent is already locked; perpendicular drift only
+            // affects the preview and cannot cancel or complete navigation.
             const bool commit = state.swipeHorizontal && !state.touchpadPinching &&
                 g_touchpadSwipeNavigation.load(std::memory_order_relaxed) &&
-                fabsf(x) >= SwipeCommitDistance(state) &&
-                fabsf(x) > 2.2f * fabsf(y) &&
+                threshold>0.f && fabsf(x)>=threshold &&
                 state.visible && !state.emptyNative &&
                 TabOwnsActiveView(state);
             if (state.swipeHorizontal)
                 Wh_Log(L"[GPU input] SWIPE_RELEASE hwnd=%p edge=%.2f threshold=%.2f y=%.2f commit=%d epoch=%llu",
-                    state.hwnd,x,SwipeCommitDistance(state),y,commit,state.mouseFolderEpoch);
+                    state.hwnd,x,threshold,y,commit,state.mouseFolderEpoch);
             if (commit) {
                 PostMessageW(state.hwnd, kMsgManipulationNavigate,
                     x > 0.f ? 1 : 0, static_cast<LPARAM>(state.mouseFolderEpoch));
             }
             if (state.swipeFeedbackActive) {
-                state.swipeFeedbackActive = false;
-                state.swipeFeedbackFading = true;
-                state.swipeFadeEndTick =
-                    GetTickCount64() + kUiTransitionDurationMs;
-                RegisterAnimationWindow(state.hwnd);
+                RetargetSwipeFeedback(state,true,commit);
                 Redraw(state);
             }
         }
@@ -21226,7 +21361,7 @@ void ApplyManipulationPan(ViewState& state, float physicalX, float dy) {
         const float x = fabsf(state.touchpadPanX), y = fabsf(state.touchpadPanY);
         const float intent = float(GetSystemMetricsForDpi(SM_CXDRAG,ViewDpi(state)));
         if (hypotf(x,y) >= intent) {
-            state.swipeHorizontal = x > 2.f*y;
+            state.swipeHorizontal = state.touch.active ? state.touch.gesture==TouchGesture::Horizontal : x>2.f*y;
             state.swipeVertical = !state.swipeHorizontal;
         }
     }
@@ -21242,13 +21377,17 @@ void ApplyManipulationPan(ViewState& state, float physicalX, float dy) {
     }
     if (!state.swipeReleased && state.swipeHorizontal) {
         if (state.swipeEdgeX) {
+            const int direction=state.swipeEdgeX>0.f ? 1:-1;
+            if(state.swipeFeedbackDirection!=direction) state.swipeIndicator={};
             state.swipeFeedbackActive = true; state.swipeFeedbackFading = false;
-            state.swipeFeedbackProgress = fabsf(state.swipeEdgeX)/SwipeCommitDistance(state);
-            state.swipeFeedbackDirection = state.swipeEdgeX > 0.f ? 1:-1;
+            state.swipeFeedbackDrag = {fabsf(state.swipeEdgeX), state.touchpadPanY};
+            state.swipeFeedbackThreshold = SwipeCommitDistance(state);
+            state.swipeFeedbackDirection = direction;
+            RetargetSwipeFeedback(state);
         } else if (state.swipeFeedbackActive) {
-            state.swipeFeedbackActive = false; state.swipeFeedbackFading = true;
-            state.swipeFadeEndTick = GetTickCount64()+kUiTransitionDurationMs;
-            RegisterAnimationWindow(state.hwnd);
+            // Columns can resume immediately while the spring retracts the
+            // old preview; it no longer participates in release commitment.
+            RetargetSwipeFeedback(state,true,false);
         }
         Redraw(state);
     }
@@ -21287,10 +21426,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
         state.touchpadPinching = true;
         state.swipeHorizontal = state.swipeVertical = false;
         if (state.swipeFeedbackActive) {
-            state.swipeFeedbackActive = false;
-            state.swipeFeedbackFading = true;
-            state.swipeFadeEndTick = GetTickCount64() + kUiTransitionDurationMs;
-            RegisterAnimationWindow(state.hwnd);
+            RetargetSwipeFeedback(state,true,false);
         }
         state.touchpadPinchHeight96 =
             state.preciseRowHeight96[state.gridView] > 0. ? state.preciseRowHeight96[state.gridView] :
@@ -23186,9 +23322,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
     }
     if (state.marqueeFading && GetTickCount64() >= state.marqueeEndTick)
         state.marqueeFading = false;
-    if (state.swipeFeedbackFading &&
-        GetTickCount64() >= state.swipeFadeEndTick)
-        ClearSwipeFeedback(state);
+    AdvanceSwipeFeedback(state);
     if (NativeColumnSnapshotReady(state)) QueueFeatureInitialization(state);
     if (!LayoutAnimationActive(state, true)) {
         if (state.nativeModeHintPending && !state.nativeModeSignalQueued)
@@ -23923,9 +24057,11 @@ bool TouchControlAt(ViewState& state, POINT point) {
 
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-HRESULT ConfigureTouchRecognizer(TouchRecognizer& session, bool control) {
+HRESULT ConfigureTouchRecognizer(TouchRecognizer& session) {
+    // Keep native movement recognition alive while one finger owns a control,
+    // so a second contact can take over without restarting the interaction.
     const INTERACTION_CONTEXT_CONFIGURATION configuration[] = {
-        {INTERACTION_ID_MANIPULATION, control ? INTERACTION_CONFIGURATION_FLAG_NONE : INTERACTION_CONFIGURATION_FLAG_MANIPULATION |
+        {INTERACTION_ID_MANIPULATION, INTERACTION_CONFIGURATION_FLAG_MANIPULATION |
             INTERACTION_CONFIGURATION_FLAG_MANIPULATION_TRANSLATION_X |
             INTERACTION_CONFIGURATION_FLAG_MANIPULATION_TRANSLATION_Y |
             INTERACTION_CONFIGURATION_FLAG_MANIPULATION_SCALING |
@@ -23937,16 +24073,14 @@ HRESULT ConfigureTouchRecognizer(TouchRecognizer& session, bool control) {
         {INTERACTION_ID_SECONDARY_TAP, INTERACTION_CONFIGURATION_FLAG_SECONDARY_TAP},
         {INTERACTION_ID_HOLD, INTERACTION_CONFIGURATION_FLAG_HOLD},
     };
-    const HRESULT hr = SetInteractionConfigurationInteractionContext(session.context, ARRAYSIZE(configuration), configuration);
-    if (SUCCEEDED(hr)) session.controls = control;
-    return hr;
+    return SetInteractionConfigurationInteractionContext(session.context, ARRAYSIZE(configuration), configuration);
 }
 
 bool StartTouchRecognizer(ViewState& state) {
     if (state.touchRecognizer) return true;
     auto session = std::make_shared<TouchRecognizer>();
     HRESULT hr = CreateInteractionContext(&session->context);
-    if (SUCCEEDED(hr)) hr = ConfigureTouchRecognizer(*session, false);
+    if (SUCCEEDED(hr)) hr = ConfigureTouchRecognizer(*session);
     if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->context,
         INTERACTION_CONTEXT_PROPERTY_MEASUREMENT_UNITS, 1); // Screen pixels, including current device calibration.
     if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->context,
@@ -24041,6 +24175,42 @@ void BeginTouchDrag(ViewState& state) {
         StopTouch(*expected);
         ResetMouseClickSequence(*expected);
     }
+}
+
+double TouchElapsedMs(const ViewState& state, LARGE_INTEGER from, LARGE_INTEGER to) {
+    return from.QuadPart && state.qpcFrequency>0. ?
+        std::max(0.,1000.*(to.QuadPart-from.QuadPart)/state.qpcFrequency) : 0.;
+}
+
+D2D1_POINT_2F TouchVelocityAfter(D2D1_POINT_2F velocity,float deceleration,double milliseconds) {
+    const double speed=std::hypot(double(velocity.x),double(velocity.y));
+    const double remaining=speed>0. ? std::max(0.,1.-deceleration*milliseconds/speed) : 0.;
+    return {float(velocity.x*remaining),float(velocity.y*remaining)};
+}
+
+bool StartTouchFling(ViewState& state,TouchRecognizer& session,const MANIPULATION_VELOCITY& released) {
+    auto& touch=state.touch;
+    if(touch.down || (touch.gesture!=TouchGesture::Vertical && touch.gesture!=TouchGesture::Horizontal)) return false;
+    float deceleration=0.f;
+    if(FAILED(GetInertiaParameterInteractionContext(session.context,INERTIA_PARAMETER_TRANSLATION_DECELERATION,&deceleration)) ||
+        !std::isfinite(deceleration) || deceleration<=0.f || deceleration==INERTIA_PARAMETER_INVALID_VALUE) return false;
+    const auto carry=TouchVelocityAfter(touch.carriedVelocity,touch.flingDeceleration,
+        TouchElapsedMs(state,touch.carriedAt,touch.sampledAt));
+    const bool horizontal=touch.gesture==TouchGesture::Horizontal;
+    const float velocity=horizontal ? released.velocityX : released.velocityY;
+    const float previous=horizontal ? carry.x : carry.y;
+    const float combined=velocity+(velocity*previous>0.f ? previous : 0.f);
+    if(!std::isfinite(combined) || combined==0.f) return false;
+    touch.flingVelocity=horizontal ? D2D1_POINT_2F{combined,0.f} : D2D1_POINT_2F{0.f,combined};
+    touch.flingApplied={}; touch.flingDeceleration=deceleration; touch.flingStarted=touch.sampledAt;
+    touch.carriedVelocity={};
+    // Recognition stays native. Drive this released translation from its
+    // measured velocity/system friction, so momentum can be added at the next
+    // release without scaling native deltas or coupling strength to distance.
+    session.Stop();
+    if(g_perf.load(std::memory_order_relaxed)) Wh_Log(L"[GPU touch] FLING velocity=%.4f carry=%.4f combined=%.4f deceleration=%.8f horizontal=%d",
+        velocity,previous,combined,deceleration,horizontal);
+    return true;
 }
 
 void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& session) {
@@ -24252,6 +24422,8 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             }
         } else if (state.touch.gesture != TouchGesture::Pending)
             ApplyManipulationPan(state,panX,panY);
+        if(State(hwnd)!=expected || state.mouseFolderEpoch!=epoch || state.touch.generation!=generation) return;
+        if(!ended && (event.interactionFlags & INTERACTION_FLAG_INERTIA) && StartTouchFling(state,*session,motion.velocity)) return;
         if (ended) {
             ApplyManipulationStatus(state, 0);
             if (state.touch.panningFeedback) EndPanningFeedback(hwnd, TRUE);
@@ -24320,6 +24492,29 @@ void TouchHoldDeadline(ViewState& state, const POINTER_INFO* next = nullptr) {
 
 void AdvanceTouchInertia(ViewState& state) {
     if (!state.touch.inertia || !state.touchRecognizer) return;
+    auto& touch=state.touch;
+    if(touch.flingStarted.QuadPart) {
+        const HWND hwnd=state.hwnd;
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        const double speed=std::hypot(double(touch.flingVelocity.x),double(touch.flingVelocity.y));
+        const double stop=speed/touch.flingDeceleration;
+        const double elapsed=std::min(stop,TouchElapsedMs(state,touch.flingStarted,now));
+        const double distance=speed*elapsed-.5*touch.flingDeceleration*elapsed*elapsed;
+        const D2D1_POINT_2F applied{float(touch.flingVelocity.x*distance/speed),float(touch.flingVelocity.y*distance/speed)};
+        const auto generation=touch.generation;
+        ApplyManipulationPan(state,applied.x-touch.flingApplied.x,applied.y-touch.flingApplied.y);
+        if(State(hwnd)!=&state || state.touch.generation!=generation) return;
+        touch.flingApplied=applied;
+        if(elapsed>=stop) {
+            touch.inertia=false;
+            ApplyManipulationStatus(state,0);
+            if(touch.panningFeedback) EndPanningFeedback(state.hwnd,TRUE);
+            touch.panningFeedback=false;
+            if(!touch.down) touch.active=false;
+            UnregisterAnimationWhenIdle(state);
+        }
+        return;
+    }
     auto session = state.touchRecognizer;
     const HRESULT hr = ProcessInertiaInteractionContext(session->context);
     if (SUCCEEDED(hr)) DrainTouchOutput(state, session);
@@ -24372,6 +24567,11 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 pressed = frame + p; break;
             }
         if (session->contacts.empty() && pressed) {
+            LARGE_INTEGER caught{}; caught.QuadPart=LONGLONG(first.PerformanceCount);
+            const auto carry=state.touch.inertia && state.touch.flingStarted.QuadPart ?
+                TouchVelocityAfter(state.touch.flingVelocity,state.touch.flingDeceleration,
+                    TouchElapsedMs(state,state.touch.flingStarted,caught)) : D2D1_POINT_2F{};
+            const float deceleration=state.touch.flingDeceleration;
             if (state.touch.inertia) StopTouch(state);
             if (state.manipulationFrameActive) StopTouchpad(state, false);
             if (GetCapture() == hwnd) ReleaseCapture();
@@ -24379,6 +24579,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 OverlayProc(hwnd, WM_CAPTURECHANGED, 0, 0);
             if (State(hwnd) != expected) return;
             state.touch = {};
+            state.touch.carriedVelocity=carry; state.touch.carriedAt=caught; state.touch.flingDeceleration=deceleration;
             state.touch.active = state.touch.down = true;
             state.pendingSelectionContextMenu = false;
             state.touch.primary = pressed->pointerId;
@@ -24390,15 +24591,18 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             MapUiPoint(nullptr, hwnd, point);
             SetTouchInputMode(state, true);
             ClearPointerHover(state);
-            state.touch.control = TouchControlAt(state, point);
+            state.touch.control = std::count_if(frame,frame+pointers,[](const auto& p) {
+                return p.pointerType == PT_TOUCH && (p.pointerFlags & POINTER_FLAG_INCONTACT) &&
+                    !(p.pointerFlags & POINTER_FLAG_UP);
+            }) == 1 && TouchControlAt(state, point);
+            if (state.touch.control)
+                state.touch.scrollbarAxis = OnHorizontalBar(state,point.x,point.y) ? 1 :
+                    OnScrollbar(state,point.x,point.y) ? 0 : -1;
             const int divider = state.touch.control ? DividerAt(state,point.x,point.y) : -1;
             if (divider >= 0 && divider == state.dividerClickIndex && state.dividerClickTick &&
                 state.dividerClickEpoch == state.mouseFolderEpoch &&
                 DWORD(inputTime-DWORD(state.dividerClickTick)) <= GetDoubleClickTime())
                 state.touch.doubleDivider = divider;
-            if (session->controls != state.touch.control && FAILED(ConfigureTouchRecognizer(*session, state.touch.control))) {
-                StopTouch(state); SetActive(hwnd,false); return;
-            }
             state.touch.row = state.touch.control ? -1 : RowFromPoint(state, point.y, point.x);
             if (state.touch.row >= 0 && size_t(state.touch.row) < state.entries.size())
                 state.touch.item = state.entries[size_t(state.touch.row)].path;
@@ -24410,6 +24614,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 hwnd,first.pointerId,first.sourceDevice,state.touch.control,state.touch.row,pointers,entries);
         }
         if (!state.touch.active) continue; // A canceled contact cannot resurrect itself through UPDATE/UP.
+        state.touch.sampledAt.QuadPart=LONGLONG(first.PerformanceCount);
         const auto generation = state.touch.generation;
         if (wasDown) {
             TouchHoldDeadline(state,&first);
@@ -24425,6 +24630,22 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
         state.touch.down = !session->contacts.empty();
         state.lastInteractionTick = GetTickCount64();
         const UINT32 contactCount = UINT32(session->contacts.size());
+        if (contactCount > 1 && state.touch.control) {
+            // Multiple fingers own content gestures. Revoke a provisional
+            // scrollbar/header press before it can drag or enlarge a control.
+            state.touch.control = false;
+            state.touch.scrollbarAxis = -1;
+            state.touch.doubleDivider = -1;
+            state.touch.row = -1; state.touch.item.clear();
+            CancelColumnDrag(state);
+            state.draggingScrollbar = state.draggingHorizontal = false;
+            state.dragDivider = -1;
+            if (GetCapture() == hwnd) {
+                ScopedFlag releasing(state.releasingPointerCapture);
+                ReleaseCapture();
+            }
+            if (State(hwnd) != expected || state.touch.generation != generation) return;
+        }
         if (contactCount > state.touch.contacts && state.touch.contacts && !state.touch.control &&
             (state.touch.gesture == TouchGesture::Pending || state.touch.gesture == TouchGesture::Marquee)) {
             if (state.touch.gesture == TouchGesture::Marquee) CancelTouchMarquee(state);
@@ -27419,7 +27640,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     CancelRename(state);
     CancelColumnDrag(state);
     CancelAutoRefit(state);
-    ResetMouseGestureForNavigation(state);
+    ResetMouseGestureForNavigation(state,true);
     state.lastFolderToReveal = allowLastFolderRestore
         ? ImmediateChildOnReturn(navigationOrigin ? *navigationOrigin :
                                  state.folderPath, path) : L"";

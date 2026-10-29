@@ -102,6 +102,123 @@ struct RenderedTouch {
     ~RenderedTouch() {DropTarget(renderer); Stop(renderer.background);}
 };
 
+void SwipeGlyphPixels(const std::vector<BYTE>& pixels,int width) {
+    const auto palette=g_swipePalette.load();
+    const COLORREF accent=COLORREF(palette&0xFFFFFF),foreground=COLORREF((palette>>24)&0xFFFFFF);
+    const std::array<int,3> bg{GetBValue(accent),GetGValue(accent),GetRValue(accent)};
+    const std::array<int,3> fg{GetBValue(foreground),GetGValue(foreground),GetRValue(foreground)};
+    int l=width,r=0,t=int(pixels.size()/4/width),b=0,channel=0;
+    size_t accentPixels=0;
+    for(size_t i=0;i<pixels.size();i+=4) if(std::abs(int(pixels[i])-bg[0])<=1 &&
+        std::abs(int(pixels[i+1])-bg[1])<=1 && std::abs(int(pixels[i+2])-bg[2])<=1) {
+        const int x=int(i/4)%width,y=int(i/4)/width;
+        l=std::min(l,x); r=std::max(r,x); t=std::min(t,y); b=std::max(b,y); ++accentPixels;
+    }
+    Check(accentPixels>100,"GPU navigation bubble missed the cached system accent");
+    for(int i=1;i<3;++i) if(std::abs(fg[i]-bg[i])>std::abs(fg[channel]-bg[channel])) channel=i;
+    // The inner quarter-inset rectangle lies on opaque accent. No glyph pixel
+    // may exceed one application of its cached alpha, including the joint.
+    const int sign=fg[channel]>bg[channel] ? 1:-1;
+    const int expected=int(std::lround(std::abs(fg[channel]-bg[channel])*double((palette>>48)&255)/255.));
+    int strongest=0;
+    for(int y=t+(b-t)/4;y<=b-(b-t)/4;++y) for(int x=l+(r-l)/4;x<=r-(r-l)/4;++x)
+        strongest=std::max(strongest,sign*(int(pixels[(size_t(y)*width+x)*4+channel])-bg[channel]));
+    Check(strongest>=expected-2 && strongest<=expected+2,"GPU chevron joint is missing or blends translucent strokes more than once");
+}
+
+void SwipePanels(Device& input,const std::wstring& fixture) {
+    StyleFixture::Session style;
+    const auto savedPalette=g_swipePalette.load();
+    const auto savedSelection=g_selectionRgb.load();
+    const bool history=g_touchpadSwipeNavigation.exchange(true),dynamic=g_dynamicAccent.exchange(false);
+    struct Restore {unsigned long long palette; COLORREF selection; bool history,dynamic;
+        ~Restore() {g_swipePalette=palette; g_selectionRgb=selection; g_touchpadSwipeNavigation=history; g_dynamicAccent=dynamic;}
+    } restore{savedPalette,savedSelection,history,dynamic};
+    RefreshThemeColor();
+    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(bool backward:{true,false}) {
+        StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"narrow swipe panel",0,rtl,false,false,240,1000);
+        auto& view=tab.state; Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        view.columns[0].width=2000; UpdateColumns(view);
+        SetHorizontalScroll(view,backward ? 0.f:view.columnContentWidth);
+        RenderedTouch frame;
+        const auto baseline=frame.Capture(view);
+        const auto reads=std::array{StyleFixture::accentQueries,StyleFixture::themeQueries,StyleFixture::systemColorQueries};
+        const float threshold=SwipeCommitDistance(view);
+        Check(threshold>0.f && threshold<=240.f/3.f,"narrow tab commit exceeds one third of its client width");
+        Reset(view,input);
+        const int sign=backward!=rtl ? 1:-1;
+        POINT point{sign>0 ? 70:130,500},second{point.x+40,point.y};
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down),input.Packet(view,input.primary+1,second,down)});
+        const auto shift=[&](int dx) {
+            point.x+=sign*dx; second.x+=sign*dx;
+            Check(point.x>0 && point.x<240 && second.x>0 && second.x<240,"narrow native swipe contact left the viewport");
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,second,move)});
+        };
+        const int entry=int(threshold*.75f);
+        shift(entry);
+        Check(view.swipeFeedbackActive && !view.swipeIndicator.armed,"entry did not remain below the commit threshold");
+        Check(Eventually([&]{AdvanceSwipeFeedback(view); frame.Capture(view); return !view.swipeIndicator.moving && !frame.renderer.textRasterPending;}),"entry springs did not settle");
+        SwipeGlyphPixels(frame.Capture(view),240);
+        const auto before=view.swipeIndicator;
+        shift(int(std::ceil(threshold))-entry+1);
+        Check(view.swipeIndicator.armed,"within-screen native gesture did not arm navigation");
+        const double seconds=(view.swipeIndicator.origin.QuadPart-before.origin.QuadPart)/view.qpcFrequency;
+        for(unsigned i=0;i<SwipeIndicator::Count;++i) {
+            const double previous=before.moving ? SampleSwipeSpring(before.springs[i],seconds).value:before.springs[i].target;
+            Check(std::abs(view.swipeIndicator.springs[i].value-previous)<.001,"threshold retarget jumped the rendered panel position");
+        }
+        std::vector<BYTE> active;
+        Check(Eventually([&]{AdvanceSwipeFeedback(view); active=frame.Capture(view); return !view.swipeIndicator.moving;}),"active springs did not settle");
+        Check(active!=baseline,"GPU navigation bubble did not paint");
+        SwipeGlyphPixels(active,240);
+        Check(reads==std::array{StyleFixture::accentQueries,StyleFixture::themeQueries,StyleFixture::systemColorQueries},
+            "swipe input/animation/paint queried system colors");
+        if(dpi==96 && !rtl && backward) {
+            const auto path=JoinPath(fixture,L"swipe-panel-active.bmp");
+            BITMAPFILEHEADER file{}; file.bfType=0x4D42; file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER); file.bfSize=DWORD(file.bfOffBits+active.size());
+            BITMAPINFOHEADER bitmap{}; bitmap.biSize=sizeof(bitmap); bitmap.biWidth=240; bitmap.biHeight=-1000;
+            bitmap.biPlanes=1; bitmap.biBitCount=32; bitmap.biSizeImage=DWORD(active.size());
+            std::ofstream output(std::filesystem::path(path),std::ios::binary);
+            output.write(reinterpret_cast<const char*>(&file),sizeof(file)); output.write(reinterpret_cast<const char*>(&bitmap),sizeof(bitmap));
+            output.write(reinterpret_cast<const char*>(active.data()),active.size()); output.close();
+            std::wcout<<L"SWIPE preview="<<path<<std::endl;
+        }
+        MSG command{};
+        Check(!PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_NOREMOVE),"swipe committed while contacts were still down");
+        input.Next(GetDoubleClickTime()); input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,second,move)});
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,point,up),input.Packet(view,input.primary+1,second,up)});
+        Check(PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE) && bool(command.wParam)==backward,
+            "within-screen native release missed navigation or reversed RTL history");
+        Check(view.swipeFeedbackFading && view.swipeIndicator.committed,"release did not select the commit animation");
+        const auto releasedOrigin=view.swipeIndicator.origin;
+        ResetMouseGestureForNavigation(view,true);
+        Check(view.swipeFeedbackFading && view.swipeIndicator.committed && view.swipeIndicator.origin.QuadPart==releasedOrigin.QuadPart,
+            "folder navigation truncated or restarted the committed visual");
+        Check(Eventually([&]{AdvanceSwipeFeedback(view); frame.Capture(view); return !view.swipeFeedbackFading;}),"commit springs did not retire");
+        StopTouch(view);
+    }
+    // Later independent enumeration tests intentionally require the original
+    // 512-file fixture. Keep the preview only if a panel check fails.
+    std::filesystem::remove(JoinPath(fixture,L"swipe-panel-active.bmp"));
+}
+
+void SwipeSprings() {
+    for(const auto [stiffness,damping]:{std::pair{450.f,.65f},std::pair{1500.f,.29f},std::pair{30000.f,1.f}}) {
+        SwipeSpring original{0.,200.,48.,stiffness,damping};
+        const auto single=SampleSwipeSpring(original,.64);
+        for(unsigned frames:{32u,64u,128u}) {
+            auto stepped=original;
+            for(unsigned i=0;i<frames;++i) stepped=SampleSwipeSpring(stepped,.64/frames);
+            Check(std::abs(stepped.value-single.value)<1e-8 && std::abs(stepped.velocity-single.velocity)<1e-7,
+                "swipe spring motion depends on frame cadence");
+        }
+        const auto rest=SampleSwipeSpring(original,10.);
+        Check(std::abs(rest.value-rest.target)<1e-6 && std::abs(rest.velocity)<1e-6,"swipe spring did not settle");
+    }
+}
+
 void MarqueePixels(Device& input,const std::wstring& fixture) {
     for(bool grid:{false,true}) for(bool rtl:{false,true}) {
         PresentationFixture::Tab tab(L"touch marquee pixels",4,rtl,grid);
@@ -306,6 +423,74 @@ void ScrollbarInteractions(Device& input,const std::wstring& fixture) {
         StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
     }
 }
+void MultiFingerScrollbars(Device& input,const std::wstring& fixture) {
+    const bool history=g_touchpadSwipeNavigation.exchange(true);
+    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"multi-finger scrollbar exclusion",64,rtl);
+        auto& view=tab.state;
+        view.columns[0].width=1400; UpdateColumns(view);
+        SelectionUiFixture::Setup(tab,fixture); Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        const auto idle=[&] {
+            return !view.horizontalScrollbarHot && !view.verticalScrollbarHot &&
+                view.touchScrollbarTo[0]==0.f && view.touchScrollbarTo[1]==0.f &&
+                !view.draggingHorizontal && !view.draggingScrollbar;
+        };
+        for(bool horizontal:{false,true}) {
+            // An established content swipe can enter either enlarged hit
+            // strip, including a remaining contact after its partner lifts.
+            Reset(view,input); SetHorizontalScroll(view,0);
+            const auto bar=horizontal ? HorizontalBar(view,true):Scrollbar(view,true);
+            POINT end{LogicalX(view,LONG(horizontal ? bar.right-Scale96(32,dpi):(bar.left+bar.right)*.5f)),
+                LONG(horizontal ? (bar.top+bar.bottom)*.5f:bar.thumbStart+bar.thumbLength*.5f)};
+            POINT point{LogicalX(view,LogicalX(view,end.x)-LONG(SwipeCommitDistance(view)*1.1f)),
+                end.y-(horizontal ? Scale96(80,dpi):0)};
+            POINT other{LogicalX(view,LogicalX(view,point.x)-Scale96(40,dpi)),point.y};
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down),input.Packet(view,input.primary+1,other,down)});
+            other.x+=end.x-point.x; other.y+=end.y-point.y; point=end;
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,other,move)});
+            Check(view.swipeFeedbackActive && view.touch.scrollbarAxis==-1 && idle(),"two-finger history swipe woke or dragged a scrollbar hit area");
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,other,up)});
+            Check(view.touch.down && view.touch.scrollbarAxis==-1 && idle(),"remaining swipe contact woke a scrollbar");
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,up)});
+            // Single-finger and header streams also retain their original DOWN
+            // owner when the finger later enters a scrollbar rectangle.
+            for(bool header:{false,true}) {
+                Reset(view,input);
+                point={LogicalX(view,LONG(ListViewportWidth(view)*.5f)),
+                    LONG(header ? view.headerPx*.5f:view.headerPx+view.rowPx*2.f)};
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
+                Check(view.touch.scrollbarAxis==-1,"non-scrollbar DOWN acquired scrollbar eligibility");
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,end,move)});
+                Check(idle(),"single-finger/header gesture woke a scrollbar it did not start on");
+                if(GetCapture()==view.hwnd) ReleaseCapture();
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,end,up)});
+            }
+            for(bool staggered:{false,true}) {
+                Reset(view,input);
+                SetHorizontalScroll(view,view.columnContentWidth-ListViewportWidth(view));
+                const auto target=horizontal ? HorizontalBar(view,true):Scrollbar(view,true);
+                point={LogicalX(view,LONG(horizontal ? target.thumbStart+target.thumbLength*.5f:(target.left+target.right)*.5f)),
+                    LONG(horizontal ? (target.top+target.bottom)*.5f:target.thumbStart+target.thumbLength*.5f)};
+                other={LogicalX(view,LogicalX(view,point.x)-Scale96(40,dpi)),point.y};
+                if(staggered) {input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});}
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,point,staggered ? move:down),input.Packet(view,input.primary+1,other,down)});
+                Check(!view.touch.control && view.touch.scrollbarAxis==-1 && GetCapture()!=view.hwnd && idle(),
+                    "simultaneous/staggered two-finger start retained scrollbar capture or enlargement");
+                point.x=LogicalX(view,LogicalX(view,point.x)-LONG(SwipeCommitDistance(view)*1.1f));
+                other.x=LogicalX(view,LogicalX(view,other.x)-LONG(SwipeCommitDistance(view)*1.1f));
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,other,move)});
+                Check(view.touch.gesture==TouchGesture::Horizontal && view.swipeFeedbackActive && idle(),
+                    "two-finger start on a scrollbar did not reach native history recognition");
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,point,up),input.Packet(view,input.primary+1,other,up)});
+            }
+        }
+        StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
+    }
+    g_touchpadSwipeNavigation=history;
+}
+
 class ShellView final : public IShellView {
     ULONG refs=1;
 public:
@@ -345,6 +530,112 @@ public:
 };
 }
 
+static void TestFlingTrajectories(TouchInputTest::Device& input) {
+    using namespace TouchInputTest;
+    Check(!g_frameEvent && !g_frameThread,"fling requires an idle compositor scheduler");
+    g_frameStopping=false; g_frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+    struct Frames {~Frames() {ShutDownFrames(); g_frameStopping=false;}} frames;
+    const bool history=g_touchpadSwipeNavigation.exchange(true);
+    struct RestoreHistory {bool value; ~RestoreHistory() {g_touchpadSwipeNavigation=value;}} restore{history};
+    for(const auto [rtl,dpi]:{std::pair{false,96u},std::pair{true,192u}}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"fling trajectory",4096,rtl);
+        auto& view=tab.state;
+        view.columns[0].width=20000; UpdateColumns(view);
+        Install(view);
+        SetWindowLongPtrW(view.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(+[](HWND hwnd,UINT message,WPARAM wp,LPARAM lp)->LRESULT {
+            if(message==kMsgFrame || message==WM_PAINT || message==kMsgPresentationReady) return OverlayProc(hwnd,message,wp,lp);
+            return TouchInputTest::Owner(hwnd,message,wp,lp);
+        }));
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        tab.Start(); tab.Await([](const auto& r){return r.accepted;}); ConsumePresentation(view);
+        struct Timer {HANDLE value=CreateWaitableTimerW(nullptr,FALSE,nullptr); ~Timer() {if(value) CloseHandle(value);}} timer;
+        Check(timer.value!=nullptr,"fling sample timer");
+        const auto pump=[] {MSG msg{}; while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&msg); DispatchMessageW(&msg);}};
+        const auto sample=[&](unsigned intervals=1) {
+            LARGE_INTEGER due{}; due.QuadPart=-LONGLONG(view.frameIntervalMs*intervals*10000.);
+            Check(SetWaitableTimer(timer.value,&due,0,nullptr,nullptr,FALSE) && WaitForSingleObject(timer.value,5000)==WAIT_OBJECT_0,"fling sample cadence");
+            input.Next();
+        };
+        struct Flight {double released=0.,nativeVelocity=0.,deceleration=0.,combined=0.; LARGE_INTEGER at{}; bool horizontal=false;};
+        const auto launch=[&](bool horizontal,int direction,unsigned steps,unsigned intervals,bool fresh) {
+            if(fresh) {
+                Reset(view,input,true); SetScrollImmediate(view,MaxScrollPx(view)*.5f);
+                SetHorizontalScroll(view,std::max(0.f,view.columnContentWidth-ListViewportWidth(view))*.5f);
+            }
+            else {input.primary+=10;}
+            POINT point{300,350};
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
+            const auto caught=horizontal ? view.horizontalScroll:view.scrollNow;
+            sample(); pump();
+            Check((horizontal ? view.horizontalScroll:view.scrollNow)==caught && !view.touch.inertia,"contact failed to catch the previous coast");
+            if(horizontal) {
+                POINT second{point.x+60,point.y};
+                input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,second,down)});
+            }
+            const auto begin=TouchFixture::recognized.size();
+            for(unsigned step=0;step<steps;++step) {
+                sample(intervals);
+                if(horizontal) point.x+=direction*16; else point.y+=direction*16;
+                if(horizontal) {POINT second{point.x+60,point.y}; input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,second,move)});}
+                else input.Send(view,{input.Packet(view,input.primary,point,move)});
+                pump();
+            }
+            sample(intervals);
+            if(horizontal) {POINT second{point.x+60,point.y}; input.Send(view,{input.Packet(view,input.primary,point,up),input.Packet(view,input.primary+1,second,up)});}
+            else input.Send(view,{input.Packet(view,input.primary,point,up)});
+            const float deceleration=TouchFixture::bindings.at(view.touchRecognizer->context)->deceleration;
+            Check(deceleration>0.f && deceleration!=INERTIA_PARAMETER_INVALID_VALUE,"native fling deceleration");
+            Flight flight; flight.horizontal=horizontal; flight.at=input.frameQpc; flight.deceleration=deceleration;
+            flight.released=horizontal ? view.horizontalScroll:view.scrollNow;
+            for(size_t i=begin;i<TouchFixture::recognized.size();++i) {
+                const auto& event=TouchFixture::recognized[i];
+                if(event.interactionId==INTERACTION_ID_MANIPULATION && (event.interactionFlags&INTERACTION_FLAG_INERTIA))
+                    flight.nativeVelocity=horizontal ? event.arguments.manipulation.velocity.velocityX:event.arguments.manipulation.velocity.velocityY;
+            }
+            flight.combined=horizontal ? view.touch.flingVelocity.x:view.touch.flingVelocity.y;
+            Check(view.touch.inertia && view.touch.flingStarted.QuadPart && flight.nativeVelocity*direction>0.,"real release failed to start velocity-based coasting");
+            return flight;
+        };
+        const auto finish=[&](const Flight& flight) {
+            const DWORD timeout=DWORD(std::ceil(std::abs(flight.combined)/flight.deceleration))+GetDoubleClickTime()+1000;
+            Check(Eventually([&] {pump(); return !view.touch.inertia;},timeout),"fling never reached its physical stopping time");
+            const double coast=(flight.horizontal ? view.horizontalScroll:view.scrollNow)-flight.released;
+            const double sign=flight.horizontal ? (rtl ? 1.:-1.) : -1.;
+            const double expected=sign*flight.combined*std::abs(flight.combined)/(2.*flight.deceleration);
+            // Scroll positions are floats at a large document offset. Repeated
+            // native pan application can round by fractions of a device pixel.
+            if(std::abs(coast-expected)>.5) std::cerr<<"FLING coast="<<coast<<" expected="<<expected<<" velocity="<<flight.combined<<" deceleration="<<flight.deceleration<<std::endl;
+            Check(std::abs(coast-expected)<.5,"compositor/owner path lost more than half a pixel of fling distance");
+            Check(Eventually([&] {pump(); return view.presentationAcceptedSequence>=view.presentationSequence && !view.framePaintPending;}),
+                "completed fling was not accepted by the renderer");
+            return std::abs(coast);
+        };
+        const int direction=rtl ? 1:-1;
+        const auto fast=launch(false,direction,3,1,true); const auto fastDistance=finish(fast);
+        const auto slow=launch(false,direction,9,4,true); const auto slowDistance=finish(slow);
+        Check(std::abs(fast.nativeVelocity)>std::abs(slow.nativeVelocity) && fastDistance>slowDistance,
+            "long slow drag overpowered a short fast flick");
+        const auto first=launch(false,direction,3,1,true);
+        sample(); pump();
+        const auto repeated=launch(false,direction,3,1,false);
+        const double remaining=std::max(0.,std::abs(first.combined)-first.deceleration*1000.*(repeated.at.QuadPart-first.at.QuadPart)/input.frequency.QuadPart);
+        Check(remaining>0. && std::abs(repeated.combined-repeated.nativeVelocity-direction*remaining)<.02,
+            "successive same-direction flick did not add the remaining momentum");
+        const auto accumulatedDistance=finish(repeated);
+        Check(accumulatedDistance>fastDistance,"added momentum did not extend the displayed coast");
+        launch(false,direction,3,1,true);
+        const auto reverse=launch(false,-direction,3,1,false);
+        Check(std::abs(reverse.combined-reverse.nativeVelocity)<.001,"reversal inherited opposite momentum");
+        const auto horizontal=launch(true,rtl ? 1:-1,3,1,false);
+        Check(std::abs(horizontal.combined-horizontal.nativeVelocity)<.001,"axis change inherited perpendicular momentum");
+        finish(horizontal);
+        std::cout<<"FLING dpi="<<dpi<<" rtl="<<rtl<<" short-fast="<<fastDistance<<" long-slow="<<slowDistance
+            <<" accumulated="<<accumulatedDistance<<" fresh-speed="<<repeated.nativeVelocity<<" accumulated-speed="<<repeated.combined<<std::endl;
+        StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
+    }
+}
+
 static void TestTouchInput(const std::wstring& fixture) {
     using namespace TouchInputTest;
     WorkerComApartment apartment;
@@ -353,10 +644,13 @@ static void TestTouchInput(const std::wstring& fixture) {
         reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"touch fonts");
     const bool swipe=g_touchpadSwipeNavigation.exchange(false),smooth=g_smooth.exchange(true),bars=g_scrollbar.exchange(true);
     Device input;
+    SwipeSprings();
     TouchFixture::Session fixtureInput;
     FrameInputFixture::Session queue;
     PointerFixture::Session pointer;
     ModifierFixture::Session modifiers;
+    SwipePanels(input,fixture);
+    TestFlingTrajectories(input);
     {
     PresentationFixture::Tab tab(L"raw touch",512),peer(L"raw touch peer",512);
     auto& state=tab.state; auto& other=peer.state;
@@ -743,18 +1037,48 @@ static void TestTouchInput(const std::wstring& fixture) {
             "history preview counted consumed column space or missed the corresponding edge");
         MSG command{};
         Check(!PeekMessageW(&command,state.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_NOREMOVE),"touch history committed before release");
+        if(commit) {
+            RenderedTouch frame;
+            std::vector<BYTE> centered;
+            Check(Eventually([&]{AdvanceSwipeFeedback(state); centered=frame.Capture(state); return !state.swipeIndicator.moving && !frame.renderer.textRasterPending;}),
+                "swipe reference text preparation");
+            shift(SwipeCommitDistance(state));
+            std::vector<BYTE> extended;
+            Check(Eventually([&]{AdvanceSwipeFeedback(state); extended=frame.Capture(state); return !state.swipeIndicator.moving;}),"swipe stretch failed to settle");
+            Check(extended!=centered,"GPU swipe arrow stopped moving beyond the commit threshold");
+            centered=extended;
+            // Real Ninput translation after horizontal intent is locked must
+            // move only the arrow, including a large perpendicular excursion.
+            const LONG dy=LONG(SwipeCommitDistance(state)*2)*(backward ? -1:1);
+            const float scroll=state.scrollNow;
+            point.y+=dy; second.y+=dy;
+            input.Next(); input.Send(state,{input.Packet(state,input.primary,point,move),input.Packet(state,input.primary+1,second,move)});
+            std::vector<BYTE> shifted;
+            Check(Eventually([&]{AdvanceSwipeFeedback(state); shifted=frame.Capture(state); return !state.swipeIndicator.moving;}),"swipe vertical follow failed to settle");
+            Check(state.swipeHorizontal && fabsf(state.swipeFeedbackDrag.y)>1.f && state.scrollNow==scroll &&
+                frame.renderer.swipeFeedbackDrag.y==state.swipeFeedbackDrag.y && centered!=shifted,
+                "perpendicular swipe movement lost its contact displacement, scrolled the list or failed GPU presentation");
+            RECT client{}; ViewClientRect(state,&client);
+            for(int y=0;y<int(state.headerPx);++y)
+                Check(memcmp(centered.data()+size_t(y)*client.right*4,
+                    shifted.data()+size_t(y)*client.right*4,size_t(client.right)*4)==0,
+                    "GPU swipe vertical follow escaped the content viewport");
+        }
         if(!commit) {
             shift(-fabsf(excess)*.5f);
             Check(state.swipeFeedbackActive && fabsf(state.horizontalScroll-(backward ? 0.f:range))<.1f,
                 "reversing an edge preview moved columns before unwinding its displacement");
             shift(-fabsf(state.swipeEdgeX)-range*.25f);
-            Check(!state.swipeFeedbackActive && state.swipeEdgeX==0 &&
+            Check(!state.swipeFeedbackActive && state.swipeFeedbackFading && state.swipeEdgeX==0 &&
                 state.horizontalScroll>0 && state.horizontalScroll<range,
                 "reversing the edge preview did not return smoothly through the columns");
+            Check(Eventually([&]{AdvanceSwipeFeedback(state); return !state.swipeFeedbackFading;}) && state.swipeFeedbackDrag.x==0,
+                "reversed swipe preview did not finish retracting");
         }
         input.Next(GetDoubleClickTime());
         input.Send(state,{input.Packet(state,input.primary,point,move),input.Packet(state,input.primary+1,second,move)});
         input.Next(); input.Send(state,{input.Packet(state,input.primary,point,up),input.Packet(state,input.primary+1,second,up)});
+        const auto released=state.swipeFeedbackDrag;
         const bool posted=PeekMessageW(&command,state.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE)!=FALSE;
         Check(posted==commit,"native edge release failed to commit or committed a reversed gesture");
         if(posted) {
@@ -767,9 +1091,12 @@ static void TestTouchInput(const std::wstring& fixture) {
                 "posted native edge release did not reach the owning Shell browser");
         }
         AdvanceTouchInertia(state);
+        Check(state.swipeFeedbackDrag.x==released.x && state.swipeFeedbackDrag.y==released.y,
+            "released swipe arrow followed inertial translation");
         Check(!PeekMessageW(&command,state.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_NOREMOVE),"inertia repeated a history command");
         if(commit) ValidateRect(state.hwnd,nullptr);
         StopTouch(state);
+        Check(!state.swipeFeedbackActive && !state.swipeFeedbackFading,"touch cancellation retained swipe feedback");
         if(commit) Check(GetUpdateRect(state.hwnd,nullptr,FALSE),"touch cancellation did not invalidate the rendered history preview");
     }
     g_touchpadSwipeNavigation=false; state.rtlLayout=false;
@@ -878,6 +1205,7 @@ static void TestTouchInput(const std::wstring& fixture) {
     StopTouch(state);
 
     ScrollbarInteractions(input,fixture);
+    MultiFingerScrollbars(input,fixture);
 
     // Native double-tap recognition must preserve the existing completed
     // divider click and reach the same content-driven refit as the mouse.

@@ -22,7 +22,7 @@ inline thread_local LONG overX=0,overY=0;
 inline thread_local BOOL inertia=FALSE,animatedEnd=FALSE;
 inline thread_local std::function<void()> duringDrag;
 inline thread_local std::vector<std::wstring> dragPaths;
-struct Binding {INTERACTION_CONTEXT_OUTPUT_CALLBACK2 callback=nullptr; void* client=nullptr;};
+struct Binding {INTERACTION_CONTEXT_OUTPUT_CALLBACK2 callback=nullptr; void* client=nullptr; float deceleration=0.f;};
 inline thread_local std::map<HINTERACTIONCONTEXT,std::unique_ptr<Binding>> bindings;
 inline void CALLBACK Observe(void* value,const INTERACTION_CONTEXT_OUTPUT2* output) {
     auto& binding=*static_cast<Binding*>(value);
@@ -45,6 +45,10 @@ inline HRESULT WINAPI Create(HINTERACTIONCONTEXT* context) {
 inline HRESULT WINAPI Process(HINTERACTIONCONTEXT context,UINT32 rows,UINT32 columns,const POINTER_INFO* info) {
     if(enabled) {++processCalls; if(rejectPackets) return E_INVALIDARG;}
     const auto hr=::ProcessPointerFramesInteractionContext(context,rows,columns,info);
+    // Snapshot the effective native value after processing returns and before
+    // production can stop the recognizer. Stop resets this per-interaction value.
+    if(enabled && SUCCEEDED(hr)) if(const auto found=bindings.find(context); found!=bindings.end())
+        ::GetInertiaParameterInteractionContext(context,INERTIA_PARAMETER_TRANSLATION_DECELERATION,&found->second->deceleration);
     if(enabled && FAILED(hr)) std::fprintf(stderr,"NINPUT failure hr=%08lx flags=%u columns=%u\n",hr,info[0].pointerFlags,columns);
     return hr;
 }
