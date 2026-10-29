@@ -57,6 +57,11 @@ swipes, spring-driven bubble/chevron stretch, threshold continuity and vertical
 follow without changing a locked history action, radial pinch/expand at different
 separations and orientations, exclusive
 pinch anchoring across layouts/DPIs/RTL, contact replacement/rotation rejection,
+unequal and drifting pinches (including gradual movement below the per-packet
+system slop), late second fingers after one-contact scrolling and same-pair
+pan-to-pinch transitions without replaying recognition distance or pan feedback,
+long same-direction swipes with converging/diverging finger spacing, within-view
+Back/Forward arming, reversal and exact owning-Shell routing without inertial repeats,
 vertical marquee in fitting directories, release-velocity flings, coalesced frames, capture
 loss, divider fitting, animated scrollbar targets, persistent input ownership
 and Explorer click/underline preferences. Scrollbar eligibility stays with the

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.286
+
+- Keep two-finger Back/Forward swipes active through finger-spacing drift.
+  Distinguish same-direction scrolling from opposed pinch movement while
+  retaining responsive unequal pinches and late pinch acquisition.
+
+## 0.9.285
+
+- Recognize touch pinches with unequal finger movement or shared drift without
+  requiring large travel. Let a late second finger and an existing two-finger
+  pan acquire zoom, while preserving swipe, rotation and contact-change guards.
+
 ## 0.9.284
 
 - Keep scrollbar track presses captured so the same held press can drag the

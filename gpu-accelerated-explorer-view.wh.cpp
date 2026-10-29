@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.284
+// @version         0.9.286
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -21464,6 +21464,11 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
         }
         state.touchpadPinching = true;
         state.swipeHorizontal = state.swipeVertical = false;
+        if (state.touch.panningFeedback) {
+            EndPanningFeedback(state.hwnd,FALSE);
+            state.touch.panningFeedback = false;
+        }
+        state.touch.overpanX = state.touch.overpanY = 0.f;
         if (state.swipeFeedbackActive) {
             RetargetSwipeFeedback(state,true,false);
         }
@@ -24397,52 +24402,51 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
         const float drag = float(std::max(GetSystemMetricsForDpi(SM_CXDRAG,ViewDpi(state)),
             GetSystemMetricsForDpi(SM_CYDRAG,ViewDpi(state))));
         float panX = motion.delta.translationX, panY = motion.delta.translationY;
-        if (state.touch.gesture == TouchGesture::Pending) {
+        const auto previousGesture = state.touch.gesture;
+        const bool pending = previousGesture == TouchGesture::Pending;
+        if (pending || (state.touch.contacts == 2 &&
+            (previousGesture == TouchGesture::Vertical || previousGesture == TouchGesture::Horizontal))) {
             bool pan = hypotf(state.touch.intentX,state.touch.intentY) >= drag, pinch = false;
             if (state.touch.contacts == 2) {
-                const bool history = g_touchpadSwipeNavigation.load(std::memory_order_relaxed);
                 pan = false;
                 if (state.touch.pairTracked && session->contacts.size() == 2) {
                     const auto& reference = state.touch.pairStart;
-                    const double rx = (double(reference[1].x)-reference[0].x)*.5;
-                    const double ry = (double(reference[1].y)-reference[0].y)*.5;
-                    const double radius = std::hypot(rx,ry);
-                    if (radius > 0.) {
-                        // Work in fractions of the initial radius about a fixed
-                        // centroid. A moving centroid alone cannot demonstrate
-                        // pinch: that would make a single early finger look like
-                        // two opposing fingers. Track identities, not frame order.
-                        std::array<double,2> dx{},dy{},radial{};
-                        double tangent2 = 0.;
-                        for (unsigned n = 0; n != 2; ++n) {
+                    const double pairX = double(reference[1].x)-reference[0].x;
+                    const double pairY = double(reference[1].y)-reference[0].y;
+                    const double span = std::hypot(pairX,pairY);
+                    if (span > 0.) {
+                        std::array<double,2> displacementX{},displacementY{},radial{};
+                        auto positions = reference;
+                        for (unsigned contactIndex = 0; contactIndex != 2; ++contactIndex) {
                             const auto current = std::find_if(session->contacts.begin(),session->contacts.end(),
-                                [&](const auto& p){return p.pointerId == state.touch.pairIds[n];});
+                                [&](const auto& pointer){return pointer.pointerId == state.touch.pairIds[contactIndex];});
                             if (current == session->contacts.end()) break;
-                            dx[n] = (double(current->ptPixelLocation.x)-reference[n].x)/radius;
-                            dy[n] = (double(current->ptPixelLocation.y)-reference[n].y)/radius;
-                            const double ux = (n ? rx:-rx)/radius, uy = (n ? ry:-ry)/radius;
-                            const double projection = dx[n]*ux+dy[n]*uy;
-                            const double distance = std::hypot(ux+dx[n],uy+dy[n])-1.;
-                            // Rotation or sideways drift can change a projection
-                            // or a radius separately; zoom requires both to agree.
-                            radial[n] = projection*distance > 0. ?
-                                std::copysign(std::min(std::abs(projection),std::abs(distance)),projection) : 0.;
-                            const double tangent = dx[n]*uy-dy[n]*ux;
-                            tangent2 += tangent*tangent*.5;
+                            positions[contactIndex] = current->ptPixelLocation;
+                            displacementX[contactIndex] = double(positions[contactIndex].x)-reference[contactIndex].x;
+                            displacementY[contactIndex] = double(positions[contactIndex].y)-reference[contactIndex].y;
+                            radial[contactIndex] = (contactIndex ? 1.:-1.) *
+                                (displacementX[contactIndex]*pairX+displacementY[contactIndex]*pairY)/span;
                         }
-                        const double common = std::hypot((dx[0]+dx[1])*.5,(dy[0]+dy[1])*.5);
-                        const double differential = std::hypot((dx[1]-dx[0])*.5,(dy[1]-dy[0])*.5);
-                        const double uncertainty = drag/radius;
-                        // The triangle bound leaves staggered first movement
-                        // undecided, while tolerating unequal speed and angle in
-                        // a swipe. There is no extra timer or fixed pixel cutoff.
-                        pan = common > differential+uncertainty;
-                        const double evidence = std::min(std::abs(radial[0]),std::abs(radial[1]));
-                        // With history enabled, require the full contact
-                        // vectors to oppose as well as both radii changing.
-                        pinch = radial[0]*radial[1] > 0. &&
-                            evidence > std::sqrt(common*common+tangent2+uncertainty*uncertainty) &&
-                            (!history || dx[0]*dx[1]+dy[0]*dy[1] < 0.);
+                        const double common = std::hypot((displacementX[0]+displacementX[1])*.5,
+                            (displacementY[0]+displacementY[1])*.5);
+                        const double differential = std::hypot((displacementX[1]-displacementX[0])*.5,
+                            (displacementY[1]-displacementY[0])*.5);
+                        const double spanChange = std::hypot(double(positions[1].x)-positions[0].x,
+                            double(positions[1].y)-positions[0].y)-span;
+                        pan = common > differential+drag;
+                        const double directionDot = displacementX[0]*displacementX[1]+displacementY[0]*displacementY[1];
+                        const bool scaling = directionDot < 0. && radial[0]*radial[1] > 0. &&
+                            spanChange*(radial[0]+radial[1]) > 0.;
+                        pinch = scaling &&
+                            std::min(std::abs(radial[0]),std::abs(radial[1])) >= drag &&
+                            std::abs(spanChange) >= drag;
+                        PipelineEvent(*state.background,{.operation=L"touch.pair[kind,radial0,radial1,spanChange]",
+                            .a=state.touch.primary,.b=state.touch.generation,
+                            .v={double(previousGesture),radial[0],radial[1],spanChange}});
+                        PipelineEvent(*state.background,{.operation=L"touch.motion[dx0,dy0,dx1,dy1]",
+                            .a=state.touch.primary,.b=state.touch.generation,
+                            .v={displacementX[0],displacementY[0],displacementX[1],displacementY[1]}});
+                        if (pan && !scaling) state.touch.pairStart = positions;
                     }
                 }
             }
@@ -24459,7 +24463,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                 POINT anchor=state.touch.pinchOrigin; MapUiPoint(nullptr,hwnd,anchor);
                 ApplyManipulationPinch(state,0.f,&anchor);
             }
-            else if (pan) {
+            else if (pending && pan) {
                 if (state.touch.contacts == 1 && (fabsf(state.touch.intentX) > fabsf(state.touch.intentY) ||
                     MaxScrollPx(state) == 0.f)) {
                     const bool focused=ReturnListInputFocus(state,GetFocus());
@@ -24475,8 +24479,12 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             }
             // Native EXACT includes movement preceding recognition. Preserve
             // that distance while our two-contact intent is still undecided.
-            panX = state.touch.intentX; panY = state.touch.intentY;
+            if (pending) { panX = state.touch.intentX; panY = state.touch.intentY; }
         }
+        if (state.touch.gesture != previousGesture)
+            PipelineEvent(*state.background,{.operation=L"touch.intent[from,to,contacts,pair]",
+                .a=state.touch.primary,.b=state.touch.generation,
+                .v={double(previousGesture),double(state.touch.gesture),double(state.touch.contacts),double(state.touch.pairTracked)}});
         if (state.touch.gesture == TouchGesture::Marquee) {
             if (state.touch.down) UpdateCapturedPointer(state,point);
             continue; // A selection gesture never inherits native pan inertia.
@@ -24726,7 +24734,8 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             if (State(hwnd) != expected || state.touch.generation != generation) return;
         }
         if (contactCount > state.touch.contacts && state.touch.contacts && !state.touch.control &&
-            (state.touch.gesture == TouchGesture::Pending || state.touch.gesture == TouchGesture::Marquee)) {
+            (state.touch.gesture == TouchGesture::Pending || state.touch.gesture == TouchGesture::Marquee ||
+             (contactCount == 2 && state.touch.contacts == 1))) {
             if (state.touch.gesture == TouchGesture::Marquee) CancelTouchMarquee(state);
             if (State(hwnd) != expected || state.touch.generation != generation) return;
             state.touch.gesture = TouchGesture::Pending;

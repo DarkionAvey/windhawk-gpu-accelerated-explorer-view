@@ -312,6 +312,91 @@ void PinchThresholdPixels(Device& input,const std::wstring& fixture) {
     }
 }
 
+void PinchAcquisition(Device& input,const std::wstring& fixture) {
+    enum class Start { Unequal, Translating, LateSecond, AfterPan, GradualDrift };
+    const bool historySetting=g_touchpadSwipeNavigation.load();
+    unsigned trials=0;
+    for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"touch pinch acquisition",128,rtl,false,false,1000,1000);
+        auto& view=tab.state;
+        view.columns[0].width=2000; UpdateColumns(view);
+        Check(HorizontalBar(view).usable,"pinch acquisition fixture overflow");
+        SelectionUiFixture::Setup(tab,fixture); Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        const LONG slop=std::max(GetSystemMetricsForDpi(SM_CXDRAG,dpi),GetSystemMetricsForDpi(SM_CYDRAG,dpi));
+        const LONG radius=Scale96(60,dpi);
+        for(bool history:{false,true}) for(int axis:{0,1,2}) for(int direction:{-1,1})
+            for(Start start:{Start::Unequal,Start::Translating,Start::LateSecond,Start::AfterPan,Start::GradualDrift}) {
+            g_touchpadSwipeNavigation=history;
+            Reset(view,input); view.rowHeight96[0]=40; view.preciseRowHeight96[0]=0.; UpdateMetrics(view); UpdateColumns(view);
+            SetScrollImmediate(view,300); SetHorizontalScroll(view,200);
+            if(start==Start::AfterPan) SetHorizontalScroll(view,rtl ? view.columnContentWidth:0.f);
+            RECT client{}; ViewClientRect(view,&client);
+            const POINT center{client.right/2,LONG((view.headerPx+client.bottom)/2)};
+            const POINT radial{axis==1 ? 0:radius,axis==0 ? 0:radius};
+            POINT first{center.x-radial.x,center.y-radial.y},second{center.x+radial.x,center.y+radial.y};
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,first,down)});
+            if(start==Start::LateSecond) {
+                first.y-=slop*8; second.y-=slop*8;
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move)});
+                Check(view.touch.gesture==TouchGesture::Vertical,"late second finger fixture did not start a native pan");
+            }
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,down)});
+            if(start==Start::AfterPan) {
+                first.x+=slop*8; second.x+=slop*8;
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,move)});
+                Check(view.touch.gesture==TouchGesture::Horizontal,"two-contact fixture did not start a native pan");
+                Check(history ? view.swipeFeedbackActive:view.touch.panningFeedback,
+                    "edge pan fixture did not acquire native boundary/history feedback");
+            }
+            const auto beforeRow=view.rowPx;
+            float beforeScroll=view.scrollNow,beforeHorizontal=view.horizontalScroll;
+            if(start==Start::GradualDrift) {
+                const LONG radialStep=std::max<LONG>(1,slop/2),driftStep=radialStep/2;
+                const POINT drift{axis==0 ? 0:driftStep,axis==1 ? 0:-driftStep};
+                for(LONG attempt=0;attempt<slop*3 && view.touch.gesture!=TouchGesture::Pinch;++attempt) {
+                    beforeScroll=view.scrollNow; beforeHorizontal=view.horizontalScroll;
+                    first.x-=direction*(radial.x ? radialStep:0); first.y-=direction*(radial.y ? radialStep:0);
+                    second.x+=direction*(radial.x ? radialStep:0); second.y+=direction*(radial.y ? radialStep:0);
+                    first.x+=drift.x; second.x+=drift.x; first.y+=drift.y; second.y+=drift.y;
+                    input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,move)});
+                }
+            } else {
+                const LONG firstStep=slop*(start==Start::Unequal ? 8:2),secondStep=slop*2;
+                first.x-=direction*(radial.x ? firstStep:0); first.y-=direction*(radial.y ? firstStep:0);
+                second.x+=direction*(radial.x ? secondStep:0); second.y+=direction*(radial.y ? secondStep:0);
+                if(start==Start::Translating) {
+                    const POINT drift{axis==0 ? 0:slop,axis==1 ? 0:-slop};
+                    first.x+=drift.x; second.x+=drift.x; first.y+=drift.y; second.y+=drift.y;
+                }
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,move)});
+            }
+            if(view.touch.gesture!=TouchGesture::Pinch)
+                std::cerr<<"PINCH ACQUIRE dpi="<<dpi<<" rtl="<<rtl<<" history="<<history<<" axis="<<axis
+                    <<" direction="<<direction<<" start="<<int(start)<<" gesture="<<int(view.touch.gesture)
+                    <<" pair="<<view.touch.pairTracked<<" contacts="<<view.touch.contacts<<std::endl;
+            Check(view.touch.gesture==TouchGesture::Pinch && view.touchpadPinching,
+                "native asymmetric/drifting pinch or pinch after pan failed to acquire zoom");
+            Check(view.rowPx==beforeRow && view.scrollNow==beforeScroll && view.horizontalScroll==beforeHorizontal &&
+                !view.swipeHorizontal && !view.swipeVertical && !view.touch.panningFeedback,
+                "pinch acquisition jumped the image or retained pan/boundary ownership");
+            const double span=std::hypot(double(second.x)-first.x,double(second.y)-first.y);
+            first.x-=direction*(radial.x ? slop:0); first.y-=direction*(radial.y ? slop:0);
+            second.x+=direction*(radial.x ? slop:0); second.y+=direction*(radial.y ? slop:0);
+            const double nextSpan=std::hypot(double(second.x)-first.x,double(second.y)-first.y);
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,move)});
+            Check(std::abs(view.preciseRowHeight96[0]-40.*nextSpan/span)<.05,
+                "acquired pinch failed to follow the next native contact span");
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,first,up),input.Packet(view,input.primary+1,second,up)});
+            ++trials;
+        }
+        StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
+    }
+    g_touchpadSwipeNavigation=historySetting;
+    std::cout<<"PASS: "<<trials<<" native unequal/drifting pinches, late second fingers and same-pair pan-to-pinch transitions; inward/outward, three axes, 96/144/192 DPI, LTR/RTL and history policies\n";
+}
+
 void ScrollbarInteractions(Device& input,const std::wstring& fixture) {
     for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) {
         StyleFixture::Session metrics; StyleFixture::dpi=dpi;
@@ -614,6 +699,74 @@ public:
     TOUCH_UNUSED(SelectItem,PCUITEMID_CHILD,SVSIF)
 #undef TOUCH_UNUSED
 };
+void DriftingHistorySwipes(Device& input,const std::wstring& fixture) {
+    const bool historySetting=g_touchpadSwipeNavigation.exchange(true);
+    unsigned trials=0;
+    for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"drifting history swipe",0,rtl,false,false,1000,1000);
+        auto& view=tab.state;
+        view.columns[0].width=2000; UpdateColumns(view);
+        Check(HorizontalBar(view).usable,"drifting history fixture overflow");
+        SelectionUiFixture::Setup(tab,fixture); Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        ComPtr<ShellView> shell; shell.Attach(new ShellView); shell->hwnd=view.nativeHwnd;
+        auto* browser=new TimingShellBrowser; browser->view=shell; view.shellBrowser.Attach(browser);
+        const LONG slop=std::max(GetSystemMetricsForDpi(SM_CXDRAG,dpi),GetSystemMetricsForDpi(SM_CYDRAG,dpi));
+        for(bool backward:{false,true}) for(int spacing:{-1,1}) for(bool staggered:{false,true}) for(bool cancel:{false,true}) {
+            Reset(view,input); SetScrollImmediate(view,0); SetHorizontalScroll(view,backward ? 0.f:view.columnContentWidth);
+            RECT client{}; ViewClientRect(view,&client);
+            const int sign=backward!=rtl ? 1:-1;
+            const LONG stroke=LONG(std::ceil(SwipeCommitDistance(view)))+slop*4;
+            const LONG originX=(client.right-sign*stroke)/2;
+            const LONG centerY=LONG((view.headerPx+client.bottom)/2),radius=Scale96(60,dpi);
+            POINT first{originX,centerY-radius},second{originX,centerY+radius};
+            if(staggered) {input.Next(); input.Send(view,{input.Packet(view,input.primary,first,down)});}
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,first,staggered ? move:down),input.Packet(view,input.primary+1,second,down)});
+            const auto heights=view.rowHeight96;
+            const auto precise=view.preciseRowHeight96;
+            const auto shift=[&](LONG distance) {
+                const LONG drift=spacing*distance*slop*3/stroke;
+                first={originX+sign*distance,centerY-radius+drift};
+                second={originX+sign*distance,centerY+radius-drift};
+                Check(first.x>0 && first.x<client.right && second.x>0 && second.x<client.right &&
+                    first.y>view.headerPx && second.y<client.bottom,"drifting history contacts left the viewport");
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,move)});
+                if(view.touch.gesture==TouchGesture::Pinch)
+                    std::cerr<<"HISTORY DRIFT dpi="<<dpi<<" rtl="<<rtl<<" backward="<<backward
+                        <<" spacing="<<spacing<<" staggered="<<staggered<<" distance="<<distance<<" drift="<<drift<<std::endl;
+                Check(view.touch.gesture!=TouchGesture::Pinch && !view.touchpadPinching &&
+                    view.rowHeight96==heights && view.preciseRowHeight96==precise,
+                    "same-direction native swipe was stolen by spacing drift as pinch");
+            };
+            for(LONG distance=slop*2;distance<stroke;distance+=slop*2) shift(distance);
+            shift(stroke);
+            Check(view.swipeHorizontal && view.swipeFeedbackActive && view.swipeIndicator.armed,
+                "drifting native swipe did not arm history before reaching the viewport edge");
+            if(cancel) shift(0);
+            const auto commandsBefore=browser->browseFlags.size();
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,first,up),input.Packet(view,input.primary+1,second,up)});
+            MSG command{};
+            const bool posted=PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE)!=FALSE;
+            Check(posted!=cancel,"drifting swipe release lost navigation or committed a reversal");
+            if(posted) {
+                Check(bool(command.wParam)==backward,"drifting swipe reversed RTL history");
+                OverlayProc(command.hwnd,command.message,command.wParam,command.lParam);
+            }
+            Check(browser->browseFlags.size()==commandsBefore+(cancel ? 0u:1u) &&
+                (cancel || browser->browseFlags.back()==UINT(backward ? SBSP_NAVIGATEBACK:SBSP_NAVIGATEFORWARD)),
+                "drifting native release did not reach the owning Shell browser exactly once");
+            AdvanceTouchInertia(view);
+            Check(!PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE),
+                "drifting swipe inertia repeated history");
+            ++trials;
+        }
+        StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
+    }
+    g_touchpadSwipeNavigation=historySetting;
+    std::cout<<"PASS: "<<trials<<" native within-screen drifting Back/Forward swipes, convergence/divergence, staggered starts, reversal, exact Shell routing and no inertial repeats; 96/144/192 DPI and LTR/RTL\n";
+}
+
 void ScrollbarMenus(Device& input,const std::wstring& fixture) {
     for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(bool horizontal:{false,true}) {
         StyleFixture::Session metrics; StyleFixture::dpi=dpi;
@@ -796,6 +949,8 @@ static void TestTouchInput(const std::wstring& fixture) {
     FrameInputFixture::Session queue;
     PointerFixture::Session pointer;
     ModifierFixture::Session modifiers;
+    DriftingHistorySwipes(input,fixture);
+    PinchAcquisition(input,fixture);
     SwipePanels(input,fixture);
     TestFlingTrajectories(input);
     {
