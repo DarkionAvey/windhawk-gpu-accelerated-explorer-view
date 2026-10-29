@@ -111,17 +111,17 @@ static void TestRealNativeViewport(const std::wstring& directory) {
             },30000);
             if(!ready) std::cout<<"NATIVE MODEL recycle="<<recycle<<" presentation="<<presentation
                 <<" expected="<<baselineCount<<" actual="<<count<<std::endl;
-            Check(ready,"empty native viewport changed the item model or failed to finish enumeration");
-            const auto emptyViewports=[&] {
+            Check(ready,"hidden native viewport changed the item model or failed to finish enumeration");
+            const auto retainedViewports=[&] {
                 Check(!state.suppressedNativeViewports.empty(),"native viewports absent after repair");
                 for(const auto& child : state.suppressedNativeViewports) {
                     if(!child->hwnd) continue;
                     RECT r{}; GetClientRect(child->hwnd,&r);
-                    Check(GetPropW(child->hwnd,kNativeViewportProperty)==child.get() && !r.right && !r.bottom,
-                        "repaired native child regained a realized viewport");
+                    Check(GetPropW(child->hwnd,kNativeViewportProperty)==child.get() && r.right>0 && r.bottom>0 && !IsWindowVisible(child->hwnd),
+                        "hidden native child lost its input layout");
                 }
             };
-            if(repaired) emptyViewports();
+            if(repaired) retainedViewports();
             PROPERTYKEY deleted{}; PSGetPropertyKeyFromName(L"System.Recycle.DateDeleted",&deleted);
             double sortTotal=0,sortMax=0;
             for(const auto key : {PKEY_Size,PKEY_ItemNameDisplay,deleted,PKEY_ItemTypeText}) {
@@ -134,7 +134,7 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                     Check(SUCCEEDED(hr),"real native sort failed");
                     sortTotal+=callMs; sortMax=std::max(sortMax,callMs);
                     pump();
-                    if(repaired) emptyViewports();
+                    if(repaired) retainedViewports();
                 }
             }
             std::cout<<"NATIVE WORK recycle="<<recycle<<" presentation="<<presentation<<" rows="<<count
@@ -144,7 +144,7 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                 // Repair the intentionally unhealthy comparison before checking
                 // the existing mode/selection/unload contracts.
                 Check(SuppressNativeContent(state),"late native model reacquisition");
-                emptyViewports();
+                retainedViewports();
                 Check(!state.suppressedNativeViewports.empty(),"real DirectUI viewport was not acquired");
                 {
                     std::vector<HWND> children;
@@ -176,7 +176,7 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                     },30000);
                     if(!selectedReady) std::cout<<"NATIVE SELECTION hr=0x"<<std::hex<<static_cast<unsigned>(selectionHr)
                         <<std::dec<<" expected="<<chosen<<" selected="<<selected<<std::endl;
-                    Check(selectedReady,"empty native viewport failed to accept/retain selection after native view changes");
+                    Check(selectedReady,"hidden native viewport failed to accept/retain selection after native view changes");
                 }
                 ComPtr<IShellView> shell;
                 Check(SUCCEEDED(sink->view.As(&shell)) && SUCCEEDED(shell->Refresh()),
@@ -187,7 +187,7 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                     return SUCCEEDED(sink->view->ItemCount(SVGIO_ALLVIEW,&refreshed)) && refreshed==baselineCount;
                 }),"native model did not repopulate after refresh");
                 Check(SuppressNativeContent(state),"refresh native child repair");
-                emptyViewports();
+                retainedViewports();
                 for(const auto& viewport : state.suppressedNativeViewports) {
                     if(!viewport->hwnd) continue;
                     NativeSetWindowPosHook(viewport->hwnd,nullptr,7,9,840,620,
@@ -197,7 +197,7 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                         SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSENDCHANGING);
                     Check(batch && EndDeferWindowPos(batch),"native viewport deferred bounds");
                     RECT rect{}; GetClientRect(viewport->hwnd,&rect);
-                    Check(rect.right==0 && rect.bottom==0,"native layout recreated the hidden viewport");
+                    Check(rect.right==860 && rect.bottom==640 && !IsWindowVisible(viewport->hwnd),"native layout was altered while hidden");
                 }
                 std::vector<HWND> children;
                 for(const auto& viewport : state.suppressedNativeViewports) if(viewport->hwnd) children.push_back(viewport->hwnd);

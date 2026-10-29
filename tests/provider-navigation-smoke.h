@@ -163,7 +163,7 @@ void Destination(ProviderSelectionFixture::Browser& host, int expected) {
         MenuFixture::Session tracking(state.hwnd);
         ContextMenu(state, 0, POINT{0, 0});
         Check(Eventually([&] { host.Pump(); return !state.pendingNativeSelection; }, 30000), "nested provider context menu stalled");
-        Check(MenuFixture::calls == 1 && MenuFixture::items > 0, "nested provider context menu never reached its native menu");
+        Check(MenuFixture::calls == 1 && MenuFixture::target == state.nativeHwnd, "nested provider context menu never reached its native menu");
     }
 }
 }

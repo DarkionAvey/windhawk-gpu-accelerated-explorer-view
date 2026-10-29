@@ -233,7 +233,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         bool entered=false;
         response->sortRequest=[&](const SORTCOLUMN*,int count) {
             RECT r{}; GetClientRect(late,&r); entered=true;
-            Check(count==1 && !r.right && !r.bottom && GetPropW(late,kNativeViewportProperty),
+            Check(count==1 && r.right==640 && r.bottom==480 && !IsWindowVisible(late) && GetPropW(late,kNativeViewportProperty),
                 "header sorting entered Shell with an unsuppressed late child");
             return E_NOTIMPL;
         };
@@ -274,7 +274,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         HWND list=CreateWindowExW(0,WC_LISTVIEWW,L"",WS_CHILD|WS_VISIBLE|LVS_REPORT,
             0,0,400,300,replacement,nullptr,cls.hInstance,nullptr);
         RECT listBounds{}; GetClientRect(list,&listBounds);
-        Check(list && GetPropW(list,kNativeViewportProperty) && listBounds.right==0 && listBounds.bottom==0,
+        Check(list && GetPropW(list,kNativeViewportProperty) && listBounds.right==400 && listBounds.bottom==300 && !IsWindowVisible(list),
             "replacement native viewport performed visible layout before its queued capture");
         Check(IsWindowVisible(overlay) && state->nativeHwnd==native && state->loaded,
             "synchronous suppression changed binding, contents or GPU presentation");

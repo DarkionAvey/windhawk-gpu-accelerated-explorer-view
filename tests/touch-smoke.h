@@ -49,7 +49,8 @@ constexpr POINTER_FLAGS down=POINTER_FLAG_NEW|POINTER_FLAG_DOWN|POINTER_FLAG_INR
 constexpr POINTER_FLAGS move=POINTER_FLAG_UPDATE|POINTER_FLAG_INRANGE|POINTER_FLAG_INCONTACT|POINTER_FLAG_FIRSTBUTTON;
 constexpr POINTER_FLAGS up=POINTER_FLAG_UP;
 static LRESULT CALLBACK Owner(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
-    if((msg==WM_TIMER && wp==kTouchHoldTimerId) || msg==kMsgTouchDrag || msg==WM_CAPTURECHANGED)
+    if((msg==WM_TIMER && wp==kTouchHoldTimerId) || msg==kMsgTouchDrag || msg==WM_CAPTURECHANGED ||
+        msg==WM_CONTEXTMENU)
         return OverlayProc(hwnd,msg,wp,lp);
     return DefWindowProcW(hwnd,msg,wp,lp);
 }

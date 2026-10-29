@@ -157,7 +157,24 @@ default private-fixture suite. See the [binding investigation](../docs/profile-p
 `--provider-selection` uses real offscreen ExplorerBrowser views of private
 archives, delegated folders and ordinary directories. It checks selection and
 focus in Details/List/grid, repeated echoes, external and bulk selection, and
-GPU context-menu preparation with popup tracking intercepted. `--selection`
+GPU context-menu preparation with the forwarded window request intercepted.
+These are routing checks of the active native HWND, screen coordinates and
+deferred mouse/keyboard origin; they do not establish that a popup appeared.
+`--native-context-menu` separately opens 36 real item/folder/mixed/background
+popups on a private desktop across folders, ZIPs, delegated folders and three
+view modes. It compares their displayed root commands/states with actual
+visible-native reference popups, checks suppression and selection, and dismisses
+the real menu loop. It never switches desktops or touches the user's focus or
+clipboard. Actual WinUI mouse presentation, keyboard keytips and expanded
+submenus require live Explorer input verification; see the
+[native menu investigation](../docs/context-menus-0.9.287.md).
+The graphics suite also compares selected GPU pixels while a real owned popup
+is shown, hidden and destroyed, with substituted focus. It checks that menu
+feedback does not grant list input or survive unrelated focus, modal/background
+frames or stale folders. This is separate from the live WinUI check; see
+[selection feedback](../docs/context-menu-feedback-0.9.289.md) and the
+[asynchronous replacement handoff](../docs/context-menu-feedback-0.9.290.md).
+`--selection`
 also checks mixed path/opaque provider keys and alternate canonical PIDLs.
 `--drive-bars` checks remaining-space inline tracks, wide/narrow resizing,
 intrinsic label/font updates, fitting at standard/custom DPI, canonical

@@ -232,6 +232,75 @@ static void TestHighlightLayering(HWND frame) {
                     Check(state.inputFocusIndicators,"returning native-list focus did not restore feedback");
                     if(feedback<=2) Check(pixels(state.backbuffer.Get())!=reference,
                         "focus return retained selection logically but failed to restore its pixels");
+                    if(feedback==0) {
+                        const auto selectedPixels=pixels(state.backbuffer.Get());
+                        // Real USER popup visibility/ownership, with only focus
+                        // substituted. This is a pixel component check; live
+                        // Explorer separately verifies the WinUI handoff.
+                        HWND popup=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"menu feedback",
+                            WS_POPUP|WS_VISIBLE,-32000,-32000,120,120,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+                        Check(popup!=nullptr,"selection-feedback owned popup");
+                        FocusFixture::focus=chromeControl;
+                        paint();
+                        Check(pixels(state.backbuffer.Get())==reference,
+                            "an unrelated owned popup acquired selection feedback");
+                        state.nativeContextMenuToken=state.token;
+                        state.nativeContextMenuFocus=chromeControl;
+                        RefreshInputFocusIndicators(state);
+                        paint();
+                        Check(!OverlayHasInputFocus(state) && !state.inputFocusIndicators &&
+                            state.selectionFeedbackVisible && pixels(state.backbuffer.Get())==selectedPixels,
+                            "native popup lost selected pixels or granted keyboard input to the list");
+                        const auto model=CapturePresentationModel(state);
+                        Check(!model->inputFocus && model->selectionFeedback,
+                            "presenter conflated native-menu selection feedback with input focus");
+                        ShowWindow(popup,SW_HIDE); RefreshInputFocusIndicators(state); paint();
+                        Check(!state.selectionFeedbackVisible && pixels(state.backbuffer.Get())==reference,
+                            "dismissed native popup retained selected pixels");
+                        Check(state.nativeContextMenuFocus==chromeControl,
+                            "a popup replacement gap discarded the native invocation's focus host");
+                        HWND replacement=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"replacement menu feedback",
+                            WS_POPUP|WS_VISIBLE,-32000,-32000,120,120,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+                        Check(replacement!=nullptr,"replacement owned popup");
+                        SetWindowPos(popup,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                        RefreshInputFocusIndicators(state); paint();
+                        Check(pixels(state.backbuffer.Get())==selectedPixels,
+                            "replacement popup lost feedback behind an older hidden enabled popup");
+                        ShowWindow(replacement,SW_HIDE);
+                        state.nativeContextMenuFocus=nullptr;
+                        state.nativeContextMenuPending=true;
+                        FocusFixture::focus=frame;
+                        RefreshInputFocusIndicators(state);
+                        Check(state.nativeContextMenuPending && !state.nativeContextMenuFocus,
+                            "frame focus completed an asynchronous native menu request");
+                        FocusFixture::focus=chromeControl;
+                        RefreshInputFocusIndicators(state); paint();
+                        Check(state.nativeContextMenuPending && !state.nativeContextMenuFocus &&
+                            pixels(state.backbuffer.Get())==reference,
+                            "early delegated focus lost the pending request or granted feedback without a popup");
+                        ShowWindow(replacement,SW_SHOWNA);
+                        RefreshInputFocusIndicators(state); paint();
+                        Check(!state.nativeContextMenuPending && state.nativeContextMenuFocus==chromeControl &&
+                            !state.inputFocusIndicators && pixels(state.backbuffer.Get())==selectedPixels,
+                            "the asynchronous replacement popup failed to complete its focus handoff");
+                        FocusFixture::focus=edit; paint();
+                        Check(pixels(state.backbuffer.Get())==reference,"menu feedback followed a different focus owner");
+                        FocusFixture::focus=chromeControl; ++state.nativeContextMenuToken; paint();
+                        Check(pixels(state.backbuffer.Get())==reference,"menu feedback survived a folder generation change");
+                        state.nativeContextMenuToken=state.token;
+                        FocusFixture::ownerEnabled=false; paint();
+                        Check(pixels(state.backbuffer.Get())==reference,"modal disabled frame retained menu selection feedback");
+                        FocusFixture::ownerEnabled=true; FocusFixture::foreground=nullptr; paint();
+                        Check(pixels(state.backbuffer.Get())==reference && state.selectedFlags==flags,
+                            "background frame retained menu selection feedback or changed logical selection");
+                        FocusFixture::foreground=frame;
+                        DestroyWindow(replacement); RefreshInputFocusIndicators(state); paint();
+                        Check(!state.selectionFeedbackVisible && pixels(state.backbuffer.Get())==reference,
+                            "destroyed popup retained selection feedback");
+                        state.nativeContextMenuFocus=nullptr;
+                        DestroyWindow(popup);
+                        FocusFixture::focus=state.nativeHwnd; paint();
+                    }
                 }
             }
         }
@@ -306,5 +375,5 @@ static void TestHighlightLayering(HWND frame) {
     }
     g_selectionAlpha=selection; g_hoverAlpha=hover; g_bothAlpha=combined; g_marqueeAlpha=marquee;
     g_selectionRgb=accent; g_filenameOnly=filenames; g_zebra=zebra;
-    std::cout<<"PASS: LTR/RTL Details/List/grid feedback hides without list focus, restores without selection changes, and coalesces focus repaints; inactive compositor pixels clear without retiming, foreground layering remains\n";
+    std::cout<<"PASS: LTR/RTL Details/List/grid selection pixels survive native-menu popup focus without granting list input; dismissal, unrelated popups/focus, modal/background frames and folder generations clear feedback; focus repaints coalesce and inactive compositor pixels clear without retiming\n";
 }

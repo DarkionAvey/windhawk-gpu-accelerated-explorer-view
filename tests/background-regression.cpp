@@ -43,6 +43,7 @@
 #undef SHGetSetSettings
 #undef SHRegGetUSValueW
 #undef TrackPopupMenuEx
+#undef SendMessageW
 #undef QueryPerformanceCounter
 #undef Wh_Log
 #undef CoCreateInstance
@@ -362,7 +363,7 @@ static void TestNativeSuppression() {
     Check(late && !GetPropW(late,kNativeViewportProperty),"late native child setup");
     Check(SuppressNativeContent(state),"recheck already suppressed host");
     RECT lateBounds{}; GetClientRect(late,&lateBounds);
-    Check(GetPropW(late,kNativeViewportProperty) && !lateBounds.right && !lateBounds.bottom,
+    Check(GetPropW(late,kNativeViewportProperty) && lateBounds.right==200 && lateBounds.bottom==176 && !IsWindowVisible(late),
         "known hidden host skipped its later presentation child");
     DestroyWindow(late);
     // A child can dispatch work before the queued lifecycle/maintenance pass.
@@ -371,7 +372,7 @@ static void TestNativeSuppression() {
         0,24,200,176,native,nullptr,cls.hInstance,nullptr);
     SuppressDispatchedNativeViewport(late);
     GetClientRect(late,&lateBounds);
-    Check(GetPropW(late,kNativeViewportProperty) && !lateBounds.right && !lateBounds.bottom,
+    Check(GetPropW(late,kNativeViewportProperty) && lateBounds.right==200 && lateBounds.bottom==176 && !IsWindowVisible(late),
         "first native work dispatch escaped viewport suppression");
     DestroyWindow(late);
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
@@ -401,15 +402,14 @@ static void TestNativeSuppression() {
     other.frameHwnd = frame;
     other.nativeHwnd = native;
     Check(!SuppressNativeContent(other), "two overlays acquired the same native host");
-    // Native layout can echo the intentionally empty physical viewport back
-    // as another resize while the GPU owns presentation. That empty echo
-    // must not erase the last usable restoration bounds.
+    // A transient empty layout must not erase usable restoration bounds.
     NativeSetWindowPosHook(list,nullptr,3,27,260,220,
         SWP_NOACTIVATE | SWP_NOZORDER);
     NativeSetWindowPosHook(list,nullptr,0,0,0,0,
         SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
     RECT suppressed{}; GetClientRect(list,&suppressed);
-    Check(suppressed.right==0 && suppressed.bottom==0,"native list escaped zero-viewport suppression");
+    Check(suppressed.right==0 && suppressed.bottom==0 && !IsWindowVisible(list),
+        "native empty layout escaped the hidden host");
     RestoreNativeContent(state);
     RECT restored{}; GetWindowRect(list,&restored);
     MapWindowPoints(nullptr,native,reinterpret_cast<POINT*>(&restored),2);
@@ -439,6 +439,12 @@ static void TestNativeSuppression() {
     };
     Check(SetWindowSubclass(list,reenter,333,reinterpret_cast<DWORD_PTR>(&restoration)),"native restoration reentry fixture");
     Check(SuppressNativeContent(state),"native restoration reentry setup");
+    // Retained native geometry no longer forces a resize on every restore.
+    // Move the real child without updating its saved bounds, so restoring it
+    // must produce a genuine USER layout callback while ownership drains.
+    Check(SetWindowPos(list,nullptr,1,1,0,0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING),
+        "native restoration reentry position");
     RestoreNativeContent(state);
     Check(restoration.entered && !restoration.reacquired && state.suppressedNativeHosts.empty() && state.suppressedNativeViewports.empty() &&
         !GetPropW(host,kSuppressedHostProperty) && !GetPropW(list,kNativeViewportProperty),
@@ -904,6 +910,10 @@ static LRESULT CALLBACK PointerCaptureProc(HWND hwnd, UINT msg, WPARAM w, LPARAM
 
 static void TestKeyboardPresentation(ViewState& state) {
     FocusFixture::Session focus(state.frameHwnd,state.nativeHwnd);
+    PointerFixture::Session cursor;
+    PointerFixture::held=false;
+    RECT pointerBounds{}; GetWindowRect(state.hwnd,&pointerBounds);
+    PointerFixture::screen={pointerBounds.right+1,pointerBounds.bottom+1};
     state.columnsView = false;
     state.headerPx = 0;
     state.total = 32;
@@ -1860,6 +1870,7 @@ static void TestPreviewInput() {
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"
+#include "native-menu-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
@@ -1991,6 +2002,10 @@ int wmain(int argc,wchar_t** argv) {
             TestRealNativeUiaPressure(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--profile-identity-probe")==0) {
             TestProfileIdentityProbe();
+        } else if (argc>1 && wcscmp(argv[1],L"--native-context-menu-child")==0) {
+            NativeMenuFixture::Child(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--native-context-menu")==0) {
+            TestNativeMenuInteraction();
         } else if (argc>1 && wcscmp(argv[1],L"--provider-selection")==0) {
             TestProviderSelection(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--provider-navigation")==0) {
@@ -2072,6 +2087,7 @@ int wmain(int argc,wchar_t** argv) {
         TestFilesystemMutationDelivery(fixture.wstring());
         TestShellProviderContents(fixture.wstring());
         TestProviderSelection(fixture.wstring());
+        TestNativeMenuInteraction();
         TestSelectionUiWork(fixture.wstring());
         TestProviderNavigation(fixture.wstring());
         TestPasteFocus(fixture.wstring());

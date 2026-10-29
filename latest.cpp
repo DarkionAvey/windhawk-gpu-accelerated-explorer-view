@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.286
+// @version         0.9.290
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -2871,6 +2871,12 @@ struct ViewState {
     // Ctrl+arrow moves the keyboard caret without replacing the selection.
     bool keyboardCaretVisible = false;
     bool inputFocusIndicators = false; // Presentation only; never changes selection.
+    bool selectionFeedbackVisible = false;
+    HWND nativeContextMenuFocus = nullptr;
+    HWND nativeContextMenuPopup = nullptr;
+    unsigned long long nativeContextMenuToken = 0;
+    bool nativeContextMenuOpening = false;
+    bool nativeContextMenuPending = false;
     bool inputFocusMessageQueued = false;
     HWND viewControlFocusReturn = nullptr, viewControlFocusExpected = nullptr, viewControlFocusTab = nullptr;
     unsigned long long viewControlFocusToken = 0;
@@ -2973,6 +2979,7 @@ struct ViewState {
     std::shared_ptr<PreparedNativeSelection> nativeSelectionCaptureJob;
     std::shared_ptr<PreparedNativeSelection> confirmedNativeSelection;
     bool pendingSelectionContextMenu = false;
+    bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
     struct DeferredSelectionKey { WPARAM key = 0; DWORD modifiers = 0; };
     std::deque<DeferredSelectionKey> deferredSelectionKeys;
@@ -3339,7 +3346,7 @@ struct PresentationModel {
     unsigned long long sequence=0,lifetime=0;
     LARGE_INTEGER columnIntentOrigin{};
     RECT client{}; int dpi=96; LOGFONTW font{};
-    bool active=false,inputFocus=false;
+    bool active=false,inputFocus=false,selectionFeedback=false;
     HWND renameEditor=nullptr; int renameIndex=-1;
     float documentHeight=0.f;
     std::shared_ptr<const std::vector<Entry>> directory;
@@ -4897,9 +4904,8 @@ LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                     viewport->bounds.right - viewport->bounds.left : pos.cx;
                 const int height = (pos.flags & SWP_NOSIZE) ?
                     viewport->bounds.bottom - viewport->bounds.top : pos.cy;
-                // Native layout can measure our empty physical viewport and
-                // echo it back. Keep usable layout bounds for the handoff;
-                // replaying that echo would leave an unowned, visible 0x0 list.
+                // Keep usable bounds through transient empty layout passes;
+                // restoration must not leave an unowned, visible 0x0 list.
                 if (width > 0 && height > 0) {
                     if (!(pos.flags & SWP_NOMOVE)) {
                         viewport->bounds.left = pos.x;
@@ -4909,8 +4915,6 @@ LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                     viewport->bounds.bottom = viewport->bounds.top + height;
                 }
             }
-            pos.cx = pos.cy = 0;
-            pos.flags &= ~SWP_NOSIZE;
         };
         constrainViewport(true);
         const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
@@ -4982,11 +4986,10 @@ bool NativeViewAvailable(HWND hwnd) {
     return minimizedHost != nullptr;
 }
 
-// Hiding the host prevents flashes but does not suspend DirectUI's virtual
-// viewport. Cold native rows still realize templates, metadata and accessibility
-// structure on the Explorer UI thread. Give only the unused presentation child
-// an empty viewport; its Shell model, mode, columns and commands remain intact.
-// Geometry belongs to this tab and is restored while its host is still hidden.
+// Keep the native presentation child's real layout while its host is hidden.
+// CDefView's mouse context-menu handler validates the point against that child,
+// and namespace views can defer their model/selection until layout exists.
+// Collapsing it to 0x0 breaks native input even when its COM calls return S_OK.
 void SuppressNativeViewport(ViewState& state, HWND child) {
     if (t_nativeVisibilityInternal || state.disposalQueued || g_unloading.load(std::memory_order_relaxed)) return;
     wchar_t cls[80]{};
@@ -5013,9 +5016,6 @@ void SuppressNativeViewport(ViewState& state, HWND child) {
         .v={static_cast<double>(viewport->bounds.right-viewport->bounds.left),
             static_cast<double>(viewport->bounds.bottom-viewport->bounds.top)}});
     state.suppressedNativeViewports.push_back(std::move(viewport));
-    ScopedFlag internal(t_nativeVisibilityInternal);
-    g_setWindowPosOriginal(child, nullptr, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
 }
 
 // A hidden child's CREATE/SHOW accessibility event can be absent or arrive
@@ -5034,6 +5034,32 @@ void SuppressDispatchedNativeViewport(HWND target) {
             state->detailsViewActive && state->hwnd==overlay)
             SuppressNativeViewport(*state,target);
         return;
+    }
+}
+
+// A hidden content host can skip the layout that normally sizes its Shell
+// view. Keep the same real client geometry the GPU surface is using; native
+// mouse input validates this geometry, whereas keyboard context menus do not.
+// Run only after suppression, using the dedicated host and direct list child.
+void PreserveNativeContentLayout(ViewState& state, HWND native, HWND host) {
+    ScopedFlag internal(t_nativeVisibilityInternal);
+    RECT bounds{};
+    if (native != host && GetParent(native) == host && GetClientRect(host, &bounds) &&
+        bounds.right > 0 && bounds.bottom > 0) {
+        RECT actual{}; GetWindowRect(native, &actual);
+        MapWindowPoints(nullptr, host, reinterpret_cast<POINT*>(&actual), 2);
+        if (!EqualRect(&bounds, &actual))
+            g_setWindowPosOriginal(native, nullptr, 0, 0, bounds.right, bounds.bottom,
+                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    }
+    for (const auto& viewport : state.suppressedNativeViewports) {
+        if (!IsWindow(viewport->hwnd) || GetParent(viewport->hwnd) != native ||
+            viewport->parent != native) continue;
+        RECT actual{}; GetClientRect(viewport->hwnd, &actual);
+        if (actual.right > 0 && actual.bottom > 0) continue;
+        if (GetClientRect(native, &bounds) && bounds.right > 0 && bounds.bottom > 0 &&
+            g_setWindowPosOriginal(viewport->hwnd, nullptr, 0, 0, bounds.right, bounds.bottom,
+                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE)) viewport->bounds = bounds;
     }
 }
 
@@ -5062,6 +5088,7 @@ bool SuppressNativeContent(ViewState& state, HWND native = nullptr) {
                     SuppressNativeViewport(*reinterpret_cast<ViewState*>(context), child);
                     return TRUE;
                 }, reinterpret_cast<LPARAM>(&state));
+                PreserveNativeContentLayout(state, native, host);
                 return !(GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE);
             }
             ++it;
@@ -5084,6 +5111,7 @@ bool SuppressNativeContent(ViewState& state, HWND native = nullptr) {
         SuppressNativeViewport(*reinterpret_cast<ViewState*>(context), child);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&state));
+    PreserveNativeContentLayout(state, native, host);
     if (g_perf.load(std::memory_order_relaxed))
         Wh_Log(L"[GPU host] HIDDEN host=%p native=%p owner=%p", host, native, state.hwnd);
     return !(GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE);
@@ -6385,6 +6413,73 @@ bool OverlayHasInputFocus(const ViewState& state) {
         (owner == ViewInputOwner::Frame && !state.optimisticStartedAt);
 }
 
+// A native menu can own a separate input host after WM_CONTEXTMENU returns.
+// Keep its selection feedback without granting keyboard input to the list.
+// Bind this to the actual invocation, foreground tab and visible owned popup;
+// an address bar, modal dialog or unrelated popup is not a list-focus return.
+HWND VisibleOwnedPopup(HWND frame) {
+    const auto visible = [frame](HWND popup) {
+        return popup && popup != frame && IsWindowVisible(popup) && IsWindowEnabled(popup) &&
+            (GetWindowLongPtrW(popup, GWL_STYLE) & WS_POPUP) &&
+            GetAncestor(popup, GA_ROOTOWNER) == frame &&
+            GetWindowThreadProcessId(popup, nullptr) == GetCurrentThreadId();
+    };
+    const HWND first = GetWindow(frame, GW_ENABLEDPOPUP);
+    if (visible(first)) return first;
+    // GW_ENABLEDPOPUP can return a hidden, cached popup while another is
+    // visible. Resolve that case only on menu/focus lifecycle notifications.
+    struct Search { HWND frame, popup = nullptr; } search{frame};
+    EnumThreadWindows(GetCurrentThreadId(), [](HWND popup, LPARAM context) -> BOOL {
+        auto& search = *reinterpret_cast<Search*>(context);
+        if (popup != search.frame && IsWindowVisible(popup) && IsWindowEnabled(popup) &&
+            (GetWindowLongPtrW(popup, GWL_STYLE) & WS_POPUP) &&
+            GetAncestor(popup, GA_ROOTOWNER) == search.frame) {search.popup = popup; return FALSE;}
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.popup;
+}
+
+void RefreshNativeContextMenuFeedback(ViewState& state) {
+    if (state.nativeContextMenuToken != state.token ||
+        (!state.nativeContextMenuOpening && !state.nativeContextMenuPending && (!state.nativeContextMenuFocus ||
+            GetFocus() != state.nativeContextMenuFocus)) ||
+        !state.visible || !state.inScope || !state.detailsViewActive || state.rename.editor ||
+        !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd)) {
+        state.nativeContextMenuFocus = state.nativeContextMenuPopup = nullptr;
+        state.nativeContextMenuPending = false;
+        return;
+    }
+    // Popup replacement can hide the old surface before showing its successor
+    // without changing the delegated focus host. Keep that invocation binding.
+    state.nativeContextMenuPopup = VisibleOwnedPopup(state.frameHwnd);
+    // Replacing a WinUI menu can return from WM_CONTEXTMENU with frame focus
+    // before the new popup takes focus. Bind only when that handoff arrives.
+    if (state.nativeContextMenuPending && state.nativeContextMenuPopup &&
+        GetFocus() && !OverlayHasInputFocus(state)) {
+        state.nativeContextMenuFocus = GetFocus();
+        state.nativeContextMenuPending = false;
+    }
+}
+
+bool NativeContextMenuHasFeedback(const ViewState& state) {
+    if (state.nativeContextMenuToken != state.token ||
+        (!state.nativeContextMenuOpening && (!state.nativeContextMenuFocus ||
+            GetFocus() != state.nativeContextMenuFocus)) ||
+        !state.visible || !state.inScope || !state.detailsViewActive ||
+        state.rename.editor || !TabOwnsActiveView(state) ||
+        !ExplorerFrameHasForeground(state.frameHwnd)) return false;
+    const HWND popup = state.nativeContextMenuPopup;
+    return popup && popup != state.frameHwnd && IsWindowVisible(popup) &&
+        (GetWindowLongPtrW(popup, GWL_STYLE) & WS_POPUP) &&
+        GetAncestor(popup, GA_ROOTOWNER) == state.frameHwnd &&
+        GetWindowThreadProcessId(popup, nullptr) == GetCurrentThreadId();
+}
+
+bool SelectionFeedbackVisible(const ViewState& state) {
+    if (state.presentationOnly) return state.selectionFeedbackVisible;
+    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state);
+}
+
 // All list-focus returns use the same ownership boundary. Native Shell focus
 // preserves preview/extension integration; a rejected hidden host falls back
 // to the GPU HWND. Never override another control, modal dialog or active tab.
@@ -6410,6 +6505,7 @@ bool CreationHasInputFocus(const ViewState& state) {
 }
 
 void RefreshInputFocusIndicators(ViewState& state) {
+    RefreshNativeContextMenuFeedback(state);
     const HWND control = state.viewControlFocusReturn;
     bool waiting = false;
     if (control && state.viewControlFocusToken == state.token &&
@@ -6445,8 +6541,10 @@ void RefreshInputFocusIndicators(ViewState& state) {
     if (!focused && !CreationHasInputFocus(state) &&
         (state.creationCommandMask || !state.pendingCreatedItemPath.empty()))
         ClearInteractiveCreation(state);
-    if (state.inputFocusIndicators == focused) return;
+    const bool selectionVisible = SelectionFeedbackVisible(state);
+    if (state.inputFocusIndicators == focused && state.selectionFeedbackVisible == selectionVisible) return;
     state.inputFocusIndicators = focused;
+    state.selectionFeedbackVisible = selectionVisible;
     Redraw(state);
 }
 
@@ -16262,6 +16360,7 @@ void Paint(ViewState& state) {
         (compositionFrame.active && !compositionFrame.Rows() ? state.modeComposition.header : 0.f);
     state.paintWidth = w;
     state.inputFocusIndicators = OverlayHasInputFocus(state);
+    state.selectionFeedbackVisible = SelectionFeedbackVisible(state);
     const int dpi = ViewDpi(state);
     const float header = static_cast<float>(state.headerPx);
     const float columnHeader = static_cast<float>(ColumnHeaderHeight(state));
@@ -16588,7 +16687,7 @@ void Paint(ViewState& state) {
         typeSearchNow - state.lastTyped <= kTypeSearchTimeoutMs;
     // One shared visual geometry for backgrounds, selection, icons, and text.
     // Actual row indices and Shell selection have already been committed.
-    if (state.inputFocusIndicators) for (int i : visibleItems) {
+    if (state.selectionFeedbackVisible) for (int i : visibleItems) {
         RowVisual v = LayoutRowVisual(state, i, layoutProgress);
         if(compositionFrame.Rows()) { v.opacity=1.f; v.height=std::max(row,v.height); }
         if (!compositionFrame.Rows() && (v.top >= contentBottom || v.top + v.height <= header)) continue;
@@ -16609,7 +16708,7 @@ void Paint(ViewState& state) {
     }
     // Deleted rows exist only as a tiny, bounded painting snapshot, not in
     // Shell state. Their shrinking height and opacity close the old gaps.
-    if (state.inputFocusIndicators && state.rowTransitionActive) {
+    if (state.selectionFeedbackVisible && state.rowTransitionActive) {
         for (const auto& old : state.disappearingRows) {
             const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
@@ -16635,7 +16734,7 @@ void Paint(ViewState& state) {
             }
         }
     }
-    if (state.inputFocusIndicators && state.keyboardSelectionAnimating &&
+    if (state.selectionFeedbackVisible && state.keyboardSelectionAnimating &&
         state.keyboardSelectionTo == state.selected &&
         state.selected >= 0 && state.selected < state.total) {
         const float progress = KeyboardSelectionProgress(state);
@@ -18395,17 +18494,6 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
         }
     } continuation{state.hwnd,state.lifetimeToken};
     ScopedFlag committing(state.nativeSelectionCommitting);
-    if (state.thisPcGpu) {
-        PidlSelection pidls;
-        if (!CollectSelectedPidls(state, pidls)) return false;
-        if (pidls.children.empty()) return ClearNativeSelection(state);
-        // Best-effort native integration uses exact identities, never stale
-        // row numbers. An unpopulated hidden native list cannot disable GPU.
-        return SUCCEEDED(state.folderView->SelectAndPositionItems(
-            static_cast<UINT>(pidls.children.size()), pidls.children.data(), nullptr,
-            SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_NOTAKEFOCUS));
-    }
-
     size_t desired = 0;
     std::vector<std::wstring> selectedPaths;
     selectedPaths.reserve(8);
@@ -19014,12 +19102,6 @@ struct NativeFileCommandScope {
             QueueNativeSelectionHint(*state);
     }
 };
-
-HRESULT InvokeShellSelectionCommand(ViewState& state,IContextMenu* menu,LPCMINVOKECOMMANDINFO invoke) {
-    PipelineScope pipeline(state.background,L"file.menu.invoke");
-    NativeFileCommandScope command(&state);
-    return menu->InvokeCommand(invoke);
-}
 
 // Immediate GPU/frame shortcuts and prepared selections share native verbs.
 // Paste belongs to the active folder, independently of any selected items.
@@ -20130,38 +20212,6 @@ void Open(ViewState& state, int index) {
     }
 }
 
-// A Shell context menu may contain dynamically populated / owner-drawn
-// submenus (notably New). Forward its messages to the provider while the
-// native popup is active. Store a *temporary* borrowed pointer in the popup
-// owner's HWND rather than a long-lived interface in our ViewState: the tab
-// may disappear while a context-menu command is being processed.
-constexpr wchar_t kPopupBridgeProperty[] = L"WindhawkGpuOverlayPopupBridge";
-struct ShellPopupBridge {
-    ComPtr<IContextMenu2> menu2;
-    ComPtr<IContextMenu3> menu3;
-};
-
-LRESULT ForwardShellPopupMessage(HWND hwnd, UINT message, WPARAM wp,
-                                 LPARAM lp, bool& handled) {
-    handled = false;
-    auto* bridge = reinterpret_cast<ShellPopupBridge*>(
-        GetPropW(hwnd, kPopupBridgeProperty));
-    if (!bridge) return 0;
-    LRESULT result = 0;
-    if (bridge->menu3 && SUCCEEDED(bridge->menu3->HandleMenuMsg2(
-            message, wp, lp, &result))) {
-        handled = true;
-        return result;
-    }
-    // Older extensions implement IContextMenu2 only.
-    if (bridge->menu2 && message != WM_MENUCHAR &&
-        SUCCEEDED(bridge->menu2->HandleMenuMsg(message, wp, lp))) {
-        handled = true;
-        return message == WM_DRAWITEM || message == WM_MEASUREITEM ? TRUE : 0;
-    }
-    return 0;
-}
-
 // State() is forward declared near the overlay's rename editor.
 
 // Native background menu of the *active Shell view*, not a context menu for
@@ -20315,126 +20365,53 @@ void ExplorerColumnMenu(ViewState& state, POINT screen) {
     }
 }
 
-bool ShellCommandInSubmenu(HMENU menu, UINT command, int depth = 0) {
-    if (!menu || depth >= 5) return false;
-    const int count = GetMenuItemCount(menu);
-    for (int i = 0; i < count; ++i) {
-        HMENU submenu = GetSubMenu(menu, i);
-        if (!submenu) continue;
-        const int childCount = GetMenuItemCount(submenu);
-        for (int j = 0; j < childCount; ++j)
-            if (GetMenuItemID(submenu, j) == command) return true;
-        if (ShellCommandInSubmenu(submenu, command, depth + 1)) return true;
-    }
-    return false;
-}
-
-void BackgroundContextMenu(ViewState& state, POINT screen) {
-    if (!state.visible || !state.inScope || !IsWindow(state.hwnd) ||
-        !IsWindow(state.nativeHwnd) || !state.folderView ||
-        !state.shellBrowser ||
-        !IsSupportedLocation(state.folderPath)) return;
-
-    // Avoid offering actions from another tab while Explorer is rebinding.
+void NativeContextMenu(ViewState& state, POINT screen, bool keyboard) {
+    if (!state.visible || !state.inScope || state.optimisticStartedAt ||
+        g_unloading.load(std::memory_order_acquire) || !IsWindow(state.hwnd) ||
+        !IsWindow(state.nativeHwnd) || !state.folderView || !state.shellBrowser ||
+        !TabOwnsActiveView(state) || !IsSupportedLocation(state.folderPath)) return;
+    const HWND owner = state.hwnd, target = state.nativeHwnd;
+    const auto lifetime = state.lifetimeToken, token = state.token;
+    const auto current = [&] {
+        auto* live = State(owner);
+        return live == &state && live->lifetimeToken == lifetime && live->token == token &&
+            live->nativeHwnd == target && live->visible && live->inScope &&
+            !live->optimisticStartedAt && TabOwnsActiveView(*live) &&
+            !g_unloading.load(std::memory_order_acquire);
+    };
+    NativeFileCommandScope command(&state);
     ComPtr<IShellView> active;
     HWND activeHwnd = nullptr;
-    if (FAILED(state.shellBrowser->QueryActiveShellView(
-            active.GetAddressOf())) || !active ||
-        FAILED(active->GetWindow(&activeHwnd)) ||
-        activeHwnd != state.nativeHwnd) return;
-    std::wstring currentPath;
-    ComPtr<IShellFolder> activeFolder;
-    if (!GetFolderPath(state.folderView.Get(), currentPath, activeFolder) ||
-        _wcsicmp(currentPath.c_str(), state.folderPath.c_str()) != 0 ||
-        !IsSupportedLocation(currentPath)) return;
+    if (FAILED(state.shellBrowser->QueryActiveShellView(&active)) || !active ||
+        !current() || FAILED(active->GetWindow(&activeHwnd)) ||
+        activeHwnd != target || !current()) return;
+    std::wstring path;
+    ComPtr<IShellFolder> folder;
+    if (!GetFolderPath(state.folderView.Get(), path, folder) || !current() ||
+        _wcsicmp(path.c_str(), state.folderPath.c_str())) return;
+    // Enter the same window handler as the native list. It records mouse vs
+    // keyboard origin before choosing the presenter and selected/background
+    // menu. Calling its later COM callbacks skips that input setup.
+    NativeViewInput input(&state);
+    if (!current()) return;
+    TabTraceSlowScope trace(L"Explorer native context menu", owner);
+    state.nativeContextMenuToken = token;
+    state.nativeContextMenuFocus = nullptr;
+    state.nativeContextMenuPopup = nullptr;
+    state.nativeContextMenuOpening = true;
+    state.nativeContextMenuPending = false;
+    SendMessageW(target, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(target),
+        keyboard ? static_cast<LPARAM>(-1) : MAKELPARAM(screen.x, screen.y));
+    auto* live = State(owner);
+    if (live != &state || live->lifetimeToken != lifetime) return;
+    live->nativeContextMenuOpening = false;
+    live->nativeContextMenuPending = current();
+    RefreshNativeContextMenuFeedback(*live);
+    QueueInputFocusUpdate(owner);
+}
 
-    ComPtr<IContextMenu> menu;
-    const HRESULT acquire = active->GetItemObject(SVGIO_BACKGROUND,
-        IID_PPV_ARGS(&menu));
-    if (FAILED(acquire) || !menu) {
-        Wh_Log(L"[GPU overlay] Shell background menu unavailable hr=0x%08X",
-               static_cast<unsigned>(acquire));
-        return;
-    }
-    HMENU popup = CreatePopupMenu();
-    if (!popup) return;
-    if (SUCCEEDED(menu->QueryContextMenu(popup, 0, 1, 0x7FFF,
-                                         CMF_NORMAL))) {
-        ShellPopupBridge bridge;
-        menu.As(&bridge.menu3);
-        if (!bridge.menu3) menu.As(&bridge.menu2);
-        // Deliver WM_INITMENUPOPUP/WM_DRAWITEM/WM_MEASUREITEM/WM_MENUCHAR
-        // to context extensions. Don't use TPM_NONOTIFY: it breaks New.
-        if (SetPropW(state.hwnd, kPopupBridgeProperty,
-                     reinterpret_cast<HANDLE>(&bridge))) {
-            const HWND owner = state.hwnd;
-            const HWND nativeOwner = state.nativeHwnd;
-            const UINT selected = TrackPopupMenuEx(popup,
-                ShellMenuFlags(state,true), screen.x, screen.y,
-                owner, nullptr);
-            if (IsWindow(owner)) RemovePropW(owner, kPopupBridgeProperty);
-            if (selected && IsWindow(nativeOwner)) {
-                // Explorer's New submenu invokes a child command. Arm before
-                // InvokeCommand: SHCNE_CREATE/MKDIR can be delivered reentrantly.
-                // Do not arm Paste or normal top-level background commands.
-                wchar_t verb[96]{};
-                const bool hasVerb = SUCCEEDED(menu->GetCommandString(
-                    selected - 1, GCS_VERBW, nullptr,
-                    reinterpret_cast<LPSTR>(verb), ARRAYSIZE(verb)));
-                const bool newVerb = hasVerb &&
-                    (_wcsnicmp(verb, L"new", 3) == 0);
-                if (ShellCommandInSubmenu(popup, selected) || newVerb)
-                    ArmInteractiveCreation(state, 3, L"Shell New menu");
-                CMINVOKECOMMANDINFOEX invoke{};
-                invoke.cbSize = sizeof(invoke);
-                invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-                invoke.hwnd = nativeOwner;
-                invoke.lpVerb = MAKEINTRESOURCEA(selected - 1);
-                invoke.lpVerbW = MAKEINTRESOURCEW(selected - 1);
-                invoke.nShow = SW_SHOWNORMAL;
-                invoke.ptInvoke = screen;
-                TabTraceSlowScope commandTrace(L"Shell background command", state.hwnd);
-                HRESULT hr;
-                {
-                    NativeViewInput input(&state,hasVerb && !_wcsnicmp(verb,L"view",4));
-                    hr = InvokeShellSelectionCommand(state,menu.Get(),reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
-                }
-                if (FAILED(hr))
-                    Wh_Log(L"[GPU overlay] background command failed hr=0x%08X",
-                           static_cast<unsigned>(hr));
-                if (FAILED(hr) && IsWindow(owner))
-                    if (auto live=State(owner); live && live->folderPath==currentPath)
-                        ClearInteractiveCreation(*live);
-                if (IsWindow(owner))
-                    if (auto live = State(owner)) PostShellVisibilityProbe(*live, true, true);
-                // A Shell Refresh command can redraw the native view without
-                // changing the directory contents (so the watcher stays
-                // silent). Refresh the custom names/details asynchronously
-                // after *any* invoked background command; New/Paste may also
-                // update files. Never refresh a tab which navigated away.
-                if (IsWindow(owner)) {
-                    if (auto* live = State(owner)) {
-                        if (live->visible && live->inScope &&
-                            _wcsicmp(live->folderPath.c_str(),
-                                     currentPath.c_str()) == 0) {
-                            if (hasVerb && _wcsicmp(verb, L"refresh") == 0) ForceRefresh(*live);
-                            else if (live->thisPcGpu) live->thisPcRowsDirty = true;
-                            else if (!live->pendingCreatedItemPath.empty() ||
-                                     live->rename.editor ||
-                                     live->creationCommandMask) {
-                                // New creates use the Shell event's fast worker
-                                // request. A second menu refresh can otherwise
-                                // invalidate the row underneath the live edit.
-                            } else if (live->directoryPending)
-                                live->refreshAgain = true;
-                            else QueueDirectoryRefresh(*live);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    DestroyMenu(popup);
+void BackgroundContextMenu(ViewState& state, POINT screen, bool keyboard = false) {
+    NativeContextMenu(state, screen, keyboard);
 }
 
 // The complete row is an item hit target. Only the dedicated logical
@@ -20466,167 +20443,25 @@ void ClearSelectionForFolderMenu(ViewState& state) {
     Redraw(state);
 }
 
-// Get *relative* PIDLs from the Shell folder actually shown by this tab.
-// The previous code mixed absolute SHParseDisplayName PIDLs with ILFindLastID,
-// and left Explorer's native selection unsynchronized. Certain commands then
-// acted on the parent folder instead of the selected files.
-void ContextMenu(ViewState& state, int index, POINT screen) {
+// Keep selection preparation on the existing tab-owned lane. Once committed,
+// every selection size uses the same native view menu and command handling.
+void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = false) {
     if (!state.folder || !state.folderView || index < 0 || index >= state.total) return;
     const bool clickedSelected = index < static_cast<int>(state.selectedFlags.size()) &&
         state.selectedFlags[static_cast<size_t>(index)] != 0;
-    if (!clickedSelected) Select(state, index); // Context-menu mouse selection fades.
-    if (state.pendingNativeSelection) {
+    if (!clickedSelected) Select(state, index);
+    const auto defer = [&] {
         state.pendingSelectionContextMenu = true;
         state.pendingSelectionContextPoint = MAKELPARAM(screen.x, screen.y);
-        return;
-    }
+        state.pendingSelectionContextKeyboard = keyboard;
+    };
+    if (state.pendingNativeSelection) { defer(); return; }
     if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
 
-    // A native Ctrl+A can select tens of thousands of items without ever
-    // enumerating their PIDLs in the GPU overlay. Never undo that by parsing
-    // every filename just because the user right-clicked one selected row.
-    const size_t selectedCount = static_cast<size_t>(std::count_if(
-        state.selectedFlags.begin(), state.selectedFlags.end(),
-        [](unsigned char flag) { return flag != 0; }));
-    if (selectedCount > kMaxDirectNativeSelectionItems) {
-        int nativeCount = -1;
-        ComPtr<IShellView> nativeView;
-        ComPtr<IContextMenu> nativeMenu;
-        if (SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount)) &&
-            nativeCount >= 0 && static_cast<size_t>(nativeCount) == selectedCount &&
-            state.shellBrowser && SUCCEEDED(state.shellBrowser->QueryActiveShellView(
-                nativeView.GetAddressOf())) && nativeView &&
-            SUCCEEDED(nativeView->GetItemObject(SVGIO_SELECTION,
-                IID_PPV_ARGS(&nativeMenu))) && nativeMenu) {
-            HMENU popup = CreatePopupMenu();
-            if (popup) {
-                if (SUCCEEDED(nativeMenu->QueryContextMenu(
-                        popup, 0, 1, 0x7FFF, CMF_NORMAL))) {
-                    const UINT command = TrackPopupMenuEx(popup,
-                        ShellMenuFlags(state),
-                        screen.x, screen.y, state.hwnd, nullptr);
-                    if (command) {
-                        CMINVOKECOMMANDINFOEX invoke{};
-                        invoke.cbSize = sizeof(invoke);
-                        invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-                        invoke.hwnd = state.nativeHwnd;
-                        invoke.lpVerb = MAKEINTRESOURCEA(command - 1);
-                        invoke.lpVerbW = MAKEINTRESOURCEW(command - 1);
-                        invoke.nShow = SW_SHOWNORMAL;
-                        invoke.ptInvoke = screen;
-                        TabTraceSlowScope commandTrace(L"Shell selected-item command", state.hwnd);
-                        const HRESULT hr = InvokeShellSelectionCommand(state,nativeMenu.Get(),
-                            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
-                        if (FAILED(hr)) Wh_Log(
-                            L"[GPU selection] bulk context command failed hr=0x%08X",
-                            static_cast<unsigned>(hr));
-                    }
-                }
-                DestroyMenu(popup);
-            }
-        } else {
-            // If the native selection is not verified, do not expose a context
-            // menu whose Delete/Properties could apply to a different group.
-            Wh_Log(L"[GPU selection] bulk context menu refused: gpu=%zu native=%d",
-                selectedCount, nativeCount);
-            ReconcileFailedNativeSelection(state);
-            if (state.pendingNativeSelection) {
-                state.pendingSelectionContextMenu=true;
-                state.pendingSelectionContextPoint=MAKELPARAM(screen.x,screen.y);
-            }
-        }
-        return;
-    }
-
-    std::vector<PITEMID_CHILD> ownedPidls;
-    std::vector<PCUITEMID_CHILD> children;
-    std::wstring current;
-    ComPtr<IShellFolder> actualFolder;
-    if (!GetFolderPath(state.folderView.Get(), current, actualFolder) ||
-        _wcsicmp(current.c_str(), state.folderPath.c_str()) != 0 ||
-        !IsSupportedLocation(current)) return;
-    for (int i = 0; i < state.total; ++i) {
-        if (i >= static_cast<int>(state.selectedFlags.size()) ||
-            !state.selectedFlags[static_cast<size_t>(i)]) continue;
-        PITEMID_CHILD child = nullptr;
-        EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
-        if (child) {
-            ownedPidls.push_back(child);
-            children.push_back(child);
-        }
-    }
-    if (children.empty()) return;
-
-    // Sync the native selection even if the user never opened a menu before.
-    // The overlay's marquee and Ctrl-selection already call this on commit.
-    if (!state.thisPcGpu && !SyncNativeSelection(state)) {
-        // Never invoke a native command on a possibly stale selection. This
-        // could otherwise run Properties/Delete on the containing folder.
-        Wh_Log(L"[GPU overlay] context menu refused: native selection not synchronized");
-        for (auto p : ownedPidls) CoTaskMemFree(p);
-        return;
-    }
-
-    ComPtr<IContextMenu> menu;
-    if (SUCCEEDED(actualFolder->GetUIObjectOf(state.nativeHwnd,
-        static_cast<UINT>(children.size()), children.data(),
-        IID_IContextMenu, nullptr,
-        reinterpret_cast<void**>(menu.GetAddressOf()))) && menu) {
-        HMENU popup = CreatePopupMenu();
-        if (popup) {
-            if (SUCCEEDED(menu->QueryContextMenu(popup, 0, 1, 0x7FFF, CMF_NORMAL))) {
-                const UINT command = TrackPopupMenuEx(popup,
-                    ShellMenuFlags(state),
-                    screen.x, screen.y, state.hwnd, nullptr);
-                if (command) {
-                    // Property sheets use the selected files' IDataObject
-                    // explicitly, avoiding Explorer's parent-folder fallback.
-                    wchar_t verb[80]{};
-                    const HRESULT verbHr = menu->GetCommandString(
-                        command - 1, GCS_VERBW, nullptr,
-                        reinterpret_cast<LPSTR>(verb), ARRAYSIZE(verb));
-                    bool handled = false;
-                    if (SUCCEEDED(verbHr) && _wcsicmp(verb, L"rename") == 0 &&
-                        children.size() == 1 && !state.thisPcGpu) {
-                        // The native list content remains suppressed. Queue
-                        // only this item's GPU editor AFTER the popup exits.
-                        handled = PostMessageW(state.hwnd, kMsgBeginRename,
-                            static_cast<WPARAM>(index),
-                            static_cast<LPARAM>(state.mouseFolderEpoch)) != FALSE;
-                    }
-                    if (!handled && SUCCEEDED(verbHr) &&
-                        _wcsicmp(verb, L"properties") == 0) {
-                        ComPtr<IDataObject> data;
-                        if (SUCCEEDED(actualFolder->GetUIObjectOf(state.nativeHwnd,
-                            static_cast<UINT>(children.size()), children.data(),
-                            IID_IDataObject, nullptr,
-                            reinterpret_cast<void**>(data.GetAddressOf()))) && data) {
-                            const HRESULT result = SHMultiFileProperties(data.Get(), 0);
-                            handled = true; // no fallback to parent-folder Properties
-                            if (FAILED(result)) Wh_Log(L"[GPU overlay] file Properties failed: 0x%08X", result);
-                        }
-                    }
-                    if (!handled) {
-                        CMINVOKECOMMANDINFOEX invoke{};
-                        invoke.cbSize = sizeof(invoke);
-                        invoke.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-                        invoke.hwnd = state.nativeHwnd;
-                        invoke.lpVerb = MAKEINTRESOURCEA(command - 1);
-                        invoke.lpVerbW = MAKEINTRESOURCEW(command - 1);
-                        invoke.nShow = SW_SHOWNORMAL;
-                        invoke.ptInvoke = screen;
-                        TabTraceSlowScope commandTrace(L"Shell selected-item command", state.hwnd);
-                        const HRESULT result = InvokeShellSelectionCommand(state,menu.Get(),
-                            reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
-                        if (FAILED(result))
-                            Wh_Log(L"[GPU overlay] context command failed: 0x%08X", result);
-                    }
-                }
-            }
-            DestroyMenu(popup);
-        }
-    }
-    for (auto p : ownedPidls) CoTaskMemFree(p);
+    // Select() or the existing preparation/import lane already committed the
+    // selection. Re-selecting it here adds a second transaction that native
+    // context-menu input does not perform.
+    NativeContextMenu(state, screen, keyboard);
 }
 
 // Explorer-style incremental prefix search. No filesystem reads on keystrokes.
@@ -23442,6 +23277,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     model->columnIntentOrigin=state.presentationColumnOrigin;
     model->active=!InactiveGraphics(state);
     model->inputFocus=OverlayHasInputFocus(state);
+    model->selectionFeedback=SelectionFeedbackVisible(state);
     ViewClientRect(state,&model->client); model->dpi=ViewDpi(state);
     if(!state.presentationFont.lfFaceName[0] || state.presentationDpi!=model->dpi) {
         state.presentationFont=NativeHeaderFont(state); state.presentationDpi=model->dpi;
@@ -23593,6 +23429,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     state.presentationRowRevision=model.rowSceneRevision; state.presentationColumnOrigin=model.columnIntentOrigin;
     state.presentationClient=model.client; state.presentationDpi=model.dpi; state.presentationFont=model.font;
     state.presentationActive=model.active; state.inputFocusIndicators=model.inputFocus;
+    state.selectionFeedbackVisible=model.selectionFeedback;
     state.rename.editor=model.renameEditor; state.rename.index=model.renameIndex;
     state.clipboardPaths=model.clipboard;
     if(!oldClipboardInitialized && state.clipboardInitialized) for(auto& [path,opacity]:state.itemOpacityRows)
@@ -23889,7 +23726,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         if(model && !model->active) {
             awaitingNames=false;
             standbyControl=model;
-            state.presentationActive=false; state.inputFocusIndicators=false;
+            state.presentationActive=false; state.inputFocusIndicators=false; state.selectionFeedbackVisible=false;
             if(!model->visible || !model->inScope || !model->detailsViewActive) DropTarget(state);
             else if(state.graphicsReady) {state.graphicsStandby=state.graphicsStandbyPending=true; AdvanceStandbyGraphics(state);}
             PublishPresentationReceipt(state,lane,false,standbyControl.get());
@@ -25210,16 +25047,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     case WM_ERASEBKGND: return 1;
-    case WM_INITMENUPOPUP:
-    case WM_DRAWITEM:
-    case WM_MEASUREITEM:
-    case WM_MENUCHAR: {
-        bool handled = false;
-        const LRESULT result = ForwardShellPopupMessage(hwnd, msg, wParam,
-                                                         lParam, handled);
-        if (handled) return result;
-        break;
-    }
     case WM_THEMECHANGED:
     case WM_SYSCOLORCHANGE:
     case WM_DWMCOLORIZATIONCOLORCHANGED:
@@ -25428,6 +25255,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             auto keys = std::move(s->deferredSelectionKeys);
             const bool menu = s->pendingSelectionContextMenu;
             const LPARAM point = s->pendingSelectionContextPoint;
+            const bool keyboard = s->pendingSelectionContextKeyboard;
             s->pendingSelectionContextMenu = false;
             Redraw(*s);
             if (committed) {
@@ -25456,7 +25284,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     // Keep the selected identity, rather than hit-testing an
                     // old screen point after the viewport may have moved.
                     if (row >= 0) ContextMenu(*live, row,
-                        POINT{GET_X_LPARAM(point), GET_Y_LPARAM(point)});
+                        POINT{GET_X_LPARAM(point), GET_Y_LPARAM(point)}, keyboard);
                 }
             } else if (!s->nativeSelectionImportPending) ReconcileFailedNativeSelection(*s);
         }
@@ -26831,6 +26659,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_RBUTTONUP:
+        // Let Windows generate its context-menu request, just as for the
+        // native control. Mouse and keyboard requests meet in one handler.
+        break;
+    case WM_CONTEXTMENU:
         if (s && s->rowTransitionActive) {
             StopRowTransition(*s);
             Redraw(*s);
@@ -26838,59 +26670,27 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) DiscardCompletedMouseClick(*s);
         if (s && s->optimisticStartedAt) return 0;
         if (s && s->visible && !s->emptyNative) {
-            const int x = GET_X_LPARAM(lParam);
-            const int y = GET_Y_LPARAM(lParam);
-            // Right-clicking either scrollbar uses the same native Shell
-            // folder-background menu as empty space. This keeps edgeMargin=0
-            // usable without modifying left-button thumb/track interaction.
-            if (OnScrollbar(*s, x, y) || OnHorizontalBar(*s, x, y)) {
-                POINT point{x, y};
-                MapUiPoint(hwnd, nullptr, point);
-                ClearSelectionForFolderMenu(*s);
-                BackgroundContextMenu(*s, point);
+            const bool keyboard = lParam == -1;
+            if (keyboard) {
+                if (s->selected >= 0 && s->selected < s->total)
+                    ContextMenu(*s, s->selected, POINT{}, true);
+                else BackgroundContextMenu(*s, POINT{}, true);
                 return 0;
             }
-            // Margins are background targets even when square highlights are
-            // visibly painted beneath the pointer.
-            if (!InsideListX(*s, x)) {
-                POINT point{x, y};
-                MapUiPoint(hwnd, nullptr, point);
+            const POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            POINT client = screen;
+            if (!MapUiPoint(nullptr, hwnd, client)) return 0;
+            const int x = client.x, y = client.y;
+            const bool background = OnScrollbar(*s, x, y) || OnHorizontalBar(*s, x, y) ||
+                !InsideListX(*s, x);
+            const int row = background ? -1 : RowFromPoint(*s, y, x);
+            if (!background && s->columnsView && y < ColumnHeaderHeight(*s))
+                ExplorerColumnMenu(*s, screen);
+            else if (row >= 0) ContextMenu(*s, row, screen);
+            else if (background || y >= s->headerPx) {
                 ClearSelectionForFolderMenu(*s);
-                BackgroundContextMenu(*s, point);
-                return 0;
+                BackgroundContextMenu(*s, screen);
             }
-            const int index = RowFromPoint(*s, y, x);
-            POINT point{x, y};
-            MapUiPoint(hwnd, nullptr, point);
-            if (y < ColumnHeaderHeight(*s) && s->columnsView && InsideListX(*s, x)) {
-                ExplorerColumnMenu(*s, point);
-            } else if (InsideListX(*s, x) && index >= 0) {
-                ContextMenu(*s, index, point);
-            } else if (!InsideListX(*s, x) ||
-                       GET_Y_LPARAM(lParam) >= s->headerPx) {
-                // The end strip is background even when aligned with headers.
-                ClearSelectionForFolderMenu(*s);
-                BackgroundContextMenu(*s, point);
-            }
-        }
-        return 0;
-    case WM_CONTEXTMENU:
-        if (s && s->rowTransitionActive) {
-            StopRowTransition(*s);
-            Redraw(*s);
-        }
-        if (s && s->optimisticStartedAt) return 0;
-        // Keyboard Context Menu key / Shift+F10, not a duplicate mouse popup.
-        if (s && s->visible && !s->emptyNative &&
-            lParam == -1) {
-            RECT rc{}; GetClientRect(hwnd, &rc);
-            POINT point{std::max(16L, (rc.right - rc.left) / 3),
-                        static_cast<LONG>(s->headerPx + std::max(12.f, s->rowPx / 2.f))};
-            if (s->rtlLayout) point.x = rc.right - point.x;
-            MapUiPoint(hwnd, nullptr, point);
-            if (s->selected >= 0 && s->selected < s->total)
-                ContextMenu(*s, s->selected, point);
-            else BackgroundContextMenu(*s, point);
             return 0;
         }
         break;
@@ -26944,11 +26744,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 RequestAnimatedColumnRefit(*s, s->columns);
                 return 0;
             }
-            if (wParam == VK_APPS || (shift && wParam == VK_F10)) {
-                SendMessageW(hwnd, WM_CONTEXTMENU,
-                    reinterpret_cast<WPARAM>(hwnd), static_cast<LPARAM>(-1));
-                return 0;
-            }
+            if (wParam == VK_APPS || (shift && wParam == VK_F10))
+                break; // Windows supplies the keyboard WM_CONTEXTMENU itself.
             if (IsKeyboardMovementKey(static_cast<UINT>(wParam), s->gridView)) {
                 NavigateKeyboardSelection(*s, static_cast<UINT>(wParam),
                     control, shift);
@@ -27527,6 +27324,14 @@ void CALLBACK ShellViewEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed
                              LONG objectId, LONG childId, DWORD, DWORD) {
     WindowCallbackGuard callback;
     if (g_unloading.load(std::memory_order_relaxed) || !changed) return;
+    if (objectId == OBJID_WINDOW && !childId &&
+        (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY)) {
+        const HWND frame = GetAncestor(changed, GA_ROOTOWNER);
+        if (IsExplorerFrame(frame)) for (HWND overlay : FrameOverlays(frame))
+            if (auto* state = State(overlay); state && state->viewEvents == sourceHook &&
+                (state->nativeContextMenuOpening || state->nativeContextMenuPending || state->nativeContextMenuFocus))
+                QueueInputFocusUpdate(overlay);
+    }
     if (event == EVENT_SYSTEM_FOREGROUND) {
         // Reusing an Explorer window often produces only a frame activation,
         // not an accessibility selection event from its hidden DirectUI list.
@@ -29751,7 +29556,21 @@ struct InputFrameCompletion {
         const HWND frame = GetAncestor(msg->hwnd,GA_ROOTOWNER);
         if (!IsExplorerFrame(frame)) return;
         owner = OverlayUnder(frame);
-        if (auto* state = State(owner)) { lifetime=state->lifetimeToken; token=state->token; }
+        if (auto* state = State(owner)) {
+            lifetime=state->lifetimeToken; token=state->token;
+            // A request with no displayed popup must not claim a later,
+            // unrelated flyout after the user starts another interaction.
+            const bool starts = message == WM_KEYDOWN || message == WM_SYSKEYDOWN ||
+                message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK ||
+                message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN ||
+                message == WM_XBUTTONDOWN || message == WM_POINTERDOWN ||
+                message == WM_NCLBUTTONDOWN || message == WM_NCRBUTTONDOWN;
+            if (starts && state->nativeContextMenuPending && !state->nativeFileCommandDepth &&
+                GetAncestor(msg->hwnd,GA_ROOT) == frame) {
+                state->nativeContextMenuPending = false;
+                state->nativeContextMenuFocus = state->nativeContextMenuPopup = nullptr;
+            }
+        }
     }
     ~InputFrameCompletion() {
         if (completed && owner) ResumeInputDeferredFrame(owner,lifetime,token,message);

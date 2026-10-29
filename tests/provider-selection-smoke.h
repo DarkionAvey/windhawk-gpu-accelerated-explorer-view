@@ -175,6 +175,7 @@ struct Browser {
 }
 
 static void TestProviderSelection(const std::wstring& fixture) {
+    ModifierFixture::Session modifiers;
     const auto root = std::filesystem::path(fixture) / L"provider-selection";
     std::filesystem::create_directory(root);
     const auto archive = root / L"private.zip";
@@ -232,15 +233,20 @@ static void TestProviderSelection(const std::wstring& fixture) {
         };
         const auto menu = [&](int row) {
             MenuFixture::Session tracking(state.hwnd);
-            ContextMenu(state, row, POINT{0, 0}); await();
-            if (MenuFixture::calls != 1 || MenuFixture::items <= 0 || state.nativeSelectionRecoveryPending)
+            RECT bounds{}; GetWindowRect(state.hwnd, &bounds);
+            const POINT point{bounds.left, bounds.bottom};
+            ContextMenu(state, row, point); await();
+            if (MenuFixture::calls != 1 || MenuFixture::target != state.nativeHwnd || state.nativeSelectionRecoveryPending)
                 std::cout << "PROVIDER MENU kind=" << (path == archive ? "archive" : provider ? "delegated" : "ordinary")
                     << " row=" << row << " selected=" << std::count(state.selectedFlags.begin(), state.selectedFlags.end(), 1)
                     << " mode=" << state.layoutNativeMode << " calls=" << MenuFixture::calls << " items=" << MenuFixture::items
                     << " unsafe=" << state.nativeSelectionUnsafe << " pending=" << state.pendingNativeSelection
                     << " recovery=" << state.nativeSelectionRecoveryPending << std::endl;
-            Check(MenuFixture::calls == 1 && MenuFixture::items > 0 && !state.nativeSelectionRecoveryPending,
-                "GPU context menu was blocked after the provider selection echo");
+            Check(MenuFixture::calls == 1 && MenuFixture::target == state.nativeHwnd &&
+                MenuFixture::source == reinterpret_cast<WPARAM>(state.nativeHwnd) &&
+                MenuFixture::menuPoint.x == point.x && MenuFixture::menuPoint.y == point.y &&
+                !state.nativeSelectionRecoveryPending,
+                "context-menu request did not reach the selected native view with its mouse position");
         };
         const auto external = [&](const std::vector<int>& rows) {
             Check(ClearNativeSelection(state), "provider external deselection");
@@ -268,11 +274,21 @@ static void TestProviderSelection(const std::wstring& fixture) {
             state.gridView = mode == FVM_ICON; state.columnsView = mode == FVM_DETAILS;
             state.layoutNativeMode = mode; UpdateMetrics(state);
             commit({0}); menu(0);
+            modifiers.keys[VK_SHIFT] = 0x80; menu(0); modifiers.keys[VK_SHIFT] = 0;
             for (int repeat = 0; repeat < 3; ++repeat) echo({0});
             if (provider) {
                 Check(CaptureNativeSelection(state, true) && state.pendingNativeSelection,
                     "provider context menu preparation fixture");
-                menu(0); verify({0});
+                MenuFixture::Session tracking(state.hwnd);
+                modifiers.keys[VK_SHIFT] = 0x80;
+                ContextMenu(state, 0, POINT{-123, 456});
+                Check(!MenuFixture::calls && state.pendingSelectionContextMenu,
+                    "pending native selection opened a stale menu");
+                modifiers.keys[VK_SHIFT] = 0; await();
+                Check(MenuFixture::calls == 1 && MenuFixture::target == state.nativeHwnd &&
+                    MenuFixture::menuPoint.x == -123 && MenuFixture::menuPoint.y == 456,
+                    "deferred native menu lost its selection/position or emulated a released modifier");
+                verify({0});
             }
             commit({unicode}); menu(unicode);
             commit({folder}); menu(folder);
@@ -283,6 +299,14 @@ static void TestProviderSelection(const std::wstring& fixture) {
             commit(bulk); menu(bulk.back());
             external(changed); menu(changed.back());
             external({});
+            for (bool shift : {false, true}) {
+                modifiers.keys[VK_SHIFT] = shift ? 0x80 : 0;
+                MenuFixture::Session tracking(state.hwnd);
+                BackgroundContextMenu(state, POINT{0, 0});
+                Check(MenuFixture::calls == 1 && MenuFixture::target == state.nativeHwnd,
+                    "folder background request bypassed the native window handler");
+            }
+            modifiers.keys[VK_SHIFT] = 0;
         }
         std::cout << "PROVIDER SELECTION kind=" << (path == archive ? "archive" : provider ? "delegated filesystem" : "ordinary filesystem")
             << " rows=" << state.total << " modes=Details/List/grid single/multiple/70-item external/echo/menu passed\n";

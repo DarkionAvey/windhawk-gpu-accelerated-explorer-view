@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.290
+
+- Preserve selection highlighting when successive native menus transfer focus
+  after the context-menu request returns.
+
+## 0.9.289
+
+- Keep selected items highlighted while Explorer's native context menu owns
+  focus, including the WinUI menu, without changing keyboard input ownership.
+
+## 0.9.288
+
+- Route mouse and keyboard context requests through Explorer's complete native
+  handler, preserving its menu presentation and Show more options behavior.
+- Retain the hidden native view's input geometry so right-clicks work for items
+  and folder backgrounds, including special namespaces.
+
+## 0.9.287
+
+- Open item and folder background menus through Explorer's native view, so
+  Windows chooses the modern menu and handles Show more options and commands.
+- Restore native Rename availability and retain Shift menu requests while
+  large selections are being prepared.
+
 ## 0.9.286
 
 - Keep two-finger Back/Forward swipes active through finger-spacing drift.
