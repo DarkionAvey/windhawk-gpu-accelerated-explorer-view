@@ -32,6 +32,20 @@ static void TestAppearanceRefinements(HWND frame, const std::wstring& fixture) {
         auto draw=[&](bool hot,bool pressed) { return render([&] { DrawScrollbar(state,bar,0xFFFFFF,hot,pressed); }); };
         auto& motion=state.scrollbarMotion[horizontal ? 1 : 0];
         auto elapsed=[&](double ms) { QueryPerformanceCounter(&motion.started); motion.started.QuadPart-=LONGLONG(state.qpcFrequency*ms/1000.); };
+        for(bool end:{false,true}) {
+            auto cap=bar;
+            cap.thumbStart=end ? (horizontal ? bar.right:bar.bottom)-bar.thumbLength :
+                (horizontal ? bar.left:bar.top);
+            const auto pixels=render([&] {DrawScrollbar(state,cap,0xFFFFFF,false,false);});
+            const auto at=[&](float along) {
+                const int x=int(horizontal ? along:(bar.left+bar.right)*.5f);
+                const int y=int(horizontal ? (bar.top+bar.bottom)*.5f:along);
+                return pixels[(size_t(y)*360+x)*4+3];
+            };
+            Check(at(cap.thumbStart+1)==0 && at(cap.thumbStart+cap.thumbLength-2)==0 &&
+                at(cap.thumbStart+cap.thumbLength*.5f)>0,
+                "scrollbar thumb caps lack transparent end padding");
+        }
         const auto rest=draw(false,false);
         Check(draw(true,false)==rest && motion.started.QuadPart && NeedsAnimationPaint(state),
             "scrollbar hover snapped instead of starting a frame-paced transition");

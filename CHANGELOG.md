@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.284
+
+- Keep scrollbar track presses captured so the same held press can drag the
+  thumb after scrolling to the pointer, on both axes.
+- Limit touch scrollbar menus to a stationary hold starting on the thumb,
+  using Windows gesture recognition to cancel menus during scrolling.
+
+## 0.9.283
+
+- Draw Back/Forward swipe bubbles and glyphs above both scrollbars.
+
+## 0.9.282
+
+- Match the horizontal thumb's end padding and rounded caps to its track.
+- Make scrollbar clearance scroll with the end of the list, letting items draw
+  behind the horizontal bar until the final rows scroll above its touch target.
+
+## 0.9.281
+
+- Reserve bottom space above the horizontal scrollbar's full touch hit area,
+  keeping the last item reachable while the bar is idle or enlarged.
+
+## 0.9.280
+
+- Pad the vertical scrollbar thumb's top and bottom to match its side inset,
+  aligning its rounded caps with the track without changing scrolling behavior.
+
 ## 0.9.279
 
 - Hide inline storage bars in This PC when there is not enough room for full

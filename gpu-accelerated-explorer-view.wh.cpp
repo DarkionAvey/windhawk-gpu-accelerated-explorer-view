@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.279
+// @version         0.9.284
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -460,6 +460,7 @@ constexpr wchar_t kDefaultFolderIconProbe[] = L"C:\\wh_icon_probe_folder";
 // One scrollbar geometry vocabulary for both the header viewport and bars.
 constexpr int kScrollbarInset96 = 3;
 constexpr int kScrollbarWidth96 = 12;
+constexpr int kScrollbarHitTolerance96 = 3;
 constexpr int kScrollbarContentGap96 = 5;
 constexpr int kHorizontalScrollbarHeight96 = 13;
 constexpr int kHeader96 = 38;
@@ -680,6 +681,7 @@ struct TouchInput {
     bool active = false, consumed = false, control = false, replaying = false;
     bool panningFeedback = false, holding = false, inertia = false, down = false;
     bool dragPending = false, dragPosted = false, dragPromoted = false, controlDouble = false;
+    bool scrollbarMenuEligible = false;
     unsigned long long epoch = 0;
     unsigned long long generation = 0;
     UINT32 primary = 0;
@@ -2858,6 +2860,7 @@ struct ViewState {
     PointingDevice pointingDevice = PointingDevice::Mouse;
     POINT passiveMousePosition{};
     std::optional<POINT> capturedPointer;
+    bool scrollbarTrackPending = false;
     bool verticalScrollbarHot = false;
     bool horizontalScrollbarHot = false;
     ScrollbarMotion scrollbarMotion[2]; // Vertical and horizontal, independently retargetable.
@@ -4308,6 +4311,7 @@ void StopTouch(ViewState& state, bool retainCommittedFeedback = false) {
     state.touch.consumed = true;
     if (control) {
         CancelColumnDrag(state);
+        state.scrollbarTrackPending = false;
         state.draggingScrollbar = state.draggingHorizontal = false;
         state.dragDivider = -1;
         if (GetCapture() == state.hwnd) ReleaseCapture();
@@ -4338,6 +4342,7 @@ void ResetMouseGestureForNavigation(ViewState& state,bool retainCommittedFeedbac
     state.marqueeFading = false;
     state.draggingScrollbar = false;
     state.draggingHorizontal = false;
+    state.scrollbarTrackPending = false;
     state.dragDivider = -1;
     if (GetCapture() == state.hwnd) ReleaseCapture();
     UnregisterAnimationWhenIdle(state);
@@ -10445,18 +10450,42 @@ float HorizontalHeight(const ViewState& state) {
         Scale96(kHorizontalScrollbarHeight96, dpi) * ColumnModeVisibility(state) : 0.f;
 }
 
+float ScrollbarBreadth(const ViewState& state, bool horizontal, bool touchTarget = false);
+float HorizontalScrollbarTop(const ViewState& state, bool touchTarget) {
+    RECT client{}; ViewClientRect(state, &client);
+    const float bottom = static_cast<float>(client.bottom - Scale96(kScrollbarInset96, ViewDpi(state)));
+    const float breadth = std::min(ScrollbarBreadth(state, true, touchTarget),
+        std::max(0.f, bottom - state.headerPx));
+    return bottom - breadth * ColumnModeVisibility(state);
+}
+
+float ScrollBottomPadding(const ViewState& state) {
+    const float height = HorizontalHeight(state);
+    if (!height) return 0.f;
+    RECT client{}; ViewClientRect(state, &client);
+    // Pad the scrollable extent by the full idle touch hit area and tolerance.
+    // Content still paints behind the bar until its trailing edge is reached.
+    // Keep it independent of engagement to protect the first touch after mouse input.
+    return std::max(height, static_cast<float>(client.bottom) - HorizontalScrollbarTop(state, true) +
+        Scale96(kScrollbarHitTolerance96, ViewDpi(state)));
+}
+
+float ScrollableHeight(const ViewState& state) {
+    const float height = DocumentHeight(state);
+    return height > 0.f ? height + ScrollBottomPadding(state) : 0.f;
+}
+
 int ViewHeight(ViewState& state) {
     RECT client{}; ViewClientRect(state, &client);
     return std::max(0, static_cast<int>(client.bottom - client.top -
-        (state.modeComposition.painting ? state.modeComposition.logicalHeader : state.headerPx) - HorizontalHeight(state)));
+        (state.modeComposition.painting ? state.modeComposition.logicalHeader : state.headerPx)));
 }
 RECT ContentViewport(ViewState& state, bool items = false) {
     RECT client{};
     ViewClientRect(state, &client);
     client.top = static_cast<LONG>(ceilf(state.headerPx));
     if (state.modeComposition.painting) client.bottom += static_cast<LONG>(state.modeComposition.header);
-    client.bottom = std::max(client.top,
-        client.bottom - static_cast<LONG>(ceilf(HorizontalHeight(state))));
+    client.bottom = std::max(client.top, client.bottom);
     if (items && !state.sections.empty()) {
         const int group = GroupAtDocument(state, state.scrollNow);
         if (group >= 0) {
@@ -10472,7 +10501,7 @@ int VisibleRows(ViewState& state) {
     return 2 + ViewHeight(state) / std::max(1.f, state.rowPx);
 }
 float MaxScrollPx(ViewState& state) {
-    const float destination = std::max(0.f, DocumentHeight(state) -
+    const float destination = std::max(0.f, ScrollableHeight(state) -
         static_cast<float>(ViewHeight(state)));
     // Destination packing changes immediately during grid zoom. Its shorter
     // extent must not clamp the still-moving old viewport on zoom-out.
@@ -11007,7 +11036,7 @@ bool HasVerticalScrollbar(ViewState& state) {
                margin + static_cast<float>(Scale96(kScrollbarWidth96, dpi)) &&
            static_cast<float>(rect.bottom - state.headerPx -
                HorizontalHeight(state)) > 2.f * margin &&
-           DocumentHeight(state) > static_cast<float>(ViewHeight(state));
+           ScrollableHeight(state) > static_cast<float>(ViewHeight(state));
 }
 
 float ListAvailableEndX(ViewState& state) {
@@ -14450,7 +14479,7 @@ float TouchScrollbarAmount(const ViewState& state, bool horizontal) {
     return state.touchScrollbarFrom[axis] + (state.touchScrollbarTo[axis] - state.touchScrollbarFrom[axis]) * p;
 }
 
-float ScrollbarBreadth(const ViewState& state, bool horizontal, bool touchTarget = false) {
+float ScrollbarBreadth(const ViewState& state, bool horizontal, bool touchTarget) {
     const int dpi = ViewDpi(state);
     const float normal = static_cast<float>(Scale96(kScrollbarWidth96, dpi));
     // Windows' recommended 40 epx touch target, honoring larger configured
@@ -14493,7 +14522,7 @@ ScrollbarGeometry Scrollbar(ViewState& state, bool touchTarget = false) {
         state.headerPx + margin,
         static_cast<float>(rect.bottom) - margin - (horizontal ? horizontal + TouchScrollbarAmount(state, true) *
             std::max(0.f, ScrollbarBreadth(state, true) + margin - horizontal) : 0.f),
-        DocumentHeight(state),
+        ScrollableHeight(state),
         static_cast<float>(ViewHeight(state)), state.scrollNow,
         std::max(static_cast<float>(Scale96(24, dpi)), barWidth));
 }
@@ -14529,11 +14558,9 @@ ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
     const float bottom = static_cast<float>(rect.bottom) - margin;
     const float extra = HasVerticalScrollbar(state) ?
         ScrollbarBreadth(state, false) - Scale96(kScrollbarWidth96, dpi) : 0.f;
-    const float breadth = std::min(ScrollbarBreadth(state, true, touchTarget),
-        std::max(0.f, bottom - state.headerPx));
     return MakeScrollbarGeometry(ScrollAxis::Horizontal,
         start + margin, std::max(start + margin, end - margin - extra),
-        bottom - breadth * ColumnModeVisibility(state), bottom,
+        HorizontalScrollbarTop(state, touchTarget), bottom,
         state.columnContentWidth, ListViewportWidth(state), state.horizontalScroll,
         std::max(static_cast<float>(Scale96(24, dpi)), ScrollbarBreadth(state, true, touchTarget)), 1.f);
 }
@@ -14547,10 +14574,14 @@ bool HitScrollbar(const ScrollbarGeometry& bar, float x, float y, float toleranc
         y >= bar.top && y <= bar.bottom;
 }
 
+bool HitScrollbarThumb(const ScrollbarGeometry& bar, float pointer) {
+    return bar.usable && pointer >= bar.thumbStart && pointer <= bar.thumbStart + bar.thumbLength;
+}
+
 bool OnHorizontalBar(ViewState& state, int x, int y) {
     return HitScrollbar(HorizontalBar(state, state.pointingDevice == PointingDevice::Touch),
         static_cast<float>(LogicalX(state, x)), static_cast<float>(y),
-        static_cast<float>(Scale96(3, ViewDpi(state))));
+        static_cast<float>(Scale96(kScrollbarHitTolerance96, ViewDpi(state))));
 }
 
 // Mouse position and the initially grabbed point are axis coordinates in
@@ -14565,7 +14596,7 @@ float ScrollFractionAt(const ScrollbarGeometry& bar, float pointer, float grab) 
 bool OnScrollbar(ViewState& state, int x, int y) {
     return HitScrollbar(Scrollbar(state, state.pointingDevice == PointingDevice::Touch),
         static_cast<float>(LogicalX(state, x)), static_cast<float>(y),
-        static_cast<float>(Scale96(3, ViewDpi(state))));
+        static_cast<float>(Scale96(kScrollbarHitTolerance96, ViewDpi(state))));
 }
 
 void UpdateTouchScrollbars(ViewState& state) {
@@ -14625,13 +14656,16 @@ void DrawScrollbar(ViewState& state, const ScrollbarGeometry& bar,
         Fill(state, bar.left, bar.top, bar.right, bar.bottom, color,
              .09f*hot + .08f*pressed, breadth * .5f);
     const float alpha = .44f + .34f*hot + .16f*pressed;
+    // Inset both ends with the sides so each thumb shares the track's cap
+    // centers at its limits. Scale the cap padding for very short tracks.
+    const float capInset = inset * std::min(1.f, bar.thumbLength / breadth);
     if (horizontal) {
-        Fill(state, bar.thumbStart, bar.top + inset,
-             bar.thumbStart + bar.thumbLength, bar.bottom - inset,
+        Fill(state, bar.thumbStart + capInset, bar.top + inset,
+             bar.thumbStart + bar.thumbLength - capInset, bar.bottom - inset,
              color, alpha, (breadth - 2.f * inset) * .5f);
     } else {
-        Fill(state, bar.left + inset, bar.thumbStart,
-             bar.right - inset, bar.thumbStart + bar.thumbLength,
+        Fill(state, bar.left + inset, bar.thumbStart + capInset,
+             bar.right - inset, bar.thumbStart + bar.thumbLength - capInset,
              color, alpha, (breadth - 2.f * inset) * .5f);
     }
 }
@@ -14756,8 +14790,11 @@ bool BeginScrollbarInteraction(ViewState& state, int x, int y) {
     const ScrollbarGeometry bar = horizontal ? HorizontalBar(state, touch) : Scrollbar(state, touch);
     const float pointer = horizontal ? static_cast<float>(LogicalX(state, x)) :
                                        static_cast<float>(y);
-    const bool thumb = pointer >= bar.thumbStart &&
-                       pointer <= bar.thumbStart + bar.thumbLength;
+    const bool thumb = HitScrollbarThumb(bar, pointer);
+    if (touch) state.touch.scrollbarMenuEligible = thumb;
+    state.scrollbarTrackPending = !thumb;
+    state.draggingHorizontal = horizontal;
+    state.draggingScrollbar = vertical;
     if (thumb) {
         // The hit target can already be enlarged while the drawn thumb is
         // still small. Anchor the grab to the drawn pose so DOWN cannot scroll
@@ -14768,22 +14805,21 @@ bool BeginScrollbarInteraction(ViewState& state, int x, int y) {
         const float grab = pointer - visual.thumbStart;
         if (horizontal) {
             state.horizontalAnimating = false;
-            state.draggingHorizontal = true;
             state.horizontalGrabOffset = grab;
             ScrubHorizontal(state, x);
         } else {
             StopScrollAnimation(state);
-            state.draggingScrollbar = true;
             state.scrollbarGrabY = grab;
             ScrubScrollbar(state, pointer);
         }
-        SetCapture(state.hwnd);
-        RegisterViewAnimation(state);
     } else {
+        state.capturedPointer = POINT{x, y};
         const float target = ScrollTrackTarget(bar, pointer);
         if (horizontal) AnimateHorizontalTrackTo(state, target);
         else MoveScroll(state, target);
     }
+    SetCapture(state.hwnd);
+    RegisterViewAnimation(state);
     state.horizontalScrollbarHot = horizontal;
     state.verticalScrollbarHot = vertical;
     Redraw(state);
@@ -15384,7 +15420,7 @@ bool PrepareFitComposition(ViewState& state, float w, float h) {
         FAILED(state.composition->CreateRectangleClip(&contentBounds)) ||
         FAILED(contentBounds->SetLeft(state.rtlLayout ? w-ListEndX(state) : ListStartX(state))) ||
         FAILED(contentBounds->SetRight(state.rtlLayout ? w-ListStartX(state) : ListEndX(state))) ||
-        FAILED(contentBounds->SetBottom(static_cast<float>(mode.size.cy)-HorizontalHeight(state))) ||
+        FAILED(contentBounds->SetBottom(static_cast<float>(mode.size.cy))) ||
         FAILED(items->SetClip(contentBounds.Get())) || FAILED(headings->SetClip(contentBounds.Get())) ||
         FAILED(AppendCompositionVisual(mode.root.Get(),items.Get()))) return false;
     const float start=ListStartX(state)-state.horizontalScroll;
@@ -16927,11 +16963,12 @@ void Paint(ViewState& state) {
         compositionFrame.Restore();
         state.target->SetTarget(state.modeComposition.chrome.bitmap.Get());
     }
-    DrawSwipeFeedback(state,w,compositionFrame.active ? compositionFrame.header:header,float(rect.bottom));
     DrawScrollbar(state, compositionFrame.active ? Scrollbar(state) : bar, nameColor,
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
     DrawScrollbar(state, HorizontalBar(state), nameColor,
         state.horizontalScrollbarHot || state.draggingHorizontal, state.draggingHorizontal);
+    // Navigation feedback is the foreground of the shared chrome plane.
+    DrawSwipeFeedback(state,w,compositionFrame.active ? compositionFrame.header:header,float(rect.bottom));
     if (compositionFrame.active) {
         compositionFrame.Canonical();
         state.target->SetTarget(frameTarget);
@@ -17237,7 +17274,7 @@ void AdvanceStandbyGraphics(ViewState& state) {
 float RevealScrollTarget(ViewState& state, int index, float desired) {
     if (!DisplayedRow(state, index)) return desired;
     const float top = DocumentRowTop(state, index);
-    const float viewport = ViewHeight(state);
+    const float viewport = std::max(0.f, ViewHeight(state) - ScrollBottomPadding(state));
     const float heading = state.sections.empty() ? 0.f :
         std::min(GroupHeadingHeight(state), std::max(0.f, viewport-1.f));
     // If a cell exceeds the viewport, keep its leading edge visible.
@@ -21053,6 +21090,7 @@ void SetActive(HWND hwnd, bool on) {
         KillTimer(hwnd, kTimerId);
         if (GetCapture() == hwnd) ReleaseCapture();
         s->draggingScrollbar = false;
+        s->scrollbarTrackPending = false;
         s->dragDivider = -1;
         s->marqueePossible = false;
         s->marqueeActive = false;
@@ -23227,6 +23265,7 @@ bool UpdateCapturedPointer(ViewState& state, std::optional<POINT> delivered = {}
         if ((touch || GetCursorPos(&current)) && MapUiPoint(nullptr, state.hwnd, current)) point = current;
         else if (frameTick) return true;
     }
+    const POINT previous = state.capturedPointer.value_or(point);
     const bool changed = !state.capturedPointer ||
         point.x != state.capturedPointer->x || point.y != state.capturedPointer->y;
     PipelineEvent(*state.background,{.operation=L"pointer.sample[x,y,changed,capture]",
@@ -23235,6 +23274,31 @@ bool UpdateCapturedPointer(ViewState& state, std::optional<POINT> delivered = {}
     if (changed) {
         state.capturedPointer = point;
         state.lastInteractionTick = GetTickCount64();
+    }
+    if (state.scrollbarTrackPending) {
+        if (!changed) return true;
+        const bool horizontal = state.draggingHorizontal;
+        const auto bar = horizontal ? HorizontalBar(state) : Scrollbar(state);
+        const float pointer = float(horizontal ? LogicalX(state, point.x) : point.y);
+        const bool animating = horizontal ? state.horizontalAnimating : state.animationActive;
+        if (animating && !HitScrollbarThumb(bar, pointer)) {
+            const auto targetBar = horizontal ? HorizontalBar(state, touch) : Scrollbar(state, touch);
+            const float target = ScrollTrackTarget(targetBar, pointer);
+            if (horizontal) AnimateHorizontalTrackTo(state, target);
+            else MoveScroll(state, target);
+            return true;
+        }
+        state.scrollbarTrackPending = false;
+        state.scrollbarGrabLength[horizontal ? 1 : 0] = bar.thumbLength;
+        const float anchor = animating ? pointer : float(horizontal ? LogicalX(state, previous.x) : previous.y);
+        const float grab = std::clamp(anchor - bar.thumbStart, 0.f, bar.thumbLength);
+        if (horizontal) {
+            state.horizontalAnimating = false;
+            state.horizontalGrabOffset = grab;
+        } else {
+            StopScrollAnimation(state);
+            state.scrollbarGrabY = grab;
+        }
     }
     if (state.marqueePossible) {
         if (!state.marqueeActive &&
@@ -24242,6 +24306,10 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                 double(event.currentContactCount),event.interactionId == INTERACTION_ID_MANIPULATION ?
                     event.arguments.manipulation.delta.scale : 1.}});
         if (event.interactionId == INTERACTION_ID_HOLD) {
+            if (canceled && state.touch.scrollbarAxis >= 0) {
+                state.touch.holding = false;
+                state.touch.scrollbarMenuEligible = false;
+            }
             if ((event.interactionFlags & INTERACTION_FLAG_BEGIN) && state.touch.down && session->contacts.size() == 1) {
                 state.touch.holding = true;
                 KillTimer(hwnd, kTouchHoldTimerId);
@@ -24287,6 +24355,9 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_SECONDARY_TAP && !canceled && TouchItemValid(state)) {
+            if ((state.touch.scrollbarAxis >= 0 || OnScrollbar(state, point.x, point.y) ||
+                 OnHorizontalBar(state, point.x, point.y)) &&
+                (!state.touch.scrollbarMenuEligible || !state.touch.holding)) continue;
             state.touch.consumed = true;
             if (state.touch.control) {
                 ReplayTouchMouse(state, WM_CAPTURECHANGED, {});
@@ -24297,7 +24368,13 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId != INTERACTION_ID_MANIPULATION) continue;
-        if (state.touch.control) continue;
+        if (state.touch.control) {
+            if (state.touch.scrollbarAxis >= 0) {
+                state.touch.scrollbarMenuEligible = state.touch.holding = false;
+                KillTimer(hwnd, kTouchHoldTimerId);
+            }
+            continue;
+        }
         if (canceled) { StopTouch(state); return; }
         state.touch.consumed = true;
         KillTimer(hwnd, kTouchHoldTimerId);
@@ -24639,6 +24716,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             state.touch.doubleDivider = -1;
             state.touch.row = -1; state.touch.item.clear();
             CancelColumnDrag(state);
+            state.scrollbarTrackPending = false;
             state.draggingScrollbar = state.draggingHorizontal = false;
             state.dragDivider = -1;
             if (GetCapture() == hwnd) {
@@ -24670,6 +24748,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
         } else if (contactCount != 2) state.touch.pairTracked = false;
         if (session->contacts.size() > 1) {
             state.touch.holding = state.touch.dragPending = false;
+            state.touch.scrollbarMenuEligible = false;
             KillTimer(hwnd,kTouchHoldTimerId);
         }
         if (state.touch.control) {
@@ -26489,12 +26568,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             MaybeFinishColumnFit(*s); // Apply a deferred metadata fit after release.
             return 0;
         } else if (s && s->draggingHorizontal) {
-            ScrubHorizontal(*s, GET_X_LPARAM(lParam));
+            if (!s->scrollbarTrackPending) ScrubHorizontal(*s, GET_X_LPARAM(lParam));
+            s->scrollbarTrackPending = false;
             s->draggingHorizontal = false;
             ReleasePointerCapture(*s, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
             Redraw(*s);
         } else if (s && s->draggingScrollbar) {
-            ScrubScrollbar(*s, static_cast<float>(GET_Y_LPARAM(lParam)));
+            if (!s->scrollbarTrackPending) ScrubScrollbar(*s, static_cast<float>(GET_Y_LPARAM(lParam)));
+            s->scrollbarTrackPending = false;
             s->draggingScrollbar = false;
             ReleasePointerCapture(*s, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
             RequestVisibleIcons(*s);
@@ -26527,6 +26608,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_CAPTURECHANGED:
         if (s) {
             s->capturedPointer.reset();
+            s->scrollbarTrackPending = false;
             // A stolen capture cancels provisional GPU-only marquee changes.
             // Restore the already-committed selection, not the marquee's
             // zeroed baseline (which differs after a row press).

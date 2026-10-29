@@ -60,7 +60,10 @@ pinch anchoring across layouts/DPIs/RTL, contact replacement/rotation rejection,
 vertical marquee in fitting directories, release-velocity flings, coalesced frames, capture
 loss, divider fitting, animated scrollbar targets, persistent input ownership
 and Explorer click/underline preferences. Scrollbar eligibility stays with the
-original DOWN hit, including header/body entry, two-finger swipes, a remaining
+original thumb hit for hold menus; native hold cancellation and manipulation
+revoke it. Track presses retain capture through animation and continue as thumb
+drags with the same contact, including release outside the track. Scrollbar
+ownership stays with the original DOWN hit, including header/body entry, two-finger swipes, a remaining
 contact, and simultaneous/staggered starts on the bars. Offscreen text checks also compare
 underlined/plain mask variants with DirectWrite. Desktop feedback, modal
 dragging, clipboard and focus are
@@ -83,7 +86,11 @@ loss. Gradual pinch checks require identical row/icon/text pixels at recognition
 and fractional scaling only after further movement; list/grid and RTL are covered.
 Scrollbar checks cover independent growth/reversal, large idle hit targets,
 track leave, captured drags outside the track, capture loss and exact return to
-idle pixels through the presentation model at 96/192 DPI in LTR/RTL.
+idle pixels through the presentation model at 96/192 DPI in LTR/RTL. Last-row
+taps also cover grouped and ungrouped lists, actual overflowing/fitting window
+resizes, keyboard reveal and matching owner/renderer scroll extents. GPU readback
+requires items to paint behind the horizontal bar before trailing padding scrolls
+into view. Both scrollbar axes also check transparent thumb padding at each end.
 
 Navigation panel checks keep both real-recognizer contacts inside 240-pixel-wide,
 1,000-pixel-tall private windows at 96/192 DPI in LTR/RTL. They verify the one-third

@@ -48,8 +48,9 @@ static void TestScrollbarPressRouting() {
         const auto track=pointAt(bar,(horizontal ? bar.left : bar.top)+bar.thumbLength*.5f+bar.travel*.55f);
         send(WM_LBUTTONDOWN,track);
         Check((horizontal ? state.horizontalTarget : state.scrollTarget)>0 &&
-            !state.draggingScrollbar && !state.draggingHorizontal,
-            "track press was swallowed or became a row/thumbnail drag");
+            state.scrollbarTrackPending && GetCapture()==state.hwnd &&
+            (horizontal ? state.draggingHorizontal : state.draggingScrollbar),
+            "track press did not retain capture for the approaching thumb");
         send(WM_LBUTTONUP,track);
         // Settle the production animation: the thumb now lies beneath the
         // first click, so Windows may deliver the next press as DBLCLK.
@@ -87,6 +88,17 @@ static void TestScrollbarPressRouting() {
         send(WM_LBUTTONDBLCLK,track);
         Check((horizontal ? state.horizontalTarget : state.scrollTarget)>0 &&
             !state.marqueePossible,"track double-click was swallowed or reached the list");
+        state.smoothStartedQpc.QuadPart-=LONGLONG(state.qpcFrequency);
+        state.horizontalStartedQpc.QuadPart-=LONGLONG(state.qpcFrequency);
+        AdvanceScroll(state); AdvanceHorizontalTrack(state); UpdateCapturedPointer(state);
+        Check(GetCapture()==state.hwnd && (horizontal ? state.draggingHorizontal:state.draggingScrollbar),
+            "held track press did not become a captured thumb after scrolling");
+        const float reached=horizontal ? state.horizontalScroll : state.scrollNow;
+        auto continued=track;
+        if(horizontal) continued.x+=rtl ? -30:30; else continued.y+=30;
+        PointerFixture::At(state.hwnd,continued); UpdateCapturedPointer(state);
+        Check(!state.scrollbarTrackPending && (horizontal ? state.horizontalTarget : state.scrollTarget)>reached,
+            "same held track press did not continue dragging through pointer sampling");
         send(WM_LBUTTONUP,track);
         ++trials;
     }
@@ -171,8 +183,9 @@ static void TestScrollbarItemSteps(ViewState& state) {
     // take the existing smooth path, even with instant item scrubbing enabled.
     const auto bar=Scrollbar(state);
     Check(BeginScrollbarInteraction(state,int((bar.left+bar.right)*.5f),int(bar.top+bar.travel*.7f)) &&
-        !state.draggingScrollbar && state.animationActive && state.scrollNow<state.scrollTarget,
+        state.scrollbarTrackPending && GetCapture()==state.hwnd && state.animationActive && state.scrollNow<state.scrollTarget,
         "instant item scrubbing changed vertical track-click animation");
+    ReleaseCapture();
     SetScrollImmediate(state,0);
     BYTE saved[256]{},plain[256]{}; GetKeyboardState(saved); SetKeyboardState(plain);
     OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA)),0);

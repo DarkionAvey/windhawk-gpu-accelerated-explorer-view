@@ -411,11 +411,22 @@ void ScrollbarInteractions(Device& input,const std::wstring& fixture) {
             point={LogicalX(view,LONG(horizontal ? track.right-2:(track.left+track.right)*.5f)),
                 LONG(horizontal ? (track.top+track.bottom)*.5f:track.bottom-2)};
             input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
-            Check(!view.draggingHorizontal && !view.draggingScrollbar && view.touchScrollbarTo[horizontal ? 1:0]==1.f,
-                "touch track press did not enlarge its scrollbar");
+            Check(view.scrollbarTrackPending && GetCapture()==view.hwnd &&
+                view.touchScrollbarTo[horizontal ? 1:0]==1.f,
+                "touch track press did not capture and enlarge its scrollbar");
+            advance(1.1); UpdateCapturedPointer(view);
+            Check(GetCapture()==view.hwnd && (horizontal ? view.draggingHorizontal:view.draggingScrollbar),
+                "settled touch track press did not activate its thumb");
+            const float reached=horizontal ? view.horizontalScroll:view.scrollNow;
+            POINT dragged=point;
+            if(horizontal) dragged.x=LogicalX(view,LogicalX(view,point.x)-LONG(track.travel*.25f));
+            else dragged.y-=LONG(track.travel*.25f);
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,dragged,move)});
+            Check(!view.scrollbarTrackPending && (horizontal ? view.horizontalTarget:view.scrollTarget)<reached,
+                "same touch could not drag the thumb after track scrolling");
             input.Next(); input.Send(view,{input.Packet(view,input.primary,body,move)});
-            Check(view.touch.down && view.touchScrollbarTo[0]==0.f && view.touchScrollbarTo[1]==0.f,
-                "uncaptured contact leaving the track retained enlargement");
+            Check(view.touch.down && GetCapture()==view.hwnd && view.touchScrollbarTo[horizontal ? 1:0]==1.f,
+                "captured track-to-thumb contact lost engagement outside the track");
             input.Next(); input.Send(view,{input.Packet(view,input.primary,body,up)});
             SetTouchInputMode(view,false); UpdatePointerHover(view,point,false);
             Check(view.touchScrollbarTo[0]==0.f && view.touchScrollbarTo[1]==0.f,"mouse hover applied touch enlargement");
@@ -423,6 +434,81 @@ void ScrollbarInteractions(Device& input,const std::wstring& fixture) {
         StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
     }
 }
+void HorizontalBottomClearance(Device& input,const std::wstring& fixture) {
+    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(bool grouped:{false,true}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"touch last row clearance",64,rtl,false,grouped);
+        auto& view=tab.state;
+        view.columns[0].width=1400; UpdateColumns(view);
+        Check(HorizontalBar(view).usable,"settled bottom-clearance fixture overflow");
+        SelectionUiFixture::Setup(tab,fixture); Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        // Both an overflowing list and one that fits before reserving the bar
+        // must be able to scroll its final row clear of the entire touch target.
+        for(int height:{480,int(std::ceil(view.headerPx+DocumentHeight(view)))}) {
+            Check(SetWindowPos(view.hwnd,nullptr,0,0,800,height,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),
+                "last-row fixture resize");
+            UpdateColumns(view); Reset(view,input); SetTouchInputMode(view,false);
+            Check(HorizontalBar(view,true).usable,"last-row horizontal overflow");
+            SetScrollImmediate(view,MaxScrollPx(view));
+            RECT client{}; ViewClientRect(view,&client);
+            const int last=view.total-1;
+            const float bottom=view.headerPx+DocumentRowTop(view,last)+DisplayRowHeight(view,last)-view.scrollNow;
+            const auto bar=HorizontalBar(view,true);
+            Check(bottom<=bar.top-Scale96(3,dpi),
+                "final item overlaps the horizontal scrollbar touch hit area");
+            Check(ContentViewport(view).bottom==client.bottom &&
+                ViewHeight(view)==int(client.bottom-view.headerPx),
+                "bottom padding clipped the list instead of extending its scrollable content");
+            Check(std::abs(Scrollbar(view).scrollRange-MaxScrollPx(view))<.01f,
+                "vertical scrollbar did not include the trailing padding");
+            Check(view.headerPx+DocumentRowTop(view,last)+DisplayRowHeight(view,last)-
+                RevealScrollTarget(view,last,0.f)<=bar.top-Scale96(3,dpi),
+                "keyboard reveal cannot clear the last row above the touch target");
+            const POINT point{LogicalX(view,LONG(ListStartX(view)+Scale96(32,dpi))),LONG(std::floor(bottom))-1};
+            Check(RowFromPoint(view,point.y,point.x)==last,"last-row tap fixture point");
+            const int viewport=ViewHeight(view);
+            const float scroll=view.scrollNow;
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
+            Check(!view.touch.control && view.touch.row==last && !view.draggingHorizontal &&
+                ViewHeight(view)==viewport && view.scrollNow==scroll,
+                "first touch after mouse input steals the final row or changes its viewport");
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,up)});
+            Check(view.selected==last && !view.draggingHorizontal,"native tap did not select the final item");
+            WaitForPreparedSelection(view);
+            RenderedTouch frame; frame.Capture(view);
+            Check(ContentViewport(frame.renderer).bottom==ContentViewport(view).bottom &&
+                ViewHeight(frame.renderer)==ViewHeight(view),"presentation lost the touch-safe bottom clearance");
+            if(!grouped && height==480) {
+                // Move the selected final row into the bar's hit strip. Its
+                // real selection pixels must paint there before the end padding appears.
+                const float behind=std::max(0.f,view.headerPx+DocumentRowTop(view,last)+
+                    DisplayRowHeight(view,last)-client.bottom);
+                SetScrollImmediate(view,behind); SelectionUiFixture::Settle(view);
+                const auto highlight=CurrentSelectionRect(view,last,false);
+                const int logicalX=int(highlight.right-std::min((highlight.right-highlight.left)*.5f,
+                    float(Scale96(24,dpi))));
+                const int x=LogicalX(view,logicalX),y=int((highlight.top+highlight.bottom)*.5f);
+                Check(HitScrollbar(HorizontalBar(view,true),float(logicalX),float(y),float(Scale96(3,dpi))),
+                    "content pixel sample must lie behind the horizontal touch target");
+                const auto selected=frame.Capture(view);
+                Select(view,last-1); WaitForPreparedSelection(view);
+                SetScrollImmediate(view,behind); SelectionUiFixture::Settle(view);
+                const auto unselected=frame.Capture(view);
+                const size_t pixel=(size_t(y)*client.right+x)*4;
+                Check(memcmp(selected.data()+pixel,unselected.data()+pixel,4)!=0,
+                    "list item pixels were clipped out of the horizontal scrollbar strip");
+            }
+        }
+        view.columns[0].width=300; UpdateColumns(view);
+        RECT client{}; ViewClientRect(view,&client);
+        Check(!HorizontalBar(view,true).usable && ContentViewport(view).bottom==client.bottom,
+            "absent horizontal scrollbar retained bottom padding");
+        StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
+    }
+    std::cout<<"PASS: content paints behind horizontal bars and trailing padding clears final-row native taps; overflowing/fitting grouped lists, 96/192 DPI, LTR/RTL, reveal and owner/renderer scroll geometry\n";
+}
+
 void MultiFingerScrollbars(Device& input,const std::wstring& fixture) {
     const bool history=g_touchpadSwipeNavigation.exchange(true);
     for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) {
@@ -506,7 +592,7 @@ public:
     ULONG STDMETHODCALLTYPE Release() override {auto n=--refs; if(!n) delete this; return n;}
     HRESULT STDMETHODCALLTYPE GetWindow(HWND* out) override {*out=hwnd; return S_OK;}
     HRESULT STDMETHODCALLTYPE GetItemObject(UINT scope,REFIID iid,void** out) override {
-        if(scope!=SVGIO_SELECTION) return E_NOTIMPL;
+        if(scope!=SVGIO_SELECTION && scope!=SVGIO_BACKGROUND) return E_NOTIMPL;
         if(iid==IID_IDataObject) {
             std::vector<PCUITEMID_CHILD> children;
             for(const auto& child:selection->selected) children.push_back(child.get());
@@ -528,6 +614,67 @@ public:
     TOUCH_UNUSED(SelectItem,PCUITEMID_CHILD,SVSIF)
 #undef TOUCH_UNUSED
 };
+void ScrollbarMenus(Device& input,const std::wstring& fixture) {
+    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(bool horizontal:{false,true}) {
+        StyleFixture::Session metrics; StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"touch scrollbar menus",64,rtl);
+        auto& view=tab.state;
+        view.columns[0].width=1400; UpdateColumns(view);
+        Check(HorizontalBar(view).usable,"settled touch menu fixture overflow");
+        auto* native=SelectionUiFixture::Setup(tab,fixture); Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        MenuFixture::Session menus(view.hwnd);
+        ComPtr<ShellView> shell; shell.Attach(new ShellView); shell->hwnd=view.nativeHwnd;
+        Check(SUCCEEDED(view.folder->CreateViewObject(view.nativeHwnd,IID_PPV_ARGS(&shell->menu))),
+            "private directory native background menu");
+        shell->selection=native; shell->parent=view.directoryFolderIdentity; native->commandView=shell;
+        auto* browser=new TimingShellBrowser; browser->view=shell; view.shellBrowser.Attach(browser);
+        for(int gesture:{0,1,2,3}) {
+            Reset(view,input,true); SetScrollImmediate(view,0); SetHorizontalScroll(view,0);
+            const auto bar=horizontal ? HorizontalBar(view,true):Scrollbar(view,true);
+            Check(bar.usable,"touch menu fixture lost its scrollbar");
+            const float along=gesture==1 ? (horizontal ? bar.right:bar.bottom)-bar.thumbLength*.25f :
+                bar.thumbStart+bar.thumbLength*.5f;
+            POINT point{LogicalX(view,LONG(horizontal ? along:(bar.left+bar.right)*.5f)),
+                LONG(horizontal ? (bar.top+bar.bottom)*.5f:along)};
+            const unsigned before=MenuFixture::calls;
+            const size_t recognizedBefore=TouchFixture::recognized.size();
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
+            if(view.touch.scrollbarMenuEligible!=(gesture!=1))
+                std::cerr<<"SCROLLBAR DOWN dpi="<<dpi<<" rtl="<<rtl<<" horizontal="<<horizontal
+                    <<" gesture="<<gesture<<" axis="<<view.touch.scrollbarAxis<<" control="<<view.touch.control
+                    <<" point="<<point.x<<","<<point.y<<" thumb="<<bar.thumbStart<<","<<bar.thumbLength
+                    <<" eligible="<<view.touch.scrollbarMenuEligible<<" contacts="<<view.touch.contacts<<std::endl;
+            Check(view.touch.scrollbarMenuEligible==(gesture!=1),"touch menu eligibility ignored the original thumb hit");
+            if(gesture!=2) Held(view);
+            Check(MenuFixture::calls==before,"touch scrollbar menu opened before release could cancel the hold");
+            if(gesture>=2) {
+                if(horizontal) point.x=LogicalX(view,LogicalX(view,point.x)+LONG(bar.travel*.5f));
+                else point.y+=LONG(bar.travel*.5f);
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,point,move)});
+                Check((horizontal ? view.horizontalTarget:view.scrollTarget)>0 && !view.touch.scrollbarMenuEligible,
+                    "native touch movement failed to scroll immediately or retained hold-menu eligibility");
+            }
+            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,up)});
+            if(MenuFixture::calls!=before+(gesture==0 ? 1u:0u) || GetCapture()==view.hwnd ||
+                view.draggingScrollbar || view.draggingHorizontal) {
+                std::cerr<<"SCROLLBAR MENU dpi="<<dpi<<" rtl="<<rtl<<" horizontal="<<horizontal
+                    <<" gesture="<<gesture<<" menus="<<MenuFixture::calls-before<<" holding="<<view.touch.holding
+                    <<" eligible="<<view.touch.scrollbarMenuEligible<<" capture="<<(GetCapture()==view.hwnd)
+                    <<" dragging="<<view.draggingScrollbar<<","<<view.draggingHorizontal<<std::endl;
+                for(size_t index=recognizedBefore;index<TouchFixture::recognized.size();++index) {
+                    const auto& event=TouchFixture::recognized[index];
+                    std::cerr<<"NINPUT id="<<event.interactionId<<" flags="<<event.interactionFlags<<std::endl;
+                }
+            }
+            Check(MenuFixture::calls==before+(gesture==0 ? 1u:0u) && GetCapture()!=view.hwnd &&
+                !view.draggingScrollbar && !view.draggingHorizontal,
+                "touch scrollbar menu overlapped a track press/drag or lost the stationary thumb hold");
+        }
+        StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
+    }
+    std::cout<<"PASS: native folder menus only after stationary thumb holds; track holds, immediate drags and hold-to-drag releases stay menu-free on both axes at 96/192 DPI in LTR/RTL\n";
+}
 }
 
 static void TestFlingTrajectories(TouchInputTest::Device& input) {
@@ -1205,6 +1352,8 @@ static void TestTouchInput(const std::wstring& fixture) {
     StopTouch(state);
 
     ScrollbarInteractions(input,fixture);
+    ScrollbarMenus(input,fixture);
+    HorizontalBottomClearance(input,fixture);
     MultiFingerScrollbars(input,fixture);
 
     // Native double-tap recognition must preserve the existing completed
