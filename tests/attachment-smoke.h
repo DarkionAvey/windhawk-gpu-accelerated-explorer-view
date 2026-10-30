@@ -37,6 +37,22 @@ public:
     HRESULT STDMETHODCALLTYPE SetSortColumns(const SORTCOLUMN* columns,int count) override {
         return sortRequest ? sortRequest(columns,count) : E_NOTIMPL;
     }
+    // This fixture substitutes attachment/mode responses, but sort settings
+    // must come from Windows rather than a made-up default key/direction.
+    HRESULT NativeSortView(ComPtr<IFolderView2>& view) {
+        if (!folder) return E_NOTIMPL;
+        ComPtr<IShellView> shell;
+        const HRESULT hr=folder->CreateViewObject(nullptr,IID_PPV_ARGS(&shell));
+        return SUCCEEDED(hr) ? shell.As(&view) : hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetSortColumnCount(int* count) override {
+        ComPtr<IFolderView2> view; const HRESULT hr=NativeSortView(view);
+        return SUCCEEDED(hr) ? view->GetSortColumnCount(count) : hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetSortColumns(SORTCOLUMN* columns,int count) override {
+        ComPtr<IFolderView2> view; const HRESULT hr=NativeSortView(view);
+        return SUCCEEDED(hr) ? view->GetSortColumns(columns,count) : hr;
+    }
 #define UNAVAILABLE(name, ...) HRESULT STDMETHODCALLTYPE name(__VA_ARGS__) override { return E_NOTIMPL; }
     UNAVAILABLE(SetCurrentViewMode, UINT)
     UNAVAILABLE(Item, int, PITEMID_CHILD*)
@@ -57,8 +73,6 @@ public:
     UNAVAILABLE(SetText, FVTEXTTYPE, LPCWSTR)
     UNAVAILABLE(SetCurrentFolderFlags, DWORD, DWORD)
     UNAVAILABLE(GetCurrentFolderFlags, DWORD*)
-    UNAVAILABLE(GetSortColumnCount, int*)
-    UNAVAILABLE(GetSortColumns, SORTCOLUMN*, int)
     UNAVAILABLE(GetItem, int, REFIID, void**)
     UNAVAILABLE(GetVisibleItem, int, BOOL, int*)
     UNAVAILABLE(GetSelectedItem, int, int*)
@@ -178,11 +192,20 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     ComPtr<IFolderView2> view;
     view.Attach(response);
     ComPtr<IShellBrowser> browser;
+    // HWND-only replacements below model an unchanged provider binding.
+    // Reuse real Shell objects: reparsing can change volatile PIDL bytes even
+    // when Windows' canonical comparison says the folder is the same.
+    std::map<std::wstring,ComPtr<IShellFolder>> boundFolders;
     auto bindFolder = [&](const std::wstring& path) {
+        if (const auto found=boundFolders.find(path); found!=boundFolders.end()) {
+            response->folder=found->second;
+            return;
+        }
         ComPtr<IShellItem> item;
         Check(SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item))) &&
               SUCCEEDED(item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&response->folder))),
               "attachment filesystem Shell folder");
+        boundFolders.emplace(path,response->folder);
     };
     bindFolder(directory);
     AttachView(native, view, response->folder, browser, directory);
@@ -796,8 +819,9 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     userMode(FVM_ICON,192); FinishColumnTransition(*state); Paint(*state);
     Check(state->gridView && state->layoutIconSize==192,"user could not override a pinned folder mode");
     userMode(FVM_DETAILS); FinishColumnTransition(*state); Paint(*state);
-    // A first visit can publish names before Explorer supplies its folder
-    // preference. Show immediately, then keep that first displayed layout.
+    // With pre-sorting disabled, a first visit can publish names before
+    // Explorer supplies its folder preference and keep that displayed layout.
+    const bool savedPreSort=g_preSort.exchange(false);
     const auto cold=JoinPath(directory,L"mode-cold-child");
     const auto coldReady=JoinPath(directory,L"mode-cold-ready");
     std::filesystem::create_directory(cold); std::filesystem::create_directory(coldReady);
@@ -826,6 +850,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     userMode(FVM_ICON,256); FinishColumnTransition(*state); Paint(*state);
     Check(state->gridView && state->layoutIconSize==256,
         "cold pinned preview rejected an explicit request matching native mode");
+    g_preSort=savedPreSort;
     // Without an early preview, a valid incoming native mode is available
     // before the worker publishes names and must be chosen immediately.
     response->mode=FVM_LIST;

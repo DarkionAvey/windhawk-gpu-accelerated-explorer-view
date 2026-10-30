@@ -132,6 +132,7 @@ static void TestUserOptions() {
         {L"Navigation.showScrollbar",true,&g_scrollbar},
         {L"Navigation.instantScrollbarScrub",false,&g_instantScrub},
         {L"Columns.autoRefitColumns",true,&g_autoRefitColumns},
+        {L"Columns.preSort",true,&g_preSort},
         {L"enableLogging",false,&g_perf},
     };
     std::map<std::wstring,std::wstring> expected;
@@ -139,7 +140,7 @@ static void TestUserOptions() {
     for(const auto& option:booleans) expected[option.key]=option.initial ? L"true" : L"false";
     expected.insert({{L"Appearance.fontFamily",L""},{L"Appearance.textAntialiasing",L"system"},{L"Appearance.middleEllipsis",L"gridOnly"},
         {L"Selection.filenameOnlySelection",L"gridOnly"},{L"Selection.selectionColor",L"accent"},
-        {L"Columns.folderPlacement",L"foldersBottom"}});
+        {L"Columns.folderPlacement",L"explorerDefault"}});
     std::map<std::wstring,std::wstring> schema;
     std::wifstream source{std::filesystem::path(GPU_OVERLAY_SOURCE)};
     Check(source.is_open(),"selected settings source unavailable");
@@ -191,7 +192,7 @@ static void TestUserOptions() {
     for(const auto& option:booleans) Check(option.setting->load()==option.initial,"boolean default binding");
     for(auto* setting:diagnostics) Check(!setting->load(),"unified logging default left a diagnostic enabled");
     Check(ConfiguredFontFamily().empty() && g_dynamicAccent && g_middleEllipsis==ViewOption::GridOnly &&
-        g_filenameOnly==ViewOption::GridOnly && g_folderPlacement==FolderPlacement::AlwaysBottom,"string default binding");
+        g_filenameOnly==ViewOption::GridOnly && g_folderPlacement==FolderPlacement::ExplorerDefault,"string default binding");
     const auto set=[&](const wchar_t* key,const std::wstring& value) {values[key]=value; LoadSettings();};
     for(const auto& [value,mode]:std::initializer_list<std::pair<const wchar_t*,TextAntialiasing>>{
         {L"system",TextAntialiasing::System},{L"smooth",TextAntialiasing::Smooth},

@@ -2,6 +2,14 @@
 
 ## 0.9.303
 
+- Use Explorer's folder sort order by default, with an option to keep early
+  unsorted loading. Synchronize sorting, including secondary keys, on folder
+  returns and view switches. New installations use Explorer's folder placement.
+- Complete name, date, size and extension sorts on the names worker, without
+  waiting for older property providers or showing an unsorted first batch.
+- Reuse preprocessing fingerprints instead of calculating them twice. Add
+  repeatable large-directory correctness and preprocessing benchmarks.
+
 - Ignore stationary mouse hover during keyboard/controller selection, including
   single-click point-to-select. Hover resumes when the pointer moves or receives
   a mouse action. The first Up/Down key still starts from the hovered item,

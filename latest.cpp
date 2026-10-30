@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.302
+// @version         0.9.303
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -36,7 +36,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Touchscreen Input** — Swipe vertically to scroll with any finger count. When the directory fits vertically, one-finger swipes select by marquee. Move horizontally with one finger for marquee selection, or two fingers to scroll columns. With swipe navigation enabled, movement beyond either column edge starts Back or Forward. Pinch to resize, tap to select, and double-tap to open. Hold and release for the Shell menu, or hold and move to drag files. Scrollbars stay small when idle, retain large touch hit areas, and grow smoothly while engaged.
 - **Explorer Click Preferences** — Honors Windows' double-click speed and File Explorer's single-click activation, point-to-select, and icon-title underline settings.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
-- **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
+- **Folder Sorting** — Uses Explorer's saved sort order when opening folders. Disable **Use Explorer sorting when opening folders** under **Columns and sorting** to show unsorted items sooner. Sorting changes stay synchronized between views.
 
 ## Report bugs
 Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
@@ -145,9 +145,12 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $description: On = jump by whole items; off = smooth scrolling while dragging the vertical thumb.
   $name: Scrolling and navigation
 - Columns:
-    - folderPlacement: foldersBottom
+    - preSort: true
+      $name: Use Explorer sorting when opening folders
+      $description: Show items in Explorer's saved sort order. Disable to show unsorted items sooner until you choose a sort. Sort changes stay synchronized with Explorer.
+    - folderPlacement: explorerDefault
       $name: Folder order when sorting
-      $description: Only applies after you sort a column. Unsorted folders keep their original order.
+      $description: Applies to saved and manually chosen sorts. Unsorted folders keep their original order.
       $options:
         - explorerDefault: Explorer default behavior
         - foldersTop: Folders first
@@ -514,6 +517,7 @@ std::atomic<int> g_row96{32};
 std::atomic<int> g_fontPercent{52}; // List/Details; keep the existing settings key.
 std::atomic<int> g_gridFontPercent{42};
 std::atomic<bool> g_autoRefitColumns{true};
+std::atomic<bool> g_preSort{true};
 // The settings callback may run on a different thread from Explorer's view.
 // Text formats take a snapshot only when they are created, never per frame.
 SRWLOCK g_fontFamilyLock = SRWLOCK_INIT;
@@ -575,17 +579,15 @@ HMODULE g_uiaModule = nullptr;
 ComPtr<IDWriteFactory> g_writeFactory;
 std::atomic<int> g_instances{0};
 
-// New GPU folders start in filesystem enumeration order, without a chevron.
-// A column-header click explicitly opts that folder into sorting and commits
-// its chosen key/direction to Explorer. This immutable policy goes to the background
-// worker and cache; Shell's late per-folder sort initialization cannot cause
-// a second, unexpected resort of a newly opened folder.
+// The native view supplies each folder's sort. Opting out of pre-sorting keeps
+// enumeration order until a deliberate sort choice; both policies use the same
+// immutable worker/cache descriptor and native command synchronization.
 enum class SortKind { Name, Modified, Type, Size, Created, Accessed, Extension, ShellProperty };
 // Directory grouping is an overlay presentation preference, separate from
 // Explorer's native sort property/direction. Include it in immutable worker jobs
 // and cache identities so a settings change never reuses the wrong row order.
 enum class FolderPlacement { ExplorerDefault, AlwaysTop, AlwaysBottom, Mixed };
-std::atomic<FolderPlacement> g_folderPlacement{FolderPlacement::AlwaysBottom};
+std::atomic<FolderPlacement> g_folderPlacement{FolderPlacement::ExplorerDefault};
 struct ShellGroupSpec {
     PROPERTYKEY key{};
     BOOL ascending = TRUE;
@@ -597,6 +599,8 @@ struct SortSpec {
     SortKind kind = SortKind::Name;
     FolderPlacement placement = FolderPlacement::ExplorerDefault;
     bool explicitOrder = false; // False: preserve filesystem enumeration order.
+    bool userChosen = false; // Distinguish saved defaults from deliberate GPU/native sorting.
+    std::vector<SORTCOLUMN> secondary; // Explorer's additional tie-breaking keys.
 };
 bool SameProperty(const PROPERTYKEY& a, const PROPERTYKEY& b) {
     return a.pid == b.pid && IsEqualGUID(a.fmtid, b.fmtid);
@@ -611,7 +615,10 @@ bool SameSort(const SortSpec& a, const SortSpec& b) {
     // No sorting means no chosen key/direction or folder grouping to compare.
     if (!a.explicitOrder) return true;
     return SameProperty(a.key, b.key) && a.direction == b.direction &&
-           a.placement == b.placement;
+           a.placement == b.placement && a.secondary.size() == b.secondary.size() &&
+           std::equal(a.secondary.begin(),a.secondary.end(),b.secondary.begin(),[](const SORTCOLUMN& x,const SORTCOLUMN& y) {
+               return SameProperty(x.propkey,y.propkey) && x.direction==y.direction;
+           });
 }
 SortKind ClassifySort(const PROPERTYKEY& key) {
     if (SameProperty(key, PKEY_ItemNameDisplay) ||
@@ -750,12 +757,22 @@ using SharedPidl = std::shared_ptr<const ITEMIDLIST>;
 // opaque cache key for canonical selection lookup, including cached revisits.
 using NamespaceIdentities = std::unordered_map<std::wstring, SharedPidl>;
 
+struct ExtraSortValue {
+    PROPERTYKEY key{};
+    std::wstring text;
+    double number = 0;
+    unsigned char kind = 0;
+    bool operator==(const ExtraSortValue& other) const {
+        return SameProperty(key,other.key) && text==other.text && number==other.number && kind==other.kind;
+    }
+};
 struct Entry {
     // Extra sort keys are populated only when the user chooses a Shell sort
     // that isn't already in WIN32_FIND_DATA. No per-row property COM on paint.
     std::wstring sortText;
     double sortNumber = 0;
     unsigned char sortValueKind = 0; // 0 absent, 1 text, 2 numeric
+    std::vector<ExtraSortValue> secondarySortValues;
     FILETIME created{}, accessed{};
     std::wstring path;
     std::wstring name, date, type, size;
@@ -2758,8 +2775,10 @@ struct ViewState {
     bool groupAnimating = false;
     LARGE_INTEGER groupFrameQpc{}; // Geometry sample shared with the input owner.
     int hotSection = -1;
-    bool sortInitialized = false; // Header sort chosen for this folder.
-    bool trackNativeSort = false; // Follow Shell changes after an explicit sort choice.
+    bool sortInitialized = false; // Native sort captured for this folder.
+    bool trackNativeSort = false; // Follow Shell changes after opting into sorting.
+    bool preSortEnabled = g_preSort.load(std::memory_order_relaxed);
+    bool nativeSortPending = false; // Retry a failed initial settings read on native readiness.
     // When navigating from a descendant to an ancestor, reveal the immediate
     // child on the return path. This selection stays stable while a cached
     // folder is revalidated by the worker.
@@ -2905,6 +2924,8 @@ struct ViewState {
     ShellClickPolicy clickPolicy;
     PointingDevice pointingDevice = PointingDevice::Mouse;
     POINT passiveMousePosition{};
+    bool pointerHoverSuppressed = false;
+    std::optional<POINT> keyboardPointerPosition; // Screen coordinates survive layout/scroll changes.
     std::optional<POINT> capturedPointer;
     bool scrollbarTrackPending = false;
     bool verticalScrollbarHot = false;
@@ -5685,6 +5706,7 @@ void LoadSettings() {
         Wh_GetIntSetting(L"Navigation.touchpadDirectManipulation") != 0);
     g_touchpadSwipeNavigation.store(
         Wh_GetIntSetting(L"Navigation.touchpadSwipeNavigation") != 0);
+    g_preSort.store(Wh_GetIntSetting(L"Columns.preSort") != 0);
     UINT wheelLines = 3;
     if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0) ||
         (wheelLines != WHEEL_PAGESCROLL && wheelLines > 100)) wheelLines = 3;
@@ -6361,6 +6383,7 @@ void StopKeyboardSelectionAnimation(ViewState& state);
 void StopSelectionFade(ViewState& state);
 void RefreshHoverUnderCursor(ViewState& state);
 void ClearPointerHover(ViewState& state, bool animate = false);
+void SuppressPointerHoverForKeyboard(ViewState& state);
 void Redraw(ViewState& state);
 void ReconcileColumnViewportAfterRowCount(ViewState& state);
 
@@ -6838,8 +6861,13 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
         if (!DirectoryJobCurrent(work, token)) return;
         Entry& e = entries[i];
         if (e.shellIdentity && e.path.starts_with(L"windhawk:pidl:") &&
-            kind != SortKind::Name && kind != SortKind::Extension)
+            kind != SortKind::Name && kind != SortKind::Extension) {
+            auto sortText=std::move(e.sortText);
+            const auto sortNumber=e.sortNumber;
+            const auto sortValueKind=e.sortValueKind;
             ReadExtraShellSortValue(e, group.key);
+            e.sortText=std::move(sortText); e.sortNumber=sortNumber; e.sortValueKind=sortValueKind;
+        }
         switch (kind) {
         case SortKind::Name: {
             wchar_t letter = e.name.empty() ? L'#' : towupper(e.name[0]);
@@ -6932,6 +6960,7 @@ Entry SortEntrySnapshot(const Entry& entry, bool includeIdentity = false) {
     key.lastWrite=entry.lastWrite; key.created=entry.created; key.accessed=entry.accessed;
     key.byteSize=entry.byteSize; key.sortText=entry.sortText;
     key.sortNumber=entry.sortNumber; key.sortValueKind=entry.sortValueKind;
+    key.secondarySortValues=entry.secondarySortValues;
     return key;
 }
 
@@ -6940,16 +6969,21 @@ SortKind EntrySortKind(const SortSpec& sort, const Entry& entry) {
     return sort.kind != SortKind::Name && sort.kind != SortKind::Extension &&
         entry.path.starts_with(L"windhawk:pidl:") ? SortKind::ShellProperty : sort.kind;
 }
-bool EntryPrecedes(const Entry& a, const Entry& b, const SortSpec& spec) {
-    const bool descending = spec.direction == SORT_DESCENDING;
-    const SortKind kind = spec.kind;
-    // One grouping rule for every Shell sort key. Mixed mode compares the
-    // actual sort keys across types; no separate folder/file partitions.
-    if (a.folder != b.folder && spec.placement != FolderPlacement::Mixed) {
-        const bool foldersFirst = spec.placement == FolderPlacement::AlwaysTop ||
-            (spec.placement == FolderPlacement::ExplorerDefault && !descending);
-        return foldersFirst ? a.folder : !a.folder;
-    }
+int CompareEntrySortKey(const Entry& a, const Entry& b, SortKind kind,
+                        const PROPERTYKEY& key, SORTDIRECTION direction, bool secondary=false) {
+    const bool descending = direction == SORT_DESCENDING;
+    const auto extra=[&](const Entry& entry) -> const ExtraSortValue* {
+        const auto it=std::find_if(entry.secondarySortValues.begin(),entry.secondarySortValues.end(),
+            [&](const ExtraSortValue& value) {return SameKey(value.key,key);});
+        return it==entry.secondarySortValues.end() ? nullptr : &*it;
+    };
+    const auto av=secondary ? extra(a) : nullptr, bv=secondary ? extra(b) : nullptr;
+    const wchar_t* at=secondary ? (av ? av->text.c_str() : L"") : a.sortText.c_str();
+    const wchar_t* bt=secondary ? (bv ? bv->text.c_str() : L"") : b.sortText.c_str();
+    const auto ak=secondary ? (av ? av->kind : 0) : a.sortValueKind;
+    const auto bk=secondary ? (bv ? bv->kind : 0) : b.sortValueKind;
+    const double an=secondary ? (av ? av->number : 0) : a.sortNumber;
+    const double bn=secondary ? (bv ? bv->number : 0) : b.sortNumber;
     int result = 0;
     switch (kind) {
     case SortKind::Name:
@@ -6975,36 +7009,58 @@ bool EntryPrecedes(const Entry& a, const Entry& b, const SortSpec& spec) {
         result = StrCmpLogicalW(EntryExtension(a), EntryExtension(b));
         break;
     case SortKind::Type:
-        result = StrCmpLogicalW(a.sortText.c_str(), b.sortText.c_str());
+        result = StrCmpLogicalW(at,bt);
         break;
     case SortKind::ShellProperty:
-        if (a.sortValueKind != b.sortValueKind) {
+        if (ak != bk) {
             // Missing values always go last, regardless of direction.
-            if (!a.sortValueKind || !b.sortValueKind)
-                return a.sortValueKind != 0;
-            result = a.sortValueKind < b.sortValueKind ? -1 : 1;
-        } else if (a.sortValueKind == 2) {
-            result = a.sortNumber < b.sortNumber ? -1 :
-                a.sortNumber > b.sortNumber ? 1 : 0;
-        } else if (a.sortValueKind == 1) {
-            result = StrCmpLogicalW(a.sortText.c_str(), b.sortText.c_str());
+            if (!ak || !bk) return ak ? -1 : 1;
+            result = ak < bk ? -1 : 1;
+        } else if (ak == 2) {
+            result = an < bn ? -1 : an > bn ? 1 : 0;
+        } else if (ak == 1) {
+            result = StrCmpLogicalW(at,bt);
         }
         break;
     }
-    if (result != 0) return descending ? result > 0 : result < 0;
+    return descending ? -result : result;
+}
+bool EntryPrecedes(const Entry& a, const Entry& b, const SortSpec& spec) {
+    const bool descending = spec.direction == SORT_DESCENDING;
+    if (a.folder != b.folder && spec.placement != FolderPlacement::Mixed) {
+        const bool foldersFirst = spec.placement == FolderPlacement::AlwaysTop ||
+            (spec.placement == FolderPlacement::ExplorerDefault && !descending);
+        return foldersFirst ? a.folder : !a.folder;
+    }
+    int result=CompareEntrySortKey(a,b,spec.kind,spec.key,spec.direction);
+    if (result) return result<0;
+    for (const auto& column : spec.secondary) {
+        auto kind=ClassifySort(column.propkey);
+        if (kind!=SortKind::Name && kind!=SortKind::Extension && a.path.starts_with(L"windhawk:pidl:"))
+            kind=SortKind::ShellProperty;
+        result=CompareEntrySortKey(a,b,kind,column.propkey,column.direction,true);
+        if (result) return result<0;
+    }
     // Apply the same direction to name tie-breaking within each group.
     const int nameOrder = CompareEntryNames(a, b);
     return descending ? nameOrder > 0 : nameOrder < 0;
 }
 
+bool SortNeedsProvider(const SortSpec& sort) {
+    const auto provider=[](SortKind kind) {return kind==SortKind::Type || kind==SortKind::ShellProperty;};
+    return sort.explicitOrder && (provider(sort.kind) ||
+        std::any_of(sort.secondary.begin(),sort.secondary.end(),[&](const SORTCOLUMN& c) {return provider(ClassifySort(c.propkey));}));
+}
+
 void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested,
                           std::map<std::wstring, std::wstring>& typeNames,
-                          const TabBackground& work, unsigned long long token, bool nativeNamespace = false) {
+                          TabBackground& work, unsigned long long token, bool nativeNamespace = false) {
+    PipelineScope timing(work, L"directory.sort", token, entries.size());
     SortSpec spec = requested;
     if (!entries.empty()) spec.kind = EntrySortKind(spec,entries.front());
-    // The filesystem's completed enumeration is the initial GPU layout.
-    // No sort-provider calls or comparison pass until a header is clicked.
+    // The opt-out policy retains enumeration order without provider calls.
     if (!spec.explicitOrder) return;
+    for (auto& entry : entries) entry.secondarySortValues.clear();
     if (spec.kind == SortKind::Type) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
@@ -7017,6 +7073,27 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
         for (size_t i = 0; i < entries.size(); ++i) {
             if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
             ReadExtraShellSortValue(entries[i], spec.key);
+        }
+    }
+    for (const auto& column : spec.secondary) {
+        auto kind=ClassifySort(column.propkey);
+        if (!entries.empty() && kind!=SortKind::Name && kind!=SortKind::Extension &&
+            entries.front().path.starts_with(L"windhawk:pidl:")) kind=SortKind::ShellProperty;
+        if (kind!=SortKind::Type && kind!=SortKind::ShellProperty) continue;
+        for (auto& entry : entries) {
+            if (!DirectoryJobCurrent(work,token,nativeNamespace)) return;
+            ExtraSortValue value; value.key=column.propkey;
+            if (kind==SortKind::Type) {
+                value.text=nativeNamespace && !entry.type.empty() ? entry.type : GetTypeName(typeNames,entry.path,entry.folder);
+                value.kind=1;
+            } else {
+                // Reuse the property conversion without overwriting the primary
+                // key. Only provider-backed secondary keys need extra storage.
+                Entry probe; probe.path=entry.path; probe.shellIdentity=entry.shellIdentity;
+                ReadExtraShellSortValue(probe,column.propkey);
+                value.text=std::move(probe.sortText); value.number=probe.sortNumber; value.kind=probe.sortValueKind;
+            }
+            entry.secondarySortValues.push_back(std::move(value));
         }
     }
     if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
@@ -7076,6 +7153,11 @@ unsigned long long DirectoryMetadataHash(const std::vector<Entry>& entries) {
         ULONGLONG number=0; memcpy(&number,&entry.sortNumber,sizeof(number)); mix(number);
         mix(entry.sortText.size());
         for (wchar_t ch : entry.sortText) mix(ch);
+        mix(entry.secondarySortValues.size());
+        for (const auto& value : entry.secondarySortValues) {
+            mix(value.kind); memcpy(&number,&value.number,sizeof(number)); mix(number);
+            mix(value.text.size()); for (wchar_t ch : value.text) mix(ch);
+        }
     }
     return hash;
 }
@@ -7137,7 +7219,8 @@ bool ShellStoragePercent(IPropertyStore* store, REFPROPERTYKEY key,
 
 template<class Current>
 DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
-    std::vector<Entry>& names, DWORD error, Current&& current) {
+    std::vector<Entry>& names, DWORD error, Current&& current,
+    std::optional<std::pair<unsigned long long,unsigned long long>> fingerprints = std::nullopt) {
     DirectoryResult result;
     if (directory.checkSort) {
         result.kind = DirectoryResult::SortCheck;
@@ -7170,8 +7253,8 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
     }
     if (!current()) return result;
     std::sort(result.pathIndex.begin(), result.pathIndex.end());
-    result.orderHash = DirectoryOrderHash(names);
-    result.metadataHash = DirectoryMetadataHash(names);
+    result.orderHash = fingerprints ? fingerprints->first : DirectoryOrderHash(names);
+    result.metadataHash = fingerprints ? fingerprints->second : DirectoryMetadataHash(names);
     result.viewportAnchorOffsetPx = directory.viewportAnchorOffsetPx;
     result.viewportCapturedScrollPx = directory.viewportCapturedScrollPx;
     result.restoreViewport = directory.restoreViewport;
@@ -7262,10 +7345,12 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
 }
 
 DirectoryResult PrepareDirectoryResult(TabBackground& work, DirectoryJob& directory,
-    std::vector<Entry>& names, DWORD error) {
+    std::vector<Entry>& names, DWORD error,
+    std::optional<std::pair<unsigned long long,unsigned long long>> fingerprints = std::nullopt) {
+    PipelineScope timing(work, L"directory.snapshot", directory.token, names.size());
     return PrepareItemSnapshot(directory, names, error, [&] {
         return DirectoryJobCurrent(work, directory.token);
-    });
+    }, fingerprints);
 }
 
 DriveCapacity ProbeThisPcCapacity(const std::wstring& path) {
@@ -7441,6 +7526,7 @@ void PublishNativeRows(TabBackground& work, const NativeRowsJob& job,
         PublishDirectoryResult(work, std::move(preview));
         return;
     }
+    if (job.sort.explicitOrder && !complete && error == ERROR_SUCCESS) return;
     DirectoryResult result;
     result.kind = DirectoryResult::NativeRows;
     result.hwnd = work.hwnd;
@@ -8073,7 +8159,10 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 // A hint observes only its item's active key, including offscreen
                 // items. An unchanged provider completion must not enumerate or
                 // animate the folder again. All I/O remains on this tab's lane.
-                if (directory.sort.kind == SortKind::Type) typeNames.clear();
+                if (directory.sort.kind == SortKind::Type ||
+                    std::any_of(directory.sort.secondary.begin(),directory.sort.secondary.end(),[](const SORTCOLUMN& c) {
+                        return ClassifySort(c.propkey)==SortKind::Type;
+                    })) typeNames.clear();
                 for (const auto& previous : directory.sortChecks) {
                     if (!DirectoryJobCurrent(work,directory.token)) break;
                     Entry current=previous;
@@ -8112,6 +8201,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             }
             ComPtr<IShellFolder> provider;
             if (!directory.enumerated && !directory.namespaceFolder && !IsThisPcLocation(directory.path)) {
+                PipelineScope timing(work, L"directory.bind", directory.token);
                 HRESULT hr = BindDirectoryProvider(directory.path, provider, directory.folderIdentity.get());
                 if (SUCCEEDED(hr) && !PlainFilesystemProvider(provider.Get(), directory.path)) {
                     PIDLIST_ABSOLUTE root = nullptr;
@@ -8163,6 +8253,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             std::vector<Entry> names = std::move(directory.enumeratedEntries);
             DWORD error = directory.enumerationError;
             if (!directory.enumerated) {
+                PipelineScope timing(work, L"directory.enumerate", directory.token);
                 names.reserve(directory.previewRows);
                 size_t nextPreview = 1;
                 size_t visited = 0;
@@ -8235,7 +8326,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
                 if (!DirectoryJobCurrent(work, directory.token)) continue;
             }
-            if (namesLane && (directory.sort.explicitOrder || directory.grouping.enabled)) {
+            // Win32 already supplies names, dates and sizes. Keep those sorts
+            // independent of an old folder's blocked type/property provider.
+            if (namesLane && (directory.grouping.enabled || SortNeedsProvider(directory.sort))) {
                 directory.enumerated = true;
                 directory.enumeratedEntries = std::move(names);
                 directory.enumerationError = error;
@@ -8246,15 +8339,16 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
                 continue;
             }
-            // Only an explicit GPU header sort runs the worker comparison;
-            // otherwise retain the filesystem's enumeration order.
+            // Saved native sorts and header/menu choices share this comparator.
             SortDirectoryEntries(names, directory.sort, typeNames,
                                  work, directory.token);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             ResolveDirectoryGroups(names, directory.grouping, typeNames,
                                    work, directory.token);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
+            std::optional<std::pair<unsigned long long,unsigned long long>> fingerprints;
             if (!directory.checkSort && error == ERROR_SUCCESS) {
+                PipelineScope timing(work, L"directory.baseline", directory.token, names.size());
                 const bool compare = lane.sortedFolder == directory.path &&
                     SameSort(lane.sortedOrder,directory.sort) &&
                     lane.sortedOrderHash == directory.previousOrderHash &&
@@ -8282,8 +8376,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 lane.sortedFolder=directory.path; lane.sortedOrder=directory.sort;
                 lane.sortedOrderHash=DirectoryOrderHash(names);
                 lane.sortedMetadataHash=DirectoryMetadataHash(names);
+                fingerprints=std::pair{lane.sortedOrderHash,lane.sortedMetadataHash};
             }
-            auto result = PrepareDirectoryResult(work, directory, names, error);
+            auto result = PrepareDirectoryResult(work, directory, names, error, fingerprints);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             PublishDirectoryResult(work, std::move(result));
         } else if (haveDetail) {
@@ -8545,6 +8640,8 @@ size_t EntryPayloadBytes(const Entry& entry) {
         entry.date.capacity() + entry.type.capacity() + entry.size.capacity() +
         entry.groupKey.capacity() + entry.groupTitle.capacity()) * sizeof(wchar_t) +
         entry.cells.capacity()*sizeof(ColumnCell);
+    bytes += entry.secondarySortValues.capacity()*sizeof(ExtraSortValue);
+    for (const auto& value : entry.secondarySortValues) bytes += value.text.capacity()*sizeof(wchar_t);
     for (const auto& cell : entry.cells) bytes += cell.text.capacity()*sizeof(wchar_t);
     if (entry.shellIdentity) bytes += ILGetSize(entry.shellIdentity.get());
     if (entry.shellChild) bytes += ILGetSize(entry.shellChild.get());
@@ -8693,14 +8790,15 @@ void ClearFolderSnapshots(ViewState& state) {
     cache.usedBytes = cache.snapshotCount = 0;
 }
 
-// A cached folder carries its own GPU sort choice (including "unsorted").
-// Never compare it to the departing folder's sort or adopt a newly created
-// Shell view's temporarily restored sort preference.
+// Cached previews carry their folder's sort, never the departing folder's.
+// A confirmed native binding revalidates it before restoring the snapshot.
 bool CachedFolderSort(const ViewState& state,
                       const std::wstring& path, SortSpec& sort,
                       ShellGroupSpec* grouping = nullptr) {
     const auto it = state.folderCache.folders.find(path);
     if (it == state.folderCache.folders.end() || it->second.visibility != state.visibility ||
+        (g_preSort.load(std::memory_order_relaxed) && !it->second.sort.explicitOrder) ||
+        (!g_preSort.load(std::memory_order_relaxed) && it->second.sort.explicitOrder && !it->second.sort.userChosen) ||
         (it->second.sort.explicitOrder &&
          it->second.sort.placement != g_folderPlacement.load(std::memory_order_relaxed)))
         return false;
@@ -9016,6 +9114,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         e.note=std::make_shared<const std::wstring>(state.folderPath); PipelineEvent(*state.background,std::move(e));
     }
     if ((state.directoryPending && !replacePending) || !state.hwnd ||
+        state.nativeSortPending ||
         (state.optimisticStartedAt && !state.directoryFolderIdentity) ||
         g_unloading.load()) return;
     if (state.thisPcGpu) {
@@ -9054,7 +9153,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         return;
     }
     if (!EnsureDirectoryFolderIdentity(state) || !EnsureDirectoryWorker(state) ||
-        ((state.sort.explicitOrder || state.grouping.enabled) &&
+        ((state.grouping.enabled || state.sort.explicitOrder) &&
          !StartTabWorker(state.background, state.background->layout,
                          DirectoryWorkerProc, THREAD_PRIORITY_BELOW_NORMAL))) {
         // Worker creation failed: never strand the native folder host under
@@ -9129,7 +9228,8 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // An ancestor return has a known child to reveal. A prefix at row zero
     // cannot position that child in the final layout; publish the complete,
     // positioned snapshot instead of showing a viewport we must later move.
-    newJob.allowInitialPreview = !state.loaded && state.lastFolderToReveal.empty();
+    newJob.allowInitialPreview = !state.loaded && state.lastFolderToReveal.empty() &&
+        !state.sort.explicitOrder && !state.grouping.enabled;
     newJob.previewRows = static_cast<size_t>(std::clamp(
         (ViewHeight(state) / std::max(1.f, state.rowPx) + 2 * kRowTransitionOverscan) * state.itemsPerRow, 16.f, 4096.f));
     newJob.lastFolderName = state.lastFolderToReveal;
@@ -9506,9 +9606,21 @@ void ReconcileShellVisibility(ViewState& state) {
 // guarantee. Actual resorting and property enrichment run on the worker.
 bool ReadShellSort(ViewState& state, SortSpec& out) {
     if (!state.folderView) return false;
+    const auto view = state.folderView;
+    const auto token = state.token;
+    const HWND native = state.nativeHwnd;
     PipelineScope query(state.background,L"shell.view.sort",state.token);
-    SORTCOLUMN column{};
-    if (FAILED(state.folderView->GetSortColumns(&column, 1))) return false;
+    int count=1;
+    const HRESULT countResult=view->GetSortColumnCount(&count);
+    if (state.folderView.Get()!=view.Get() || state.token!=token || state.nativeHwnd!=native) return false;
+    if (FAILED(countResult)) count=1;
+    if (count<1 || count>static_cast<int>(kMaxShellColumns)) return false;
+    std::vector<SORTCOLUMN> columns(count);
+    if (FAILED(view->GetSortColumns(columns.data(), count)) || state.folderView.Get() != view.Get() ||
+        state.token != token || state.nativeHwnd != native) return false;
+    for (const auto& column : columns)
+        if (IsEqualGUID(column.propkey.fmtid,GUID_NULL) || !column.propkey.pid) return false;
+    const auto& column=columns.front();
     if (IsEqualGUID(column.propkey.fmtid, GUID_NULL) || !column.propkey.pid)
         return false;
     out.key = column.propkey;
@@ -9516,7 +9628,35 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
     out.kind = ClassifySort(out.key);
     out.placement = g_folderPlacement.load(std::memory_order_relaxed);
     out.explicitOrder = true;
+    out.secondary.assign(columns.begin()+1,columns.end());
     return true;
+}
+
+void InitializeFolderSort(ViewState& state, const std::wstring& path, bool provisional = false) {
+    state.preSortEnabled = g_preSort.load(std::memory_order_relaxed);
+    state.sort = DefaultSort();
+    state.sortInitialized = state.trackNativeSort = state.nativeSortPending = false;
+    SortSpec cached;
+    if (CachedFolderSort(state, path, cached, provisional ? &state.grouping : nullptr)) {
+        state.sort = cached;
+        state.sortInitialized = cached.explicitOrder;
+        state.trackNativeSort = cached.explicitOrder;
+    }
+    if (provisional) {
+        state.nativeSortPending = state.preSortEnabled && !state.sortInitialized;
+        return;
+    }
+    if (!state.preSortEnabled && !state.trackNativeSort) return;
+    SortSpec native;
+    if (ReadShellSort(state, native)) {
+        native.userChosen = state.sort.userChosen;
+        state.sort = native;
+        state.sortInitialized = state.trackNativeSort = true;
+    } else {
+        // Do not flash enumeration order or guess a sort on a transient COM
+        // failure. The existing view/enumeration events and maintenance retry.
+        state.nativeSortPending = true;
+    }
 }
 // A single authoritative source for Group by, including This PC.
 // S_FALSE means Group by None; an actual COM error means "unknown", NOT None.
@@ -9545,14 +9685,14 @@ ShellGroupSpec ReadShellGrouping(ViewState& state) {
     return result;
 }
 
-void ReconcileShellGrouping(ViewState& state, bool force = false) {
+bool ReconcileShellGrouping(ViewState& state, bool force = false, bool queueIfChanged = true) {
     // A hidden namespace's provider/layout notifications do not represent
     // user Group by changes. Its explicit commands own live settings reads.
-    if (IsRecycleBinLocation(state.folderPath) && !force) return;
-    if (!state.folderView || !state.inScope || state.optimisticStartedAt) return;
+    if (IsRecycleBinLocation(state.folderPath) && !force) return false;
+    if (!state.folderView || !state.inScope || state.optimisticStartedAt) return false;
     ShellGroupSpec next;
-    if (!TryReadShellGrouping(state, next)) return;
-    if (SameShellGroup(state.grouping, next)) return;
+    if (!TryReadShellGrouping(state, next)) return false;
+    if (SameShellGroup(state.grouping, next)) return false;
     state.grouping = next;
     if (state.thisPcGpu) {
         // Grouping affects the GPU row order and section geometry, but not
@@ -9560,27 +9700,54 @@ void ReconcileShellGrouping(ViewState& state, bool force = false) {
         // can rebuild it without directory enumeration or a new worker.
         state.thisPcRowsDirty = true;
         state.thisPcSnapshotRetries = 0;
-    } else if (state.loaded) {
+    } else if (state.loaded && queueIfChanged) {
         QueueDirectoryRefresh(state, true, true);
     }
+    return true;
 }
 
 void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force = false,
                              bool acceptUntrackedSort = false) {
-    ReconcileShellGrouping(state, force);
-    if (IsRecycleBinLocation(state.folderPath) && !force) return;
-    if (!acceptUntrackedSort && (!state.trackNativeSort || !state.sort.explicitOrder)) return;
+    if (!state.inScope || state.optimisticStartedAt) return;
+    const bool groupingChanged=ReconcileShellGrouping(state, force, false);
+    bool sortChanged=false;
     SortSpec updated;
-    if (!ReadShellSort(state, updated)) return;
-    state.trackNativeSort = true;
-    if (state.sortInitialized && SameSort(updated, state.sort)) return;
-    state.sort = updated;
-    state.sortInitialized = true;
+    if ((!IsRecycleBinLocation(state.folderPath) || force || state.nativeSortPending) &&
+        (state.preSortEnabled || acceptUntrackedSort || state.trackNativeSort) && ReadShellSort(state, updated)) {
+        state.trackNativeSort = true;
+        const bool pending = std::exchange(state.nativeSortPending, false);
+        sortChanged = pending || !state.sortInitialized || !SameSort(updated, state.sort);
+        updated.userChosen = state.sort.userChosen || acceptUntrackedSort ||
+            (state.sortInitialized && !SameSort(updated,state.sort));
+        state.sort = std::move(updated);
+        state.sortInitialized = true;
+        if (SameSort(state.displayedSort,state.sort)) state.displayedSort.userChosen=state.sort.userChosen;
+    }
+    if (!sortChanged && !groupingChanged) return;
     if (queueIfChanged && state.inScope) {
-        if (state.thisPcGpu) QueueNativeRows(state);
+        if (state.thisPcGpu) QueueNativeRows(state,sortChanged);
         else QueueDirectoryRefresh(state, true, true);
     }
     Redraw(state);
+}
+
+// Settings can arrive while an old unsorted enumeration is still pending.
+// Return whether its generation must be replaced, even when placement stayed
+// equal. Merely updating the header policy would mislabel that old result.
+bool ReconcileSortSettings(ViewState& state) {
+    const auto placement=g_folderPlacement.load(std::memory_order_relaxed);
+    const bool preSort=g_preSort.load(std::memory_order_relaxed);
+    const bool changed=state.preSortEnabled!=preSort;
+    const bool placementChanged=state.sort.placement!=placement;
+    if (changed) {
+        state.preSortEnabled=preSort;
+        if (preSort) {
+            state.nativeSortPending=true;
+            RefreshSortFromExplorer(state,false,true);
+        } else state.nativeSortPending=false;
+    }
+    state.sort.placement=placement;
+    return changed || placementChanged;
 }
 // Resolve header property keys from the folder's actual column mapping when
 // available; filesystem-folder fallback matches the four displayed columns.
@@ -9621,7 +9788,9 @@ void SortByHeader(ViewState& state, int column) {
         sort.kind = ClassifySort(key);
         sort.placement = g_folderPlacement.load(std::memory_order_relaxed);
         sort.explicitOrder = true;
+        sort.userChosen = true;
         state.trackNativeSort = true;
+        state.nativeSortPending = false;
         if (!state.sortInitialized || !SameSort(sort, state.sort)) {
             state.sort = sort;
             state.sortInitialized = true;
@@ -19354,8 +19523,11 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
     if (state.optimisticStartedAt) return;
     if ((key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
         state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0)
-        RefreshHoverUnderCursor(state); // Navigation may leave the pointer stationary over new rows.
+        RefreshHoverUnderCursor(state);
     const int target = KeyboardNavigationTarget(state, key, !control && !shift);
+    // Resolve the initial hover seed before keyboard input retires its visual
+    // and point-to-select tracking. Subsequent keys use the keyboard selection.
+    SuppressPointerHoverForKeyboard(state);
     if (g_perf.load(std::memory_order_relaxed) &&
         (target < 0 || !state.postDeletionFocusPath.empty()))
         Wh_Log(L"[GPU selection] KEY_TARGET key=0x%X index=%d target=%d restored=%d vacant=%d rows=%d",
@@ -19426,6 +19598,7 @@ void ToggleKeyboardFocusedItem(ViewState& state) {
 }
 
 void BeginNativeSelectAll(ViewState& state, bool nativeCommand = false) {
+    SuppressPointerHoverForKeyboard(state);
     // A previous marquee/bulk preparation must not overwrite a later Ctrl+A.
     // Cancel its generation before Explorer handles this newer command.
     CancelNativeSelectionPreparation(state);
@@ -21034,6 +21207,8 @@ bool MatchesTypeSearchPrefix(const std::wstring& name,
 }
 
 void TypeToSelect(ViewState& state, wchar_t ch) {
+    if (ch == L'\b' || (ch >= L' ' && ch != 0x7F))
+        SuppressPointerHoverForKeyboard(state);
     const ULONGLONG now = GetTickCount64();
     if (now - state.lastTyped > kTypeSearchTimeoutMs)
         state.typeSearch.clear();
@@ -21425,6 +21600,10 @@ void SetActive(HWND hwnd, bool on) {
         StopKeyboardSelectionAnimation(*s);
     }
     s->visible = on;
+    // Native headers/menus may change sorting while the overlay is disabled.
+    // Import the authoritative descriptor before showing the GPU view again,
+    // including the opt-out mode after a native user sort choice.
+    if (on) RefreshSortFromExplorer(*s, true, true, true);
     if (on) QueueFeatureInitialization(*s);
     if (on && (previousLocation != s->folderPath ||
         s->autoRefitConfiguredEnabled !=
@@ -22505,10 +22684,32 @@ void StartNativeShellDrag(ViewState& state, int row) {
             (unsigned long long)(GetTickCount64() - started));
 }
 
+void SuppressPointerHoverForKeyboard(ViewState& state) {
+    state.pointerHoverSuppressed = true;
+    POINT cursor{};
+    state.keyboardPointerPosition = GetCursorPos(&cursor) ?
+        std::optional<POINT>(cursor) : std::nullopt;
+    TRACKMOUSEEVENT cancel{sizeof(cancel),TME_CANCEL|TME_LEAVE|TME_HOVER,state.hwnd,0};
+    TrackMouseEvent(&cancel);
+    state.mouseTracking = false;
+    ClearPointerHover(state);
+}
+
+bool PointerHoverSuppressed(ViewState& state) {
+    if (!state.pointerHoverSuppressed) return false;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return true;
+    if (!state.keyboardPointerPosition) state.keyboardPointerPosition = cursor;
+    const POINT previous = *state.keyboardPointerPosition;
+    if (cursor.x == previous.x && cursor.y == previous.y) return true;
+    state.pointerHoverSuppressed = false;
+    return false;
+}
+
 // All pointer-based hover states are derived from the same hit tests, for
 // mouse motion and for stationary-pointer touchpad/animated scrolling alike.
 void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
-    if (state.pointingDevice == PointingDevice::Touch) return;
+    if (state.pointingDevice == PointingDevice::Touch || PointerHoverSuppressed(state)) return;
     RECT client{};
     ViewClientRect(state, &client);
     const bool inside = PtInRect(&client, pos) != FALSE;
@@ -22559,7 +22760,7 @@ void ReleasePointerCapture(ViewState& state, POINT pos) {
     ReleaseCapture();
 }
 
-// Scrolling and fresh keyboard entry can put new content under a stationary
+// Scrolling and folder navigation can put new content under a stationary
 // pointer without WM_MOUSEMOVE. Reconcile only on demand, never on an idle
 // timer. Ignore other foreground windows and active drag operations.
 void RefreshHoverUnderCursor(ViewState& state) {
@@ -23672,7 +23873,7 @@ void InitializeOverlayFeatures(ViewState& state) {
             ComPtr<IDispatch> browser = std::move(state.pendingAutomation);
             BindShellAutomation(state, browser.Get());
         } else AttachShellSelectionEvents(state, nullptr);
-        ReconcileShellGrouping(state, true);
+        RefreshSortFromExplorer(state, true, true);
         RefreshExplorerColumns(state);
         RefreshViewToggleForFrame(state.frameHwnd);
         break;
@@ -25407,6 +25608,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->pointingDevice = source.deviceType == IMDT_PEN ? PointingDevice::Pen : PointingDevice::Mouse;
             }
             if (s->pointingDevice == PointingDevice::Touch || s->touch.dragPromoted) return 0;
+            if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+                msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK ||
+                msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK ||
+                msg == WM_XBUTTONDOWN || msg == WM_XBUTTONDBLCLK ||
+                msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+                s->pointerHoverSuppressed = false;
         }
     }
     // CS_DBLCLKS replaces a rapid second DOWN even when a track click has
@@ -25801,8 +26008,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->enumerationEventMessageQueued &&
                 s->enumerationEventMessageQueued->exchange(false, std::memory_order_acq_rel) &&
                 s->visible && s->inScope && s->detailsViewActive && !s->optimisticStartedAt &&
-                !PresentationMinimized(*s) && TabOwnsActiveView(*s))
+                !PresentationMinimized(*s) && TabOwnsActiveView(*s)) {
+                RefreshSortFromExplorer(*s, false, true);
                 ForceRefresh(*s);
+            }
             if (s->folderView && s->inScope && TabOwnsActiveView(*s))
                 QueueNativeSelectionHint(*s);
         }
@@ -26358,7 +26567,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->nativeSettingsHintPending && !s->visibilitySignalQueued)
                 PostShellVisibilityProbe(*s);
             if (s->thisPcGpu) {
-                ReconcileShellGrouping(*s);
+                RefreshSortFromExplorer(*s, true);
                 if (!s->directoryPending &&
                     timerNow - s->driveCapacityRequestedAt >= kDriveSpaceRefreshMs) {
                     s->driveCapacityRequestedAt = timerNow;
@@ -26901,7 +27110,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // The wiggle has already docked. Hold capture solely to swallow UP;
         // ignore all further drag movements until that button is released.
         if (s && s->columnWiggleAwaitRelease) return 0;
-        if (s && (!s->mouseTracking || s->clickPolicy.singleClick)) {
+        if (s && !PointerHoverSuppressed(*s) && (!s->mouseTracking || s->clickPolicy.singleClick)) {
             TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE | (s->clickPolicy.singleClick ? TME_HOVER : 0u),hwnd,HOVER_DEFAULT};
             if (TrackMouseEvent(&tme)) s->mouseTracking = true;
         }
@@ -26926,7 +27135,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_MOUSEHOVER:
-        if (s && s->clickPolicy.singleClick && s->pointingDevice != PointingDevice::Touch &&
+        if (s && !s->pointerHoverSuppressed && s->clickPolicy.singleClick && s->pointingDevice != PointingDevice::Touch &&
             s->visible && !s->emptyNative && !s->optimisticStartedAt &&
             !PointerDragActive(*s) && !s->shellDragRunning && !s->rename.editor &&
             !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON)) && TabOwnsActiveView(*s)) {
@@ -27386,7 +27595,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
     case WM_KEYDOWN:
-        if (s) DiscardCompletedMouseClick(*s);
+        if (s) {
+            DiscardCompletedMouseClick(*s);
+            if (wParam != VK_CONTROL && wParam != VK_SHIFT && wParam != VK_MENU &&
+                wParam != VK_LWIN && wParam != VK_RWIN &&
+                !IsKeyboardMovementKey(static_cast<UINT>(wParam), s->gridView))
+                SuppressPointerHoverForKeyboard(*s);
+        }
         if (s && s->optimisticStartedAt) {
             // File operations wait until Explorer confirms the new IShellView.
             return 0;
@@ -27472,12 +27687,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // A new grouping policy invalidates any pending old-policy sort.
             // Do this on the owning STA, preserving the displayed selection and
             // viewport while the worker produces the replacement row order.
-            const FolderPlacement placement =
-                g_folderPlacement.load(std::memory_order_relaxed);
-            const bool placementChanged = s->sort.placement != placement;
-            s->sort.placement = placement;
+            const bool sortSettingsChanged=ReconcileSortSettings(*s);
             // Other settings retain their existing coalesced refresh behavior.
-            QueueDirectoryRefresh(*s, placementChanged, true);
+            QueueDirectoryRefresh(*s, sortSettingsChanged, true);
             // A settings change cancels animation; settle at the destination
             // instead of leaving the viewport frozen at an intermediate pixel.
             s->scrollNow = s->scrollTarget;
@@ -28223,17 +28435,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.visibility = ReadShellVisibilityPolicy();
     state.clickPolicy = ReadShellClickPolicy();
     state.visibilitySelectionSyncPending = false;
-    // Fresh visits have no sorting preference in the GPU overlay. A previously
-    // visited folder may restore the explicit sort chosen there, along with
-    // its cached rows, but must not inherit the departing folder's sort.
-    state.sort = DefaultSort();
-    state.sortInitialized = false;
-    state.trackNativeSort = false;
-    SortSpec folderSort;
-    if (CachedFolderSort(state, path, folderSort, &state.grouping)) {
-        state.sort = folderSort;
-        state.sortInitialized = folderSort.explicitOrder;
-    }
+    InitializeFolderSort(state, path, cachedPreviewOnly);
     state.nativeSelectionImportPending = false;
     state.nativeSelectionAllPending = false;
     state.nativeSelectionAllCount = -1;
@@ -29079,7 +29281,7 @@ void BindTabPresentation(ViewState& state, HWND tabHost) {
 bool RefreshThisPcRows(ViewState& state, bool requestData) {
     TabTraceSlowScope trace(L"This PC row projection", state.hwnd);
     state.thisPcRowsDirty = false;
-    if (!state.thisPcGpu) return false;
+    if (!state.thisPcGpu || state.nativeSortPending) return false;
     if (state.nativeRowsNeedCapture && !state.nativeRowsPending) RequestNativeRows(state);
     if (state.nativeRows.empty() && !state.nativeRowsComplete) return false;
     if (state.loaded && state.nativeRowsPending) return false;
@@ -29192,17 +29394,20 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
         // Capacity/type values are already worker-resolved. Reuse the same
         // comparator without property-provider calls in this tiny projection.
         for (auto& entry : fresh) {
-            if (state.sort.kind == SortKind::Type || SameKey(state.sort.key,PKEY_ItemTypeText)) {
-                entry.sortText=entry.type; entry.sortValueKind=entry.type.empty() ? 0 : 1;
-            } else if (SameKey(state.sort.key,PKEY_Capacity) || SameKey(state.sort.key,PKEY_FreeSpace) ||
-                       SameKey(state.sort.key,PKEY_PercentFull)) {
-                entry.sortValueKind=(SameKey(state.sort.key,PKEY_PercentFull) ?
+            const auto seed=[&](const PROPERTYKEY& key,std::wstring& text,double& number,unsigned char& kind) {
+                if (SameKey(key,PKEY_ItemTypeText)) {
+                    text=entry.type; kind=entry.type.empty() ? 0 : 1;
+                } else if (SameKey(key,PKEY_Capacity) || SameKey(key,PKEY_FreeSpace) || SameKey(key,PKEY_PercentFull)) {
+                kind=(SameKey(key,PKEY_PercentFull) ?
                     entry.driveTotal || entry.driveUsedPercent>=0 : entry.driveTotal!=0) ? 2 : 0;
-                entry.sortNumber=SameKey(state.sort.key,PKEY_Capacity) ? static_cast<double>(entry.driveTotal) :
-                    SameKey(state.sort.key,PKEY_FreeSpace) ? static_cast<double>(entry.driveTotal-entry.driveUsed) :
+                number=SameKey(key,PKEY_Capacity) ? static_cast<double>(entry.driveTotal) :
+                    SameKey(key,PKEY_FreeSpace) ? static_cast<double>(entry.driveTotal-entry.driveUsed) :
                     entry.driveUsedPercent>=0 ? entry.driveUsedPercent :
                     entry.driveTotal ? 100.*entry.driveUsed/entry.driveTotal : 0.;
-            }
+                }
+            };
+            seed(state.sort.key,entry.sortText,entry.sortNumber,entry.sortValueKind);
+            for (auto& value : entry.secondarySortValues) seed(value.key,value.text,value.number,value.kind);
         }
         std::sort(fresh.begin(),fresh.end(),[&](const Entry& a,const Entry& b) { return EntryPrecedes(a,b,state.sort); });
     }
@@ -29235,6 +29440,7 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
                     a.driveTotal == b.driveTotal && a.driveUsed == b.driveUsed &&
                     a.driveUsedPercent == b.driveUsedPercent &&
                     a.sortValueKind == b.sortValueKind && a.sortNumber == b.sortNumber && a.sortText == b.sortText &&
+                    a.secondarySortValues == b.secondarySortValues &&
                     a.groupKey == b.groupKey && a.groupTitle == b.groupTitle &&
                     std::equal(a.cells.begin(), a.cells.end(), b.cells.begin(), b.cells.end(),
                         [](const ColumnCell& x, const ColumnCell& y) { return SameKey(x.key,y.key) && x.text==y.text; }) &&
@@ -29445,6 +29651,7 @@ void PrepareInitialOverlay(ViewState& state) {
     if(!StartPresentation(state)) {
         state.visible=false; RestoreNativeContent(state); return;
     }
+    InitializeFolderSort(state, state.folderPath);
     if (state.thisPcGpu) {
         RequestNativeRows(state); // Copy PIDLs; name providers run independently of GPU setup.
     } else {
@@ -29570,9 +29777,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         if (s->firstContentSubmittedAt) AttachShellDestinationEvents(*s, shellBrowser.Get());
         s->inScope = true;
         const ULONGLONG rebindBegin = GetTickCount64();
-        // Do not consult the new Shell view's late-restored sorting preference
-        // here. The new folder owns an independent unsorted/cached policy.
-        // A sort chosen by the user may be tracked after it is committed.
+        // Capture the confirmed folder's native sort before names are queued.
+        // Subsequent Shell completion/command events reconcile late restoration.
         BindNativeViewInput(native, overlay);
         if (IsThisPcLocation(path)) {
             if (!s->thisPcGpu || changedPath || wasOutside) {
@@ -29605,9 +29811,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ++s->token;
                 ++s->iconToken;
                 s->directoryPending = false;
-                s->sort = DefaultSort();
-                s->sortInitialized = false;
-                s->trackNativeSort = false;
+                InitializeFolderSort(*s, path);
                 s->lastNativeModeProbe = 0;
                 ClearNavigationProbe(*s);
                 BeginDirectoryViewMode(*s,true);
@@ -29624,6 +29828,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 // contents. Keep the committed tiles, capacities and motion
                 // while the ordinary worker revalidates their identities.
                 s->folder=folder;
+                RefreshSortFromExplorer(*s, false, true);
                 ClearNavigationProbe(*s);
                 QueueNativeRows(*s);
             }
@@ -29644,6 +29849,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // The already-painted name snapshot belongs to this destination:
             // KEEP it. Resetting it here would recreate the 200ms blank wait.
             s->folder = folder;
+            RefreshSortFromExplorer(*s, false, true);
             s->directoryFolderIdentity.reset();
             WatchDirectory(*s);
             // Revalidate on the confirmed binding. Path-only announcements
@@ -29674,6 +29880,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // to erase a breadcrumb-restored child after the first GPU paint.
             // A genuinely different tab can have an independent selection.
             s->folder = folder;
+            RefreshSortFromExplorer(*s, true, true);
             if (oldTabHost == newTabHost && !wasOutside) {
                 // The new native view might not have inherited the focused
                 // item yet. Reconcile a single selected item after paint;

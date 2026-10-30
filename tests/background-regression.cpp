@@ -274,11 +274,24 @@ static void TestPreviewAndLayout(const std::wstring& directory) {
     {
         ExclusiveSrwLock lock(state.background->directoryLock);
         const auto& results = state.background->directoryResults;
-        Check(std::any_of(results.begin(), results.end(), [](const auto& value) {
-            return value.kind == DirectoryResult::Preview && !value.entries.empty();
-        }), "cold grouped/sorted folder waited for providers before publishing names");
+        Check(std::none_of(results.begin(), results.end(), [](const auto& value) {
+            return value.kind == DirectoryResult::Preview;
+        }), "cold grouped/sorted folder flashed an unsorted prefix");
     }
     state.grouping.enabled = false;
+    // Common sorts use enumeration's own metadata, so they must finish even
+    // while an older provider-dependent layout is blocked on the same tab.
+    for (const auto& key : {PKEY_ItemNameDisplay,PKEY_Size,PKEY_DateModified,PKEY_FileExtension}) {
+        state.sort.key=key; state.sort.kind=ClassifySort(key);
+        for (auto direction : {SORT_ASCENDING,SORT_DESCENDING}) {
+            state.sort.direction=direction;
+            QueueDirectoryRefresh(state, true);
+            auto result=WaitForComplete(*state.background,state.directoryToken);
+            Check(std::is_sorted(result.entries.begin(),result.entries.end(),[&](const Entry& a,const Entry& b) {
+                return EntryPrecedes(a,b,state.sort);
+            }),"metadata-backed sort waited on the layout provider or returned unsorted rows");
+        }
+    }
     state.sort.explicitOrder = false;
     QueueDirectoryRefresh(state, true);
     WaitForComplete(*state.background, state.directoryToken);
@@ -287,7 +300,7 @@ static void TestPreviewAndLayout(const std::wstring& directory) {
     DestroyWindow(state.hwnd);
     CloseHandle(providerGate);
     providerGate = nullptr;
-    std::cout << "PASS: grouped/sorted preview precedes blocked layout; next unsorted folder bypasses it\n";
+    std::cout << "PASS: no unsorted prefix for saved sorts/groups; common sorts and unsorted navigation bypass blocked providers\n";
 }
 
 static void TestPublicationAndEpochs() {
@@ -1875,6 +1888,8 @@ static void TestPreviewInput() {
 #include "icon-sizing-smoke.h"
 #include "shell-provider-smoke.h"
 #include "provider-selection-smoke.h"
+#include "initial-sort-smoke.h"
+#include "preprocessing-benchmark.h"
 #include "profile-identity-smoke.h"
 #include "provider-navigation-smoke.h"
 #include "paste-focus-smoke.h"
@@ -2023,6 +2038,10 @@ int wmain(int argc,wchar_t** argv) {
             NativeMenuFixture::Child(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--native-context-menu")==0) {
             TestNativeMenuInteraction();
+        } else if (argc>1 && wcscmp(argv[1],L"--preprocessing")==0) {
+            TestPreprocessingBenchmarks(fixture.wstring(),true);
+        } else if (argc>1 && wcscmp(argv[1],L"--initial-sort")==0) {
+            TestInitialSorting(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--provider-selection")==0) {
             TestProviderSelection(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--provider-navigation")==0) {
@@ -2103,10 +2122,12 @@ int wmain(int argc,wchar_t** argv) {
         TestPropertyPoolIsolation(fixture.wstring());
         TestDriveSpaceRefresh();
         TestPreviewAndLayout(fixture.wstring());
+        TestPreprocessingBenchmarks(fixture.wstring());
         TestLayoutWatchAndCache(fixture.wstring());
         TestFilesystemMutationDelivery(fixture.wstring());
         TestShellProviderContents(fixture.wstring());
         TestProviderSelection(fixture.wstring());
+        TestInitialSorting(fixture.wstring());
         TestNativeMenuInteraction();
         TestSelectionUiWork(fixture.wstring());
         TestProviderNavigation(fixture.wstring());

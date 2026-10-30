@@ -89,6 +89,15 @@ static void TestResizePresentation(HWND frame,const std::wstring& fixture) {
                 pending->device==accepted->device && !pending->failed,
                 "pending navigation painted a placeholder or discarded its ready image");
         }
+        // Confirm the destination through Windows' default Shell view before
+        // names can publish under the default-on native sorting policy.
+        ComPtr<IShellItem> item; ComPtr<IShellView> native;
+        Check(SUCCEEDED(SHCreateItemFromParsingName(destination.c_str(),nullptr,IID_PPV_ARGS(&item))) &&
+            SUCCEEDED(item->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&folder))) &&
+            SUCCEEDED(folder->CreateViewObject(nullptr,IID_PPV_ARGS(&native))) &&
+            SUCCEEDED(native.As(&tab.state.folderView)),"empty replacement native sort binding");
+        tab.state.folder=folder;
+        InitializeFolderSort(tab.state,destination.wstring());
         QueueDirectoryRefresh(tab.state);
         Check(Eventually([&] {ReceiveDirectoryResults(tab.state); return tab.state.loaded;}),
             "empty replacement directory enumeration");

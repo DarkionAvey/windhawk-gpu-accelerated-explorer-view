@@ -307,11 +307,49 @@ Python 3's standard library. Python is not needed for the build or tests.
 and [release history](../CHANGELOG.md) contain investigation details.
 
 ## Coverage
+
+### Sorting and preprocessing references
+
+`--initial-sort` compares the GPU order to indices returned by a real private
+ExplorerBrowser after saved Name/Size/Date sorts in both directions and a
+two-key sort. It also exercises cached returns, native/overlay switches,
+GPU header writes and the unsorted option. It never uses user folders or input.
+
+`--preprocessing` creates real private directories with 1,000, 10,000 and 50,000
+items, including folders, numeric and Unicode names, four extensions, different
+sizes and timestamps. It runs unsorted loading and Name (both directions),
+Modified, Size, Extension and Type sorting five times each. The full release
+suite runs the 1,000/10,000-item cases three times each.
+
+```powershell
+.\tests\run-regressions.ps1 -SourceFile latest.cpp -TestArguments --preprocessing |
+    Tee-Object -FilePath preprocessing-run.log
+Get-Content preprocessing-run.log | Where-Object { $_ -like 'PREPROCESS,*' } |
+    Set-Content preprocessing-run.csv
+```
+
+The CSV columns after the `PREPROCESS` marker are item count, sort, run,
+provider binding, enumeration, sort, baseline preparation, snapshot preparation,
+and request-to-ready time (all durations in milliseconds). Timings come from
+the production workers' QPC spans; request-to-ready ends at the complete-result
+publication marker, before delivery-queue insertion, and excludes observer polling.
+Creation, correctness checks and fixture cleanup are excluded. Snapshot work
+includes identity indexes and fingerprints. Worker startup, queueing, handoff
+and unlisted bookkeeping also contribute to request-to-ready time.
+
+These are warm local filesystem/component measurements. The harness does not
+flush OS caches or measure live Explorer navigation, displayed frame rates,
+network storage or third-party metadata providers. Compare runs on the same
+machine, toolchain, filesystem and build configuration; keep raw samples and
+medians/maxima as references. There is no machine-dependent timing pass/fail
+threshold. Counts, ordering, path indexes and opt-out enumeration order must
+still pass correctness checks. See [the recorded baseline](../docs/preprocessing-0.9.303.md).
+
 The harness covers:
 
 - Thirty independent directory workers while ninety layout, property and icon workers are deliberately blocked. The test also fills more icon jobs than the former global queue allowed.
 - Generation cancellation, preview coalescing, complete-result delivery, and asynchronous thread/context reclamation.
-- Early names for a grouped/sorted folder, and navigation past a blocked layout provider.
+- No unsorted first batch for saved sorts/groups; metadata-backed sorts and unsorted navigation bypass blocked layout providers.
 - Real sorting/grouping, cached row/index restoration, and background filesystem watch installation and delivery.
 - Repeated Name/Date/Type/Size sorts while the property lane is blocked: previously resolved cells remain available before paint, including known empty values, offscreen rows and folder-cache returns, without duplicate provider requests. Column generations reuse existing keys; a newly added property requests only that key. Changed file metadata and Shell UPDATEITEM hints still invalidate the affected row.
 - Baseline native host suppression through 100 unpumped show/style/resize cycles, visibility restoration and ownership cleanup.
