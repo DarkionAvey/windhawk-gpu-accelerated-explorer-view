@@ -242,8 +242,17 @@ static void TestSelectionGestures(ViewState& state, SelectionFolderView& native)
                 fresh(); PointerFixture::At(state.hwnd,point);
                 Check(state.hovered==-1,"fresh directory retained hover before the first key");
                 NavigateKeyboardSelection(state,key,false,false); expectSingle(seed);
+                Check(state.hovered==-1 && !state.hoverAnimationActive && state.pointerHoverSuppressed,
+                    "initial hover seed retained a second highlight after keyboard selection");
                 NavigateKeyboardSelection(state,key,false,false);
                 expectSingle(seed+(key==VK_UP ? -state.itemsPerRow : state.itemsPerRow));
+                RefreshHoverUnderCursor(state);
+                Check(state.hovered==-1 && state.pointerHoverSuppressed,
+                    "stationary pointer displaced keyboard ownership in list/grid");
+                fresh();
+                NavigateKeyboardSelection(state,key,false,false); expectSingle(0);
+                Check(state.hovered==-1 && state.pointerHoverSuppressed,
+                    "clearing keyboard selection revived a suppressed stationary hover seed");
                 fresh(); PointerFixture::At(state.hwnd,POINT{-20,-20});
                 NavigateKeyboardSelection(state,key,false,false); expectSingle(0);
             }
@@ -269,7 +278,7 @@ static void TestSelectionGestures(ViewState& state, SelectionFolderView& native)
     StopSelectionFade(state);
     g_smooth = smooth;
     Check(SetKeyboardState(saved), "repeat click keyboard restore");
-    std::cout << "PASS: repeated clicks, bulk edge navigation, stationary-pointer first-key seeding/fallback in list/grid, remembered/deleted caret priority and native selection identities\n";
+    std::cout << "PASS: repeated clicks, bulk edge navigation, initial hover seeding/first-item fallback in list/grid followed by stationary-hover suppression, remembered/deleted caret priority and native selection identities\n";
 }
 
 static void TestMarqueeSelection(const std::wstring& directory, bool entireDirectory = false) {

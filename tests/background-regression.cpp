@@ -1073,32 +1073,38 @@ static void TestKeyboardPresentation(ViewState& state) {
         ClearPointerHover(state, false);
         Select(state, 1);
         StopSelectionFade(state);
+        PointerFixture::At(state.hwnd, pointer);
         UpdatePointerHover(state, pointer, false);
         NavigateKeyboardSelection(state, VK_DOWN, false, false);
+        UpdatePointerHover(state, pointer, false);
+        RefreshHoverUnderCursor(state);
+        Check(state.hovered == -1 && !state.hoverAnimationActive && state.pointerHoverSuppressed,
+              "stationary pointer regained hover after keyboard navigation");
         elapsed(state.keyboardSelectionStartedQpc, -1000.);
-        const int restingHover = alpha(2);
-        Check(std::abs(restingHover - 255 * g_hoverAlpha.load() / 100) <= 2,
-              "keyboard selection erased the destination's resting hover");
+        Check(alpha(2) <= 2, "keyboard destination retained a second pointer highlight");
         elapsed(state.keyboardSelectionStartedQpc, 181.);
         const int keyboardOverlap = alpha(2);
         StopKeyboardSelectionAnimation(state);
         Check(std::abs(alpha(2) - keyboardOverlap) <= 2 &&
-              std::abs(keyboardOverlap - 255 * opacity / 100) <= 2,
-              "combined highlight jumped when keyboard motion ended");
+              std::abs(keyboardOverlap - 255 * g_selectionAlpha.load() / 100) <= 2,
+              "keyboard highlight inherited the pointer's combined opacity");
         NavigateKeyboardSelection(state, VK_DOWN, false, false);
         elapsed(state.keyboardSelectionStartedQpc, 181.);
-        Check(std::abs(alpha(2) - 255 * g_hoverAlpha.load() / 100) <= 2,
-              "hover disappeared when selection left its row");
+        Check(alpha(2) <= 2, "stationary pointer stayed highlighted after keyboard selection moved on");
         StopKeyboardSelectionAnimation(state);
         Select(state, 2);
         StopSelectionFade(state);
         ClearPointerHover(state, false);
-        UpdatePointerHover(state, pointer, true);
+        const POINT resumed{pointer.x + 1, pointer.y};
+        PointerFixture::At(state.hwnd, resumed);
+        UpdatePointerHover(state, resumed, true);
         elapsed(state.hoverStartedQpc, kHoverAnimationDurationMs + 1.);
-        Check(std::abs(alpha(2) - keyboardOverlap) <= 2,
-              "mouse and keyboard overlap painted different backgrounds");
+        Check(!state.pointerHoverSuppressed && state.hovered == 2 &&
+              std::abs(alpha(2) - 255 * opacity / 100) <= 2,
+              "actual pointer movement did not restore combined mouse selection styling");
         NavigateKeyboardSelection(state, VK_UP, false, false);
-        Check(state.hoverAnimationActive, "keyboard input cancelled independent hover motion");
+        Check(!state.hoverAnimationActive && state.hovered == -1,
+              "keyboard input retained an outgoing hover animation");
         StopKeyboardSelectionAnimation(state);
         StopHoverAnimation(state);
     }
@@ -1112,6 +1118,7 @@ static void TestKeyboardPresentation(ViewState& state) {
     BYTE savedKeys[256]{}, plainKeys[256]{};
     Check(GetKeyboardState(savedKeys) && SetKeyboardState(plainKeys), "highlight click keyboard setup");
     const LPARAM clickPoint = MAKELPARAM(pointer.x, pointer.y);
+    PointerFixture::At(state.hwnd, pointer);
     Select(state, 2); StopSelectionFade(state);
     for (int opacity : {70, 20}) {
         g_bothAlpha = opacity;

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.303
+
+- Ignore stationary mouse hover during keyboard/controller selection, including
+  single-click point-to-select. Hover resumes when the pointer moves or receives
+  a mouse action. The first Up/Down key still starts from the hovered item,
+  or the first item when nothing is hovered.
+
 ## 0.9.302
 
 - Restore animated Group by changes in Details, List and icon grids, including
