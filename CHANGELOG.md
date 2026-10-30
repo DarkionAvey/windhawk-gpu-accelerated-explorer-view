@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.301 (unreleased)
+
+- Match rename fields to dark, light and high contrast themes, and center text
+  using the selected font's metrics.
+- Reveal rename fields vertically and horizontally, keep them inside the list
+  during resizing, and retain the renamed item's selection background.
+
 ## 0.9.300
 
 - Restore Back/Forward bubbles on repeated swipes by detaching completed fade

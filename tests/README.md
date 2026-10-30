@@ -43,6 +43,13 @@ contain spaces or Unicode. Relative source paths are rooted at the repository.
 
 ## Focused or historical tests
 
+`--rename` includes native EDIT paint color checks for dark/light/high contrast,
+font-metric centering with custom fonts and wrapped names, immediate reveal
+from both horizontal edges, and actual window resize/move containment.
+Grouped/ungrouped Details, List and grid layouts cover 96/192 DPI and LTR/RTL;
+GPU readback checks the renamed item's selection through the presentation model.
+These private offscreen component tests do not establish live Explorer rendering.
+
 `--touch` feeds calibrated contacts through the production input boundary into
 the real Windows Interaction Context recognizer. A private synthetic digitizer
 supplies calibration; it never injects input into the desktop. No gesture

@@ -1579,7 +1579,9 @@ static void TestRenameSizing() {
         state.columns.push_back(name);
         const RECT initial = RenameEditorRect(state, 0);
         auto& r = state.rename;
-        r.editor = CreateWindowExW(0, L"EDIT", entry.name.c_str(), WS_CHILD | WS_BORDER |
+        // Production owns its themed nonclient border; keep native text/undo
+        // checks on that same borderless EDIT style.
+        r.editor = CreateWindowExW(0, L"EDIT", entry.name.c_str(), WS_CHILD |
             ES_AUTOHSCROLL | (rtl ? ES_RIGHT : ES_LEFT), initial.left, initial.top,
             initial.right-initial.left, initial.bottom-initial.top, frame, nullptr, GetModuleHandleW(nullptr), nullptr);
         Check(r.editor != nullptr, "rename native EDIT");
@@ -1871,6 +1873,7 @@ static void TestPreviewInput() {
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"
+#include "rename-appearance-smoke.h"
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
 
@@ -2036,6 +2039,7 @@ int wmain(int argc,wchar_t** argv) {
             TestRowComposition<ViewState>(frame); DestroyWindow(frame); g_writeFactory.Reset();
         } else if (argc>1 && wcscmp(argv[1],L"--rename")==0) {
             TestRenameSizing();
+            TestRenameAppearance(fixture.wstring());
             TestRenameHandoff(fixture.wstring());
             TestEditorSelectionOwnership(fixture.wstring());
             TestRenameReorderReadiness(fixture.wstring());
@@ -2109,6 +2113,7 @@ int wmain(int argc,wchar_t** argv) {
         TestTimingReadiness(fixture.wstring());
         TestMirroredWindowCoordinates(fixture.wstring());
         TestRenameSizing();
+        TestRenameAppearance(fixture.wstring());
         TestRenameHandoff(fixture.wstring());
         TestEditorSelectionOwnership(fixture.wstring());
         TestRenameReorderReadiness(fixture.wstring());
