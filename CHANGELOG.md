@@ -2,6 +2,8 @@
 
 ## 0.9.301 (unreleased)
 
+- Draw selection marquees above file/folder content and group headings, while
+  keeping scrollbars and navigation gestures in the foreground.
 - Match rename fields to dark, light and high contrast themes, and center text
   using the selected font's metrics.
 - Reveal rename fields vertically and horizontally, keep them inside the list

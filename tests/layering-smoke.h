@@ -188,12 +188,14 @@ static void TestHighlightLayering(HWND frame) {
             for(UINT32 y=0;y<size.height;++y) memcpy(result.data()+y*size.width*4,map.bits+y*map.pitch,size.width*4);
             cpu->Unmap(); return result;
         };
-        const auto checkForeground=[&](const auto& reference,const auto& actual,UINT32 from,UINT32 to) {
+        const auto checkForeground=[&](const auto& reference,const auto& actual,UINT32 from,UINT32 to,bool marquee=false) {
             unsigned opaque=0;
             for(size_t p=size_t(from)*640*4;p<std::min(actual.size(),size_t(to)*640*4);p+=4)
                 if(reference[p]==255 && reference[p+1]==255 && reference[p+2]==255 && reference[p+3]==255) {
                     ++opaque;
-                    Check(memcmp(&reference[p],&actual[p],4)==0,"highlight tinted an opaque label/icon foreground pixel");
+                    Check((memcmp(&reference[p],&actual[p],4)!=0)==marquee,
+                        marquee ? "marquee failed to cover an opaque label/icon pixel" :
+                            "highlight tinted an opaque label/icon foreground pixel");
                 }
             Check(opaque>40,"layering fixture contained no opaque foreground");
         };
@@ -215,7 +217,7 @@ static void TestHighlightLayering(HWND frame) {
                 state.marqueeStartDocumentY=0;
                 state.marqueeCurrent={640,LONG(state.headerPx+state.rowPx)};
                 paint();
-                checkForeground(reference,pixels(state.backbuffer.Get()),UINT32(state.headerPx),UINT32(state.headerPx+state.rowPx));
+                checkForeground(reference,pixels(state.backbuffer.Get()),UINT32(state.headerPx),UINT32(state.headerPx+state.rowPx),feedback>=5);
                 if(feedback!=3) { // A Shell drop target is independent of keyboard focus.
                     const auto flags=state.selectedFlags;
                     const int selected=state.selected,hovered=state.hovered;
@@ -324,6 +326,7 @@ static void TestHighlightLayering(HWND frame) {
         state.marqueeActive=state.marqueeFading=state.keyboardCaretVisible=false;
         ApplyViewLayout(state,{FVM_DETAILS,48},false); FinishColumnTransition(state); icon();
         state.selected=0; state.selectedFlags[0]=1; state.hovered=0; state.shellDropHotRow=-1;
+        AnimationClockFixture::Freeze clock;
         SetColumnViewMode(state,false); Paint(state);
         Check(state.modeComposition.published,"layering mode scene was not prepared");
         const auto origin=state.modeComposition.started.QuadPart;
@@ -345,8 +348,7 @@ static void TestHighlightLayering(HWND frame) {
             names{state.modeComposition.names.bitmap.Get()}, metadata{state.modeComposition.metadata.bitmap.Get()},
             chrome{state.modeComposition.chrome.bitmap.Get()};
         [&]<class V>(V& parent,const std::array<V*,4>& layers) {
-            // Historical sources lack the new shared append operation; their
-            // real marquee pixel check above still runs and exposes the tint.
+            // Replay the submitted composition order, independently of scan-out.
             if constexpr(requires { AppendCompositionVisual(&parent,layers[0]); }) {
                 for(auto* layer : layers) Check(SUCCEEDED(AppendCompositionVisual(&parent,layer)),"append composition layer");
                 Check(parent.children.front()==layers.front() && parent.children.back()==layers.back(),
@@ -369,11 +371,25 @@ static void TestHighlightLayering(HWND frame) {
                     "body ordering moved background or chrome");
             }
         }(root,std::array{&background,&names,&metadata,&chrome});
+        const auto plainChrome=pixels(state.modeComposition.chrome.bitmap.Get());
+        state.marqueeActive=true;
+        state.marqueeStart={0,LONG(std::ceil(state.headerPx))};
+        state.marqueeStartDocumentY=state.scrollNow;
+        state.marqueeCurrent={640,320};
+        Paint(state);
+        const auto coveredChrome=pixels(state.modeComposition.chrome.bitmap.Get());
+        Check(coveredChrome!=plainChrome,"animated mode marquee did not reach the foreground chrome plane");
+        const size_t headerBytes=size_t(std::ceil(state.headerPx))*640*4;
+        Check(std::equal(plainChrome.begin(),plainChrome.begin()+headerBytes,coveredChrome.begin()),
+            "animated mode marquee covered the column headers");
+        for(int y:{int(std::ceil(state.headerPx))+2,317})
+            Check(coveredChrome[(size_t(y)*640+320)*4+3]>0,
+                "animated mode marquee used canonical source bounds instead of the live viewport");
         UnregisterAnimationWindow(state.hwnd); DropTarget(state);
         SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
         DestroyWindow(edit); DestroyWindow(chromeControl); DestroyWindow(state.hwnd);
     }
     g_selectionAlpha=selection; g_hoverAlpha=hover; g_bothAlpha=combined; g_marqueeAlpha=marquee;
     g_selectionRgb=accent; g_filenameOnly=filenames; g_zebra=zebra;
-    std::cout<<"PASS: LTR/RTL Details/List/grid selection pixels survive native-menu popup focus without granting list input; dismissal, unrelated popups/focus, modal/background frames and folder generations clear feedback; focus repaints coalesce and inactive compositor pixels clear without retiming\n";
+    std::cout<<"PASS: LTR/RTL Details/List/grid marquee and fade cover opaque item pixels; animated mode uses foreground chrome and live viewport bounds; selection pixels survive native-menu popup focus without granting input, and focus/foreground loss clears feedback\n";
 }

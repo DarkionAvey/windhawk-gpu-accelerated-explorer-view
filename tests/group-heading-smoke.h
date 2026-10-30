@@ -66,6 +66,29 @@ static void TestStickyGroupHeaders(HWND frame) {
                 "scrolling labels/icons/selection/zebra bled through the sticky header");
         }
         Check(ink>20,"sticky heading reference was blank");
+        // A pinned heading belongs to the file content. The marquee must
+        // cross its text as well as the item body below its reserved band.
+        const auto activeTabHost=state.activeTabHost;
+        state.activeTabHost=state.frameHwnd;
+        Check(OverlayHasInputFocus(state),"sticky marquee fixture has no active list input");
+        const auto marqueeAlpha=g_marqueeAlpha.exchange(80);
+        const auto marqueeColor=g_selectionRgb.exchange(RGB(0,96,220));
+        state.marqueeActive=true;
+        state.marqueeStart={0,LONG(state.headerPx)};
+        state.marqueeStartDocumentY=state.scrollNow;
+        state.marqueeCurrent={640,360};
+        const auto covered=paintBand();
+        size_t coveredInk=0;
+        for(size_t p=0;p<actual.size();p+=4)
+            if(actual[p+3]) {
+                ++coveredInk;
+                Check(memcmp(actual.data()+p,covered.data()+p,4)!=0,
+                    "marquee was clipped below pinned group text");
+            }
+        Check(coveredInk>20,"sticky marquee fixture had no heading text");
+        state.marqueeActive=false;
+        state.activeTabHost=activeTabHost;
+        g_marqueeAlpha=marqueeAlpha; g_selectionRgb=marqueeColor;
         UpdatePointerHover(state,{x,y},false);
         Check(state.hotSection==0 && state.hovered==-1,"sticky hover targeted an underlying file");
         const auto captured=CaptureVisibleGroupHeaders(state);

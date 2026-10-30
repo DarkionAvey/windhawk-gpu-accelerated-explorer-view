@@ -175,6 +175,10 @@ the real menu loop. It never switches desktops or touches the user's focus or
 clipboard. Actual WinUI mouse presentation, keyboard keytips and expanded
 submenus require live Explorer input verification; see the
 [native menu investigation](../docs/context-menus-0.9.287.md).
+The graphics suite checks active/fading marquees above opaque item pixels and
+pinned group headings in LTR/RTL Details/List/grid. Mode and row transitions
+must put the marquee on the existing chrome plane using live viewport bounds.
+These are offscreen GPU/source-plane checks, not live Explorer captures.
 The graphics suite also compares selected GPU pixels while a real owned popup
 is shown, hidden and destroyed, with substituted focus. It checks that menu
 feedback does not grant list input or survive unrelated focus, modal/background

@@ -17022,43 +17022,6 @@ void Paint(ViewState& state) {
         }
     }
     state.target->PopAxisAlignedClip(); // zebra background margins
-    // Marquee fill/outline are background feedback, like selection/hover.
-    // Unlike the row layer, a selection marquee may extend from start to end
-    // of the entire viewport, including the designated empty safe zone.
-    state.target->PushAxisAlignedClip(D2D1::RectF(0.f, itemClipTop, w, contentBottom),
-                                      D2D1_ANTIALIAS_MODE_ALIASED);
-    if (state.inputFocusIndicators && (state.marqueeActive || state.marqueeFading)) {
-        const float left = static_cast<float>(std::min(state.marqueeStart.x, state.marqueeCurrent.x));
-        const float right = static_cast<float>(std::max(state.marqueeStart.x, state.marqueeCurrent.x));
-        const float anchoredY = static_cast<float>(state.headerPx) +
-            state.marqueeStartDocumentY - state.scrollNow;
-        const float top = std::max(static_cast<float>(state.headerPx),
-            std::min(anchoredY, static_cast<float>(state.marqueeCurrent.y)));
-        const float bottom = std::max(anchoredY,
-            static_cast<float>(state.marqueeCurrent.y));
-        float opacity = g_marqueeAlpha.load(std::memory_order_relaxed) / 100.f;
-        if (state.marqueeFading && !state.marqueeActive) {
-            const ULONGLONG now = GetTickCount64();
-            opacity *= std::clamp(
-                static_cast<float>(state.marqueeEndTick > now ?
-                state.marqueeEndTick - now : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f);
-        }
-        if ((right > left || bottom > top) && opacity > 0.f) {
-            const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
-            const unsigned rgb = ThemeRgb(c);
-            const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
-            // Marquee is stored in physical pointer coordinates, unlike the
-            // logical column geometry mirrored by Fill().
-            Fill(state, state.rtlLayout ? w - right : left, top,
-                 state.rtlLayout ? w - left : right, bottom,
-                 rgb, opacity, 4.f);
-            state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
-            if (right == left || bottom == top)
-                StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
-            else StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),state.brush.Get(),1.f);
-        }
-    }
-    state.target->PopAxisAlignedClip(); // full-width marquee, not row clip
     state.target->PushAxisAlignedClip(state.rtlLayout ?
         D2D1::RectF(w-rowBgEnd,itemClipTop,w-rowBgStart,contentBottom) :
         D2D1::RectF(rowBgStart,itemClipTop,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
@@ -17444,6 +17407,45 @@ void Paint(ViewState& state) {
         compositionFrame.Restore();
         state.target->SetTarget(state.modeComposition.chrome.bitmap.Get());
     }
+    // Marquee covers item contents and group headings on the ordinary target
+    // or transition chrome plane. Use the restored viewport, not an animated
+    // source's geometry or the body clip below a pinned group heading.
+    if (state.inputFocusIndicators && (state.marqueeActive || state.marqueeFading)) {
+        const auto viewport = ContentViewport(state);
+        state.target->PushAxisAlignedClip(D2D1::RectF(0.f, static_cast<float>(viewport.top),
+            w, static_cast<float>(viewport.bottom)), D2D1_ANTIALIAS_MODE_ALIASED);
+        const float left = static_cast<float>(std::min(state.marqueeStart.x, state.marqueeCurrent.x));
+        const float right = static_cast<float>(std::max(state.marqueeStart.x, state.marqueeCurrent.x));
+        const float anchoredY = static_cast<float>(state.headerPx) +
+            state.marqueeStartDocumentY - state.scrollNow;
+        const float top = std::max(static_cast<float>(state.headerPx),
+            std::min(anchoredY, static_cast<float>(state.marqueeCurrent.y)));
+        const float bottom = std::max(anchoredY,
+            static_cast<float>(state.marqueeCurrent.y));
+        float opacity = g_marqueeAlpha.load(std::memory_order_relaxed) / 100.f;
+        if (state.marqueeFading && !state.marqueeActive) {
+            const ULONGLONG now = GetTickCount64();
+            opacity *= std::clamp(
+                static_cast<float>(state.marqueeEndTick > now ?
+                state.marqueeEndTick - now : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f);
+        }
+        if ((right > left || bottom > top) && opacity > 0.f) {
+            const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
+            const unsigned rgb = ThemeRgb(c);
+            const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
+            // Marquee is stored in physical pointer coordinates, unlike the
+            // logical column geometry mirrored by Fill().
+            Fill(state, state.rtlLayout ? w - right : left, top,
+                 state.rtlLayout ? w - left : right, bottom,
+                 rgb, opacity, 4.f);
+            state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
+            if (right == left || bottom == top)
+                StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
+            else StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),state.brush.Get(),1.f);
+        }
+        state.target->PopAxisAlignedClip();
+    }
+    // Scrollbars and persistent navigation feedback remain above the marquee.
     DrawScrollbar(state, compositionFrame.active ? Scrollbar(state) : bar, nameColor,
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
     DrawScrollbar(state, HorizontalBar(state), nameColor,

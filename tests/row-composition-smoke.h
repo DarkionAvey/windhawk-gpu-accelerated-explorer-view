@@ -85,6 +85,17 @@ static void TestRowComposition(HWND frame) {
                 <<" icons="<<ink(icons)<<" feedback="<<ink(feedback)<<" focus="<<s.inputFocusIndicators<<std::endl;
             Check(ink(text) && ink(icons) && ink(feedback),"packed sources lost item text, icons or selection");
             Check(!grouped || ink(read(s.modeComposition.groups.bitmap.Get())),"group headings missing from compositor");
+            const auto chrome=read(s.modeComposition.chrome.bitmap.Get());
+            s.marqueeActive=true;
+            s.marqueeStart={0,LONG(std::ceil(s.headerPx))};
+            s.marqueeStartDocumentY=s.scrollNow;
+            s.marqueeCurrent={800,480};
+            Paint(s);
+            Check(read(s.modeComposition.chrome.bitmap.Get())!=chrome &&
+                read(s.modeComposition.names.bitmap.Get())==icons &&
+                read(s.modeComposition.metadata.bitmap.Get())==text,
+                "row transition marquee did not stay above the packed item sources on its chrome plane");
+            s.marqueeActive=false; Paint(s);
             Check(s.modeComposition.names.bitmap->GetPixelSize().height<6*480,
                 "row sources scale with the directory rather than the viewport");
             const auto root=s.modeComposition.root.Get(); const auto atlas=s.modeComposition.names.bitmap.Get();
