@@ -41,7 +41,9 @@ preprocessing from 280.16 to 213.72 ms. The
 development version before that optimization. Whole-run differences also include
 scheduling and cache variation; these figures are references, not timing gates.
 
-To reproduce the archived baseline:
+To reproduce the archived baseline, use the matching source and test harness
+from release 0.9.303 (repository revision `a4c0648`). Newer harness revisions
+can depend on newer production helpers. Within that matching checkout:
 
 ```powershell
 .\tests\run-regressions.ps1 -SourceFile previous-versions/0.9.303.cpp -TestArguments --preprocessing

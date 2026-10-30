@@ -321,6 +321,17 @@ sizes and timestamps. It runs unsorted loading and Name (both directions),
 Modified, Size, Extension and Type sorting five times each. The full release
 suite runs the 1,000/10,000-item cases three times each.
 
+The same fixture also compares direct introsort, index introsort, index merge
+sort and adaptive natural merge sort. `SORT_KERNEL` rows include item count,
+sort, input order, algorithm, sample, sorting/permutation milliseconds and
+comparison count. Inputs are the real enumerated rows, reversed enumeration,
+a reproducible shuffle, sorted rows and reverse-sorted rows; copies and checks
+are outside the interval. Extended runs use 50,000 items and three samples;
+the release suite checks 1,000 items once. Secondary keys, stable equal-key
+groups, small/odd runs and complete row metadata are checked against standard
+sorts. Published path indexes are checked row by row; mixed private directories
+exercise the shared-prefix hash fallback.
+
 ```powershell
 .\tests\run-regressions.ps1 -SourceFile latest.cpp -TestArguments --preprocessing |
     Tee-Object -FilePath preprocessing-run.log
@@ -333,8 +344,10 @@ provider binding, enumeration, sort, baseline preparation, snapshot preparation,
 and request-to-ready time (all durations in milliseconds). Timings come from
 the production workers' QPC spans; request-to-ready ends at the complete-result
 publication marker, before delivery-queue insertion, and excludes observer polling.
-Creation, correctness checks and fixture cleanup are excluded. Snapshot work
-includes identity indexes and fingerprints. Worker startup, queueing, handoff
+Creation, correctness checks and fixture cleanup are excluded. Since 0.9.304,
+baseline preparation builds the shared identity index and fingerprints, which
+snapshot preparation consumes. Compare their combined cost across versions.
+Worker startup, queueing, handoff
 and unlisted bookkeeping also contribute to request-to-ready time.
 
 These are warm local filesystem/component measurements. The harness does not
@@ -343,7 +356,8 @@ network storage or third-party metadata providers. Compare runs on the same
 machine, toolchain, filesystem and build configuration; keep raw samples and
 medians/maxima as references. There is no machine-dependent timing pass/fail
 threshold. Counts, ordering, path indexes and opt-out enumeration order must
-still pass correctness checks. See [the recorded baseline](../docs/preprocessing-0.9.303.md).
+still pass correctness checks. See [the original baseline](../docs/preprocessing-0.9.303.md)
+and [the sorting optimization reference](../docs/preprocessing-0.9.304.md).
 
 The harness covers:
 

@@ -1,6 +1,30 @@
 // Actual tab-owned production pipeline over private Win32 filesystem fixtures.
 // Creation and correctness checks are outside the timed interval. OS caches
 // remain warm; these numbers do not measure displayed Explorer frame rates.
+#include "sort-algorithm-benchmark.h"
+
+static void TestMixedDirectoryIndex(const std::wstring& fixture, const std::vector<Entry>& nested) {
+    std::vector<Entry> rows(nested.begin(),nested.begin()+std::min(size_t(3),nested.size()));
+    WIN32_FIND_DATAW data{};
+    HANDLE find=FindFirstFileExW(JoinPath(fixture,L"*").c_str(),FindExInfoBasic,&data,FindExSearchNameMatch,nullptr,0);
+    Check(find!=INVALID_HANDLE_VALUE,"mixed-directory identity fixture");
+    do {
+        if (data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
+        Entry entry; entry.name=data.cFileName; entry.path=JoinPath(fixture,entry.name);
+        entry.attributes=data.dwFileAttributes; entry.created=data.ftCreationTime;
+        entry.accessed=data.ftLastAccessTime; entry.lastWrite=data.ftLastWriteTime;
+        entry.byteSize=(ULONGLONG(data.nFileSizeHigh)<<32)|data.nFileSizeLow;
+        rows.push_back(std::move(entry)); break;
+    } while (FindNextFileW(find,&data));
+    FindClose(find);
+    Check(rows.size()>3,"mixed-directory fixture has no parent file");
+    const auto index=BuildDirectorySnapshotIndex(rows,[] {return true;});
+    Check(index.orderHash==DirectoryOrderHash(rows) && index.metadataHash==DirectoryMetadataHash(rows),
+        "shared prefix hash changed a mixed-directory fingerprint");
+    for (const auto& [hash,row] : index.paths)
+        Check(hash==SelectionPathHash(rows[row].path),"shared prefix hash failed its mixed-path fallback");
+}
+
 static void TestPreprocessingBenchmarks(const std::wstring& fixture, bool extended=false) {
     const bool tracing=g_pipelineTracing.exchange(true);
     struct Restore {bool trace; ~Restore() {g_pipelineTracing=trace;}} restore{tracing};
@@ -66,6 +90,13 @@ static void TestPreprocessingBenchmarks(const std::wstring& fixture, bool extend
                     result.pathIndex.size()==size_t(count),"large-directory preprocessing lost identities");
                 Check(result.orderHash==DirectoryOrderHash(result.entries) &&
                     result.metadataHash==DirectoryMetadataHash(result.entries),"preprocessing reused stale fingerprints");
+                Check(std::is_sorted(result.pathIndex.begin(),result.pathIndex.end()),"preprocessing identity index order");
+                std::vector<bool> indexed(count);
+                for (const auto& [hash,row] : result.pathIndex) {
+                    Check(row>=0 && row<count && !indexed[row] &&
+                        hash==SelectionPathHash(result.entries[row].path),"preprocessing identity index mismatch");
+                    indexed[row]=true;
+                }
                 if (choice.sorted) Check(std::is_sorted(result.entries.begin(),result.entries.end(),
                     [&](const Entry& a,const Entry& b) {return EntryPrecedes(a,b,state.sort);}),
                     "large-directory preprocessing returned the wrong order");
@@ -89,6 +120,15 @@ static void TestPreprocessingBenchmarks(const std::wstring& fixture, bool extend
             std::sort(totals.begin(),totals.end());
             std::cout<<"PREPROCESS_SUMMARY,"<<count<<','<<choice.name<<",median_ms,"<<totals[totals.size()/2]
                 <<",max_ms,"<<totals.back()<<'\n';
+        }
+        // Keep algorithm experiments outside the sequence of pipeline samples.
+        // Obtain their input through another real unsorted worker enumeration.
+        if (extended ? count==50000 : count==1000) {
+            state.sort=DefaultSort(); state.sort.explicitOrder=false;
+            QueueDirectoryRefresh(state,true);
+            const auto rows=WaitForComplete(work,state.directoryToken);
+            TestMixedDirectoryIndex(fixture,rows.entries);
+            TestSortAlgorithms(rows.entries,extended);
         }
         Stop(state.background); DestroyWindow(state.hwnd);
         Check(std::filesystem::weakly_canonical(root).parent_path()==std::filesystem::weakly_canonical(fixture),

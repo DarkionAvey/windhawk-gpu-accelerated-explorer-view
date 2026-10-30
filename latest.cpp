@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.303
+// @version         0.9.304
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -766,7 +766,9 @@ struct ExtraSortValue {
         return SameProperty(key,other.key) && text==other.text && number==other.number && kind==other.kind;
     }
 };
-struct Entry {
+// Refresh baselines retain only comparison data, without presentation cells,
+// formatted metadata, grouping strings or in-flight enrichment state.
+struct EntrySortKey {
     // Extra sort keys are populated only when the user chooses a Shell sort
     // that isn't already in WIN32_FIND_DATA. No per-row property COM on paint.
     std::wstring sortText;
@@ -775,18 +777,21 @@ struct Entry {
     std::vector<ExtraSortValue> secondarySortValues;
     FILETIME created{}, accessed{};
     std::wstring path;
-    std::wstring name, date, type, size;
+    std::wstring name;
+    FILETIME lastWrite{};
+    ULONGLONG byteSize = 0;
+    bool folder = false;
+    SharedPidl shellIdentity; // Immutable identity for targeted provider rechecks.
+};
+struct Entry : EntrySortKey {
+    std::wstring date, type, size;
     std::vector<ColumnCell> cells;
     unsigned long long columnEpoch = 0;
     // Shell associations invalidate property text independently of UI columns.
     unsigned long long propertyEpoch = 1;
     // Refresh freshness is independent of the last displayed property values.
     unsigned long long detailsRefreshEpoch = 0;
-    FILETIME lastWrite{};
-    ULONGLONG byteSize = 0;
-    bool folder = false;
     DWORD attributes = 0; // Captured by the names worker; never queried while painting.
-    SharedPidl shellIdentity; // Tab-owned immutable Shell identity; never a native row-number dependency.
     SharedPidl shellChild; // Exact enumerated relative PIDL, including compound children.
     ULONGLONG driveUsed = 0, driveTotal = 0;
     int driveUsedPercent = -1; // Shell may report percentage without total bytes.
@@ -979,13 +984,15 @@ using EntryPathIndex = std::vector<std::pair<size_t, int>>;
 // Sparse local identity changes between worker-built directory snapshots.
 // Updating one row must not rebuild/shift the whole sorted index on the STA.
 using EntryPathUpdates = std::map<size_t, std::set<int>>;
-size_t SelectionPathHash(const std::wstring& path) noexcept {
-    size_t hash = static_cast<size_t>(2166136261u);
+size_t ContinueSelectionPathHash(size_t hash, std::wstring_view path) noexcept {
     for (wchar_t ch : path) {
         hash ^= static_cast<size_t>(towlower(ch));
         hash *= static_cast<size_t>(16777619u);
     }
     return hash;
+}
+size_t SelectionPathHash(const std::wstring& path) noexcept {
+    return ContinueSelectionPathHash(static_cast<size_t>(2166136261u),path);
 }
 
 struct CaseInsensitiveFolderLess {
@@ -1441,7 +1448,7 @@ struct DirectoryJob {
     unsigned long long previousOrderHash = 0, previousMetadataHash = 0;
     bool checkSort = false; // Observe keys without invalidating the displayed snapshot.
     unsigned long long checkOrderHash = 0;
-    std::vector<Entry> sortChecks; // Bounded changed identities; empty means verify overflow order.
+    std::vector<EntrySortKey> sortChecks; // Bounded changed identities; empty means verify overflow order.
     SharedPidl folderIdentity; // Native binding, including filesystem-addressed providers.
     SharedPidl namespaceFolder; // Immutable; rebound only by the names worker.
     std::shared_ptr<const NamespaceIdentities> verifyIdentities;
@@ -1924,9 +1931,10 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
         PTP_WORK pooled = nullptr;
         std::atomic<bool> scheduled{false};
         std::map<std::wstring, std::wstring> typeNames;
-        // Layout-lane ownership only. Compare watch-only edits without copying
+        // Lane-owned. Compare watch-only edits without copying
         // the entire live list on Explorer's STA or retaining provider objects.
-        std::unordered_map<std::wstring, std::pair<int, Entry>> sortedEntries;
+        std::vector<EntrySortKey> sortedEntries;
+        EntryPathIndex sortedPathIndex; // Hash collisions checked against the retained path.
         std::wstring sortedFolder;
         SortSpec sortedOrder;
         unsigned long long sortedOrderHash = 0, sortedMetadataHash = 0;
@@ -6789,11 +6797,11 @@ void RegisterSystemShellNotifications(ViewState& state) {
 ULONGLONG FileTimeNumber(const FILETIME& ft) {
     return (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
-int CompareEntryNames(const Entry& a, const Entry& b) {
+int CompareEntryNames(const EntrySortKey& a, const EntrySortKey& b) {
     int c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
     return c ? c : wcscmp(a.name.c_str(), b.name.c_str());
 }
-const wchar_t* EntryExtension(const Entry& e) {
+const wchar_t* EntryExtension(const EntrySortKey& e) {
     const wchar_t* ext = PathFindExtensionW(e.name.c_str());
     return ext ? ext : L"";
 }
@@ -6850,6 +6858,68 @@ void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key) {
     }
     PropVariantClear(&pv);
 }
+// Natural merge sort reuses ascending runs and reverses strictly descending
+// runs. Balanced merge rounds bound arbitrary inputs by O(n log n), preserve
+// equal-key order and make already ordered/reversed input linear. All buffers
+// belong to the calling tab's worker; no parallel pool or provider calls.
+template<class Less>
+void NaturalSortIndices(std::vector<size_t>& order, Less&& less) {
+    if (order.size()<2) return;
+    std::vector<size_t> runs{0};
+    for (size_t begin=0;begin<order.size();) {
+        size_t end=begin+1;
+        if (end<order.size()) {
+            if (less(order[end],order[begin])) {
+                while (++end<order.size() && less(order[end],order[end-1])) {}
+                std::reverse(order.begin()+begin,order.begin()+end);
+            } else {
+                while (++end<order.size() && !less(order[end],order[end-1])) {}
+            }
+        }
+        runs.push_back(end); begin=end;
+    }
+    if (runs.size()==2) return;
+    std::vector<size_t> scratch(order.size());
+    while (runs.size()>2) {
+        size_t write=1;
+        for (size_t run=0;run+1<runs.size();run+=2) {
+            const size_t begin=runs[run],middle=runs[run+1];
+            const size_t end=run+2<runs.size() ? runs[run+2] : middle;
+            if (middle==end || !less(order[middle],order[middle-1]))
+                std::copy(order.begin()+begin,order.begin()+end,scratch.begin()+begin);
+            else std::merge(order.begin()+begin,order.begin()+middle,
+                order.begin()+middle,order.begin()+end,scratch.begin()+begin,less);
+            runs[write++]=end;
+        }
+        runs.resize(write); order.swap(scratch);
+    }
+}
+
+enum class EntrySortAlgorithm { Intro, Merge, Natural };
+// Compare stationary rows and sort only compact indices. Moving the full Entry
+// (strings, cells, shared identities) at every partition costs much more than
+// applying the resulting permutation once. The same Windows comparator is used.
+template<EntrySortAlgorithm Algorithm=EntrySortAlgorithm::Natural, class Less>
+void SortEntriesByIndex(std::vector<Entry>& entries, Less&& less) {
+    std::vector<size_t> order(entries.size());
+    for (size_t i=0;i<order.size();++i) order[i]=i;
+    const auto compare=[&](size_t a,size_t b) {return less(entries[a],entries[b]);};
+    if constexpr (Algorithm==EntrySortAlgorithm::Merge) std::stable_sort(order.begin(),order.end(),compare);
+    else if constexpr (Algorithm==EntrySortAlgorithm::Intro) std::sort(order.begin(),order.end(),compare);
+    else NaturalSortIndices(order,compare);
+    for (size_t i=0;i<order.size();++i) {
+        if (order[i]==i) continue;
+        Entry saved=std::move(entries[i]);
+        size_t row=i;
+        while (order[row]!=i) {
+            const size_t next=order[row];
+            entries[row]=std::move(entries[next]);
+            order[row]=row; row=next;
+        }
+        entries[row]=std::move(saved); order[row]=row;
+    }
+}
+
 // Compute group identities before publishing a directory snapshot. This runs
 // on the existing background Shell worker; never on WM_PAINT or Explorer's STA.
 void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& group,
@@ -6947,32 +7017,28 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
     }
     if (!DirectoryJobCurrent(work, token)) return;
     const bool ascending = group.ascending != FALSE;
-    std::stable_sort(entries.begin(), entries.end(), [ascending](const Entry& a,
+    SortEntriesByIndex(entries, [ascending](const Entry& a,
             const Entry& b) {
         const int comparison = StrCmpLogicalW(a.groupKey.c_str(), b.groupKey.c_str());
         return ascending ? comparison < 0 : comparison > 0;
     });
 }
 
-Entry SortEntrySnapshot(const Entry& entry, bool includeIdentity = false) {
-    Entry key; key.path=entry.path; key.name=entry.name; key.folder=entry.folder;
-    if (includeIdentity) key.shellIdentity=entry.shellIdentity;
-    key.lastWrite=entry.lastWrite; key.created=entry.created; key.accessed=entry.accessed;
-    key.byteSize=entry.byteSize; key.sortText=entry.sortText;
-    key.sortNumber=entry.sortNumber; key.sortValueKind=entry.sortValueKind;
-    key.secondarySortValues=entry.secondarySortValues;
+EntrySortKey SortEntrySnapshot(const Entry& entry, bool includeIdentity = false) {
+    EntrySortKey key=entry;
+    if (!includeIdentity) key.shellIdentity.reset();
     return key;
 }
 
-SortKind EntrySortKind(const SortSpec& sort, const Entry& entry) {
+SortKind EntrySortKind(const SortSpec& sort, const EntrySortKey& entry) {
     if (!sort.explicitOrder) return SortKind::Name;
     return sort.kind != SortKind::Name && sort.kind != SortKind::Extension &&
         entry.path.starts_with(L"windhawk:pidl:") ? SortKind::ShellProperty : sort.kind;
 }
-int CompareEntrySortKey(const Entry& a, const Entry& b, SortKind kind,
+int CompareEntrySortKey(const EntrySortKey& a, const EntrySortKey& b, SortKind kind,
                         const PROPERTYKEY& key, SORTDIRECTION direction, bool secondary=false) {
     const bool descending = direction == SORT_DESCENDING;
-    const auto extra=[&](const Entry& entry) -> const ExtraSortValue* {
+    const auto extra=[&](const EntrySortKey& entry) -> const ExtraSortValue* {
         const auto it=std::find_if(entry.secondarySortValues.begin(),entry.secondarySortValues.end(),
             [&](const ExtraSortValue& value) {return SameKey(value.key,key);});
         return it==entry.secondarySortValues.end() ? nullptr : &*it;
@@ -7025,7 +7091,7 @@ int CompareEntrySortKey(const Entry& a, const Entry& b, SortKind kind,
     }
     return descending ? -result : result;
 }
-bool EntryPrecedes(const Entry& a, const Entry& b, const SortSpec& spec) {
+bool EntryPrecedes(const EntrySortKey& a, const EntrySortKey& b, const SortSpec& spec) {
     const bool descending = spec.direction == SORT_DESCENDING;
     if (a.folder != b.folder && spec.placement != FolderPlacement::Mixed) {
         const bool foldersFirst = spec.placement == FolderPlacement::AlwaysTop ||
@@ -7097,19 +7163,22 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
         }
     }
     if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
-    std::sort(entries.begin(), entries.end(), [&spec](const Entry& a, const Entry& b) {
+    SortEntriesByIndex(entries, [&spec](const Entry& a, const Entry& b) {
         return EntryPrecedes(a,b,spec);
     });
 }
 
 // Stable order fingerprint is computed off the Explorer STA. If a refresh
 // returns exactly the same ordered names, the live rows stay where they are.
-unsigned long long DirectoryOrderHash(const std::vector<Entry>& entries) {
+unsigned long long DirectoryOrderHash(const std::vector<Entry>& entries,
+                                     const EntryPathIndex* rowHashes = nullptr) {
     unsigned long long hash = 14695981039346656037ULL; // FNV-1a 64
-    for (const auto& e : entries) {
+    for (size_t i=0;i<entries.size();++i) {
+        const auto& e=entries[i];
         // Equal display labels are common in namespaces. Membership/order
         // belongs to item identity, not just the caption or number of rows.
-        hash ^= SelectionPathHash(e.path);
+        // Optional hashes are in ROW order, before sorting the path index.
+        hash ^= rowHashes ? (*rowHashes)[i].first : SelectionPathHash(e.path);
         hash *= 1099511628211ULL;
         for (wchar_t ch : e.name) {
             hash ^= static_cast<unsigned long long>(ch);
@@ -7217,10 +7286,40 @@ bool ShellStoragePercent(IPropertyStore* store, REFPROPERTYKEY key,
     return true;
 }
 
+struct DirectorySnapshotIndex {
+    EntryPathIndex paths;
+    unsigned long long orderHash=0, metadataHash=0;
+};
+template<class Current>
+DirectorySnapshotIndex BuildDirectorySnapshotIndex(const std::vector<Entry>& names, Current&& current) {
+    DirectorySnapshotIndex result;
+    result.paths.reserve(names.size());
+    // FNV can resume from an existing state. Verify the actual prefix per row
+    // before reusing it, including for mixed/provider identities. Folding uses
+    // the same CRT function as a complete path hash, including non-ASCII text.
+    std::wstring_view prefix;
+    if (!names.empty()) {
+        const auto end=names.front().path.find_last_of(L"\\/");
+        if (end!=std::wstring::npos) prefix=std::wstring_view(names.front().path).substr(0,end+1);
+    }
+    const size_t prefixHash=ContinueSelectionPathHash(static_cast<size_t>(2166136261u),prefix);
+    for (size_t i=0;i<names.size();++i) {
+        if ((i&1023u)==0 && !current()) return result;
+        const std::wstring_view path=names[i].path;
+        const size_t hash=path.starts_with(prefix) ? ContinueSelectionPathHash(prefixHash,path.substr(prefix.size())) :
+            SelectionPathHash(names[i].path);
+        result.paths.emplace_back(hash,static_cast<int>(i));
+    }
+    result.orderHash=DirectoryOrderHash(names,&result.paths);
+    result.metadataHash=DirectoryMetadataHash(names);
+    std::sort(result.paths.begin(),result.paths.end());
+    return result;
+}
+
 template<class Current>
 DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
     std::vector<Entry>& names, DWORD error, Current&& current,
-    std::optional<std::pair<unsigned long long,unsigned long long>> fingerprints = std::nullopt) {
+    std::optional<DirectorySnapshotIndex> prepared = std::nullopt) {
     DirectoryResult result;
     if (directory.checkSort) {
         result.kind = DirectoryResult::SortCheck;
@@ -7240,21 +7339,20 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
         for (const auto& entry : names) identities->emplace(entry.path, entry.shellChild);
         result.namespaceIdentities = std::move(identities);
     }
-    result.pathIndex.reserve(names.size());
-    for (size_t i = 0; i < names.size(); ++i) {
+    if (!prepared) prepared=BuildDirectorySnapshotIndex(names,current);
+    if (!current()) return result;
+    result.pathIndex=std::move(prepared->paths);
+    result.orderHash=prepared->orderHash;
+    result.metadataHash=prepared->metadataHash;
+    if (directory.sortRevealOldIndex>=0) for (size_t i = 0; i < names.size(); ++i) {
         if ((i & 1023u) == 0 &&
             !current()) break;
-        result.pathIndex.emplace_back(SelectionPathHash(names[i].path),
-            static_cast<int>(i));
         if (directory.sortRevealOldIndex >= 0 &&
             directory.sortRevealOldIndex != static_cast<int>(i) &&
             names[i].path == directory.sortRevealPath)
             result.sortRevealIndex = static_cast<int>(i);
     }
     if (!current()) return result;
-    std::sort(result.pathIndex.begin(), result.pathIndex.end());
-    result.orderHash = fingerprints ? fingerprints->first : DirectoryOrderHash(names);
-    result.metadataHash = fingerprints ? fingerprints->second : DirectoryMetadataHash(names);
     result.viewportAnchorOffsetPx = directory.viewportAnchorOffsetPx;
     result.viewportCapturedScrollPx = directory.viewportCapturedScrollPx;
     result.restoreViewport = directory.restoreViewport;
@@ -7346,11 +7444,11 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
 
 DirectoryResult PrepareDirectoryResult(TabBackground& work, DirectoryJob& directory,
     std::vector<Entry>& names, DWORD error,
-    std::optional<std::pair<unsigned long long,unsigned long long>> fingerprints = std::nullopt) {
+    std::optional<DirectorySnapshotIndex> prepared = std::nullopt) {
     PipelineScope timing(work, L"directory.snapshot", directory.token, names.size());
     return PrepareItemSnapshot(directory, names, error, [&] {
         return DirectoryJobCurrent(work, directory.token);
-    }, fingerprints);
+    }, std::move(prepared));
 }
 
 DriveCapacity ProbeThisPcCapacity(const std::wstring& path) {
@@ -8165,7 +8263,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     })) typeNames.clear();
                 for (const auto& previous : directory.sortChecks) {
                     if (!DirectoryJobCurrent(work,directory.token)) break;
-                    Entry current=previous;
+                    Entry current; static_cast<EntrySortKey&>(current)=previous;
                     current.sortText.clear(); current.sortNumber=0; current.sortValueKind=0;
                     if (current.path.starts_with(L"windhawk:pidl:")) {
                         if (directory.sort.kind == SortKind::Name || directory.sort.kind == SortKind::Extension) {
@@ -8346,39 +8444,63 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             ResolveDirectoryGroups(names, directory.grouping, typeNames,
                                    work, directory.token);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
-            std::optional<std::pair<unsigned long long,unsigned long long>> fingerprints;
+            std::optional<DirectorySnapshotIndex> prepared;
             if (!directory.checkSort && error == ERROR_SUCCESS) {
                 PipelineScope timing(work, L"directory.baseline", directory.token, names.size());
                 const bool compare = lane.sortedFolder == directory.path &&
                     SameSort(lane.sortedOrder,directory.sort) &&
                     lane.sortedOrderHash == directory.previousOrderHash &&
                     lane.sortedMetadataHash == directory.previousMetadataHash;
-                std::unordered_map<std::wstring,std::pair<int,Entry>> fresh;
+                prepared=BuildDirectorySnapshotIndex(names,[&] {return DirectoryJobCurrent(work,directory.token);});
+                if (!DirectoryJobCurrent(work,directory.token)) continue;
+                // Unchanged revalidations already have the exact comparison
+                // baseline. Keep its allocations and immutable key snapshots.
+                const bool baselineCurrent=lane.sortedFolder==directory.path &&
+                    SameSort(lane.sortedOrder,directory.sort) &&
+                    lane.sortedOrderHash==prepared->orderHash &&
+                    lane.sortedMetadataHash==prepared->metadataHash;
+                if (!baselineCurrent) {
+                std::vector<EntrySortKey> fresh;
                 fresh.reserve(names.size());
                 SortSpec comparison=directory.sort;
                 if (!names.empty()) comparison.kind=EntrySortKind(comparison,names.front());
                 for (size_t i=0;i<names.size();++i) {
                     if ((i&1023u)==0 && !DirectoryJobCurrent(work,directory.token)) break;
                     const auto& entry=names[i];
-                    if (compare && directory.sortRevealPath.empty()) {
-                        const auto old=lane.sortedEntries.find(entry.path);
-                        if (old!=lane.sortedEntries.end() && old->second.first!=static_cast<int>(i) &&
-                            (EntryPrecedes(old->second.second,entry,comparison) ||
-                             EntryPrecedes(entry,old->second.second,comparison))) {
+                    fresh.push_back(SortEntrySnapshot(entry));
+                }
+                if (!DirectoryJobCurrent(work,directory.token)) continue;
+                // Reuse the published identity index for refresh comparisons.
+                // Exact paths resolve folded-hash collisions, as in GPU lookup.
+                int revealRow=INT_MAX;
+                size_t checked=0;
+                const bool findReveal=compare && directory.sortRevealPath.empty();
+                if (findReveal) for (const auto& [hash,row] : prepared->paths) {
+                    if ((checked++&1023u)==0 && !DirectoryJobCurrent(work,directory.token)) break;
+                    if (row>=revealRow) continue;
+                    auto old=std::lower_bound(lane.sortedPathIndex.begin(),lane.sortedPathIndex.end(),std::pair{hash,0});
+                    for (;old!=lane.sortedPathIndex.end() && old->first==hash;++old) {
+                        const auto& previous=lane.sortedEntries[old->second];
+                        const auto& entry=names[row];
+                        if (previous.path!=entry.path) continue;
+                        if (old->second!=row && (EntryPrecedes(previous,entry,comparison) ||
+                            EntryPrecedes(entry,previous,comparison))) {
                             directory.sortRevealPath=entry.path;
-                            directory.sortRevealOldIndex=old->second.first;
+                            directory.sortRevealOldIndex=old->second;
+                            revealRow=row; // Preserve the first changed row in display order.
                         }
+                        break;
                     }
-                    fresh.emplace(entry.path,std::make_pair(static_cast<int>(i),SortEntrySnapshot(entry)));
                 }
                 if (!DirectoryJobCurrent(work,directory.token)) continue;
                 lane.sortedEntries.swap(fresh);
+                lane.sortedPathIndex=prepared->paths;
+                }
                 lane.sortedFolder=directory.path; lane.sortedOrder=directory.sort;
-                lane.sortedOrderHash=DirectoryOrderHash(names);
-                lane.sortedMetadataHash=DirectoryMetadataHash(names);
-                fingerprints=std::pair{lane.sortedOrderHash,lane.sortedMetadataHash};
+                lane.sortedOrderHash=prepared->orderHash;
+                lane.sortedMetadataHash=prepared->metadataHash;
             }
-            auto result = PrepareDirectoryResult(work, directory, names, error, fingerprints);
+            auto result = PrepareDirectoryResult(work, directory, names, error, std::move(prepared));
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             PublishDirectoryResult(work, std::move(result));
         } else if (haveDetail) {
@@ -8472,6 +8594,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     // Release the potentially large plain-key snapshot on its owning worker,
     // before the tab lifetime regulator lets Explorer retire the state.
     lane.sortedEntries.clear();
+    lane.sortedPathIndex.clear();
     return 0;
 }
 
@@ -29409,7 +29532,7 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
             seed(state.sort.key,entry.sortText,entry.sortNumber,entry.sortValueKind);
             for (auto& value : entry.secondarySortValues) seed(value.key,value.text,value.number,value.kind);
         }
-        std::sort(fresh.begin(),fresh.end(),[&](const Entry& a,const Entry& b) { return EntryPrecedes(a,b,state.sort); });
+        SortEntriesByIndex(fresh,[&](const Entry& a,const Entry& b) { return EntryPrecedes(a,b,state.sort); });
     }
     if (state.grouping.enabled) {
         const bool ascending = state.grouping.ascending != FALSE;

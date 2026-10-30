@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.304
+
+- Speed up folder preprocessing with adaptive sorting of row indices, compact
+  refresh baselines, shared-prefix path hashing and reuse of unchanged baselines.
+  Preserve Windows natural names, secondary keys and stable grouping order.
+- Add repeatable sort-algorithm comparisons over real large-directory fixtures,
+  including shuffled, sorted and reversed inputs and comparison counts.
+
 ## 0.9.303
 
 - Use Explorer's folder sort order by default, with an option to keep early
