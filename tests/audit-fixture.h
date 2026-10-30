@@ -80,6 +80,13 @@ inline HRESULT WINAPI FramePulse() {
     if(const auto probe=framePulseProbe.exchange(nullptr,std::memory_order_acq_rel)) probe();
     return result;
 }
+inline DWORD WINAPI CompositorClock(UINT count,const HANDLE* handles,DWORD timeout) {
+    const auto clock=reinterpret_cast<DWORD(WINAPI*)(UINT,const HANDLE*,DWORD)>(
+        ::GetProcAddress(GetModuleHandleW(L"dcomp.dll"),"DCompositionWaitForCompositorClock"));
+    const auto result=clock(count,handles,timeout);
+    if(const auto probe=framePulseProbe.exchange(nullptr,std::memory_order_acq_rel)) probe();
+    return result;
+}
 }
 #define CreateThread AuditFixture::Thread
 #define DCompositionCreateDevice AuditFixture::Composition

@@ -338,7 +338,7 @@ static void TestResizeAutoRefit() {
         SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
         const auto original=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(+[](HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)->LRESULT {
-                if(msg==WM_SIZE || msg==WM_PAINT || msg==kMsgColumnFitReady || msg==kMsgPresentationReady)
+                if(msg==WM_SIZE || msg==WM_PAINT || msg==kMsgFrame || msg==kMsgColumnFitReady || msg==kMsgPresentationReady)
                     return OverlayProc(hwnd,msg,wp,lp);
                 return DefWindowProcW(hwnd,msg,wp,lp);
             })));
@@ -382,7 +382,18 @@ static void TestResizeAutoRefit() {
                 Check(state.autoRefitPending,"resize lost its pending fit during interactive sizing");
                 SendMessageW(tab.frame,WM_EXITSIZEMOVE,0,0);
             }
-            Check(Eventually(settled),"resize fit never completed through presentation acknowledgements");
+            const bool complete=Eventually(settled);
+            if(!complete) {
+                const auto receipt=tab.Receipt();
+                std::cout<<"RESIZE STALL width="<<width<<" interactive="<<interactive
+                    <<" pending="<<state.autoRefitPending<<" queued="<<state.columnFitMessageQueued
+                    <<" transition="<<state.columnTransitionActive<<" presentation="<<state.columnPresentationPending
+                    <<" animating="<<state.presenter->animating.load()<<" sequence="<<state.presentationSequence
+                    <<" receipt="<<(receipt ? receipt->sequence:0)<<" columns="<<(receipt && receipt->columns)
+                    <<" column-pending="<<(receipt && receipt->columnPending)<<" accepted="<<(receipt && receipt->accepted)
+                    <<" frame="<<(receipt ? receipt->frames:0)<<" composition="<<g_compositionCompleted.load()<<std::endl;
+            }
+            Check(complete,"resize fit never completed through presentation acknowledgements");
             checkWidth();
         }
         // Several ellipsized columns after a small change to a wide window:

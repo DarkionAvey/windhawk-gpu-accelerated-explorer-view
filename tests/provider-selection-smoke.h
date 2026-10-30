@@ -82,8 +82,13 @@ struct Browser {
     NativeViewportEvents* sink = nullptr;
     DWORD cookie = 0;
     unsigned shellHints = 0;
-    Browser() {
-        frame = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"private provider selection",
+    bool registered = false;
+    explicit Browser(bool travelLog = false) {
+        if (travelLog) {
+            WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
+            cls.lpszClassName=L"CabinetWClass"; RegisterClassW(&cls);
+        }
+        frame = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, travelLog ? L"CabinetWClass" : L"STATIC", L"private provider selection",
             WS_POPUP | WS_VISIBLE, -32000, -32000, 1000, 700, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
         state.hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 1000, 700,
             frame, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -92,6 +97,7 @@ struct Browser {
         state.visible = state.inScope = state.detailsViewActive = true;
         state.firstContentSubmittedAt = 1; state.deferColumnProviders = false;
         SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+        if (travelLog) { RegisterTabOverlay(frame,frame,state.hwnd); registered=true; }
         Check(SetWindowSubclass(state.hwnd, +[](HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data)->LRESULT {
             if (message == kMsgShellItemCreated) {
                 ++reinterpret_cast<Browser*>(data)->shellHints;
@@ -103,7 +109,7 @@ struct Browser {
             IID_PPV_ARGS(&browser))), "provider ExplorerBrowser");
         RECT bounds{0, 0, 1000, 700}; FOLDERSETTINGS settings{FVM_DETAILS, FWF_NOBROWSERVIEWSTATE};
         Check(SUCCEEDED(browser->Initialize(frame, &bounds, &settings)), "provider browser initialization");
-        browser->SetOptions(EBO_NOBORDER | EBO_NOTRAVELLOG);
+        browser->SetOptions(EBO_NOBORDER | (travelLog ? EBO_NONE : EBO_NOTRAVELLOG));
         sink = new NativeViewportEvents(state, true, true);
         Check(SUCCEEDED(browser->Advise(sink, &cookie)), "provider browser events");
     }
@@ -150,6 +156,7 @@ struct Browser {
         ComPtr<IShellFolder> folder;
         Check(GetFolderPath(state.folderView.Get(), location, folder) && IsSupportedLocation(location),
             "native provider destination was rejected as an unsupported location");
+        ClearOptimisticNavigation(state); // The real native completion above confirms this binding.
         ResetForNewDirectory(state, location, folder, false, state.activeTabHost);
         state.deferColumnProviders = false; UpdateMetrics(state);
         auto result = WaitForComplete(*state.background, state.directoryToken);
@@ -169,6 +176,7 @@ struct Browser {
         if (browser) { browser->Unadvise(cookie); browser->Destroy(); }
         if (sink) { sink->view.Reset(); sink->Release(); }
         browser.Reset(); Stop(state.background);
+        if (registered) UnregisterTabOverlay(frame,frame,state.hwnd);
         SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, 0); DestroyWindow(frame);
     }
 };

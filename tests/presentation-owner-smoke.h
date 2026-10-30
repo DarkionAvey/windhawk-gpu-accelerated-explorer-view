@@ -181,6 +181,20 @@ void GroupAnimationClock(bool rtl,bool grid) {
 }
 
 static void TestPresentationOwners() {
+    {
+        using WaitForClock=DWORD(WINAPI*)(UINT,const HANDLE*,DWORD);
+        const auto clock=reinterpret_cast<WaitForClock>(::GetProcAddress(
+            GetModuleHandleW(L"dcomp.dll"),"DCompositionWaitForCompositorClock"));
+        if(clock) {
+            HANDLE control=CreateEventW(nullptr,FALSE,TRUE,nullptr);
+            Check(control!=nullptr,"native compositor control event");
+            const auto interrupted=clock(1,&control,5000);
+            const auto tick=clock(1,&control,5000);
+            CloseHandle(control);
+            Check(interrupted==WAIT_OBJECT_0 && tick==WAIT_OBJECT_0+1,
+                "native compositor clock did not distinguish control wake from heartbeat");
+        }
+    }
     Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"presentation fonts");
     const auto before=g_gpuDevices.load();

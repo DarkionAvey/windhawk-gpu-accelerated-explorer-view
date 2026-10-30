@@ -1,5 +1,6 @@
 // Runs the actual mod pipeline in a standalone process. WH_EDITING stubs only
-// Windhawk's host API; no Explorer injection, hooks, or visible windows occur.
+// Windhawk's host API; no Explorer injection or hooks occur. Visible private
+// windows are restricted to the explicit --swipe-compositor integration probe.
 #ifndef GPU_OVERLAY_SOURCE
 #define GPU_OVERLAY_SOURCE "../latest.cpp"
 #endif
@@ -1870,6 +1871,7 @@ static void TestPreviewInput() {
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"
+#include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
 
 int wmain(int argc,wchar_t** argv) {
@@ -1935,6 +1937,8 @@ int wmain(int argc,wchar_t** argv) {
             TestLlmReport(); TestFilesystemMutationDelivery(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--render-quality")==0) {
             TestRenderQuality(); TestToggleRepaint();
+        } else if (argc>1 && wcscmp(argv[1],L"--pipeline-trace")==0) {
+            TestPipelineTrace();
         } else if (argc>1 && wcscmp(argv[1],L"--frame-report")==0) {
             TestFrameHookRelease(); TestDispatchStateRetirement(); TestRenameHandoff(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--lifetime")==0) {
@@ -2037,6 +2041,8 @@ int wmain(int argc,wchar_t** argv) {
             TestRenameReorderReadiness(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--scrollbar-input")==0) {
             TestScrollbarPressRouting();
+        } else if (argc>1 && wcscmp(argv[1],L"--swipe-compositor")==0) {
+            TestSwipeCompositor();
         } else if (argc>1 && wcscmp(argv[1],L"--touch")==0) {
             TestTouchInput(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {

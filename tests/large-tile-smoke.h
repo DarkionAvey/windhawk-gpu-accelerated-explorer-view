@@ -76,11 +76,16 @@ static void TestLargeTileBackpressure() {
         AuditFixture::busyPresentationThread=accepted->thread;
         struct ClearBusy {~ClearBusy() {AuditFixture::busyPresentationThread=0;}} clear;
         SetEvent(tab.state.presenter->wake);
-        Check(Eventually([] {return AuditFixture::busySharedProbes.load()>10;}),"worker did not probe readiness");
-        Check(tab.Receipt()==accepted && accepted->accepted,"busy wake overwrote an unread successful receipt");
+        // Fence the idle wake through the real generation-control path. An
+        // unchanged tab must not enter DXGI just because a late pulse arrived.
+        ++tab.state.directoryToken; SynchronizePresentationGeneration(tab.state);
+        const auto idle=tab.Await([&](const auto& r) {return r.directoryToken==tab.state.directoryToken;});
+        Check(!AuditFixture::busySharedProbes.load() && idle->accepted && idle->frames==accepted->frames,
+            "idle heartbeat probed the GPU or lost the accepted pixels");
         tab.state.hovered=5; SubmitPresentation(tab.state);
         const auto sequence=tab.state.presentationSequence;
         const auto deferred=tab.Await([&](const auto& r) {return r.sequence==sequence && !r.accepted;});
+        Check(Eventually([] {return AuditFixture::busySharedProbes.load()>10;}),"changed model did not retry GPU readiness");
         Check(deferred->frames==accepted->frames && !deferred->content,"new busy revision claimed stale pixels");
         AuditFixture::busyPresentationThread=0; SetEvent(tab.state.presenter->wake);
         tab.Await([&](const auto& r) {return r.sequence==sequence && r.accepted && r.frames>accepted->frames;});

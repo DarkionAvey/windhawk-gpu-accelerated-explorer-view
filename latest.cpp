@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.290
+// @version         0.9.300
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -674,7 +674,9 @@ struct SwipeIndicator {
     enum Property { X, Y, Scale, Width, Height, Edge, Far, Length, ArrowHeight, Alpha, ArrowAlpha, Count };
     std::array<SwipeSpring,Count> springs{};
     LARGE_INTEGER origin{};
-    bool moving=false, armed=false, committed=false;
+    float originY=0.f;
+    int direction=0;
+    bool moving=false, armed=false, committed=false, released=false;
 };
 
 struct TouchInput {
@@ -1180,6 +1182,15 @@ struct FrameProfile {
     unsigned activity = 0;
     bool recording = false, continuing = false, hasInterval = false, accepted = false;
 };
+struct FrameSummary {
+    FrameProfile profile;
+    std::wstring folder;
+    HWND tab=nullptr;
+    DWORD thread=0;
+    UINT mode=0;
+    int rows=0,hz=0;
+    size_t icons=0;
+};
 struct IconResult {
     HWND hwnd = nullptr;
     unsigned long long token = 0;
@@ -1206,6 +1217,9 @@ void SignalPresentationFrames();
 
 DWORD WINAPI CompositionFrameProc(LPVOID context) {
     const HANDLE wake=static_cast<HANDLE>(context);
+    using WaitForClock=DWORD(WINAPI*)(UINT,const HANDLE*,DWORD);
+    const auto waitForClock=reinterpret_cast<WaitForClock>(GetProcAddress(
+        GetModuleHandleW(L"dcomp.dll"),"DCompositionWaitForCompositorClock"));
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
     unsigned long long sequence=0;
     // The inner cadence wait can consume shutdown's auto-reset signal. Test
@@ -1218,13 +1232,22 @@ DWORD WINAPI CompositionFrameProc(LPVOID context) {
             const bool any = !g_activeFrames.empty() || PresentationFramesActive();
             ReleaseSRWLockShared(&g_frameLock);
             if (!any) break;
-            // Wait for a DWM composition cycle rather than guessing 6ms on
-            // 165Hz monitors. Swap-chain submissions themselves never wait.
+            // DwmFlush drains this application's queued updates; it can return
+            // immediately without a new display cycle. Wait for the actual
+            // compositor heartbeat, with the existing wake also interrupting
+            // shutdown and registry changes. Never wait on an Explorer STA.
             const bool tracePacing=g_pipelineTracing.load(std::memory_order_relaxed);
             LARGE_INTEGER pacingStart{},pacingEnd{};
             if (tracePacing) QueryPerformanceCounter(&pacingStart);
             const auto cycle=g_compositionStarted.fetch_add(1,std::memory_order_acq_rel)+1;
-            const HRESULT hr = DwmFlush();
+            HRESULT hr=S_OK;
+            if(waitForClock) {
+                const DWORD result=waitForClock(1,&wake,INFINITE);
+                if(g_frameStopping.load(std::memory_order_acquire)) break;
+                if(result==WAIT_OBJECT_0) continue; // Control wake, not a frame.
+                if(result!=WAIT_OBJECT_0+1) hr=(result&0x80000000UL) ?
+                    HRESULT_FROM_NT(result):HRESULT_FROM_WIN32(result);
+            } else hr=DwmFlush(); // Compatibility with pre-Windows 11 hosts.
             if (SUCCEEDED(hr)) g_compositionCompleted.store(cycle,std::memory_order_release);
             if (tracePacing) QueryPerformanceCounter(&pacingEnd);
             ++sequence;
@@ -1243,9 +1266,10 @@ DWORD WINAPI CompositionFrameProc(LPVOID context) {
             }
             ReleaseSRWLockExclusive(&g_frameLock);
             SignalPresentationFrames();
-            // DwmFlush may return immediately if composition is suspended.
-            // This short wait prevents an unbounded busy-spin in that case.
-            WaitForSingleObject(wake, 1);
+            // Preserve the bounded legacy/error fallback when the clock is
+            // unavailable or the display is occluded. Healthy clock waits
+            // require no additional timer or guessed refresh interval.
+            if(!waitForClock || FAILED(hr)) WaitForSingleObject(wake,1);
         }
     }
     return 0;
@@ -1261,10 +1285,11 @@ void RegisterAnimationWindow(HWND hwnd) {
     }
     bool found = false;
     for (const auto& t : g_activeFrames) if (t.hwnd == hwnd) found = true;
+    const bool wakePacer=!found || !g_frameThread;
     if (!found) g_activeFrames.push_back({hwnd, false});
     if (g_frameEvent && !g_frameThread)
         g_frameThread = CreateThread(nullptr, 0, CompositionFrameProc, g_frameEvent, 0, nullptr);
-    if (g_frameEvent) SetEvent(g_frameEvent);
+    if (g_frameEvent && wakePacer) SetEvent(g_frameEvent);
     ReleaseSRWLockExclusive(&g_frameLock);
 }
 
@@ -1823,6 +1848,7 @@ struct PipelineRecord {
     unsigned long long sequence = 0, frame = 0, input = 0, a = 0, b = 0;
     double v[4]{};
     std::shared_ptr<const std::wstring> note; // Folder/item identity; output formatting stays on the writer.
+    std::shared_ptr<const FrameSummary> summary;
     unsigned long long span=0;
 };
 struct PipelineTrace {
@@ -2007,7 +2033,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
 
 void PipelineEvent(TabBackground& work, PipelineRecord event, bool ui = false) {
     if ((!g_pipelineTracing.load(std::memory_order_relaxed) &&
-         !(ui && g_uiTransitionLogging.load(std::memory_order_relaxed))) ||
+         !(ui && g_uiTransitionLogging.load(std::memory_order_relaxed)) &&
+         !(event.summary && g_frameTimeLogging.load(std::memory_order_relaxed))) ||
         work.stopping.load(std::memory_order_relaxed)) return;
     auto* trace=work.pipelinePublished.load(std::memory_order_acquire);
     if (!trace || !trace->enabled.load(std::memory_order_relaxed)) return;
@@ -2043,6 +2070,23 @@ struct PipelineScope {
     }
 };
 
+void WriteFrameSummary(const FrameSummary& summary) {
+    const auto& p=summary.profile;
+    auto sorted=p.intervals;
+    std::sort(sorted.begin(),sorted.begin()+p.samples);
+    const auto percentile=[&](double q) {return p.samples ? sorted[static_cast<size_t>((p.samples-1)*q)] : 0.;};
+    const double rate=p.intervalTotal>0. ? 1000.*p.intervalSubmits/p.intervalTotal : 0.;
+    Wh_Log(L"[GPU frames] tab=%p thread=%lu folder=%s mode=%u rows=%d hz=%d frames=%zu submitted=%zu submitHz=%.1f "
+        L"interval-ms p50=%.2f p95=%.2f p99=%.2f max=%.2f late=%zu/%zu "
+        L"cpu-ms avg=%.2f max=%.2f stage-ms avg/max delivery=%.2f/%.2f demand=%.2f/%.2f "
+        L"upload=%.2f/%.2f draw=%.2f/%.2f present=%.2f/%.2f flush=%.2f/%.2f cleanup=%.2f/%.2f icons=%zu text-cache=%zu/%zu text-wait=%zu activity=0x%X",
+        summary.tab,summary.thread,summary.folder.c_str(),summary.mode,summary.rows,summary.hz,
+        p.frames,p.submitted,rate,percentile(.5),percentile(.95),percentile(.99),percentile(1.),p.late,p.samples,
+        p.cpuTotal/p.frames,p.cpuMax,p.totals[0]/p.frames,p.maxima[0],p.totals[1]/p.frames,p.maxima[1],
+        p.totals[2]/p.frames,p.maxima[2],p.totals[3]/p.frames,p.maxima[3],p.totals[4]/p.frames,p.maxima[4],
+        p.totals[5]/p.frames,p.maxima[5],p.totals[6]/p.frames,p.maxima[6],summary.icons,p.textHits,p.textMisses,p.textDeferred,p.activity);
+}
+
 DWORD WINAPI PipelineWriterProc(LPVOID context) {
     auto& worker=*static_cast<TabBackground::Worker*>(context);
     auto& work=*worker.owner;
@@ -2055,7 +2099,8 @@ DWORD WINAPI PipelineWriterProc(LPVOID context) {
         const size_t n=trace.Drain(batch.data(),batch.size(),worker.wake);
         for (size_t i=0;i<n;++i) {
             const auto& e=batch[i];
-            Wh_Log(L"[GPU pipe] gpu=%p n=%llu qpc=%lld tid=%lu f=%llu i=%llu span=%llu op=%s phase=%lc a=0x%llX b=0x%llX v=%.4f,%.4f,%.4f,%.4f note=%s",
+            if(e.summary) WriteFrameSummary(*e.summary);
+            else Wh_Log(L"[GPU pipe] gpu=%p n=%llu qpc=%lld tid=%lu f=%llu i=%llu span=%llu op=%s phase=%lc a=0x%llX b=0x%llX v=%.4f,%.4f,%.4f,%.4f note=%s",
                 work.hwnd,e.sequence,e.qpc,e.thread,e.frame,e.input,e.span,e.operation,e.phase,e.a,e.b,
                 e.v[0],e.v[1],e.v[2],e.v[3],e.note ? e.note->c_str() : L"");
             trace.written.fetch_add(1,std::memory_order_relaxed);
@@ -3123,6 +3168,9 @@ struct ViewState {
     int swipeFeedbackDirection = 0; // +1: Back, -1: Forward
     float swipeFeedbackOriginY = 0.f;
     SwipeIndicator swipeIndicator;
+    SwipeIndicator swipeOutgoingIndicator; // The other edge can retract during a reversal.
+    unsigned long long swipeFeedbackRevision = 0; // Tab foreground, independent of directory generations.
+    bool swipeTraceHadFeedback = false; // Render-lane diagnostic; never copied from content models.
     DWORD manipulationCookie = 0;
     ComPtr<IDirectManipulationManager> manipulationManager;
     ComPtr<IDirectManipulationViewport> manipulationViewport;
@@ -3219,6 +3267,7 @@ struct ViewState {
     ComPtr<IDXGISwapChain1> swapChain;
     ComPtr<IDCompositionTarget> compTarget;
     ComPtr<IDCompositionVisual> visual;
+    ComPtr<IDCompositionVisual> compositionRoot, contentVisual;
     bool modeRootAttached = false;
     bool compositionSurfacePoolUsed = false;
     // Temporary transition planes belong to this tab/device. DWM samples
@@ -3228,6 +3277,24 @@ struct ViewState {
         ComPtr<IDCompositionSurface> surface;
         size_t estimatedBytes = 0; // Bitmap plus DComp surface pixel storage; excludes driver overhead.
     };
+    struct SwipeComposition {
+        ModePlane plane;
+        ComPtr<IDCompositionVisual> visual;
+        ComPtr<IDCompositionEffectGroup> opacity;
+        ComPtr<IDCompositionAnimation> fade;
+        unsigned long long revision=0,traceRevision=0;
+        LARGE_INTEGER origin{},fadeStarted{};
+        double frequency=0.;
+        D2D1_RECT_F bounds{};
+        D2D1_SIZE_U viewport{};
+        int dpi=96;
+        float top=0.f;
+        bool rtl=false;
+        bool moving=false,visible=false;
+    };
+    std::array<SwipeComposition,2> swipeComposition;
+    unsigned long long swipeCompositionSerial=0;
+    bool swipeCompositionDirty=false;
     struct FitPlane {
         ModePlane content, trailing;
         float sourceX = 0.f, trailingSourceX = 0.f;
@@ -3306,6 +3373,16 @@ struct ViewState {
 
 // Plain visual data only: no Shell interfaces, HWND ownership, GPU resources,
 // providers or mutable directory/selection arrays cross this boundary.
+#define SWIPE_FEEDBACK_FIELDS(X) \
+    X(swipeFeedbackActive) X(swipeFeedbackFading) X(swipeFeedbackDrag) X(swipeFeedbackThreshold) \
+    X(swipeFeedbackDirection) X(swipeFeedbackOriginY) X(swipeIndicator) X(swipeOutgoingIndicator) X(swipeFeedbackRevision)
+
+struct SwipeFeedbackSnapshot {
+#define SWIPE_FIELD(name) std::remove_cvref_t<decltype(std::declval<ViewState>().name)> name{};
+    SWIPE_FEEDBACK_FIELDS(SWIPE_FIELD)
+#undef SWIPE_FIELD
+};
+
 #define PRESENTATION_MODEL_FIELDS(X) \
     X(hwnd) X(nativeHwnd) X(frameHwnd) X(activeTabHost) X(rtlLayout) X(inScope) X(thisPcGpu) \
     X(detailsViewActive) X(columnsView) X(gridView) X(nativeIconSize) X(layoutNativeMode) X(layoutIconSize) \
@@ -3334,12 +3411,11 @@ struct ViewState {
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
     X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
-    X(swipeFeedbackActive) X(swipeFeedbackFading) X(swipeFeedbackDrag) X(swipeFeedbackThreshold) X(swipeFeedbackDirection) X(swipeFeedbackOriginY) X(swipeIndicator) \
     X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
     X(nativeTextColor) X(nativeHeaderTextColor) X(cachedNativeMode) X(folderPath) X(selectedFlags) \
     X(presentationStyleRevision) X(presentationGroupIntents) X(lastInteractionTick) X(pipelineInputTime) X(uiTraceUntil)
 
-struct PresentationModel {
+struct PresentationModel : SwipeFeedbackSnapshot {
 #define PRESENTATION_FIELD(name) std::remove_cvref_t<decltype(std::declval<ViewState>().name)> name{};
     PRESENTATION_MODEL_FIELDS(PRESENTATION_FIELD)
 #undef PRESENTATION_FIELD
@@ -3362,6 +3438,12 @@ struct PresentationModel {
 struct PresentationReceipt {
     unsigned long long sequence=0,lifetime=0,token=0,directoryToken=0,rowRevision=0;
     unsigned long long frames=0;
+    unsigned long long swipeFeedbackRevision=0;
+    float swipeFeedbackAlpha=0.f;
+    bool swipeFeedbackMoving=false;
+    unsigned long long foregroundFrames=0;
+    std::array<ULONG_PTR,2> foregroundVisuals{},foregroundFades{};
+    bool contentPending=false;
     ULONG_PTR device=0,swapchain=0;
     ULONG_PTR sceneRoot=0,backbuffer=0;
     bool scenePublished=false;
@@ -3391,6 +3473,7 @@ struct PresentationLane {
     std::mutex mutex;
     std::shared_ptr<const PresentationModel> pending;
     std::shared_ptr<const PresentationReceipt> receipt;
+    std::optional<SwipeFeedbackSnapshot> swipeFeedback;
     // Cancellation-only acknowledgement. Its sequence cannot supersede a
     // newer paint packet when the owner and renderer advance concurrently.
     struct ValidatedGeneration { unsigned long long sequence, token, directoryToken; };
@@ -3403,6 +3486,34 @@ struct PresentationLane {
     std::atomic<bool> diagnostics{false};
     bool receiptPosted=false;
 };
+
+template<class Model>
+SwipeFeedbackSnapshot CaptureSwipeFeedback(const Model& state) {
+    SwipeFeedbackSnapshot snapshot;
+#define COPY_SWIPE(name) snapshot.name=state.name;
+    SWIPE_FEEDBACK_FIELDS(COPY_SWIPE)
+#undef COPY_SWIPE
+    return snapshot;
+}
+
+bool ApplySwipeFeedback(ViewState& state,const SwipeFeedbackSnapshot& snapshot) {
+    if(snapshot.swipeFeedbackRevision<=state.swipeFeedbackRevision) return false;
+#define APPLY_SWIPE(name) state.name=snapshot.name;
+    SWIPE_FEEDBACK_FIELDS(APPLY_SWIPE)
+#undef APPLY_SWIPE
+    return true;
+}
+
+void PublishSwipeFeedback(ViewState& state) {
+    if(state.presentationOnly) return;
+    ++state.swipeFeedbackRevision;
+    if(!state.presenter || state.presenter->stopping.load(std::memory_order_acquire)) return;
+    // Bounded foreground updates never capture names, icons or folder state.
+    // Publish before Shell navigation can block or replace the content model.
+    std::lock_guard lock(state.presenter->mutex);
+    state.presenter->swipeFeedback=CaptureSwipeFeedback(state);
+    SetEvent(state.presenter->wake);
+}
 
 int DpiOf(HWND hwnd);
 int ViewDpi(const ViewState& state) {
@@ -3967,7 +4078,7 @@ bool LayoutAnimationActive(const ViewState& state, bool includeDirectInput = fal
             state.columnDragArmed || state.dragDivider >= 0 || state.shellDragRunning || state.mousePressActive));
 }
 
-bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true) {
+bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, bool includeForeground = true) {
     return LayoutAnimationActive(state) || state.zebraExtentAnimating || state.selectionFadeActive ||
         (state.columnPresentationPending && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
@@ -3978,10 +4089,11 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true) 
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
         state.hoverAnimationActive || state.marqueeFading ||
-        ((state.swipeFeedbackActive || state.swipeFeedbackFading) && state.swipeIndicator.moving) ||
+        (includeForeground && (!state.presenter || state.presentationOnly) &&
+            (state.swipeIndicator.moving || state.swipeOutgoingIndicator.moving)) ||
         state.presentPending || (includeEnrichment && state.iconUploadsPending) ||
         (includeEnrichment && state.visible && state.inScope && state.detailsViewActive &&
-            (state.iconResultsPending || state.detailResultsPending || state.viewportDemandPending ||
+            ((!state.presentationOnly && (state.iconResultsPending || state.detailResultsPending || state.viewportDemandPending)) ||
              state.textRasterPending || !state.retiredTextLayouts.empty() || !state.retiredIconBitmaps.empty()));
 }
 
@@ -4012,7 +4124,7 @@ void UnregisterAnimationWhenIdle(ViewState& state) {
 void EnsurePipelineTrace(ViewState& state) {
     auto& work=*state.background;
     const bool enabled=g_pipelineTracing.load(std::memory_order_relaxed) ||
-        g_uiTransitionLogging.load(std::memory_order_relaxed);
+        g_uiTransitionLogging.load(std::memory_order_relaxed) || g_frameTimeLogging.load(std::memory_order_relaxed);
     if (auto* trace=work.pipelinePublished.load(std::memory_order_acquire)) {
         if (trace->enabled.exchange(enabled,std::memory_order_relaxed)!=enabled && work.traceWorker.wake)
             SetEvent(work.traceWorker.wake);
@@ -4124,6 +4236,7 @@ struct FrameStageScope {
 };
 
 void BeginFrameProfile(ViewState& state) {
+    if(g_frameTimeLogging.load(std::memory_order_relaxed)) EnsurePipelineTrace(state);
     if (g_pipelineTracing.load(std::memory_order_relaxed)) {
         EnsurePipelineTrace(state);
         if (auto* trace=state.background->pipelinePublished.load(std::memory_order_acquire)) {
@@ -4190,19 +4303,16 @@ void EndFrameProfile(ViewState& state) {
         state.manipulationFrameActive || state.marqueeFrameActive;
     const double elapsed = 1000.*(now.QuadPart-p.window)/p.frequency;
     if (elapsed < 1000. && p.samples < p.intervals.size() && (p.continuing || p.frames < 8)) return;
-    auto sorted = p.intervals;
-    std::sort(sorted.begin(), sorted.begin()+p.samples);
-    const auto percentile = [&](double q) { return p.samples ? sorted[static_cast<size_t>((p.samples-1)*q)] : 0.; };
-    const double rate = p.intervalTotal > 0. ? 1000.*p.intervalSubmits/p.intervalTotal : 0.;
-    Wh_Log(L"[GPU frames] tab=%p thread=%lu folder=%s mode=%u rows=%d hz=%d frames=%zu submitted=%zu submitHz=%.1f "
-        L"interval-ms p50=%.2f p95=%.2f p99=%.2f max=%.2f late=%zu/%zu "
-        L"cpu-ms avg=%.2f max=%.2f stage-ms avg/max delivery=%.2f/%.2f demand=%.2f/%.2f "
-        L"upload=%.2f/%.2f draw=%.2f/%.2f present=%.2f/%.2f flush=%.2f/%.2f cleanup=%.2f/%.2f icons=%zu text-cache=%zu/%zu text-wait=%zu activity=0x%X",
-        state.activeTabHost,GetCurrentThreadId(),state.folderPath.c_str(),state.cachedNativeMode,state.total,state.refreshHz,
-        p.frames,p.submitted,rate,percentile(.5),percentile(.95),percentile(.99),percentile(1.),p.late,p.samples,
-        p.cpuTotal/p.frames,p.cpuMax,p.totals[0]/p.frames,p.maxima[0],p.totals[1]/p.frames,p.maxima[1],
-        p.totals[2]/p.frames,p.maxima[2],p.totals[3]/p.frames,p.maxima[3],p.totals[4]/p.frames,p.maxima[4],
-        p.totals[5]/p.frames,p.maxima[5],p.totals[6]/p.frames,p.maxima[6],state.icons.size(),p.textHits,p.textMisses,p.textDeferred,p.activity);
+    // Windhawk's OutputDebugString transport can wait for its consumer. Keep
+    // that wait, percentile sorting and formatting on the tab's existing writer.
+    // The bounded queue may drop a summary under load; it never blocks a frame.
+    if(auto* trace=state.background->pipelinePublished.load(std::memory_order_acquire);
+        trace && trace->enabled.load(std::memory_order_relaxed)) {
+        auto summary=std::make_shared<FrameSummary>(); summary->profile=p;
+        summary->folder=state.folderPath; summary->tab=state.activeTabHost; summary->thread=GetCurrentThreadId();
+        summary->mode=state.cachedNativeMode; summary->rows=state.total; summary->hz=state.refreshHz; summary->icons=state.icons.size();
+        PipelineEvent(*state.background,{.operation=L"frame.summary",.summary=std::move(summary)});
+    }
     const auto previous = p.previous;
     const double hz = p.frequency;
     const bool continuing = p.continuing;
@@ -4294,11 +4404,13 @@ void CancelColumnDrag(ViewState& state);
 void CancelTouchMarquee(ViewState& state);
 void UpdateTouchScrollbars(ViewState& state);
 void ClearSwipeFeedback(ViewState& state);
-void StopTouch(ViewState& state, bool retainCommittedFeedback = false) {
+void RetargetSwipeFeedback(ViewState& state,bool released,bool committed);
+void StopTouch(ViewState& state) {
     const bool control = state.touch.control;
     const bool owned = state.touch.active || state.touch.primary;
-    const bool feedback = state.swipeFeedbackActive || state.swipeFeedbackFading;
-    const bool retain = retainCommittedFeedback && state.swipeFeedbackFading && state.swipeIndicator.committed;
+    const bool feedback = state.swipeFeedbackActive || state.swipeFeedbackFading || state.swipeOutgoingIndicator.moving;
+    // Cancel contact input, not the tab's released foreground animation.
+    if(state.swipeFeedbackActive) RetargetSwipeFeedback(state,true,false);
     if (state.touch.gesture == TouchGesture::Marquee) CancelTouchMarquee(state);
     ++state.touchGeneration;
     KillTimer(state.hwnd, kTouchHoldTimerId);
@@ -4310,7 +4422,6 @@ void StopTouch(ViewState& state, bool retainCommittedFeedback = false) {
         state.swipeHorizontal = state.swipeVertical = false;
         state.swipeEdgeX = 0.f;
     }
-    if(!retain) ClearSwipeFeedback(state);
     const bool replaying = state.touch.replaying;
     state.touch = {};
     state.touch.replaying = replaying;
@@ -4326,9 +4437,8 @@ void StopTouch(ViewState& state, bool retainCommittedFeedback = false) {
     UpdateTouchScrollbars(state);
     if (feedback) Redraw(state); // Retire the preview on the independent render owner too.
 }
-void ResetMouseGestureForNavigation(ViewState& state,bool retainCommittedFeedback=false) {
-    StopTouch(state,retainCommittedFeedback);
-    if(!retainCommittedFeedback) ClearSwipeFeedback(state);
+void ResetMouseGestureForNavigation(ViewState& state) {
+    StopTouch(state);
     CancelNativeSelectionPreparation(state);
     AdvanceRowHeight(state, true);
     StopSelectionFade(state);
@@ -4532,11 +4642,9 @@ public:
 // viewport accepts the next contact without reinitializing DirectManipulation.
 static void StopTouchpad(ViewState& state, bool releaseResources = true) {
     StopTouch(state);
-    if (releaseResources) state.touchRecognizer.reset();
+    if (releaseResources) {ClearSwipeFeedback(state); state.touchRecognizer.reset();}
     state.manipulationFrameActive = false;
     state.touchpadPinching = false;
-    state.swipeFeedbackActive = state.swipeFeedbackFading = false;
-    state.swipeIndicator = {};
     state.swipeHorizontal = state.swipeVertical = false;
     state.swipeEdgeX = 0.f;
     state.swipeReleased = true;
@@ -6570,7 +6678,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context);
 bool EnsureDirectoryFolderIdentity(ViewState& state) {
     if (state.directoryFolderIdentity) return true;
     // Optimistic navigation still holds the departing native folder. Only
-    // confirmed bindings may supply an identity for the destination worker.
+    // a destination identity supplied by the Shell or retained from its prior
+    // native binding can authorize provisional work. Never capture this stale
+    // departing COM folder as the incoming identity.
     if (state.optimisticStartedAt) return true;
     if (!state.folder) return !UsesNamespaceFolderIdentity(state.folderPath);
     PIDLIST_ABSOLUTE root = nullptr;
@@ -8874,10 +8984,13 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
                            bool preserveViewport = false, bool verifyNamespace = false) {
     PipelineScope pipeline(state.background,L"directory.request",replacePending,verifyNamespace);
     if (g_pipelineTracing.load(std::memory_order_relaxed)) {
-        PipelineRecord e; e.operation=L"directory.context"; e.a=state.directoryToken; e.b=state.token;
+        PipelineRecord e{.operation=L"directory.context",.a=state.directoryToken,.b=state.token,
+            .v={double(bool(state.directoryFolderIdentity)),double(bool(state.optimisticStartedAt)),
+                double(state.loaded),double(bool(state.namespaceIdentities))}};
         e.note=std::make_shared<const std::wstring>(state.folderPath); PipelineEvent(*state.background,std::move(e));
     }
     if ((state.directoryPending && !replacePending) || !state.hwnd ||
+        (state.optimisticStartedAt && !state.directoryFolderIdentity) ||
         g_unloading.load()) return;
     if (state.thisPcGpu) {
         // Capacity updates share neither cancellation nor a queue with names
@@ -8987,7 +9100,10 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     if (UsesNamespaceFolderIdentity(state.folderPath)) {
         newJob.namespaceFolder = state.directoryFolderIdentity;
     }
-    newJob.allowInitialPreview = !state.loaded;
+    // An ancestor return has a known child to reveal. A prefix at row zero
+    // cannot position that child in the final layout; publish the complete,
+    // positioned snapshot instead of showing a viewport we must later move.
+    newJob.allowInitialPreview = !state.loaded && state.lastFolderToReveal.empty();
     newJob.previewRows = static_cast<size_t>(std::clamp(
         (ViewHeight(state) / std::max(1.f, state.rowPx) + 2 * kRowTransitionOverscan) * state.itemsPerRow, 16.f, 4096.f));
     newJob.lastFolderName = state.lastFolderToReveal;
@@ -9821,7 +9937,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     // sort/group change must still invalidate a click on the old row order.
     const bool stablePreviewAppend = state.namesPreview &&
         (!complete || (!state.sort.explicitOrder && !state.grouping.enabled));
-    if (!stablePreviewAppend) ResetMouseGestureForNavigation(state,true);
+    if (!stablePreviewAppend) ResetMouseGestureForNavigation(state);
     state.entries.swap(incoming);
     // The lookup follows the full sorted row vector. A provisional viewport
     // preview remains noninteractive and never has a native-selection lookup.
@@ -13273,6 +13389,7 @@ void ProfileGpuMemory(ViewState& state, const wchar_t* reason, bool force=false,
     const auto& scene=state.modeComposition;
     for (const auto* p : {&scene.background,&scene.names,&scene.metadata,&scene.groups,&scene.chrome,&scene.feedback}) planes+=p->estimatedBytes;
     for (const auto& p : scene.fitted) planes+=p.content.estimatedBytes+p.trailing.estimatedBytes;
+    for (const auto& p : state.swipeComposition) planes+=p.plane.estimatedBytes;
     const auto size=state.backbuffer ? state.backbuffer->GetPixelSize() : D2D1_SIZE_U{};
     size_t buffers=static_cast<size_t>(size.width)*size.height*4*2;
     if(state.presentedSwapChain && state.presentedSwapChain!=state.swapChain) {
@@ -13321,12 +13438,50 @@ struct GraphicsContinuation {
     }
 };
 
+HRESULT SetPresentationContentRoot(ViewState& state,IDCompositionVisual* content) {
+    // Content scenes occupy the bottom child of one persistent root. Foreground
+    // visuals are siblings above it and survive content replacement/handoff.
+    HRESULT hr=S_OK;
+    if(!state.compositionRoot) {
+        ComPtr<IDCompositionVisual> root;
+        hr=CreatePixelAlignedVisual(state.composition.Get(),&root);
+        if(SUCCEEDED(hr)) hr=state.compTarget->SetRoot(root.Get());
+        if(FAILED(hr)) return hr;
+        state.compositionRoot=std::move(root);
+    }
+    if(state.contentVisual.Get()==content) return S_OK;
+    if(content && FAILED(hr=state.compositionRoot->AddVisual(content,TRUE,nullptr))) return hr;
+    if(state.contentVisual && FAILED(hr=state.compositionRoot->RemoveVisual(state.contentVisual.Get()))) {
+        if(content) state.compositionRoot->RemoveVisual(content);
+        return hr;
+    }
+    state.contentVisual=content;
+    PipelineEvent(*state.background,{.operation=L"composition.content[root,content]",
+        .a=reinterpret_cast<ULONG_PTR>(state.compositionRoot.Get()),.b=reinterpret_cast<ULONG_PTR>(content),
+        .v={double(state.presentationOnly),double(state.swipeIndicator.direction),
+            double(state.swipeOutgoingIndicator.direction)}},true);
+    return S_OK;
+}
+
+void ClearSwipeComposition(ViewState& state) {
+    if(state.swipeComposition[0].visual || state.swipeComposition[1].visual)
+        PipelineEvent(*state.background,{.operation=L"swipe.clear[root,revision]",
+            .a=reinterpret_cast<ULONG_PTR>(state.compositionRoot.Get()),.b=state.swipeFeedbackRevision},true);
+    bool changed=false;
+    for(auto& layer:state.swipeComposition) {
+        if(layer.visual && state.compositionRoot) {state.compositionRoot->RemoveVisual(layer.visual.Get()); changed=true;}
+        layer={};
+    }
+    state.swipeCompositionDirty=false;
+    if(changed && state.composition) state.composition->Commit();
+}
+
 void ClearModeComposition(ViewState& state, bool restoreRoot = true) {
     if (!state.modeComposition.started.QuadPart && !state.modeRootAttached && !state.modeComposition.rows) return;
     TraceUiState(state,restoreRoot ? L"ui.scene.restore[layout,native,header,selected]" :
         L"ui.scene.replace[layout,native,header,selected]");
     if (restoreRoot && state.modeRootAttached && state.compTarget && state.visual) {
-        state.compTarget->SetRoot(state.visual.Get());
+        SetPresentationContentRoot(state,state.visual.Get());
         state.modeRootAttached=false;
     }
     state.modeComposition = {};
@@ -13343,6 +13498,10 @@ void DropTarget(ViewState& state) {
         state.graphicsReady=false; state.graphicsSuspended=true;
         return;
     }
+    if(state.compositionRoot) PipelineEvent(*state.background,{.operation=L"composition.drop[stage,ready,standby,active]",
+        .a=reinterpret_cast<ULONG_PTR>(state.compositionRoot.Get()),.b=static_cast<unsigned>(state.graphicsFailure),
+        .v={double(state.graphicsFailureStage),double(state.graphicsReady),double(state.graphicsStandby),
+            double(state.presentationActive)}},true);
     GraphicsContinuation continuation(state);
     ScopedFlag releasing(state.graphicsInitializing);
     auto memoryAdapter=g_gpuMemoryLogging.load(std::memory_order_relaxed) ? MemoryAdapter(state) : nullptr;
@@ -13393,6 +13552,8 @@ void DropTarget(ViewState& state) {
         if (state.composition) state.composition->Commit();
     }
     state.visual.Reset();
+    state.contentVisual.Reset(); state.compositionRoot.Reset();
+    state.swipeComposition={}; state.swipeCompositionDirty=false;
     state.compTarget.Reset();
     if (state.frameLatencyWaitable) CloseHandle(std::exchange(state.frameLatencyWaitable,nullptr));
     state.swapChain.Reset();
@@ -13552,7 +13713,7 @@ bool EnsureTarget(ViewState& state) {
     state.graphicsFailureStage=5;
     hr = CreatePixelAlignedVisual(state.composition.Get(),state.visual.GetAddressOf());
     if (FAILED(hr)) goto failed;
-    hr = state.compTarget->SetRoot(state.visual.Get());
+    hr = SetPresentationContentRoot(state,state.visual.Get());
     if (FAILED(hr)) goto failed;
     hr = state.composition->Commit();
     if (FAILED(hr)) goto failed;
@@ -15444,7 +15605,8 @@ HRESULT AppendCompositionVisual(Visual* parent, Visual* child) {
     return parent->AddVisual(child,FALSE,nullptr);
 }
 
-bool CreateColumnPlane(ViewState& state, ViewState::ModePlane& plane, D2D1_SIZE_U size) {
+bool CreateColumnPlane(ViewState& state, ViewState::ModePlane& plane, D2D1_SIZE_U size,HRESULT* failure=nullptr) {
+    if(failure) *failure=S_OK;
     if(plane.bitmap && plane.surface) {
         const auto existing=plane.bitmap->GetPixelSize();
         if(existing.width==size.width && existing.height>=size.height) return true;
@@ -15452,12 +15614,13 @@ bool CreateColumnPlane(ViewState& state, ViewState::ModePlane& plane, D2D1_SIZE_
     plane={};
     const auto properties = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
-    const bool ready=SUCCEEDED(state.target->CreateBitmap(size,nullptr,0,&properties,&plane.bitmap)) &&
-        SUCCEEDED(state.composition->CreateSurface(size.width,size.height,DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_ALPHA_MODE_PREMULTIPLIED,&plane.surface));
+    HRESULT hr=state.target->CreateBitmap(size,nullptr,0,&properties,&plane.bitmap);
+    if(SUCCEEDED(hr)) hr=state.composition->CreateSurface(size.width,size.height,DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_ALPHA_MODE_PREMULTIPLIED,&plane.surface);
+    if(failure) *failure=hr;
     state.compositionSurfacePoolUsed |= bool(plane.surface);
     plane.estimatedBytes=static_cast<size_t>(size.width)*size.height*4*((plane.bitmap ? 1 : 0)+(plane.surface ? 1 : 0));
-    return ready;
+    return SUCCEEDED(hr);
 }
 
 template<class Visual>
@@ -16059,16 +16222,29 @@ bool PublishModePlane(ViewState& state, ViewState::ModePlane& plane) {
     PipelineScope pipeline(state.background,state.modeComposition.rows ? L"rows.composition.upload" : L"columns.composition.upload");
     ComPtr<IDXGISurface> surface;
     POINT offset{};
+    const auto checked=[&](HRESULT result,const wchar_t* operation) {
+        if(FAILED(result)) {
+            const auto size=plane.bitmap ? plane.bitmap->GetPixelSize():D2D1_SIZE_U{};
+            PipelineEvent(*state.background,{.operation=operation,
+                .a=reinterpret_cast<ULONG_PTR>(plane.surface.Get()),.b=static_cast<unsigned>(result),
+                .v={double(size.width),double(size.height),double(offset.x),double(offset.y)}},true);
+        }
+        return SUCCEEDED(result);
+    };
     HRESULT hr = plane.surface->BeginDraw(nullptr,IID_PPV_ARGS(&surface),&offset);
-    if (FAILED(hr)) return false;
+    if (!checked(hr,L"surface.failure.begin[width,height,offsetX,offsetY]")) return false;
     ComPtr<ID2D1Bitmap1> bitmap;
     const auto properties = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
     hr = state.target->CreateBitmapFromDxgiSurface(surface.Get(),&properties,&bitmap);
     const D2D1_POINT_2U point{static_cast<UINT32>(offset.x),static_cast<UINT32>(offset.y)};
-    if (SUCCEEDED(hr)) hr = bitmap->CopyFromBitmap(&point,plane.bitmap.Get(),nullptr);
+    const bool created=checked(hr,L"surface.failure.bitmap[width,height,offsetX,offsetY]");
+    if (created) {
+        hr = bitmap->CopyFromBitmap(&point,plane.bitmap.Get(),nullptr);
+        checked(hr,L"surface.failure.copy[width,height,offsetX,offsetY]");
+    }
     const HRESULT end = plane.surface->EndDraw();
-    return SUCCEEDED(hr) && SUCCEEDED(end);
+    return checked(end,L"surface.failure.end[width,height,offsetX,offsetY]") && SUCCEEDED(hr);
 }
 
 bool PublishColumnPlanes(ViewState& state) {
@@ -16157,16 +16333,21 @@ float SwipeCurve(float progress,float x1,float y1,float x2,float y2) {
     return bezier((low+high)*.5f,y1,y2);
 }
 
-double SwipeSeconds(const ViewState& state,LARGE_INTEGER now) {
-    return state.qpcFrequency>0. ? std::max(0.,(now.QuadPart-state.swipeIndicator.origin.QuadPart)/state.qpcFrequency):0.;
+constexpr double kSwipeCommitFadeSeconds=.080;
+
+double SwipeSeconds(const ViewState& state,const SwipeIndicator& motion,LARGE_INTEGER now) {
+    return state.qpcFrequency>0. ? std::max(0.,(now.QuadPart-motion.origin.QuadPart)/state.qpcFrequency):0.;
 }
 
-std::array<float,SwipeIndicator::Count> SwipePose(const ViewState& state,LARGE_INTEGER now) {
+std::array<float,SwipeIndicator::Count> SwipePose(const ViewState& state,const SwipeIndicator& motion,LARGE_INTEGER now) {
     std::array<float,SwipeIndicator::Count> pose{};
+    const double seconds=SwipeSeconds(state,motion,now);
     for(unsigned i=0;i<pose.size();++i) {
-        const auto& spring=state.swipeIndicator.springs[i];
-        pose[i]=float(state.swipeIndicator.moving ? SampleSwipeSpring(spring,SwipeSeconds(state,now)).value:spring.target);
+        const auto& spring=motion.springs[i];
+        pose[i]=float(motion.moving ? SampleSwipeSpring(spring,seconds).value:spring.target);
     }
+    if(motion.committed) pose[SwipeIndicator::Alpha]=float(motion.springs[SwipeIndicator::Alpha].value*
+        std::max(0.,1.-seconds/kSwipeCommitFadeSeconds));
     return pose;
 }
 
@@ -16179,10 +16360,10 @@ void RetargetSwipeFeedback(ViewState& state,bool released=false,bool committed=f
         const std::array<float,S::Count> initial{-48.f,0.f,.98f,0.f,48.f,6.f,6.f,8.6f,5.f,1.f,0.f};
         for(unsigned i=0;i<S::Count;++i) motion.springs[i].value=motion.springs[i].target=initial[i];
     } else for(auto& spring:motion.springs) {
-        if(motion.moving) spring=SampleSwipeSpring(spring,SwipeSeconds(state,now));
+        if(motion.moving) spring=SampleSwipeSpring(spring,SwipeSeconds(state,motion,now));
         else {spring.value=spring.target; spring.velocity=0.;}
     }
-    motion.origin=now; motion.moving=true; motion.committed=committed;
+    motion.origin=now; motion.moving=true; motion.committed=committed; motion.released=released;
     const bool wasArmed=motion.armed;
     const float distance=state.swipeFeedbackDrag.x, threshold=state.swipeFeedbackThreshold;
     motion.armed=!released && threshold>0.f && distance>=threshold;
@@ -16191,16 +16372,18 @@ void RetargetSwipeFeedback(ViewState& state,bool released=false,bool committed=f
         auto& spring=motion.springs[i]; spring.target=value; spring.stiffness=stiffness; spring.damping=damping;
     };
     if(released) {
-        state.swipeFeedbackActive=false; state.swipeFeedbackFading=true;
-        set(S::Alpha,0.f,committed ? 1400.f:450.f,1.f);
-        set(S::Scale,committed ? .86f:.98f,committed ? 5700.f:120.f,committed ? 1.f:.8f);
-        if(committed) motion.springs[S::Scale].velocity=3.f;
-        else {
+        if(committed) {
+            // Freeze the released shape; opacity alone runs for exactly 80 ms.
+            for(auto& spring:motion.springs) {spring.target=spring.value; spring.velocity=0.;}
+        } else {
+            set(S::Scale,.98f,120.f,.8f);
             set(S::Width,0.f,450.f,.65f); set(S::X,-48.f,800.f,.76f);
             set(S::Length,12.f,600.f,.4f); set(S::ArrowHeight,0.f,600.f,.4f);
             set(S::ArrowAlpha,0.f,450.f,1.f);
         }
     } else {
+        motion.direction=state.swipeFeedbackDirection;
+        motion.originY=state.swipeFeedbackOriginY;
         const float entry=SwipeCurve(p,.19f,1.27f,.71f,.86f);
         const float post=std::clamp((distance-threshold)/std::max(threshold,1.f),0.f,1.f);
         const float stretch=SwipeCurve(post,.19f,1.27f,.71f,.86f);
@@ -16218,7 +16401,8 @@ void RetargetSwipeFeedback(ViewState& state,bool released=false,bool committed=f
         RECT rc{}; ViewClientRect(state,&rc);
         const float dpi=ViewDpi(state)/96.f;
         const float maxY=std::max(0.f,std::min(110.f,(rc.bottom-state.headerPx)/dpi*.5f-24.f));
-        const float dy=state.swipeFeedbackDrag.y/dpi;
+        // Touch contacts already provide their current centroid in client pixels.
+        const float dy=state.touch.active ? 0.f:state.swipeFeedbackDrag.y/dpi;
         set(S::Y,maxY>0.f ? std::copysign(maxY*SwipeCurve(std::abs(dy)/(maxY*15.f),.5f,1.15f,.41f,.94f),dy):0.f,30000.f,1.f);
         if(motion.armed!=wasArmed) {
             const float impulse=motion.armed ? 4.5f:-1.5f;
@@ -16226,44 +16410,84 @@ void RetargetSwipeFeedback(ViewState& state,bool released=false,bool committed=f
             motion.springs[S::Scale].velocity=impulse*-.8f;
         }
     }
-    RegisterAnimationWindow(state.hwnd);
+    state.swipeFeedbackActive=!released; state.swipeFeedbackFading=released;
+    PublishSwipeFeedback(state);
+    if(!state.presenter) RegisterAnimationWindow(state.hwnd);
 }
 
-void AdvanceSwipeFeedback(ViewState& state) {
-    auto& motion=state.swipeIndicator;
-    if(!motion.moving) return;
-    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-    const double seconds=SwipeSeconds(state,now);
+bool AdvanceSwipeIndicator(ViewState& state,SwipeIndicator& motion,LARGE_INTEGER now) {
+    if(!motion.moving) return false;
+    double seconds=SwipeSeconds(state,motion,now);
+    if(motion.committed) {
+        if(state.presentationOnly) {
+            const auto& layer=state.swipeComposition[&motion==&state.swipeOutgoingIndicator ? 1:0];
+            if(!layer.fade || layer.revision!=state.swipeFeedbackRevision || layer.origin.QuadPart!=motion.origin.QuadPart)
+                return false; // An input-side deadline cannot erase an unpublished foreground intent.
+            seconds=std::max(0.,(now.QuadPart-layer.fadeStarted.QuadPart)/layer.frequency);
+        }
+        if(seconds<kSwipeCommitFadeSeconds) return false;
+        motion={}; return true;
+    }
     for(unsigned i=0;i<SwipeIndicator::Count;++i) {
         const auto sample=SampleSwipeSpring(motion.springs[i],seconds);
         // Android DynamicAnimation's minimum visible change and equilibrium
         // velocity criterion, scaled to this surface's actual device pixels.
         const double epsilon=.75*(i==SwipeIndicator::Scale ? .002:
             i>=SwipeIndicator::Alpha ? 1./256.:96./ViewDpi(state));
-        if(std::abs(sample.value-sample.target)>=epsilon || std::abs(sample.velocity)>=epsilon*62.5) return;
+        if(std::abs(sample.value-sample.target)>=epsilon || std::abs(sample.velocity)>=epsilon*62.5) return false;
     }
     motion.moving=false;
-    if(state.swipeFeedbackFading) ClearSwipeFeedback(state);
+    if(motion.released) motion={};
+    return true;
 }
 
-void DrawSwipeFeedback(ViewState& state,float width,float top,float bottom) {
-    using S=SwipeIndicator;
-    if(!(state.swipeFeedbackActive || state.swipeFeedbackFading) || !state.swipeFeedbackDirection || width<=0.f || bottom<=top) return;
+void AdvanceSwipeFeedback(ViewState& state) {
+    if(!state.swipeIndicator.moving && !state.swipeOutgoingIndicator.moving) return;
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-    const auto pose=SwipePose(state,now);
-    const float alpha=std::clamp(pose[S::Alpha],0.f,1.f);
+    AdvanceSwipeIndicator(state,state.swipeOutgoingIndicator,now);
+    if(AdvanceSwipeIndicator(state,state.swipeIndicator,now) && state.swipeFeedbackFading) {
+        state.swipeFeedbackActive=state.swipeFeedbackFading=false;
+        state.swipeFeedbackDrag={}; state.swipeFeedbackThreshold=0.f; state.swipeFeedbackDirection=0;
+    }
+}
+
+struct SwipeLayout {
+    float alpha=0.f,scale=0.f,w=0.f,h=0.f,l=0.f,r=0.f,cy=0.f,edge=0.f,farRadius=0.f,dx=0.f,dy=0.f;
+    bool left=false;
+    D2D1_RECT_F Bounds() const {
+        const float cx=(l+r)*.5f,pad=2.f*scale+1.f; // Stroke radius and one device pixel of antialias coverage.
+        return D2D1::RectF(std::floor(std::min(l,cx-std::abs(dx)*.5f)-pad),
+            std::floor(cy-std::max(h*.5f,std::abs(dy))-pad),
+            std::ceil(std::max(r,cx+std::abs(dx)*.5f)+pad),std::ceil(cy+std::max(h*.5f,std::abs(dy))+pad));
+    }
+};
+
+SwipeLayout LayoutSwipeIndicator(const ViewState& state,const SwipeIndicator& motion,LARGE_INTEGER now,
+    float width,float top,float bottom,bool compositorOpacity=false) {
+    using S=SwipeIndicator;
+    if(!motion.direction || width<=0.f || bottom<=top) return {};
+    const auto pose=SwipePose(state,motion,now);
+    const float alpha=std::clamp(compositorOpacity && motion.committed ? float(motion.springs[S::Alpha].value):pose[S::Alpha],0.f,1.f);
     const float dpi=ViewDpi(state)/96.f;
     const float unit=dpi*std::max(0.f,std::min({1.f,width/(156.f*dpi),(bottom-top)/(48.f*dpi)}));
     const float scale=std::max(0.f,pose[S::Scale])*unit;
     const float w=std::min(width,std::max(0.f,pose[S::Width])*scale);
     const float h=std::min(bottom-top,std::max(0.f,pose[S::Height])*scale);
-    if(alpha<=0.f || w<=0.f || h<=0.f) return;
-    const bool left=(state.swipeFeedbackDirection>0)!=state.rtlLayout;
+    if(alpha<=0.f || w<=0.f || h<=0.f) return {};
+    const bool left=(motion.direction>0)!=state.rtlLayout;
     const float x=pose[S::X]*unit+(1.f-pose[S::Scale])*pose[S::Width]*unit;
-    const float cy=std::clamp(state.swipeFeedbackOriginY+pose[S::Y]*unit,top+h*.5f,bottom-h*.5f);
+    const float cy=std::clamp(motion.originY+pose[S::Y]*unit,top+h*.5f,bottom-h*.5f);
     const float l=left ? x:width-x-w,r=l+w;
     const float edge=std::clamp(pose[S::Edge]*scale,0.f,std::min(w,h)*.5f);
     const float farRadius=std::clamp(pose[S::Far]*scale,0.f,std::min(w,h)*.5f);
+    return {alpha,scale,w,h,l,r,cy,edge,farRadius,pose[S::Length]*scale,pose[S::ArrowHeight]*scale,left};
+}
+
+void DrawSwipeIndicator(ViewState& state,const SwipeIndicator& motion,LARGE_INTEGER now,float width,float top,float bottom,
+    bool compositorOpacity=false) {
+    const auto [alpha,scale,w,h,l,r,cy,edge,farRadius,dx,dy,left]=
+        LayoutSwipeIndicator(state,motion,now,width,top,bottom,compositorOpacity);
+    if(alpha<=0.f || w<=0.f || h<=0.f) return;
     const auto colors=g_swipePalette.load(std::memory_order_relaxed);
     state.brush->SetColor(Packed(ThemeRgb(COLORREF(colors&0xFFFFFF)),alpha));
     // Clip each half of the rounded surface to retain independent edge/far
@@ -16274,10 +16498,9 @@ void DrawSwipeFeedback(ViewState& state,float width,float top,float bottom) {
         state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(l,cy-h*.5f,r,cy+h*.5f),radius,radius),state.brush.Get());
         state.target->PopAxisAlignedClip();
     }
-    const float dx=pose[S::Length]*scale,dy=pose[S::ArrowHeight]*scale;
     const float cx=(l+r)*.5f,tip=cx+(left ? -dx:dx)*.5f,tail=cx+(left ? dx:-dx)*.5f;
     state.brush->SetColor(Packed(ThemeRgb(COLORREF((colors>>24)&0xFFFFFF)),
-        std::min(alpha,std::clamp(pose[S::ArrowAlpha],0.f,1.f))*float((colors>>48)&255)/255.f));
+        alpha*std::clamp(SwipePose(state,motion,now)[SwipeIndicator::ArrowAlpha],0.f,1.f)*float((colors>>48)&255)/255.f));
     // Stroke one continuous figure: Direct2D joins the tip and applies the
     // translucent foreground once, without flat-cap gaps or a brighter overlap.
     ComPtr<ID2D1PathGeometry> arrow;
@@ -16289,6 +16512,139 @@ void DrawSwipeFeedback(ViewState& state,float width,float top,float bottom) {
         path->EndFigure(D2D1_FIGURE_END_OPEN);
         if(SUCCEEDED(path->Close())) state.target->DrawGeometry(arrow.Get(),state.brush.Get(),4.f*scale);
     }
+}
+
+float SwipeCompositionOpacity(const ViewState& state,const ViewState::SwipeComposition& layer,LARGE_INTEGER now) {
+    if(!layer.visible) return 0.f;
+    return layer.fade && layer.frequency>0. ? float(std::clamp(1.-(now.QuadPart-layer.fadeStarted.QuadPart)/layer.frequency/kSwipeCommitFadeSeconds,0.,1.)):1.f;
+}
+
+bool RenderSwipeFeedback(ViewState& state) {
+    if(!state.swipeIndicator.direction && !state.swipeOutgoingIndicator.direction &&
+        !state.swipeComposition[0].visual && !state.swipeComposition[1].visual) return true;
+    const auto checked=[&](HRESULT result,const wchar_t* operation,int layer=-1) {
+        if(FAILED(result)) PipelineEvent(*state.background,{.operation=operation,
+            .a=state.swipeFeedbackRevision,.b=static_cast<unsigned>(result),
+            .v={double(layer),double(state.graphicsFailureStage),double(state.graphicsReady)}},true);
+        return SUCCEEDED(result);
+    };
+    if(!EnsureTarget(state) || !state.compositionRoot) {
+        checked(FAILED(state.graphicsFailure) ? state.graphicsFailure:E_UNEXPECTED,L"swipe.failure.target"); return false;
+    }
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    RECT client{}; ViewClientRect(state,&client);
+    const int dpi=ViewDpi(state);
+    struct Restore {
+        ID2D1DeviceContext* context;
+        ComPtr<ID2D1Image> target;
+        D2D1_MATRIX_3X2_F transform{};
+        explicit Restore(ID2D1DeviceContext* value):context(value) {context->GetTarget(&target); context->GetTransform(&transform);}
+        ~Restore() {context->SetTarget(target.Get()); context->SetTransform(transform);}
+    } restore(state.target.Get());
+    const SwipeIndicator* motions[]{&state.swipeIndicator,&state.swipeOutgoingIndicator};
+    // The outgoing bubble is inserted first; the engaged bubble is above it.
+    for(int i=1;i>=0;--i) {
+        auto& layer=state.swipeComposition[size_t(i)]; const auto& motion=*motions[i];
+        if(!motion.direction) {
+            // Renderer completion never cancels a compositor-owned fade. Only a
+            // newer explicit foreground intent may replace it before its End.
+            if(layer.visible && (!layer.fade || layer.revision!=state.swipeFeedbackRevision)) {
+                if(!checked(layer.visual->SetContent(nullptr),L"swipe.failure.hide",i)) return false;
+                layer.visible=false; layer.fade.Reset(); state.swipeCompositionDirty=true;
+            }
+            continue;
+        }
+        const bool sameIntent=layer.visual && layer.revision==state.swipeFeedbackRevision && layer.origin.QuadPart==motion.origin.QuadPart;
+        const bool sameViewport=layer.viewport.width==UINT(client.right) && layer.viewport.height==UINT(client.bottom) &&
+            layer.dpi==dpi && layer.rtl==state.rtlLayout;
+        if(sameIntent && sameViewport &&
+            ((motion.committed && layer.fade) || (!motion.moving && !layer.moving))) continue;
+        const float top=sameIntent ? layer.top*float(dpi)/layer.dpi:state.headerPx;
+        const auto layout=LayoutSwipeIndicator(state,motion,now,float(client.right),top,float(client.bottom),true);
+        // A successful Commit and the effect's opacity do not prove the bitmap
+        // has visible geometry. Record the actual shared draw layout once per
+        // input revision (not on each animation wake), including skipped draws.
+        if(layer.traceRevision!=state.swipeFeedbackRevision &&
+            (g_pipelineTracing.load(std::memory_order_relaxed) || g_uiTransitionLogging.load(std::memory_order_relaxed))) {
+            layer.traceRevision=state.swipeFeedbackRevision;
+            PipelineEvent(*state.background,{.operation=L"swipe.geometry[left,top,right,bottom]",
+                .a=state.swipeFeedbackRevision,.b=size_t(i),
+                .v={layout.l,layout.cy-layout.h*.5f,layout.r,layout.cy+layout.h*.5f}},true);
+            PipelineEvent(*state.background,{.operation=L"swipe.pose[alpha,scale,originY,header]",
+                .a=state.swipeFeedbackRevision,.b=size_t(i),.v={layout.alpha,layout.scale,motion.originY,top}},true);
+            PipelineEvent(*state.background,{.operation=L"swipe.target[width,height,dpi,direction]",
+                .a=reinterpret_cast<ULONG_PTR>(state.compositionRoot.Get()),
+                .b=reinterpret_cast<ULONG_PTR>(layer.visual.Get()),
+                .v={double(client.right),double(client.bottom),double(dpi),double(motion.direction)}},true);
+        }
+        if(layout.alpha<=0.f || layout.w<=0.f || layout.h<=0.f) continue;
+        const auto bounds=layout.Bounds();
+        D2D1_SIZE_U size{UINT(bounds.right-bounds.left),UINT(bounds.bottom-bounds.top)};
+        if(layer.plane.bitmap) {
+            const auto previous=layer.plane.bitmap->GetPixelSize();
+            size.width=std::max(size.width,previous.width); size.height=std::max(size.height,previous.height);
+        }
+        HRESULT allocation=S_OK;
+        if(!CreateColumnPlane(state,layer.plane,size,&allocation)) {
+            checked(allocation,L"swipe.failure.allocate",i); return false;
+        }
+        state.target->SetTarget(layer.plane.bitmap.Get());
+        state.target->BeginDraw();
+        state.target->SetTransform(D2D1::Matrix3x2F::Translation(-bounds.left,-bounds.top));
+        state.target->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
+        DrawSwipeIndicator(state,motion,now,float(client.right),top,float(client.bottom),true);
+        if(!checked(state.target->EndDraw(),L"swipe.failure.draw",i) || !PublishModePlane(state,layer.plane)) return false;
+        if(!layer.visual) {
+            ComPtr<IDCompositionVisual> visual;
+            ComPtr<IDCompositionEffectGroup> opacity;
+            if(!checked(CreatePixelAlignedVisual(state.composition.Get(),&visual),L"swipe.failure.visual",i) ||
+                !checked(state.composition->CreateEffectGroup(&opacity),L"swipe.failure.effect",i) ||
+                !checked(state.compositionRoot->AddVisual(visual.Get(),FALSE,i ? state.swipeComposition[0].visual.Get():nullptr),L"swipe.failure.attach",i)) return false;
+            layer.visual=std::move(visual); layer.opacity=std::move(opacity);
+        }
+        if(!checked(layer.visual->SetContent(layer.plane.surface.Get()),L"swipe.failure.content",i) ||
+            !checked(layer.visual->SetOffsetX(bounds.left),L"swipe.failure.offsetX",i) ||
+            !checked(layer.visual->SetOffsetY(bounds.top),L"swipe.failure.offsetY",i)) return false;
+        if(!(sameIntent && motion.committed && layer.fade)) {
+            layer.fade.Reset();
+            if(motion.committed) {
+                if(!checked(state.composition->CreateAnimation(&layer.fade),L"swipe.failure.animation",i) ||
+                    !checked(layer.fade->AddCubic(0.,1.f,float(-1./kSwipeCommitFadeSeconds),0.f,0.f),L"swipe.failure.curve",i) ||
+                    !checked(layer.fade->End(kSwipeCommitFadeSeconds,0.f),L"swipe.failure.end",i) ||
+                    !checked(layer.opacity->SetOpacity(layer.fade.Get()),L"swipe.failure.fade",i) ||
+                    !checked(layer.visual->SetEffect(layer.opacity.Get()),L"swipe.failure.setEffect",i)) return false;
+                layer.fadeStarted=now;
+                LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); layer.frequency=double(frequency.QuadPart);
+            } else {
+                // Tracking/retraction has no compositor opacity effect. Reusing
+                // an effect after its animation ended at zero can leave the
+                // visual transparent even when SetOpacity(1.f) succeeds. Its
+                // raster alpha already belongs to the shared spring pose.
+                if(!checked(layer.visual->SetEffect(nullptr),L"swipe.failure.setEffect",i)) return false;
+            }
+        }
+        layer.revision=state.swipeFeedbackRevision; layer.origin=motion.origin;
+        layer.viewport={UINT(client.right),UINT(client.bottom)}; layer.dpi=dpi; layer.rtl=state.rtlLayout; layer.top=top;
+        layer.bounds=bounds; layer.moving=motion.moving; layer.visible=true;
+        state.swipeCompositionDirty=true;
+    }
+    if(state.swipeCompositionDirty) {
+        if(!checked(state.composition->Commit(),L"swipe.failure.commit")) return false;
+        state.swipeCompositionDirty=false; ++state.swipeCompositionSerial;
+        if(state.frameProfile.recording) state.frameProfile.accepted=true;
+    }
+    const float alpha=SwipeCompositionOpacity(state,state.swipeComposition[0],now);
+    const float outgoing=SwipeCompositionOpacity(state,state.swipeComposition[1],now);
+    const bool feedback=alpha>0.f || outgoing>0.f;
+    if(!feedback && !state.swipeTraceHadFeedback) return true;
+    if(g_pipelineTracing.load(std::memory_order_relaxed) || g_uiTransitionLogging.load(std::memory_order_relaxed))
+        PipelineEvent(*state.background,{.operation=L"swipe.foreground[alpha,outgoing,fadeMs,committed]",
+            .a=state.swipeFeedbackRevision,.b=state.swipeCompositionSerial,
+            .v={alpha,outgoing,state.swipeComposition[0].fade ?
+                1000.*(now.QuadPart-state.swipeComposition[0].fadeStarted.QuadPart)/state.swipeComposition[0].frequency:0.,
+                double(bool(state.swipeComposition[0].fade))}},true);
+    state.swipeTraceHadFeedback=feedback;
+    return true;
 }
 
 void Paint(ViewState& state) {
@@ -16317,6 +16673,7 @@ void Paint(ViewState& state) {
         RECT latest{}; ViewClientRect(state,&latest);
         if(!ResizeTarget(state,UINT(std::max<LONG>(1,latest.right)),UINT(std::max<LONG>(1,latest.bottom)))) return;
     }
+    RenderSwipeFeedback(state);
     ScopedFlag rasterPainting(state.textRasterPainting);
     RefreshTextRendering(state,true);
     ModeCompositionFrame compositionFrame(state);
@@ -17066,8 +17423,8 @@ void Paint(ViewState& state) {
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
     DrawScrollbar(state, HorizontalBar(state), nameColor,
         state.horizontalScrollbarHot || state.draggingHorizontal, state.draggingHorizontal);
-    // Navigation feedback is the foreground of the shared chrome plane.
-    DrawSwipeFeedback(state,w,compositionFrame.active ? compositionFrame.header:header,float(rect.bottom));
+    // Foreground visuals belong to the persistent composition root, never to
+    // this repaint or to a temporary row/column transition's chrome plane.
     if (compositionFrame.active) {
         compositionFrame.Canonical();
         state.target->SetTarget(frameTarget);
@@ -17101,7 +17458,7 @@ void Paint(ViewState& state) {
     else if (state.swapChain) {
         HRESULT present=S_OK;
         if (compositionFrame.active) {
-            present=state.compTarget->SetRoot(state.modeComposition.root.Get());
+            present=SetPresentationContentRoot(state,state.modeComposition.root.Get());
             if (SUCCEEDED(present)) {
                 state.modeRootAttached=true;
                 present=state.composition->Commit();
@@ -17130,7 +17487,7 @@ void Paint(ViewState& state) {
             if(SUCCEEDED(present) && state.presentedSwapChain!=state.swapChain) {
                 present=state.visual->SetContent(state.swapChain.Get());
                 if(SUCCEEDED(present) && state.modeRootAttached)
-                    present=state.compTarget->SetRoot(state.visual.Get());
+                    present=SetPresentationContentRoot(state,state.visual.Get());
                 if(SUCCEEDED(present)) present=state.composition->Commit();
                 if(SUCCEEDED(present)) {
                     state.presentedSwapChain=state.swapChain;
@@ -17293,9 +17650,10 @@ void RecycleStandbyComposition(ViewState& state) {
     // Build its small replacement while hidden; the rendered swap chain and
     // D2D text/icon resources stay on their existing tab-owned device.
     ComPtr<IDCompositionDevice> replacement;
-    ComPtr<IDCompositionVisual> visual;
+    ComPtr<IDCompositionVisual> visual,root;
     if (FAILED(DCompositionCreateDevice(state.dxgiDevice.Get(),IID_PPV_ARGS(&replacement))) ||
-        FAILED(CreatePixelAlignedVisual(replacement.Get(),&visual)) || FAILED(visual->SetContent(state.presentedSwapChain.Get())))
+        FAILED(CreatePixelAlignedVisual(replacement.Get(),&visual)) || FAILED(visual->SetContent(state.presentedSwapChain.Get())) ||
+        FAILED(CreatePixelAlignedVisual(replacement.Get(),&root)) || FAILED(root->AddVisual(visual.Get(),TRUE,nullptr)))
         return; // Keep the ready image if allocation fails; retry on a later hide.
     // Device creation can dispatch activation. Never detach a resumed tab's
     // ready composition target; its caller resumes presentation after setup.
@@ -17305,15 +17663,17 @@ void RecycleStandbyComposition(ViewState& state) {
     state.compTarget.Reset(); // HWND can have only one target at this layer.
     ComPtr<IDCompositionTarget> target;
     if (SUCCEEDED(replacement->CreateTargetForHwnd(state.hwnd,TRUE,&target)) &&
-        SUCCEEDED(target->SetRoot(visual.Get())) && SUCCEEDED(replacement->Commit())) {
+        SUCCEEDED(target->SetRoot(root.Get())) && SUCCEEDED(replacement->Commit())) {
         state.composition=std::move(replacement);
         state.visual=std::move(visual); state.compTarget=std::move(target);
+        state.compositionRoot=std::move(root); state.contentVisual=state.visual;
+        state.swipeComposition={}; state.swipeCompositionDirty=false;
         state.compositionSurfacePoolUsed=false;
     } else {
         target.Reset();
         // A failed replacement must not discard a perfectly usable image.
         if (FAILED(previous->CreateTargetForHwnd(state.hwnd,TRUE,&state.compTarget)) ||
-            FAILED(state.compTarget->SetRoot(state.visual.Get())) || FAILED(previous->Commit())) {
+            FAILED(state.compTarget->SetRoot(state.compositionRoot.Get())) || FAILED(previous->Commit())) {
             state.graphicsSuspended=true;
             DropTarget(state); // Genuine target/device failure, not a tab switch.
         }
@@ -20042,12 +20402,14 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
                           ComPtr<IShellFolder>& folder,
                           bool allowLastFolderRestore, HWND oldTab,
                           const std::wstring* navigationOrigin = nullptr,
-                          bool cachedPreviewOnly = false);
+                          bool cachedPreviewOnly = false,
+                          const SharedPidl& destinationIdentity = {});
 void DeactivateOutsideScope(ViewState& state);
 
 // Defined after ResetForNewDirectory; only invokes the existing directory
 // cache/worker, and never navigates or calls into Shell COM.
-void BeginOptimisticNavigation(ViewState& state, const std::wstring& path);
+void BeginOptimisticNavigation(ViewState& state, const std::wstring& path,
+                               const SharedPidl& destinationIdentity = {});
 void MaybeDisplayImmediateBack(HWND overlay, const wchar_t* reason);
 void RollbackOptimisticNavigation(HWND overlay, const std::wstring& destination);
 
@@ -21120,11 +21482,14 @@ float SwipeCommitDistance(ViewState& state) {
 void ClearSwipeFeedback(ViewState& state) {
     // Visual completion must not reset contact intent or the release guard:
     // native inertia can outlive the arrow fade.
+    const bool visible=state.swipeIndicator.direction || state.swipeOutgoingIndicator.direction;
     state.swipeFeedbackActive = state.swipeFeedbackFading = false;
     state.swipeFeedbackDrag = {};
     state.swipeFeedbackThreshold = 0.f;
     state.swipeFeedbackDirection = 0;
     state.swipeIndicator = {};
+    state.swipeOutgoingIndicator = {};
+    if(visible) PublishSwipeFeedback(state);
 }
 
 // Validate that this view still belongs to the active Explorer tab. Do not
@@ -21134,24 +21499,45 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
     // view takes time to bind. Cancellation is not a rename commit.
     CancelRename(state);
     if (!state.shellBrowser || !IsWindow(state.nativeHwnd) ||
-        !IsSupportedLocation(state.folderPath) || !state.visible) return;
+        !IsSupportedLocation(state.folderPath) || !state.visible ||
+        state.optimisticStartedAt || !TabOwnsActiveView(state)) return;
+    const auto browser = state.shellBrowser;
+    const HWND overlay = state.hwnd, native = state.nativeHwnd;
+    const auto lifetime = state.lifetimeToken, epoch = state.mouseFolderEpoch;
+    const auto current = [&]() -> ViewState* {
+        auto* live = IsWindow(overlay) ? State(overlay) : nullptr;
+        return live == &state && live->lifetimeToken == lifetime &&
+            live->nativeHwnd == native && live->shellBrowser.Get() == browser.Get() &&
+            live->visible && TabOwnsActiveView(*live) ? live : nullptr;
+    };
     ComPtr<IShellView> active;
-    if (FAILED(state.shellBrowser->QueryActiveShellView(active.GetAddressOf())) ||
+    if (FAILED(browser->QueryActiveShellView(active.GetAddressOf())) ||
         !active) return;
-    HWND current = nullptr;
-    if (FAILED(active->GetWindow(&current)) || current != state.nativeHwnd)
+    HWND activeWindow = nullptr;
+    if (FAILED(active->GetWindow(&activeWindow)) || activeWindow != native)
         return;
-    // Start bounded Shell rebind checks before BrowserObject can replace
+    auto* live = current();
+    if (!live || live->mouseFolderEpoch != epoch) return;
+    // Prepare the same known cached return as native Back input BEFORE the
+    // Shell call. BrowseObject can announce/rebind the destination reentrantly,
+    // at which point the departing path and its Back hint are already gone.
+    if (backward) MaybeDisplayImmediateBack(overlay, L"swipe Back");
+    live = current();
+    if (!live) return;
+    const auto previewToken = live->token;
+    const std::wstring preview = live->optimisticDestination;
+    // Start bounded Shell rebind checks before BrowseObject can replace
     // SHELLDLL_DefView; the frame-owned GPU window remains on top throughout.
-    ScheduleNavigationProbe(state);
-    const HWND overlay = state.hwnd;
-    const HRESULT hr = state.shellBrowser->BrowseObject(nullptr,
+    ScheduleNavigationProbe(*live);
+    const HRESULT hr = browser->BrowseObject(nullptr,
         backward ? SBSP_NAVIGATEBACK : SBSP_NAVIGATEFORWARD);
-    if (SUCCEEDED(hr) && backward && IsWindow(overlay))
-        MaybeDisplayImmediateBack(overlay, L"touchpad Back");
-    if (FAILED(hr))
-        Wh_Log(L"[GPU overlay] touchpad history navigation failed hr=0x%08X",
+    if (FAILED(hr)) {
+        live = current();
+        if (live && live->token == previewToken && !preview.empty())
+            RollbackOptimisticNavigation(overlay, preview);
+        Wh_Log(L"[GPU overlay] swipe history navigation failed hr=0x%08X",
                static_cast<unsigned>(hr));
+    }
 }
 
 // Touchscreens and touchpads share intent, history commits, scrolling and zoom.
@@ -21159,7 +21545,16 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
 void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
     state.lastManipulationActivity = GetTickCount64();
     if (wParam == 1) { // New genuine touchpad contact.
-        const bool feedback = state.swipeFeedbackActive || state.swipeFeedbackFading;
+        if(g_pipelineTracing.load(std::memory_order_relaxed) || g_uiTransitionLogging.load(std::memory_order_relaxed)) {
+            RECT host{}; GetWindowRect(state.hwnd,&host);
+            const HWND above=GetWindow(state.hwnd,GW_HWNDPREV);
+            wchar_t name[256]{}; if(above) GetClassNameW(above,name,ARRAYSIZE(name));
+            PipelineEvent(*state.background,{.operation=L"swipe.host[left,top,right,bottom]",
+                .a=reinterpret_cast<ULONG_PTR>(state.hwnd),.b=reinterpret_cast<ULONG_PTR>(above),
+                .v={double(host.left),double(host.top),double(host.right),double(host.bottom)},
+                .note=std::make_shared<const std::wstring>(name)},true);
+        }
+        const bool feedback = state.swipeFeedbackActive || state.swipeFeedbackFading || state.swipeOutgoingIndicator.moving;
         state.touchpadPanX = state.touchpadPanY = 0.f;
         state.touchpadPinching = false;
         state.swipeHorizontal = state.swipeVertical = false;
@@ -21169,7 +21564,7 @@ void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
         state.swipeFeedbackOriginY=state.headerPx+(client.bottom-state.headerPx)*.5f;
         if(state.touch.active) {
             POINT contact=state.touch.start;
-            if(MapUiPoint(nullptr,state.hwnd,contact)) state.swipeFeedbackOriginY=float(contact.y-Scale96(64,ViewDpi(state)));
+            if(MapUiPoint(nullptr,state.hwnd,contact)) state.swipeFeedbackOriginY=float(contact.y);
         }
         if (feedback) Redraw(state);
         state.swipeReleased = false;
@@ -21252,7 +21647,14 @@ void ApplyManipulationPan(ViewState& state, float physicalX, float dy) {
     if (!state.swipeReleased && state.swipeHorizontal) {
         if (state.swipeEdgeX) {
             const int direction=state.swipeEdgeX>0.f ? 1:-1;
-            if(state.swipeFeedbackDirection!=direction) state.swipeIndicator={};
+            if(state.swipeIndicator.direction!=direction) {
+                if(state.swipeIndicator.origin.QuadPart) {
+                    if(!state.swipeIndicator.released) RetargetSwipeFeedback(state,true,false);
+                    std::swap(state.swipeIndicator,state.swipeOutgoingIndicator);
+                } else if(state.swipeOutgoingIndicator.direction==direction)
+                    std::swap(state.swipeIndicator,state.swipeOutgoingIndicator);
+                if(state.swipeIndicator.direction!=direction) state.swipeIndicator={};
+            }
             state.swipeFeedbackActive = true; state.swipeFeedbackFading = false;
             state.swipeFeedbackDrag = {fabsf(state.swipeEdgeX), state.touchpadPanY};
             state.swipeFeedbackThreshold = SwipeCommitDistance(state);
@@ -23257,8 +23659,10 @@ void SignalPresentationFrames() {
     ReleaseSRWLockShared(&g_frameLock);
 }
 void PulsePresentation(const std::shared_ptr<PresentationLane>& lane,bool active) {
-    lane->animating.store(active,std::memory_order_release);
-    if(!active || g_frameStopping.load(std::memory_order_acquire)) return;
+    const bool wasActive=lane->animating.exchange(active,std::memory_order_acq_rel);
+    // Existing active lanes already receive heartbeats. Waking on every input
+    // or rendered frame would interrupt the clock wait during continuous input.
+    if(!active || wasActive || g_frameStopping.load(std::memory_order_acquire)) return;
     AcquireSRWLockShared(&g_frameLock);
     if(g_frameEvent && !g_frameStopping.load(std::memory_order_acquire)) SetEvent(g_frameEvent);
     ReleaseSRWLockShared(&g_frameLock);
@@ -23271,6 +23675,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
 #undef CAPTURE_PRESENTATION
+    static_cast<SwipeFeedbackSnapshot&>(*model)=CaptureSwipeFeedback(state);
     model->sequence=++state.presentationSequence; model->lifetime=state.lifetimeToken;
     if(state.columnTransitionStartedQpc.QuadPart!=state.presentationColumnActualOrigin.QuadPart)
         state.presentationColumnOrigin=state.columnTransitionStartedQpc;
@@ -23400,6 +23805,7 @@ void SynchronizePresentationGeneration(ViewState& state) {
 }
 
 bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,const std::shared_ptr<PresentationLane>& lane) {
+    ApplySwipeFeedback(state,model);
     auto oldDirectory=state.presentationEntries;
     const bool sameFolder=state.folderPath==model.folderPath;
     const auto oldIntents=state.presentationGroupIntents;
@@ -23563,10 +23969,24 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->sequence=state.presentationSequence; receipt->lifetime=lane->lifetime;
     receipt->token=state.token; receipt->directoryToken=state.directoryToken;
     receipt->frames=state.graphicsPaintSerial; receipt->thread=GetCurrentThreadId();
+    receipt->foregroundFrames=state.swipeCompositionSerial;
+    receipt->contentPending=NeedsAnimationPaint(state,true,false) ||
+        (state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive);
+    for(size_t i=0;i<state.swipeComposition.size();++i) {
+        receipt->foregroundVisuals[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].visual.Get());
+        receipt->foregroundFades[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].fade.Get());
+    }
     receipt->device=reinterpret_cast<ULONG_PTR>(state.d3d.Get()); receipt->swapchain=reinterpret_cast<ULONG_PTR>(state.swapChain.Get());
     receipt->sceneRoot=reinterpret_cast<ULONG_PTR>(state.modeComposition.root.Get());
     receipt->backbuffer=reinterpret_cast<ULONG_PTR>(state.backbuffer.Get());
     receipt->scenePublished=state.modeRootAttached && state.modeComposition.published;
+    if(lane->diagnostics.load(std::memory_order_relaxed)) {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        receipt->swipeFeedbackRevision=state.swipeFeedbackRevision;
+        receipt->swipeFeedbackAlpha=state.swipeComposition[0].fade ? SwipeCompositionOpacity(state,state.swipeComposition[0],now):
+            SwipePose(state,state.swipeIndicator,now)[SwipeIndicator::Alpha];
+        receipt->swipeFeedbackMoving=state.swipeIndicator.moving || state.swipeOutgoingIndicator.moving;
+    }
     receipt->sceneOrigin=state.modeComposition.started; receipt->columnClock=state.columnTransitionStartedQpc;
     if(lane->diagnostics.load(std::memory_order_relaxed) && state.composition) {
         DCOMPOSITION_FRAME_STATISTICS statistics{};
@@ -23713,35 +24133,58 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         if(work.stopping.load(std::memory_order_acquire) || lane->stopping.load(std::memory_order_acquire)) break;
         std::shared_ptr<const PresentationModel> model;
         std::optional<PresentationLane::ValidatedGeneration> validated;
+        std::optional<SwipeFeedbackSnapshot> foreground;
         {
             std::lock_guard lock(lane->mutex);
             model=std::exchange(lane->pending,{});
             validated=std::exchange(lane->validatedGeneration,{});
+            foreground=std::exchange(lane->swipeFeedback,{});
             ResetEvent(worker.wake);
         }
         if(lane->release.exchange(false,std::memory_order_acq_rel)) {
             DropTarget(state); PulsePresentation(lane,false);
             if(!model) continue;
         }
+        // A heartbeat can be queued just before the preceding paint retires
+        // its animation. Do not redraw an idle tab for that stale signal;
+        // model, generation and foreground packets remain independently live.
+        if(!model && !validated && !foreground && !lane->animating.load(std::memory_order_acquire)) continue;
+        // A model captured before a newer input packet cannot rewind the
+        // foreground. Cold folder controls carry it without replacing rows.
+        bool foregroundChanged=false;
+        if(model) foregroundChanged=ApplySwipeFeedback(state,CaptureSwipeFeedback(*model));
+        if(foreground) foregroundChanged=ApplySwipeFeedback(state,*foreground) || foregroundChanged;
+        // Publish a new foreground intent before content preparation can enter
+        // text/resource/layout work. An already committed DWM fade needs no CPU
+        // continuation while that work runs.
+        if(foregroundChanged && state.graphicsReady) RenderSwipeFeedback(state);
         if(model && !model->active) {
             awaitingNames=false;
             standbyControl=model;
             state.presentationActive=false; state.inputFocusIndicators=false; state.selectionFeedbackVisible=false;
+            // A real tab/window hide retires the intent as well as its pixels.
+            // Preserve the revision so resuming from an unchanged content
+            // snapshot cannot replay a released animation with a new clock.
+            ClearSwipeFeedback(state);
+            ClearSwipeComposition(state);
             if(!model->visible || !model->inScope || !model->detailsViewActive) DropTarget(state);
             else if(state.graphicsReady) {state.graphicsStandby=state.graphicsStandbyPending=true; AdvanceStandbyGraphics(state);}
             PublishPresentationReceipt(state,lane,false,standbyControl.get());
             PulsePresentation(lane,state.graphicsStandbyPending);
             continue;
         }
-        if(!model && awaitingNames) continue;
         if(model && model->active && !model->loaded && !model->total) {
             // Keep both the accepted model and its pixels until names arrive.
             // This is a control acknowledgment, never acceptance of old pixels
             // as the new directory. Visibility/fallback packets still run above.
-            PublishPresentationReceipt(state,lane,false,model.get());
+            standbyControl=model;
+            PublishPresentationReceipt(state,lane,false,standbyControl.get());
             awaitingNames=true;
-            PulsePresentation(lane,false);
-            continue;
+            model.reset();
+        }
+        if(!model && awaitingNames && !foregroundChanged &&
+            !state.swipeIndicator.moving && !state.swipeOutgoingIndicator.moving && !state.presentPending) {
+            PulsePresentation(lane,false); continue;
         }
         if(model) {
             awaitingNames=false;
@@ -23754,7 +24197,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         if(validated) {
             const bool current=validated->sequence==state.presentationSequence && validated->token==state.token;
             if(current) state.directoryToken=validated->directoryToken;
-            if(!model && !lane->animating.load(std::memory_order_acquire)) {
+            if(!model && !foregroundChanged && !lane->animating.load(std::memory_order_acquire)) {
                 if(current) PublishPresentationReceipt(state,lane,!state.graphicsReady);
                 continue;
             }
@@ -23764,20 +24207,30 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             AdvanceStandbyGraphics(state); PublishPresentationReceipt(state,lane,false,standbyControl.get());
             PulsePresentation(lane,state.graphicsStandbyPending); continue;
         }
+        if(!state.presentationActive) {PulsePresentation(lane,false); continue;}
         BeginFrameProfile(state);
         AdvanceAnimationFrame(state,false);
         const auto previousPaint=state.graphicsPaintSerial;
-        Paint(state);
+        const auto previousForeground=state.swipeCompositionSerial;
+        const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
+        const bool repaint=model || !state.graphicsReady || NeedsAnimationPaint(state,true,false) || handoff;
+        if(repaint) Paint(state);
+        else if(!RenderSwipeFeedback(state) && state.d3d) {
+            const HRESULT device=state.d3d->GetDeviceRemovedReason();
+            if(FAILED(device)) {state.graphicsFailure=device; state.graphicsFailureStage=6; DropTarget(state);}
+        }
         EndFrameProfile(state);
         TrimPresentationImages(state);
-        if(state.target) {ScheduleVisibleIconUploads(state);}
+        if(repaint && state.target) {ScheduleVisibleIconUploads(state);}
         // A readiness miss produced no new pixels. Keep the last accepted
         // receipt available to an unpumped owner until a newer model needs a
         // deferred acknowledgment, or a new paint/device failure supersedes it.
-        if (state.graphicsPaintSerial!=previousPaint || model || !state.graphicsReady)
-            PublishPresentationReceipt(state,lane,!state.graphicsReady);
-        const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
-        PulsePresentation(lane,state.presentationActive && (NeedsAnimationPaint(state) || handoff || state.presentationCachePending));
+        if (state.graphicsPaintSerial!=previousPaint || state.swipeCompositionSerial!=previousForeground ||
+            foregroundChanged || model || !state.graphicsReady || lane->diagnostics.load(std::memory_order_relaxed))
+            PublishPresentationReceipt(state,lane,!state.graphicsReady,awaitingNames ? standbyControl.get():nullptr);
+        const bool animating=awaitingNames ? state.swipeIndicator.moving || state.swipeOutgoingIndicator.moving || state.presentPending :
+            NeedsAnimationPaint(state) || handoff || state.presentationCachePending;
+        PulsePresentation(lane,state.presentationActive && animating);
     }
     return 0;
 }
@@ -24581,6 +25034,18 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             Redraw(state);
         }
         state.touch.contacts = std::max(state.touch.contacts,contactCount);
+        // Use the physical contact centroid, including this frame's lifted
+        // contacts. Retain it when fingers leave one by one to avoid a jump
+        // toward the remaining finger before the gesture is released.
+        double centerX=0.,centerY=0.; unsigned centerCount=0;
+        for(UINT32 p=0;p<pointers;++p) if(frame[p].pointerType==PT_TOUCH &&
+            (frame[p].pointerFlags&(POINTER_FLAG_INCONTACT|POINTER_FLAG_UP))) {
+            centerX+=frame[p].ptPixelLocation.x; centerY+=frame[p].ptPixelLocation.y; ++centerCount;
+        }
+        if(centerCount && centerCount>=state.touch.contacts) {
+            POINT center{LONG(std::lround(centerX/centerCount)),LONG(std::lround(centerY/centerCount))};
+            if(MapUiPoint(nullptr,hwnd,center)) state.swipeFeedbackOriginY=float(center.y);
+        }
         if (state.touch.pairTracked && std::any_of(state.touch.pairIds.begin(),state.touch.pairIds.end(),
             [&](UINT32 id){return std::none_of(session->contacts.begin(),session->contacts.end(),
                 [&](const auto& p){return p.pointerId == id;});})) state.touch.pairTracked = false;
@@ -27235,7 +27700,8 @@ enum class ShellNavigationSignal {
 void ReportShellNavigationEvent(HWND overlay, ShellNavigationSignal signal,
                                 const wchar_t* source = nullptr,
                                 const std::wstring* destination = nullptr,
-                                HWND nativeCandidate = nullptr);
+                                HWND nativeCandidate = nullptr,
+                                const SharedPidl& destinationIdentity = {});
 
 // Resolve only dedicated file-view surfaces, including a view which Explorer
 // reparents after creation. Shared DirectUI navigation/toolbar hosts are never
@@ -27519,7 +27985,8 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
                           ComPtr<IShellFolder>& folder,
                           bool allowLastFolderRestore, HWND oldTab,
                           const std::wstring* navigationOrigin,
-                          bool cachedPreviewOnly) {
+                          bool cachedPreviewOnly,
+                          const SharedPidl& destinationIdentity) {
     TraceUiState(state,L"ui.navigation.depart[layout,native,header,selected]");
     state.renamePreviewPath.clear(); state.renamePreviewName.clear(); state.renamePreviewToken = 0;
     if (state.manipulationFrameActive || state.touch.active) StopTouchpad(state, false);
@@ -27537,7 +28004,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     CancelRename(state);
     CancelColumnDrag(state);
     CancelAutoRefit(state);
-    ResetMouseGestureForNavigation(state,true);
+    ResetMouseGestureForNavigation(state);
     state.lastFolderToReveal = allowLastFolderRestore
         ? ImmediateChildOnReturn(navigationOrigin ? *navigationOrigin :
                                  state.folderPath, path) : L"";
@@ -27547,7 +28014,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.lastFolderNativeAfterPaint = false;
     state.lastFolderNativePresentAfter = 0;
     CacheDepartingFolder(state);
-    state.directoryFolderIdentity.reset();
+    state.directoryFolderIdentity = cachedPreviewOnly ? destinationIdentity : SharedPidl{};
     RetireCachedEntries(state, state.namespaceIdentities);
     state.visibility = ReadShellVisibilityPolicy();
     state.clickPolicy = ReadShellClickPolicy();
@@ -27634,7 +28101,9 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
         WatchDirectory(state);
     }
     BeginDirectoryViewMode(state,!cachedPreviewOnly);
-    const bool cached = RestoreCachedFolder(state);
+    // A parsing path can name more than one Shell provider. Reuse speculative
+    // rows only with their known destination binding, never a path-only guess.
+    const bool cached = (!cachedPreviewOnly || state.directoryFolderIdentity) && RestoreCachedFolder(state);
     TraceUiState(state,cached ? L"ui.navigation.cached[layout,native,header,selected]" :
         L"ui.navigation.cold[layout,native,header,selected]");
     if (!cachedPreviewOnly) {
@@ -27650,13 +28119,33 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
 // Fast visual navigation: this ONLY swaps the GPU name snapshot. Explorer's
 // current IShellView remains authoritative until AttachView confirms the path.
 // Never call native Shell selection/menu/open operations against this preview.
-void BeginOptimisticNavigation(ViewState& state, const std::wstring& path) {
-    if (!state.visible || !state.inScope || state.optimisticStartedAt ||
-        !IsTargetPath(path) || !IsWindow(state.hwnd) ||
-        _wcsicmp(path.c_str(), state.folderPath.c_str()) == 0) return;
+void BeginOptimisticNavigation(ViewState& state, const std::wstring& path,
+                               const SharedPidl& destinationIdentity) {
+    if (!state.visible || !state.inScope || !IsTargetPath(path) || !IsWindow(state.hwnd)) return;
+    if (state.optimisticStartedAt) {
+        if (!destinationIdentity || _wcsicmp(state.optimisticDestination.c_str(),path.c_str())) return;
+        if (state.directoryFolderIdentity && PidlBytesEqual(state.directoryFolderIdentity.get(),destinationIdentity.get())) return;
+        if (state.directoryFolderIdentity) {
+            // An actual Shell PIDL supersedes a prior binding hint, including
+            // two providers exposing the same path. Retire the provisional
+            // model without caching it as a confirmed destination.
+            const auto origin=state.optimisticFromPath;
+            auto folder=state.folder;
+            state.loaded=false;
+            ResetForNewDirectory(state,path,folder,true,state.activeTabHost,&origin,true,destinationIdentity);
+        } else state.directoryFolderIdentity=destinationIdentity;
+        QueueDirectoryRefresh(state,true);
+        return;
+    }
+    if (_wcsicmp(path.c_str(), state.folderPath.c_str()) == 0) return;
     const std::wstring previous = state.folderPath;
     const HWND previousNative = state.nativeHwnd;
     const bool oldViewWasEmpty = state.emptyNative;
+    SharedPidl identity = destinationIdentity;
+    if (!identity) {
+        const auto cached = state.folderCache.folders.find(path);
+        if (cached != state.folderCache.folders.end()) identity = cached->second.folderIdentity;
+    }
     // ResetForNewDirectory uses this destination's cached presentation, or
     // unsorted enumeration order on a miss; it never inherits the old folder's
     // Shell sort preference.
@@ -27669,12 +28158,18 @@ void BeginOptimisticNavigation(ViewState& state, const std::wstring& path) {
     // Cached rows restore immediately; on a miss the existing directory worker
     // starts after the provisional identity has been established below.
     ResetForNewDirectory(state, path, departingFolder, true,
-                         state.activeTabHost, nullptr, true);
+                         state.activeTabHost, nullptr, true, identity);
     state.optimisticFromPath = previous;
     state.optimisticDestination = path;
     state.optimisticSourceView = previousNative;
     state.optimisticStartedAt = GetTickCount64();
-    if (!state.loaded) QueueDirectoryRefresh(state);
+    // Both cache hits and background names belong to the same known provider.
+    // Without an identity, retain accepted pixels until a Shell PIDL event or
+    // AttachView supplies the binding. Never reparse a guessed destination.
+    if (!state.loaded && identity) QueueDirectoryRefresh(state);
+    PipelineEvent(*state.background,{.operation=L"navigation.identity[known,supplied,cached,queued]",
+        .a=state.token,.v={double(bool(identity)),double(bool(destinationIdentity)),
+            double(state.loaded),double(state.directoryPending)}});
     if (oldViewWasEmpty) SuppressNativeContent(state);
     state.pendingNavigationPaint = state.optimisticStartedAt;
     state.shellViewConfirmedAt = 0;
@@ -27739,16 +28234,21 @@ std::wstring AutomationNavigationUrlToPath(const VARIANT& supplied) {
 
 void MaybeDisplayEarlyDestination(HWND overlay, const std::wstring& destination,
                                   const wchar_t* reason,
-                                  bool shellDestination = false) {
+                                  bool shellDestination = false,
+                                  const SharedPidl& destinationIdentity = {}) {
     ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
     if (!state || !state->visible || !state->inScope ||
-        state->optimisticStartedAt || !IsWindow(state->nativeHwnd) ||
+        !IsWindow(state->nativeHwnd) ||
         !NativeViewAvailable(state->nativeHwnd) ||
         !IsWindowVisible(state->hwnd) ||
         !IsTargetPath(destination) ||
         GetWindowThreadProcessId(state->nativeHwnd, nullptr) != GetCurrentThreadId() ||
         GetAncestor(GetForegroundWindow(), GA_ROOT) != state->frameHwnd)
         return;
+    if (state->optimisticStartedAt) {
+        BeginOptimisticNavigation(*state,destination,destinationIdentity);
+        return;
+    }
     // A confirmed Shell navigation event carries an actual destination and
     // can safely preview any visited filesystem folder. Input-only predictions
     // are still limited to ancestors; do not guess Back/Forward history.
@@ -27765,7 +28265,7 @@ void MaybeDisplayEarlyDestination(HWND overlay, const std::wstring& destination,
     const ULONGLONG started = GetTickCount64();
     state->navigationStartedAt = started;
     ScheduleNavigationProbe(*state);
-    BeginOptimisticNavigation(*state, destination);
+    BeginOptimisticNavigation(*state, destination, destinationIdentity);
     if (g_perf.load(std::memory_order_relaxed))
         Wh_Log(L"[GPU overlay] early cached navigation via %s: %s (%llu ms)",
             reason, destination.c_str(),
@@ -27779,7 +28279,8 @@ void MaybeDisplayEarlyDestination(HWND overlay, const std::wstring& destination,
 void ReportShellNavigationEvent(HWND overlay, ShellNavigationSignal signal,
                                 const wchar_t* source,
                                 const std::wstring* destination,
-                                HWND nativeCandidate) {
+                                HWND nativeCandidate,
+                                const SharedPidl& destinationIdentity) {
     if (g_unloading.load(std::memory_order_relaxed) || !IsWindow(overlay))
         return;
     // A callback from a foreign apartment must not read/mutate ViewState.
@@ -27823,7 +28324,7 @@ void ReportShellNavigationEvent(HWND overlay, ShellNavigationSignal signal,
     if (signal == ShellNavigationSignal::Announced) {
         if (destination && !destination->empty())
             MaybeDisplayEarlyDestination(overlay, *destination,
-                                         source ? source : L"Shell", true);
+                                         source ? source : L"Shell", true, destinationIdentity);
         return;
     }
 
@@ -28178,8 +28679,9 @@ public:
             auto& path = pathStorage->value;
             if (SHGetPathFromIDListW(pidl, path)) {
                 const std::wstring destination(path);
+                const SharedPidl identity(ILCloneFull(pidl),TaskMemDeleter{});
                 ReportShellNavigationEvent(overlay_, ShellNavigationSignal::Announced,
-                                           L"OnNavigationPending", &destination);
+                                           L"OnNavigationPending", &destination, nullptr, identity);
             }
         }
         // Failing OnNavigationPending (even E_NOTIMPL) cancels navigation.
@@ -28769,7 +29271,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         const bool wasOutside = !s->inScope;
         const bool optimistic = s->optimisticStartedAt != 0;
         bool changedBinding = false;
-        if (changedView && !changedPath && !optimistic && s->directoryFolderIdentity) {
+        if ((changedView || optimistic) && !changedPath && s->directoryFolderIdentity) {
             PIDLIST_ABSOLUTE root = nullptr;
             const HRESULT hr = SHGetIDListFromObject(folder.Get(), &root);
             OwnedPidl identity(root);
@@ -28778,7 +29280,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         }
         const std::wstring optimisticOrigin = optimistic ? s->optimisticFromPath : L"";
         const std::wstring navigationOrigin = optimistic ? optimisticOrigin : s->folderPath;
-        const bool optimisticMatch = optimistic && !changedPath &&
+        const bool optimisticMatch = optimistic && !changedPath && !changedBinding &&
             _wcsicmp(s->optimisticDestination.c_str(), path.c_str()) == 0 &&
             s->optimisticSourceView == s->nativeHwnd;
         const ULONGLONG optimisticElapsed = optimistic ?
@@ -28921,11 +29423,11 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // The already-painted name snapshot belongs to this destination:
             // KEEP it. Resetting it here would recreate the 200ms blank wait.
             s->folder = folder;
+            s->directoryFolderIdentity.reset();
             WatchDirectory(*s);
-            // A speculative worker had only a parsing path. Replace its
-            // generation with the confirmed binding even when names/grouping
-            // agree: identical paths can expose incompatible child PIDLs.
-            // Keep painted names; provider command identities await this job.
+            // Revalidate on the confirmed binding. Path-only announcements
+            // have not published rows; known-identity previews retain their
+            // already-positioned names while child command identities refresh.
             if (s->namespaceIdentities) s->loaded = false;
             QueueDirectoryRefresh(*s, true, s->loaded);
             ArmAutoRefit(*s);

@@ -59,7 +59,7 @@ void Install(ViewState& state) {
     SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(Owner));
 }
 void Reset(ViewState& state,Device& input,bool real=false) {
-    StopTouch(state); state.touchRecognizer.reset(); ResetMouseGestureForNavigation(state);
+    StopTouch(state); ClearSwipeFeedback(state); state.touchRecognizer.reset(); ResetMouseGestureForNavigation(state);
     input.ResetTime(real); input.primary+=10;
     MSG message{}; while(PeekMessageW(&message,state.hwnd,kMsgTouchDrag,kMsgTouchDrag,PM_REMOVE)) {}
 }
@@ -89,11 +89,35 @@ struct RenderedTouch {
         const auto waitable=std::exchange(renderer.frameLatencyWaitable,nullptr);
         Paint(renderer); renderer.frameLatencyWaitable=waitable; renderer.swapChain=std::move(swap);
         const auto size=renderer.backbuffer->GetPixelSize();
+        // Component readback flattens the independently rendered foreground
+        // surfaces. Native DWM curve/visual ownership is checked separately;
+        // this samples their expected opacity, not actual desktop scanout.
+        ComPtr<ID2D1Bitmap1> flattened;
+        const auto flattenProperties=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+            renderer.backbuffer->GetPixelFormat());
+        Check(SUCCEEDED(renderer.target->CreateBitmap(size,nullptr,0,&flattenProperties,&flattened)) &&
+            SUCCEEDED(flattened->CopyFromBitmap(nullptr,renderer.backbuffer.Get(),nullptr)),"touch composite target");
+        ComPtr<ID2D1Image> previous; renderer.target->GetTarget(&previous);
+        D2D1_MATRIX_3X2_F transform{}; renderer.target->GetTransform(&transform);
+        renderer.target->SetTarget(flattened.Get()); renderer.target->SetTransform(D2D1::Matrix3x2F::Identity());
+        renderer.target->BeginDraw();
+        LARGE_INTEGER now{}; AnimationClockFixture::Counter(&now);
+        for(int i=1;i>=0;--i) {
+            const auto& layer=renderer.swipeComposition[size_t(i)];
+            if(!layer.plane.bitmap || !layer.visible) continue;
+            const auto pixels=layer.plane.bitmap->GetPixelSize();
+            const auto destination=D2D1::RectF(layer.bounds.left,layer.bounds.top,
+                layer.bounds.left+pixels.width,layer.bounds.top+pixels.height);
+            renderer.target->DrawBitmap(layer.plane.bitmap.Get(),destination,SwipeCompositionOpacity(renderer,layer,now));
+        }
+        const auto hr=renderer.target->EndDraw();
+        renderer.target->SetTarget(previous.Get()); renderer.target->SetTransform(transform);
+        Check(SUCCEEDED(hr),"touch foreground component composition");
         ComPtr<ID2D1Bitmap1> cpu;
         const auto properties=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             renderer.backbuffer->GetPixelFormat());
         Check(SUCCEEDED(renderer.target->CreateBitmap(size,nullptr,0,&properties,&cpu)) &&
-            SUCCEEDED(cpu->CopyFromBitmap(nullptr,renderer.backbuffer.Get(),nullptr)),"touch pixel readback");
+            SUCCEEDED(cpu->CopyFromBitmap(nullptr,flattened.Get(),nullptr)),"touch pixel readback");
         D2D1_MAPPED_RECT map{};
         Check(SUCCEEDED(cpu->Map(D2D1_MAP_OPTIONS_READ,&map)),"touch pixel mapping");
         std::vector<BYTE> pixels(size_t(size.width)*size.height*4);
@@ -103,7 +127,7 @@ struct RenderedTouch {
     ~RenderedTouch() {DropTarget(renderer); Stop(renderer.background);}
 };
 
-void SwipeGlyphPixels(const std::vector<BYTE>& pixels,int width) {
+void SwipeGlyphPixels(const std::vector<BYTE>& pixels,int width,int centerY=-1) {
     const auto palette=g_swipePalette.load();
     const COLORREF accent=COLORREF(palette&0xFFFFFF),foreground=COLORREF((palette>>24)&0xFFFFFF);
     const std::array<int,3> bg{GetBValue(accent),GetGValue(accent),GetRValue(accent)};
@@ -116,6 +140,7 @@ void SwipeGlyphPixels(const std::vector<BYTE>& pixels,int width) {
         l=std::min(l,x); r=std::max(r,x); t=std::min(t,y); b=std::max(b,y); ++accentPixels;
     }
     Check(accentPixels>100,"GPU navigation bubble missed the cached system accent");
+    if(centerY>=0) Check(std::abs((t+b)*.5-centerY)<=1.,"GPU navigation bubble did not center between the touch contacts");
     for(int i=1;i<3;++i) if(std::abs(fg[i]-bg[i])>std::abs(fg[channel]-bg[channel])) channel=i;
     // The inner quarter-inset rectangle lies on opaque accent. No glyph pixel
     // may exceed one application of its cached alpha, including the joint.
@@ -150,10 +175,11 @@ void SwipePanels(Device& input,const std::wstring& fixture) {
         Check(threshold>0.f && threshold<=240.f/3.f,"narrow tab commit exceeds one third of its client width");
         Reset(view,input);
         const int sign=backward!=rtl ? 1:-1;
-        POINT point{sign>0 ? 70:130,500},second{point.x+40,point.y};
+        POINT point{sign>0 ? 70:130,400},second{point.x+40,600};
         input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down),input.Packet(view,input.primary+1,second,down)});
-        const auto shift=[&](int dx) {
+        const auto shift=[&](int dx,int dy=0) {
             point.x+=sign*dx; second.x+=sign*dx;
+            point.y+=dy; second.y+=dy;
             Check(point.x>0 && point.x<240 && second.x>0 && second.x<240,"narrow native swipe contact left the viewport");
             input.Next(); input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,second,move)});
         };
@@ -161,7 +187,7 @@ void SwipePanels(Device& input,const std::wstring& fixture) {
         shift(entry);
         Check(view.swipeFeedbackActive && !view.swipeIndicator.armed,"entry did not remain below the commit threshold");
         Check(Eventually([&]{AdvanceSwipeFeedback(view); frame.Capture(view); return !view.swipeIndicator.moving && !frame.renderer.textRasterPending;}),"entry springs did not settle");
-        SwipeGlyphPixels(frame.Capture(view),240);
+        SwipeGlyphPixels(frame.Capture(view),240,500);
         const auto before=view.swipeIndicator;
         shift(int(std::ceil(threshold))-entry+1);
         Check(view.swipeIndicator.armed,"within-screen native gesture did not arm navigation");
@@ -173,7 +199,10 @@ void SwipePanels(Device& input,const std::wstring& fixture) {
         std::vector<BYTE> active;
         Check(Eventually([&]{AdvanceSwipeFeedback(view); active=frame.Capture(view); return !view.swipeIndicator.moving;}),"active springs did not settle");
         Check(active!=baseline,"GPU navigation bubble did not paint");
-        SwipeGlyphPixels(active,240);
+        SwipeGlyphPixels(active,240,500);
+        shift(0,37);
+        Check(Eventually([&]{AdvanceSwipeFeedback(view); active=frame.Capture(view); return !view.swipeIndicator.moving;}),"touch centroid motion did not settle");
+        SwipeGlyphPixels(active,240,537);
         Check(reads==std::array{StyleFixture::accentQueries,StyleFixture::themeQueries,StyleFixture::systemColorQueries},
             "swipe input/animation/paint queried system colors");
         if(dpi==96 && !rtl && backward) {
@@ -194,15 +223,113 @@ void SwipePanels(Device& input,const std::wstring& fixture) {
             "within-screen native release missed navigation or reversed RTL history");
         Check(view.swipeFeedbackFading && view.swipeIndicator.committed,"release did not select the commit animation");
         const auto releasedOrigin=view.swipeIndicator.origin;
-        ResetMouseGestureForNavigation(view,true);
+        StopTouchpad(view,false);
+        ResetMouseGestureForNavigation(view);
         Check(view.swipeFeedbackFading && view.swipeIndicator.committed && view.swipeIndicator.origin.QuadPart==releasedOrigin.QuadPart,
             "folder navigation truncated or restarted the committed visual");
+        {
+            AnimationClockFixture::Freeze clock;
+            const auto initial=SwipePose(view,view.swipeIndicator,releasedOrigin);
+            std::array<std::vector<BYTE>,3> fadePixels;
+            for(int ms:{0,20,40,79,80}) {
+                auto instant=releasedOrigin; instant.QuadPart+=LONGLONG(std::llround(view.qpcFrequency*ms/1000.));
+                const auto pose=SwipePose(view,view.swipeIndicator,instant);
+                Check(std::abs(pose[SwipeIndicator::Alpha]-initial[SwipeIndicator::Alpha]*(1.f-ms/80.f))<.00001f,
+                    "successful navigation did not fade linearly over exactly 80 ms");
+                for(unsigned i=0;i<SwipeIndicator::Count;++i) if(i!=SwipeIndicator::Alpha)
+                    Check(std::abs(pose[i]-initial[i])<.00001f,"successful fade changed the released bubble shape");
+                AnimationClockFixture::instant=instant;
+                auto pixels=frame.Capture(view);
+                if(ms==0 || ms==40 || ms==80) fadePixels[ms/40]=std::move(pixels);
+            }
+            const auto palette=g_swipePalette.load();
+            const COLORREF accent=COLORREF(palette&0xFFFFFF);
+            const std::array<int,3> color{GetBValue(accent),GetGValue(accent),GetRValue(accent)};
+            size_t fadingSurface=0;
+            for(size_t i=0;i<fadePixels[0].size();i+=4) {
+                bool surface=true;
+                for(unsigned c=0;c<3;++c) surface&=std::abs(int(fadePixels[0][i+c])-color[c])<=1;
+                if(!surface) continue;
+                for(unsigned c=0;c<3;++c)
+                    Check(std::abs(int(fadePixels[1][i+c])-(int(fadePixels[0][i+c])+int(fadePixels[2][i+c]))*.5)<=2.,
+                        "GPU bubble opacity did not reach half at 40 ms");
+                ++fadingSurface;
+            }
+            Check(fadingSurface>100,"commit fade had no visible bubble surface");
+            AdvanceSwipeFeedback(view);
+            Check(!view.swipeFeedbackFading,"80 ms commit fade did not retire on the compositor clock");
+        }
         Check(Eventually([&]{AdvanceSwipeFeedback(view); frame.Capture(view); return !view.swipeFeedbackFading;}),"commit springs did not retire");
         StopTouch(view);
     }
     // Later independent enumeration tests intentionally require the original
     // 512-file fixture. Keep the preview only if a panel check fails.
     std::filesystem::remove(JoinPath(fixture,L"swipe-panel-active.bmp"));
+}
+
+void SwipeReversals(Device& input) {
+    const bool history=g_touchpadSwipeNavigation.exchange(true);
+    struct Restore {bool history; ~Restore() {g_touchpadSwipeNavigation=history;}} restore{history};
+    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(bool backward:{false,true}) {
+        StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"reversing swipe bubbles",0,rtl,false,false,600,1000);
+        auto& view=tab.state; Install(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        Reset(view,input);
+        POINT a{280,400},b{320,600};
+        const LONG stroke=LONG(std::ceil(SwipeCommitDistance(view)))+1;
+        const int sign=backward!=rtl ? 1:-1;
+        const auto shift=[&](LONG dx) {
+            a.x+=sign*dx; b.x+=sign*dx; input.Next();
+            Check(a.x>0 && a.x<600 && b.x>0 && b.x<600,"reversing contacts left the private viewport");
+            input.Send(view,{input.Packet(view,input.primary,a,move),input.Packet(view,input.primary+1,b,move)});
+        };
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,a,down)});
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,a,move),input.Packet(view,input.primary+1,b,down)});
+        shift(stroke);
+        Check(view.swipeIndicator.armed && view.swipeIndicator.originY==500.f,"staggered touch swipe missed the contact midpoint");
+        Check(Eventually([&]{AdvanceSwipeFeedback(view); return !view.swipeIndicator.moving;}),"reversal entry did not settle");
+        const auto before=view.swipeIndicator;
+        RenderedTouch frame;
+        frame.Capture(view);
+        shift(-2*stroke);
+        Check(view.swipeFeedbackDirection==(backward ? -1:1) && view.swipeIndicator.armed &&
+            view.swipeOutgoingIndicator.direction==before.direction && view.swipeOutgoingIndicator.released &&
+            !view.swipeOutgoingIndicator.committed && view.swipeOutgoingIndicator.moving,
+            "direction reversal discarded the canceled bubble instead of retracting it");
+        const double seconds=SwipeSeconds(view,before,view.swipeOutgoingIndicator.origin);
+        for(unsigned i=0;i<SwipeIndicator::Count;++i) {
+            const double previous=before.moving ? SampleSwipeSpring(before.springs[i],seconds).value:before.springs[i].target;
+            Check(std::abs(view.swipeOutgoingIndicator.springs[i].value-previous)<.001,"reversal jumped the outgoing bubble");
+        }
+        Check(view.swipeIndicator.springs[SwipeIndicator::Width].value==0. &&
+            view.swipeOutgoingIndicator.springs[SwipeIndicator::Alpha].target==1.,
+            "reversal skipped the new bubble entry or faded the canceled bubble");
+        frame.Capture(view);
+        const auto returning=view.swipeOutgoingIndicator;
+        shift(2*stroke); // Reverse again before either side has finished.
+        Check(view.swipeIndicator.direction==before.direction && view.swipeOutgoingIndicator.released,
+            "rapid reversal lost one of the two edge animations");
+        const double elapsed=SwipeSeconds(view,returning,view.swipeIndicator.origin);
+        Check(std::abs(view.swipeIndicator.springs[SwipeIndicator::Width].value-
+            SampleSwipeSpring(returning.springs[SwipeIndicator::Width],elapsed).value)<.001,
+            "rapid reversal restarted a still-visible bubble");
+        shift(-stroke/2); // Release below the threshold: geometric retraction only.
+        const float center=view.swipeIndicator.originY;
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,a,up),input.Packet(view,input.primary+1,b,move)});
+        Check(view.swipeIndicator.originY==center,"first finger lift moved the bubble toward the remaining contact");
+        b.y+=35; input.Next(); input.Send(view,{input.Packet(view,input.primary+1,b,move)});
+        Check(view.swipeIndicator.originY==center,"remaining finger motion moved the retained two-contact midpoint");
+        input.Next(); input.Send(view,{input.Packet(view,input.primary+1,b,up)});
+        Check(view.swipeFeedbackFading && !view.swipeIndicator.committed &&
+            view.swipeIndicator.springs[SwipeIndicator::Alpha].target==1.,"short swipe faded instead of retracting");
+        MSG command{};
+        Check(!PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE),"short reversed swipe committed navigation");
+        Check(Eventually([&]{AdvanceSwipeFeedback(view); frame.Capture(view); return !view.swipeFeedbackFading && !view.swipeOutgoingIndicator.moving;}),
+            "reversing swipe animations did not retire independently");
+        StopTouch(view);
+    }
+    std::cout<<"PASS: native touch contact midpoints, repeated Back/Forward reversals, independent bubble retraction and staggered release at 96/192 DPI and LTR/RTL\n";
 }
 
 void SwipeSprings() {
@@ -218,6 +345,107 @@ void SwipeSprings() {
         const auto rest=SampleSwipeSpring(original,10.);
         Check(std::abs(rest.value-rest.target)<1e-6 && std::abs(rest.velocity)<1e-6,"swipe spring did not settle");
     }
+}
+
+void SwipeForegroundLifetime(Device& input,const std::wstring& fixture) {
+    const bool history=g_touchpadSwipeNavigation.exchange(true);
+    struct Restore {bool value; ~Restore() {g_touchpadSwipeNavigation=value;}} restore{history};
+    struct Frames {~Frames() {ShutDownFrames(); g_frameStopping=false;}} frames;
+    const auto destination=std::filesystem::path(fixture)/L"foreground-navigation";
+    Check(CreateDirectoryW(destination.c_str(),nullptr),"private foreground navigation destination");
+    for(bool rtl:{false,true}) for(bool backward:{false,true}) for(bool commit:{false,true}) for(bool cold:{false,true}) {
+        PresentationFixture::Tab tab(L"foreground navigation",20,rtl,false,false,600,1000);
+        auto& view=tab.state; Install(view);
+        view.columns[0].width=200; UpdateColumns(view);
+        FocusFixture::Session focus(tab.frame,view.hwnd);
+        Reset(view,input); tab.Start();
+        tab.Await([](const auto& r) {return r.accepted && !r.opacity;});
+        POINT a{280,400},b{320,600};
+        const int sign=backward!=rtl ? 1:-1;
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,a,down),input.Packet(view,input.primary+1,b,down)});
+        const LONG stroke=LONG(std::ceil(SwipeCommitDistance(view)*(commit ? 1.1f:.6f)));
+        a.x+=sign*stroke; b.x+=sign*stroke;
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,a,move),input.Packet(view,input.primary+1,b,move)});
+        const auto engaged=view.swipeFeedbackRevision;
+        const auto before=tab.Await([&](const auto& r) {return r.swipeFeedbackRevision==engaged && r.swipeFeedbackAlpha>0.f && !r.contentPending;});
+        const auto stale=CapturePresentationModel(view);
+        input.Next(); input.Send(view,{input.Packet(view,input.primary,a,up),input.Packet(view,input.primary+1,b,up)});
+        Check(view.swipeIndicator.released && view.swipeIndicator.committed==commit,"native foreground release chose the wrong exit");
+        const auto origin=view.swipeIndicator.origin;
+        const auto revision=view.swipeFeedbackRevision;
+        // Exercise both real input-resource cleanup and the complete folder
+        // reset. The destination intentionally supplies no new names yet.
+        StopTouchpad(view,false);
+        if(cold) {
+            ComPtr<IShellFolder> folder;
+            ResetForNewDirectory(view,destination.wstring(),folder,false,tab.frame,nullptr,true);
+            Check(!view.loaded && !view.total,"foreground navigation destination unexpectedly had cached names");
+            SubmitPresentation(view);
+        } else ResetMouseGestureForNavigation(view);
+        Check(view.swipeFeedbackRevision==revision && view.swipeIndicator.origin.QuadPart==origin.QuadPart,
+            "navigation cleanup canceled or restarted the foreground animation");
+        std::shared_ptr<const PresentationReceipt> committed;
+        if(commit) {
+            committed=tab.Await([&](const auto& r) {return r.swipeFeedbackRevision==revision && r.foregroundFades[0];});
+            Check(committed->foregroundVisuals[0],"successful gesture has no independent composition visual");
+        }
+        if(commit && !cold && !rtl && backward) {
+            // Real nonactivating window state changes must retire the tab's
+            // foreground lifetime, including its unchanged input-side snapshot.
+            ShowWindow(tab.frame,SW_SHOWMINNOACTIVE);
+            Check(IsIconic(tab.frame),"foreground minimize fixture");
+            SubmitPresentation(view);
+            tab.Await([](const auto& r) {return !r.swipeFeedbackMoving && !r.foregroundVisuals[0];});
+            ShowWindow(tab.frame,SW_SHOWNOACTIVATE);
+            Check(!IsIconic(tab.frame),"foreground restore fixture");
+            SubmitPresentation(view);
+            const auto resumed=tab.Await([](const auto& r) {return r.accepted && !r.standby;});
+            Check(!resumed->swipeFeedbackMoving && !resumed->foregroundFades[0],
+                "restoring a hidden tab replayed a released foreground intent");
+            StopTouchpad(view);
+            MSG command{}; while(PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE)) {}
+            continue;
+        }
+        if(commit && !cold) {
+            // Deliver late label/metadata and parent-item scroll changes through
+            // the actual presentation mailbox while the native fade exists.
+            for(unsigned update=0;update<3;++update) {
+                view.entries.front().name+=L" refreshed";
+                view.presentationEntries=std::make_shared<const std::vector<Entry>>(view.entries);
+                SetScrollImmediate(view,MaxScrollPx(view)*float(update+1)/3.f);
+                if(update==1) ApplyViewLayout(view,{UINT(FVM_ICON),48},true);
+                if(update==2) ApplyViewLayout(view,{UINT(FVM_DETAILS),48},true);
+                SubmitPresentation(view);
+                const auto refreshed=tab.Await([](const auto& r) {return r.accepted;});
+                Check(refreshed->foregroundVisuals==committed->foregroundVisuals &&
+                    refreshed->foregroundFades==committed->foregroundFades && refreshed->foregroundFrames==committed->foregroundFrames,
+                    "content refresh or parent-item scroll replaced a foreground visual/curve");
+            }
+        }
+        // Await only worker receipts: no owner dispatch, input, names delivery
+        // or animation advancement can rescue the released foreground here.
+        const auto ended=tab.Await([&](const auto& r) {return r.swipeFeedbackRevision==revision &&
+            !r.swipeFeedbackMoving && r.swipeFeedbackAlpha==0.f && (!cold || r.control);});
+        Check(ended->foregroundFrames>before->foregroundFrames && ended->thread!=GetCurrentThreadId() &&
+            (!cold || (!ended->accepted && ended->modelRows==before->modelRows)),
+            "foreground exit waited for the UI owner or replaced pending folder content");
+        if(commit) Check(ended->foregroundFades==committed->foregroundFades,
+            "CPU completion removed the native foreground fade before the compositor could finish");
+        if(cold) Check(ended->frames==before->frames,
+            "foreground-only animation repainted retained file-list content while names were pending");
+        ViewState sampled;
+        auto lane=std::make_shared<PresentationLane>();
+        const auto current=CapturePresentationModel(view);
+        Check(ApplyPresentationModel(sampled,*current,lane) && ApplyPresentationModel(sampled,*stale,lane) &&
+            sampled.swipeFeedbackRevision==revision && sampled.swipeIndicator.released,
+            "stale content snapshot rewound the newer foreground exit");
+        Stop(sampled.background);
+        StopTouchpad(view); // Explicit resource teardown still clears both sides.
+        Check(!view.swipeIndicator.direction && !view.swipeOutgoingIndicator.direction,"foreground survived resource teardown");
+        MSG command{}; while(PeekMessageW(&command,view.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE)) {}
+    }
+    Check(RemoveDirectoryW(destination.c_str()),"foreground fixture cleanup");
+    std::cout<<"PASS: native Back/Forward commit/cancel exits survive complete navigation and input cleanup; independent foreground frames with unpumped UI and missing names, stale content revisions and teardown in LTR/RTL\n";
 }
 
 void MarqueePixels(Device& input,const std::wstring& fixture) {
@@ -768,6 +996,97 @@ void DriftingHistorySwipes(Device& input,const std::wstring& fixture) {
     std::cout<<"PASS: "<<trials<<" native within-screen drifting Back/Forward swipes, convergence/divergence, staggered starts, reversal, exact Shell routing and no inertial repeats; 96/144/192 DPI and LTR/RTL\n";
 }
 
+void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
+    const auto parent=std::filesystem::path(fixture)/L"swipe-history-parent";
+    std::filesystem::create_directory(parent);
+    for(int i=0;i<256;++i) {
+        wchar_t name[32]{}; swprintf_s(name,L"child-%03d",i);
+        std::filesystem::create_directory(parent/name);
+    }
+    const auto child=parent/L"child-255";
+    const bool history=g_touchpadSwipeNavigation.exchange(true);
+    struct Restore {bool history; ~Restore() {g_touchpadSwipeNavigation=history;}} restore{history};
+    for(bool rtl:{false,true}) {
+        ProviderSelectionFixture::Browser host(true);
+        auto& state=host.state;
+        FocusFixture::Session focus(host.frame,state.hwnd);
+        host.Navigate(parent.wstring(),256);
+        const auto parentIdentity=state.directoryFolderIdentity;
+        Check(bool(parentIdentity),"native parent identity missing");
+        const int departed=GpuRowForNativePath(state,child.wstring());
+        Check(departed>=0,"history departed child absent");
+        Select(state,departed); CenterRow(state,departed);
+        Check(state.scrollNow>ViewHeight(state),"history child must be outside the initial viewport");
+        host.sink->navigationComplete=false;
+        Open(state,departed); host.Bind(0);
+        Check(state.folderPath==child.wstring() && state.immediateBackTo==parent.wstring(),
+            "real folder activation did not establish its known Back return");
+        state.rtlLayout=rtl; Install(state); Reset(state,input);
+        const int sign=rtl ? -1:1;
+        POINT first{500,250},second{500,400};
+        input.Next(); input.Send(state,{input.Packet(state,input.primary,first,down),input.Packet(state,input.primary+1,second,down)});
+        const int distance=int(std::ceil(SwipeCommitDistance(state)))+GetSystemMetricsForDpi(SM_CXDRAG,ViewDpi(state))*4;
+        for(int step=1;step<=4;++step) {
+            first.x=second.x=500+sign*distance*step/4;
+            input.Next(); input.Send(state,{input.Packet(state,input.primary,first,move),input.Packet(state,input.primary+1,second,move)});
+        }
+        host.sink->navigationComplete=false;
+        const HWND departingNative=state.nativeHwnd;
+        input.Next(); input.Send(state,{input.Packet(state,input.primary,first,up),input.Packet(state,input.primary+1,second,up)});
+        MSG command{};
+        Check(PeekMessageW(&command,state.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_REMOVE) && command.wParam,
+            "native return gesture did not commit Back");
+        OverlayProc(command.hwnd,command.message,command.wParam,command.lParam);
+        Check(state.folderPath==parent.wstring() && state.optimisticStartedAt,
+            "swipe Back did not prepare the same early parent return as native Back");
+        Check(state.directoryFolderIdentity && PidlBytesEqual(state.directoryFolderIdentity.get(),parentIdentity.get()),
+            "swipe Back reparsed the path instead of retaining the destination's native provider");
+        bool sawParent=false;
+        Check(Eventually([&] {
+            ReceiveDirectoryResults(state);
+            if(!state.total) return false;
+            const int row=GpuRowForNativePath(state,child.wstring());
+            Check(state.loaded && !state.namesPreview && row>=0 && state.selected==row &&
+                !state.animationActive && !state.rowTransitionActive,
+                "parent rows became visible before the returned child was positioned");
+            Check(DocumentRowTop(state,row)>=state.scrollNow-.5f &&
+                DocumentRowTop(state,row)+DisplayRowHeight(state,row)<=state.scrollNow+ViewHeight(state)+.5f,
+                "first parent snapshot did not reveal the returned child");
+            sawParent=true; return true;
+        }),"history parent names did not complete");
+        const float acceptedScroll=state.scrollNow;
+        const auto acceptedOrder=state.displayedOrderHash;
+        Check(sawParent && Eventually([&] {host.Pump(); return host.sink->navigationComplete;}),
+            "native history travel did not complete");
+        std::wstring actual; ComPtr<IShellFolder> folder;
+        Check(GetFolderPath(host.sink->view.Get(),actual,folder) && actual==parent.wstring(),
+            "swipe Back selected a different native history destination");
+        // The probe sink captures the new HWND before the production rebind.
+        // Restore the departing identity, then run the actual attachment and
+        // confirmed-provider refresh which were missing from the old test.
+        const HWND incoming=state.nativeHwnd;
+        state.nativeHwnd=departingNative;
+        auto incomingView=host.sink->view;
+        auto browser=state.shellBrowser;
+        AttachView(incoming,incomingView,folder,browser,actual);
+        Check(!state.optimisticStartedAt && state.nativeHwnd==incoming,"history production rebind did not confirm");
+        Check(Eventually([&] {
+            host.Pump(); ReceiveDirectoryResults(state);
+            Check(state.scrollNow==acceptedScroll && state.displayedOrderHash==acceptedOrder && !state.rowTransitionActive,
+                "confirmed provider changed the speculative history layout");
+            return state.loaded && !state.directoryPending;
+        }),"confirmed history names did not complete");
+        Check(state.scrollNow==acceptedScroll && !state.animationActive,
+            "late native history completion moved the already-positioned parent");
+        StopTouchpad(state); state.touchRecognizer.reset();
+    }
+    Check(std::filesystem::weakly_canonical(parent).parent_path()==std::filesystem::weakly_canonical(fixture),
+        "history return cleanup escaped its private fixture");
+    Check(Eventually([&] {std::error_code error; std::filesystem::remove_all(parent,error); return !error;}),
+        "history return fixture cleanup did not drain native/watch handles");
+    std::cout<<"PASS: real Shell travel log and native LTR/RTL Back swipes publish the parent at its returned child before any visible rows; late native completion preserves the viewport\n";
+}
+
 void ScrollbarMenus(Device& input,const std::wstring& fixture) {
     for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(bool horizontal:{false,true}) {
         StyleFixture::Session metrics; StyleFixture::dpi=dpi;
@@ -951,8 +1270,11 @@ static void TestTouchInput(const std::wstring& fixture) {
     PointerFixture::Session pointer;
     ModifierFixture::Session modifiers;
     DriftingHistorySwipes(input,fixture);
+    SwipeAncestorReturn(input,fixture);
     PinchAcquisition(input,fixture);
     SwipePanels(input,fixture);
+    SwipeReversals(input);
+    SwipeForegroundLifetime(input,fixture);
     TestFlingTrajectories(input);
     {
     PresentationFixture::Tab tab(L"raw touch",512),peer(L"raw touch peer",512);
@@ -1398,9 +1720,11 @@ static void TestTouchInput(const std::wstring& fixture) {
             "released swipe arrow followed inertial translation");
         Check(!PeekMessageW(&command,state.hwnd,kMsgManipulationNavigate,kMsgManipulationNavigate,PM_NOREMOVE),"inertia repeated a history command");
         if(commit) ValidateRect(state.hwnd,nullptr);
+        const auto visualOrigin=state.swipeIndicator.origin;
         StopTouch(state);
-        Check(!state.swipeFeedbackActive && !state.swipeFeedbackFading,"touch cancellation retained swipe feedback");
-        if(commit) Check(GetUpdateRect(state.hwnd,nullptr,FALSE),"touch cancellation did not invalidate the rendered history preview");
+        Check(!state.swipeFeedbackActive && state.swipeIndicator.origin.QuadPart==visualOrigin.QuadPart,
+            "stopping contact input canceled or restarted a released navigation bubble");
+        if(commit) Check(GetUpdateRect(state.hwnd,nullptr,FALSE),"touch input cleanup did not invalidate its foreground");
     }
     g_touchpadSwipeNavigation=false; state.rtlLayout=false;
 

@@ -807,6 +807,13 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     Check(modeFile!=INVALID_HANDLE_VALUE,"cold mode fixture"); CloseHandle(modeFile);
     Check(!state->folderCache.folders.contains(cold),"cold mode fixture was already cached");
     BeginOptimisticNavigation(*state,cold);
+    QueueDirectoryRefresh(*state);
+    Check(state->optimisticStartedAt && !state->directoryFolderIdentity && !state->directoryPending && !state->total,
+        "path-only speculation launched an unbound provider scan");
+    PIDLIST_ABSOLUTE coldRaw=nullptr;
+    Check(SUCCEEDED(SHParseDisplayName(cold.c_str(),nullptr,&coldRaw,0,nullptr)),"cold destination Shell identity");
+    const SharedPidl coldIdentity(coldRaw,TaskMemDeleter{});
+    BeginOptimisticNavigation(*state,cold,coldIdentity);
     Check(Eventually([&] { ReceiveDirectoryResults(*state); Paint(*state);
         return state->loaded && state->directoryModePinned; }),"cold preview did not submit first content");
     Check(!state->gridView && state->layoutNativeMode==FVM_DETAILS,

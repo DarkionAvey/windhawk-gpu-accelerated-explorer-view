@@ -6,6 +6,72 @@ static ULONGLONG TraceThreadCpu(HANDLE thread) {
     const auto ticks=[](FILETIME value) { return (static_cast<ULONGLONG>(value.dwHighDateTime)<<32)|value.dwLowDateTime; };
     return ticks(kernel)+ticks(user);
 }
+namespace FrameSummaryIo {
+inline HANDLE pipe=nullptr,entered=nullptr;
+inline std::atomic<bool> first{true},written{false},flushed{false};
+inline DWORD loggingThread=0;
+inline void Log(PCWSTR text) {
+    if(!first.exchange(false)) return;
+    loggingThread=GetCurrentThreadId();
+    DWORD bytes=0;
+    const DWORD length=static_cast<DWORD>((wcslen(text)+1)*sizeof(wchar_t));
+    written=WriteFile(pipe,text,length,&bytes,nullptr) && bytes==length;
+    SetEvent(entered);
+    // Real Windows I/O: this waits until the private client actually reads.
+    // No application messages or assumed logging delay emulate backpressure.
+    if(written) flushed=FlushFileBuffers(pipe)!=FALSE;
+}
+}
+static void TestFrameSummaryIo() {
+    const bool oldTrace=g_pipelineTracing.exchange(false),oldUi=g_uiTransitionLogging.exchange(false);
+    const bool oldFrames=g_frameTimeLogging.exchange(true);
+    const auto name=L"\\\\.\\pipe\\gpu-frame-summary-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(g_nextToken++);
+    HANDLE server=CreateNamedPipeW(name.c_str(),PIPE_ACCESS_OUTBOUND,PIPE_TYPE_BYTE|PIPE_WAIT,1,65536,0,0,nullptr);
+    Check(server!=INVALID_HANDLE_VALUE,"frame summary private pipe server");
+    HANDLE client=CreateFileW(name.c_str(),GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr);
+    Check(client!=INVALID_HANDLE_VALUE,"frame summary private pipe client");
+    Check(ConnectNamedPipe(server,nullptr) || GetLastError()==ERROR_PIPE_CONNECTED,"frame summary private pipe connection");
+    HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr),done=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    Check(entered && done,"frame summary observation events");
+    ViewState state; state.hwnd=MessageWindow();
+    EnsurePipelineTrace(state);
+    Check(state.background->traceWorker.thread!=nullptr,"frame-only logging did not start its tab writer");
+    state.presentationOnly=true;
+    FrameSummaryIo::pipe=server; FrameSummaryIo::entered=entered;
+    FrameSummaryIo::first=true; FrameSummaryIo::written=false; FrameSummaryIo::flushed=false;
+    SelectionLogFixture::frameSink=FrameSummaryIo::Log;
+    DWORD producerId=0;
+    std::thread producer([&] {
+        producerId=GetCurrentThreadId();
+        const auto deadline=GetTickCount64()+10000;
+        // Use actual profiler frames until the native pipe licenses the check.
+        // Contended diagnostic records are deliberately allowed to be dropped.
+        do { for(unsigned i=0;i<8;++i) {BeginFrameProfile(state); EndFrameProfile(state);} }
+        while(WaitForSingleObject(entered,0)!=WAIT_OBJECT_0 && GetTickCount64()<deadline);
+        for(unsigned i=0;i<8;++i) {BeginFrameProfile(state); EndFrameProfile(state);}
+        SetEvent(done);
+    });
+    const bool logging=WaitForSingleObject(entered,10000)==WAIT_OBJECT_0;
+    const bool progressed=logging && WaitForSingleObject(done,10000)==WAIT_OBJECT_0;
+    const bool held=logging && FrameSummaryIo::written && !FrameSummaryIo::flushed;
+    std::vector<wchar_t> output(32768); DWORD read=0;
+    const bool received=logging && ReadFile(client,output.data(),static_cast<DWORD>(output.size()*sizeof(wchar_t)),&read,nullptr);
+    // Disconnect also releases a failed fixture's pending native write/flush.
+    CloseHandle(client); DisconnectNamedPipe(server);
+    producer.join();
+    SelectionLogFixture::frameSink=nullptr;
+    auto lifetime=state.background;
+    Stop(state.background);
+    lifetime->Join(); // Drain the released native I/O before closing its handles.
+    lifetime.reset(); DestroyWindow(state.hwnd);
+    CloseHandle(server); CloseHandle(entered); CloseHandle(done);
+    g_pipelineTracing=oldTrace; g_uiTransitionLogging=oldUi; g_frameTimeLogging=oldFrames;
+    Check(logging && progressed && held && received,"frame profiler waited for a blocked native log consumer");
+    const auto attribution=L"thread="+std::to_wstring(producerId)+L" ";
+    Check(FrameSummaryIo::loggingThread!=producerId && wcsstr(output.data(),attribution.c_str()) &&
+        wcsstr(output.data(),L"frames=8 "),"deferred frame summary lost its producer attribution or metrics");
+    std::cout<<"PASS: frame-only diagnostics preserve producer metrics and keep profiling while the tab logger waits for actual named-pipe consumption\n";
+}
 static void TestIdleTraceCpu() {
     const bool previousTrace=g_pipelineTracing.exchange(true);
     const bool previousUi=g_uiTransitionLogging.exchange(false);
@@ -142,5 +208,6 @@ static void TestPipelineTrace() {
     DestroyWindow(state.hwnd); DestroyWindow(other.hwnd);
     g_pipelineTracing=oldTrace; g_frameTimeLogging=oldFrames; g_uiTransitionLogging=oldUi;
     TestIdleTraceCpu();
+    TestFrameSummaryIo();
     std::cout<<"PASS: disabled trace, nonblocking bounded transport, accounted overflow/contended producers, independent background writers, nested frames and stop/re-enable/reclamation\n";
 }

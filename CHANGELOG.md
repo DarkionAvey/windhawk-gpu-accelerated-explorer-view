@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.300
+
+- Restore Back/Forward bubbles on repeated swipes by detaching completed fade
+  effects during tracking and retraction. Successful gestures retain the 80 ms fade.
+
+## 0.9.299
+
+- Add targeted gesture diagnostics for missing bubbles: drawing bounds and
+  opacity, overlay placement, composition lifetime and graphics failures.
+
+## 0.9.298
+
+- Keep early folder navigation on its known Shell binding. Wait for the actual
+  destination identity when needed, avoiding a second layout after rebind.
+
+## 0.9.297
+
+- Prepare swipe Back returns before native navigation and position the returned
+  child before displaying parent rows, avoiding a top-of-folder flash or scroll.
+
+## 0.9.296
+
+- Retire hidden tabs' foreground gestures so restoring a tab or window cannot
+  replay an old animation from an unchanged content snapshot.
+
+## 0.9.295
+
+- Keep navigation feedback on persistent foreground surfaces across metadata,
+  scroll and view-layout updates. Successful fades run on the compositor.
+- Reuse file-list pixels for foreground-only animation frames and avoid
+  repainting while waiting for metadata that has not arrived.
+
+## 0.9.294
+
+- Write frame diagnostic summaries on the tab's logging worker so a slow log
+  consumer cannot hold up those frames.
+
+## 0.9.293
+
+- Pace animations with Windows' compositor clock to avoid excess redraws when
+  the older flush call returns immediately.
+
+## 0.9.292
+
+- Keep Back/Forward bubbles animating through folder resets, native view
+  replacement and delayed folder loading, independently of the UI thread.
+
+## 0.9.291
+
+- Center touchscreen Back/Forward bubbles between the fingers and animate both
+  bubbles when reversing direction.
+- Fade successful swipe bubbles out over 80 ms; canceled gestures retract to
+  their edge without fading the bubble.
+
 ## 0.9.290
 
 - Preserve selection highlighting when successive native menus transfer focus

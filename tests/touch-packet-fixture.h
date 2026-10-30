@@ -61,6 +61,10 @@ inline BOOL WINAPI Promote() {
     ++promotions; promoted=promotionSucceeds; return promoted;
 }
 inline FARPROC WINAPI Procedure(HMODULE module,LPCSTR name) {
+    if(!IS_INTRESOURCE(name) && std::strcmp(name,"DCompositionWaitForCompositorClock")==0) {
+        const auto clock=::GetProcAddress(module,name);
+        return clock ? reinterpret_cast<FARPROC>(AuditFixture::CompositorClock) : nullptr;
+    }
     if(enabled && !IS_INTRESOURCE(name) && std::strcmp(name,"ConvertPrimaryPointerToMouseDrag")==0)
         return reinterpret_cast<FARPROC>(Promote);
     return ::GetProcAddress(module,name);
