@@ -1,7 +1,17 @@
 # Changelog
 
-## 0.9.301 (unreleased)
+## 0.9.302
 
+- Restore animated Group by changes in Details, List and icon grids, including
+  changing the grouping property, reversing groups and choosing None. Items
+  retain their previous positions while section headings move, appear or fade.
+
+## 0.9.301
+
+- Restore Explorer context-menu sorting, view and icon-size changes in GPU
+  lists and grids, including sorting before any column header has been clicked.
+- Revalidate GPU content and cached details when Explorer finishes a native
+  Refresh, including folder views without a browser automation document.
 - Draw selection marquees above file/folder content and group headings, while
   keeping scrollbars and navigation gestures in the foreground.
 - Match rename fields to dark, light and high contrast themes, and center text

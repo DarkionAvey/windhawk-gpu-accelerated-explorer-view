@@ -65,12 +65,29 @@ static void TestGraphicsMemoryProbe() {
 
 // Route the actual production hide, retirement and paint handlers. Other
 // messages use a stock window: no Shell providers, native commands or focus.
+struct MemoryFixtureEvent {
+    HWND hwnd; UINT message,flags; DWORD error;
+    bool before,after,queued,visible; unsigned operations;
+};
+static std::deque<MemoryFixtureEvent> memoryFixtureEvents;
 static LRESULT CALLBACK MemoryFixtureProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_NCCREATE) {
         SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
         return TRUE;
     }
-    if(msg==kMsgRetireGraphics || msg==kMsgFrame || msg==WM_WINDOWPOSCHANGED || msg==WM_PAINT) return OverlayProc(hwnd,msg,wp,lp);
+    if(msg==kMsgRetireGraphics || msg==kMsgFrame || msg==WM_WINDOWPOSCHANGED || msg==WM_PAINT) {
+        auto* state=State(hwnd);
+        const bool before=state && state->graphicsStandby;
+        const UINT flags=msg==WM_WINDOWPOSCHANGED && lp ? reinterpret_cast<const WINDOWPOS*>(lp)->flags : 0;
+        const auto result=OverlayProc(hwnd,msg,wp,lp);
+        const DWORD error=GetLastError();
+        if(state && State(hwnd)==state && ((msg!=kMsgFrame && msg!=WM_PAINT) || before!=state->graphicsStandby)) {
+            if(memoryFixtureEvents.size()==64) memoryFixtureEvents.pop_front();
+            memoryFixtureEvents.push_back({hwnd,msg,flags,error,before,state->graphicsStandby,
+                state->graphicsReleaseQueued,IsWindowVisible(hwnd)!=FALSE,state->graphicsOperations});
+        }
+        return result;
+    }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
 static void TestGraphicsResourceLifecycle() {
@@ -97,13 +114,13 @@ static void TestGraphicsResourceLifecycle() {
         MSG msg{};
         while(PeekMessageW(&msg,hwnd,kMsgRetireGraphics,kMsgRetireGraphics,PM_REMOVE)) DispatchMessageW(&msg);
     };
-    const auto settle=[&](ViewState& state) {
+    const auto settle=[&](ViewState& state,const char* phase) {
         const bool settled=Eventually([&] {
             drain(state.hwnd);
             if(state.graphicsStandbyPending) SendMessageW(state.hwnd,kMsgFrame,0,0);
             return state.graphicsStandby && !state.graphicsStandbyPending;
         });
-        if(!settled) std::cout<<"GPU STANDBY timeout ready="<<state.graphicsReady<<" standby="<<state.graphicsStandby
+        if(!settled) std::cout<<"GPU STANDBY phase="<<phase<<" timeout ready="<<state.graphicsReady<<" standby="<<state.graphicsStandby
             <<" pending="<<state.graphicsStandbyPending<<" scene="<<state.modeRootAttached<<" started="<<state.modeComposition.started.QuadPart
             <<" rows="<<state.rowTransitionActive<<" columns="<<state.columnTransitionActive<<" mode="<<state.columnModeTransition
             <<" present-pending="<<state.presentPending<<" visible="<<IsWindowVisible(state.hwnd)
@@ -114,6 +131,10 @@ static void TestGraphicsResourceLifecycle() {
             <<" reported-visible="<<PresentationVisible(state)<<" presenter="<<bool(state.presenter)
             <<" view-id="<<(state.entries.empty() ? 0 : SelectionPathHash(state.entries[0].path))
             <<" retired-glyphs="<<state.retiredTextLayouts.size()<<" retired-icons="<<state.retiredIconBitmaps.size()<<std::endl;
+        if(!settled) for(const auto& event:memoryFixtureEvents) if(event.hwnd==state.hwnd)
+            std::cout<<"GPU EVENT message="<<event.message<<" flags="<<event.flags<<" error="<<event.error
+                <<" before="<<event.before<<" after="<<event.after<<" queued="<<event.queued
+                <<" visible="<<event.visible<<" operations="<<event.operations<<std::endl;
         Check(settled,"standby scene/cache retirement did not finish on frame completion");
     };
     const auto pixels=[&](ViewState& state,ID2D1Bitmap* source) {
@@ -211,7 +232,7 @@ static void TestGraphicsResourceLifecycle() {
                 Check(state->d3d.Get()==device,"nested owner scope released live graphics after its initialization flag cleared");
             }
         } else ShowWindow(state->hwnd,SW_HIDE);
-        settle(*state);
+        settle(*state,"initial hide");
         // Test-only completion fence: measure reclaimed resources after DWM
         // has processed the release transaction, without guessing a delay.
         Check(SUCCEEDED(state->composition->WaitForCommitCompletion()),"standby composition completion");
@@ -267,7 +288,7 @@ static void TestGraphicsResourceLifecycle() {
         Paint(resumed);
         Check(resumed.textLayouts[0].layouts.at(resumed.entries[0].name).rasters.back().bitmap.Get()==savedGlyph.Get(),
             "tab return rebuilt the visible glyph texture");
-        ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed);
+        ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed,"cached return");
         Check(resumed.composition.Get()==savedComposition.Get(),"ordinary tab return recycled composition without an animation pool");
     }
     savedComposition.Reset();
@@ -276,7 +297,7 @@ static void TestGraphicsResourceLifecycle() {
     Check(Eventually([&] { Paint(resumed); return resumed.modeRootAttached; }),"replacement-failure scene setup");
     const auto beforeFailure=resumed.composition.Get();
     AuditFixture::failComposition=true;
-    ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed);
+    ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed,"replacement failure");
     AuditFixture::failComposition=false;
     Check(resumed.graphicsReady && resumed.composition.Get()==beforeFailure && resumed.compositionSurfacePoolUsed &&
         resumed.d3d.Get()==savedDevice.Get() && resumed.swapChain.Get()==savedSwapchain.Get(),
@@ -284,7 +305,7 @@ static void TestGraphicsResourceLifecycle() {
     ShowWindow(resumed.hwnd,SW_SHOWNOACTIVATE);
     Check(EnsureTarget(resumed),"warm return after failed pool replacement");
     Paint(resumed); // Active paint resumes the warm lifetime, like production activation.
-    ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed);
+    ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed,"replacement retry");
     Check(resumed.graphicsReady && !resumed.compositionSurfacePoolUsed,"later hide did not retry pool retirement");
     ShowWindow(resumed.hwnd,SW_SHOWNOACTIVATE); Paint(resumed);
     SetColumnViewMode(resumed,!resumed.columnsView);
@@ -302,7 +323,7 @@ static void TestGraphicsResourceLifecycle() {
     Check(nestedActivation && !AuditFixture::compositionProbe && resumed.graphicsReady &&
         resumed.composition.Get()==beforeActivation && IsWindowVisible(resumed.hwnd) && !resumed.graphicsStandby,
         "nested activation lost its already resumed composition target");
-    Paint(resumed); ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed);
+    Paint(resumed); ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed,"nested activation");
     Check(!resumed.compositionSurfacePoolUsed,"pool retirement after nested activation");
     DXGI_QUERY_VIDEO_MEMORY_INFO final{};
     if(adapter) adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&final);

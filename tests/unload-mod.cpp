@@ -109,6 +109,9 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,frame,nullptr,type.hInstance,nullptr);
     HWND view=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,host,nullptr,type.hInstance,nullptr);
     state->nativeHwnd=view;
+    BindNativeViewInput(view,overlay);
+    const bool commandBound=GetPropW(view,kOverlayProperty)==overlay &&
+        static_cast<ULONG_PTR>(GetWindowLongPtrW(view,GWLP_WNDPROC))!=GetClassLongPtrW(view,GCLP_WNDPROC);
     HWND list=CreateWindowExW(0,L"DirectUIHWND",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,view,nullptr,type.hInstance,nullptr);
     NativeSetWindowPosHook(list,nullptr,0,0,0,0,SWP_NOZORDER|SWP_NOACTIVATE);
     const bool blocked=host && view && GetPropW(host,kSuppressedHostProperty)==overlay &&
@@ -173,9 +176,14 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     contact.ButtonChangeType=POINTER_CHANGE_FIRSTBUTTON_DOWN;
     FeedTouchFrames(*state,state->touchRecognizer,1,1,&contact);
     const bool touchArmed=state->touch.active && state->touch.holdDeadline && g_callbackObjects.load()!=0;
+    // Ownership discovery can disappear before disposal. The callback must
+    // still be removed by its overlay ID before this DLL is unmapped.
+    RemovePropW(view,kOverlayProperty);
     Wh_ModBeforeUninit(); // Exercise actual disable, not just direct HWND destruction.
     RECT bounds{}; GetClientRect(list,&bounds);
-    const bool retired=touchArmed && g_callbackObjects.load()==0 &&
+    const bool retired=touchArmed && commandBound && !GetPropW(view,kOverlayProperty) &&
+        static_cast<ULONG_PTR>(GetWindowLongPtrW(view,GWLP_WNDPROC))==GetClassLongPtrW(view,GCLP_WNDPROC) &&
+        g_callbackObjects.load()==0 &&
         g_shellViewHooks.empty() && g_windowCallbacks.load()==0 && !g_instances.load() &&
         !GetPropW(host,kSuppressedHostProperty) && (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE) &&
         !GetPropW(list,kNativeViewportProperty) && bounds.right==320 && bounds.bottom==240;

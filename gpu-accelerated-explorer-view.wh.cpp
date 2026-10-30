@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.300
+// @version         0.9.302
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -2561,6 +2561,7 @@ struct ViewState {
     bool nativeModeSignalQueued = false, nativeModeApplying = false;
     bool nativeModeHintPending = false, nativeSettingsHintPending = false;
     bool nativeViewCommandPending = false, nativeColumnsDirty = true;
+    bool nativeMenuCommandPending = false;
     ULONGLONG lastInteractionTick = 0;
     LPARAM lastPointerInput = -1;
     std::vector<DriveCapacity> thisPcCapacities;
@@ -2758,7 +2759,7 @@ struct ViewState {
     LARGE_INTEGER groupFrameQpc{}; // Geometry sample shared with the input owner.
     int hotSection = -1;
     bool sortInitialized = false; // Header sort chosen for this folder.
-    bool trackNativeSort = false; // Only follow Shell changes after a GPU header click.
+    bool trackNativeSort = false; // Follow Shell changes after an explicit sort choice.
     // When navigating from a descendant to an ancestor, reveal the immediate
     // child on the return path. This selection stays stable while a cached
     // folder is revalidated by the worker.
@@ -2975,6 +2976,7 @@ struct ViewState {
     // are still loading, apply after the complete sorted snapshot arrives.
     bool nativeSelectionImportPending = false;
     std::shared_ptr<std::atomic<bool>> selectionEventMessageQueued;
+    std::shared_ptr<std::atomic<bool>> enumerationEventMessageQueued;
     // The Shell can select an item independently of the GPU ("Show in folder"
     // from browsers, applications or an existing Explorer tab). Accessibility
     // events only set this flag; actual COM capture runs on the owning STA.
@@ -3051,6 +3053,8 @@ struct ViewState {
     struct RenameSession {
         HWND editor = nullptr;
         HFONT font = nullptr;
+        HBRUSH background = nullptr;
+        COLORREF backgroundColor = CLR_INVALID;
         int index = -1;
         std::wstring path, folder;
         HWND tab = nullptr, native = nullptr;
@@ -3261,6 +3265,7 @@ struct ViewState {
     // branches. COLORREF is kept in Win32 format until the drawing call.
     COLORREF nativeTextColor = CLR_INVALID;
     COLORREF nativeHeaderTextColor = CLR_INVALID;
+    COLORREF nativeEditBackground = RGB(255,255,255), nativeEditForeground = RGB(0,0,0);
     COLORREF lastThemeTextColor = CLR_INVALID, lastThemeHeaderTextColor = CLR_INVALID;
     bool nativeAppPaletteResolved = false;
     COLORREF nativeAppBackground = CLR_INVALID, nativeAppForeground = CLR_INVALID;
@@ -5481,6 +5486,19 @@ unsigned ThemeRgb(COLORREF c) {
             static_cast<unsigned>(GetBValue(c));
 }
 
+void RefreshRenamePalette(ViewState& state) {
+    auto& r = state.rename;
+    if (!r.editor) return;
+    if (!r.background || r.backgroundColor != state.nativeEditBackground) {
+        HBRUSH replacement = CreateSolidBrush(state.nativeEditBackground);
+        if (!replacement) return;
+        if (r.background) DeleteObject(r.background);
+        r.background = replacement;
+        r.backgroundColor = state.nativeEditBackground;
+    }
+    RedrawWindow(r.editor, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+}
+
 // Read theme resources for Explorer's actual native view. We deliberately do
 // not infer colors from AppsUseLightTheme: Explorer/theme mods can override it.
 // OpenThemeData uses native Windows theme resources; no registry color guesses.
@@ -5556,6 +5574,12 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     state.nativeTextColor = text;
     state.nativeHeaderTextColor = headerText;
     state.nativePaletteResolved = true;
+    // This is an opaque surface, unlike the inherited GPU list background.
+    state.nativeEditBackground = !highContrast && ValidRgb(state.nativeAppBackground) ?
+        state.nativeAppBackground : GetSysColor(COLOR_WINDOW);
+    state.nativeEditForeground = highContrast ? systemText :
+        ReadableForeground(state.nativeEditBackground, {text, state.nativeAppForeground, systemText});
+    RefreshRenamePalette(state);
     if (state.viewTogglePaletteDirty) {
         state.viewTogglePaletteDirty = false;
         COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
@@ -6585,7 +6609,8 @@ bool NativeContextMenuHasFeedback(const ViewState& state) {
 
 bool SelectionFeedbackVisible(const ViewState& state) {
     if (state.presentationOnly) return state.selectionFeedbackVisible;
-    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state);
+    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state) ||
+        (state.rename.editor && InputFocusOwner(state) == ViewInputOwner::RenameEditor);
 }
 
 // All list-focus returns use the same ownership boundary. Native Shell focus
@@ -8941,11 +8966,12 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
     if (state.loaded && state.visible && state.inScope &&
         state.detailsViewActive && !state.rename.editor &&
         !state.marqueeActive && !state.marqueePossible &&
-        !state.optimisticStartedAt && state.rowPx > 0 &&
-        SameSort(state.displayedSort, state.sort)) {
+        !state.optimisticStartedAt && state.rowPx > 0) {
         // The same bounded viewport snapshot preserves resolved metadata in
         // grouped views too, avoiding Date/Type/Size flicker on Delete/Undo.
-        // Legacy uniform-row movement is independently disabled for groups.
+        // A Shell grouping choice can also change the sort key. Capture the
+        // displayed geometry before either change; the worker maps identities
+        // and the shared commit decides which layout transition to animate.
         const auto captureRows = VisibleItemRows(state,
             static_cast<float>(kRowTransitionOverscan));
         snapshot.oldViewport.reserve(captureRows.size());
@@ -9334,8 +9360,8 @@ bool ReadNativeViewMode(ViewState& state, FolderViewMode& result) {
     return true;
 }
 
-// Capture the native baseline around user input, never around an automatic
-// WM_COMMAND/reorder. The queued existing probe accepts only a real change
+// Capture the native baseline around input and native menu dispatch. A frame
+// command/reorder alone cannot authorize a layout. The probe accepts a real change
 // made to this SAME folder/view. Navigation discards its pending baseline.
 struct NativeViewInput {
     HWND overlay = nullptr, native = nullptr;
@@ -9353,9 +9379,12 @@ struct NativeViewInput {
         if (!IsWindow(owner) || State(owner)!=state || state->nativeHwnd!=source || state->token!=generation) return;
         overlay=owner; native=source; token=generation;
     }
-    struct InputOwner { ViewState* state=nullptr; bool explicitMode=false; HWND viewControl=nullptr; };
+    struct InputOwner {
+        ViewState* state=nullptr; bool explicitMode=false; HWND viewControl=nullptr;
+        bool commandDispatch=false;
+    };
     explicit NativeViewInput(InputOwner input) : NativeViewInput(input.state,input.explicitMode) {
-        if (overlay && input.viewControl)
+        if (overlay && (input.viewControl || input.commandDispatch))
             if (auto* state=State(overlay)) {
                 viewControl=input.viewControl; controlLifetime=state->lifetimeToken;
                 ++state->viewControlDispatchDepth;
@@ -9423,6 +9452,42 @@ struct NativeViewInput {
         }
     }
 };
+
+// Shell background menus invoke commands on DefView directly, including after
+// an asynchronous presenter has returned from WM_CONTEXTMENU. Observe the
+// actual command transaction, not just menu opening or frame input. The depth
+// guard keeps nested Shell pumps from consuming its observation prematurely.
+LRESULT CALLBACK NativeViewSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                    UINT_PTR id, DWORD_PTR owner) {
+    WindowCallbackGuard callback;
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, NativeViewSubclass, id);
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
+    auto* state = msg == WM_COMMAND && !HIWORD(wp) && !lp &&
+        GetPropW(hwnd, kOverlayProperty) == reinterpret_cast<HANDLE>(owner)
+        ? State(reinterpret_cast<HWND>(owner)) : nullptr;
+    NativeViewInput input({state && state->nativeHwnd == hwnd ? state : nullptr,
+        false, nullptr, true});
+    if (input.overlay) {
+        state->nativeMenuCommandPending = true;
+        PostShellVisibilityProbe(*state, true, true, &input.before);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+void BindNativeViewInput(HWND native, HWND overlay) {
+    if (!SetPropW(native, kOverlayProperty, overlay) ||
+        !SetWindowSubclass(native, NativeViewSubclass, reinterpret_cast<UINT_PTR>(overlay),
+                           reinterpret_cast<DWORD_PTR>(overlay)))
+        Wh_Log(L"[GPU input] native command binding failed native=%p error=%lu", native, GetLastError());
+}
+
+void UnbindNativeViewInput(HWND native, HWND overlay) {
+    if (!IsWindow(native)) return;
+    RemoveWindowSubclass(native, NativeViewSubclass, reinterpret_cast<UINT_PTR>(overlay));
+    if (GetPropW(native, kOverlayProperty) == overlay) RemovePropW(native, kOverlayProperty);
+}
 
 void ReconcileShellVisibility(ViewState& state) {
     const ShellVisibilityPolicy current = ReadShellVisibilityPolicy();
@@ -9500,17 +9565,21 @@ void ReconcileShellGrouping(ViewState& state, bool force = false) {
     }
 }
 
-void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force = false) {
+void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force = false,
+                             bool acceptUntrackedSort = false) {
     ReconcileShellGrouping(state, force);
     if (IsRecycleBinLocation(state.folderPath) && !force) return;
-    if (!state.trackNativeSort || !state.sort.explicitOrder) return;
+    if (!acceptUntrackedSort && (!state.trackNativeSort || !state.sort.explicitOrder)) return;
     SortSpec updated;
     if (!ReadShellSort(state, updated)) return;
+    state.trackNativeSort = true;
     if (state.sortInitialized && SameSort(updated, state.sort)) return;
     state.sort = updated;
     state.sortInitialized = true;
-    if (queueIfChanged && state.inScope)
-        QueueDirectoryRefresh(state, true, true);
+    if (queueIfChanged && state.inScope) {
+        if (state.thisPcGpu) QueueNativeRows(state);
+        else QueueDirectoryRefresh(state, true, true);
+    }
     Redraw(state);
 }
 // Resolve header property keys from the folder's actual column mapping when
@@ -14938,6 +15007,7 @@ void SetHorizontalScroll(ViewState& state, float next) {
     state.horizontalAnimating = false; // Direct manipulation wins over track easing.
     state.horizontalScroll = std::clamp(next, 0.f, maximum);
     state.horizontalTarget = state.horizontalScroll;
+    RepositionRenameEdit(state);
     // The text layout cache validates its own available-width key. Avoid
     // emptying it every frame while a high-refresh touchpad pan is running.
     Redraw(state);
@@ -14982,6 +15052,7 @@ bool AdvanceHorizontalTrack(ViewState& state) {
         state.horizontalScroll = state.horizontalTarget;
         state.horizontalAnimating = false;
     }
+    RepositionRenameEdit(state);
     return true;
 }
 float ScrollTrackTarget(const ScrollbarGeometry& bar, float pointer) {
@@ -16997,43 +17068,6 @@ void Paint(ViewState& state) {
         }
     }
     state.target->PopAxisAlignedClip(); // zebra background margins
-    // Marquee fill/outline are background feedback, like selection/hover.
-    // Unlike the row layer, a selection marquee may extend from start to end
-    // of the entire viewport, including the designated empty safe zone.
-    state.target->PushAxisAlignedClip(D2D1::RectF(0.f, itemClipTop, w, contentBottom),
-                                      D2D1_ANTIALIAS_MODE_ALIASED);
-    if (state.inputFocusIndicators && (state.marqueeActive || state.marqueeFading)) {
-        const float left = static_cast<float>(std::min(state.marqueeStart.x, state.marqueeCurrent.x));
-        const float right = static_cast<float>(std::max(state.marqueeStart.x, state.marqueeCurrent.x));
-        const float anchoredY = static_cast<float>(state.headerPx) +
-            state.marqueeStartDocumentY - state.scrollNow;
-        const float top = std::max(static_cast<float>(state.headerPx),
-            std::min(anchoredY, static_cast<float>(state.marqueeCurrent.y)));
-        const float bottom = std::max(anchoredY,
-            static_cast<float>(state.marqueeCurrent.y));
-        float opacity = g_marqueeAlpha.load(std::memory_order_relaxed) / 100.f;
-        if (state.marqueeFading && !state.marqueeActive) {
-            const ULONGLONG now = GetTickCount64();
-            opacity *= std::clamp(
-                static_cast<float>(state.marqueeEndTick > now ?
-                state.marqueeEndTick - now : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f);
-        }
-        if ((right > left || bottom > top) && opacity > 0.f) {
-            const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
-            const unsigned rgb = ThemeRgb(c);
-            const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
-            // Marquee is stored in physical pointer coordinates, unlike the
-            // logical column geometry mirrored by Fill().
-            Fill(state, state.rtlLayout ? w - right : left, top,
-                 state.rtlLayout ? w - left : right, bottom,
-                 rgb, opacity, 4.f);
-            state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
-            if (right == left || bottom == top)
-                StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
-            else StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),state.brush.Get(),1.f);
-        }
-    }
-    state.target->PopAxisAlignedClip(); // full-width marquee, not row clip
     state.target->PushAxisAlignedClip(state.rtlLayout ?
         D2D1::RectF(w-rowBgEnd,itemClipTop,w-rowBgStart,contentBottom) :
         D2D1::RectF(rowBgStart,itemClipTop,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
@@ -17058,9 +17092,9 @@ void Paint(ViewState& state) {
             xName, nameRight, listEnd, v.left, v.width,&shape);
         const float alpha = strength * SelectionBaseOpacity(state, hover,
             DocumentRowTop(state, i) / std::max(1.f, state.rowPx), selection.left, selection.right);
-        // Active rename owns this row's filename background and caret; do
-        // not paint the bright GPU selection through the native textbox.
-        if (alpha > 0.f && !(state.rename.editor && i == state.rename.index))
+        // The opaque native editor covers the filename; retain the item's
+        // selection behind it, including its icon and the rest of the row.
+        if (alpha > 0.f)
             FillSelectionRect(state, selection, alpha * v.opacity,&shape);
     }
     // Deleted rows exist only as a tiny, bounded painting snapshot, not in
@@ -17419,6 +17453,45 @@ void Paint(ViewState& state) {
         compositionFrame.Restore();
         state.target->SetTarget(state.modeComposition.chrome.bitmap.Get());
     }
+    // Marquee covers item contents and group headings on the ordinary target
+    // or transition chrome plane. Use the restored viewport, not an animated
+    // source's geometry or the body clip below a pinned group heading.
+    if (state.inputFocusIndicators && (state.marqueeActive || state.marqueeFading)) {
+        const auto viewport = ContentViewport(state);
+        state.target->PushAxisAlignedClip(D2D1::RectF(0.f, static_cast<float>(viewport.top),
+            w, static_cast<float>(viewport.bottom)), D2D1_ANTIALIAS_MODE_ALIASED);
+        const float left = static_cast<float>(std::min(state.marqueeStart.x, state.marqueeCurrent.x));
+        const float right = static_cast<float>(std::max(state.marqueeStart.x, state.marqueeCurrent.x));
+        const float anchoredY = static_cast<float>(state.headerPx) +
+            state.marqueeStartDocumentY - state.scrollNow;
+        const float top = std::max(static_cast<float>(state.headerPx),
+            std::min(anchoredY, static_cast<float>(state.marqueeCurrent.y)));
+        const float bottom = std::max(anchoredY,
+            static_cast<float>(state.marqueeCurrent.y));
+        float opacity = g_marqueeAlpha.load(std::memory_order_relaxed) / 100.f;
+        if (state.marqueeFading && !state.marqueeActive) {
+            const ULONGLONG now = GetTickCount64();
+            opacity *= std::clamp(
+                static_cast<float>(state.marqueeEndTick > now ?
+                state.marqueeEndTick - now : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f);
+        }
+        if ((right > left || bottom > top) && opacity > 0.f) {
+            const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
+            const unsigned rgb = ThemeRgb(c);
+            const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
+            // Marquee is stored in physical pointer coordinates, unlike the
+            // logical column geometry mirrored by Fill().
+            Fill(state, state.rtlLayout ? w - right : left, top,
+                 state.rtlLayout ? w - left : right, bottom,
+                 rgb, opacity, 4.f);
+            state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
+            if (right == left || bottom == top)
+                StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
+            else StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),state.brush.Get(),1.f);
+        }
+        state.target->PopAxisAlignedClip();
+    }
+    // Scrollbars and persistent navigation feedback remain above the marquee.
     DrawScrollbar(state, compositionFrame.active ? Scrollbar(state) : bar, nameColor,
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
     DrawScrollbar(state, HorizontalBar(state), nameColor,
@@ -19771,6 +19844,16 @@ LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                      UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
     const HWND overlay = reinterpret_cast<HWND>(data);
+    if ((msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORSTATIC) &&
+        reinterpret_cast<HWND>(lp) == reinterpret_cast<HWND>(id)) {
+        ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
+        if (state && state->rename.editor == reinterpret_cast<HWND>(lp) && state->rename.background) {
+            const HDC dc = reinterpret_cast<HDC>(wp);
+            SetTextColor(dc, state->nativeEditForeground);
+            SetBkColor(dc, state->nativeEditBackground);
+            return reinterpret_cast<LRESULT>(state->rename.background);
+        }
+    }
     if (msg == WM_COMMAND && HIWORD(wp) == EN_CHANGE &&
         reinterpret_cast<HWND>(lp) == reinterpret_cast<HWND>(id)) {
         ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
@@ -19783,13 +19866,32 @@ LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 
 // Rename is an overlay-owned EDIT control. Never let F2 open the obscured
 // native Shell edit: commit through the currently bound parent IShellFolder.
-RECT RenameEditorRect(ViewState& state, int index) {
+RECT RenameViewport(ViewState& state, bool frameCoordinates = true) {
+    RECT viewport = ContentViewport(state, true), client{};
+    ViewClientRect(state, &client);
+    const LONG start = static_cast<LONG>(std::ceil(ListStartX(state)));
+    const LONG end = std::max(start, static_cast<LONG>(std::floor(ListEndX(state))));
+    viewport.left = state.rtlLayout ? client.right - end : start;
+    viewport.right = state.rtlLayout ? client.right - start : end;
+    viewport.bottom = std::max(viewport.top, viewport.bottom -
+        static_cast<LONG>(std::ceil(ScrollBottomPadding(state))));
+    if (frameCoordinates)
+        MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&viewport), 2);
+    return viewport;
+}
+
+RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true) {
     const int dpi = ViewDpi(state);
     const auto geometry = LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
         DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
     const float nameStart = geometry.text.left;
-    const float textEnd = geometry.text.right - (state.columnsView && !state.gridView ? 1.f : 0.f);
-    const float maxWidth = std::max(1.f, textEnd - nameStart);
+    // Use the whole Name column even when its current origin is offscreen.
+    // Measuring against the clipped draw extent could collapse the EDIT to 1px.
+    const float textEnd = !state.gridView && ColumnsPresented(state) ?
+        NameColumnEnd(state) - 9.f : geometry.text.right;
+    const RECT viewport = RenameViewport(state, false);
+    const float maxWidth = std::max(1.f, std::min(textEnd - nameStart,
+        static_cast<float>(viewport.right - viewport.left)));
     float measured = SelectedFilenameWidth(state, index, maxWidth);
     const HWND editor = state.rename.index == index ? state.rename.editor : nullptr;
     if (editor && IsWindow(editor)) {
@@ -19814,13 +19916,14 @@ RECT RenameEditorRect(ViewState& state, int index) {
     const int x = state.rtlLayout ?
         static_cast<int>(client.right - nameStart - width) : static_cast<int>(nameStart);
     const int y = static_cast<int>(geometry.text.top + Scale96(2, dpi));
-    const int height = static_cast<int>(std::lround(std::max(20.f,
-        geometry.text.bottom - geometry.text.top - Scale96(4, dpi))));
+    const int height = std::max(1, std::min(static_cast<int>(viewport.bottom - viewport.top),
+        static_cast<int>(std::lround(std::max(20.f,
+            geometry.text.bottom - geometry.text.top - Scale96(4, dpi))))));
     RECT rc{x, y, x + width, y + height};
     // Native EDIT is a sibling of the composited GPU HWND, not its child.
     // Both coordinates are mapped atomically to the owning Explorer frame.
-    MapWindowPoints(state.hwnd, state.frameHwnd,
-        reinterpret_cast<POINT*>(&rc), 2);
+    if (frameCoordinates)
+        MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&rc), 2);
     return rc;
 }
 
@@ -19851,6 +19954,8 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     ++r.epoch; // Invalidate any queued Enter/Escape/focus messages.
     r.editor = nullptr;
     if (r.font) { DeleteObject(r.font); r.font = nullptr; }
+    if (r.background) { DeleteObject(r.background); r.background = nullptr; }
+    r.backgroundColor = CLR_INVALID;
     r.index = -1;
     r.path.clear();
     r.folder.clear();
@@ -19929,6 +20034,34 @@ void CancelRename(ViewState& state) {
     CloseRenameEditor(state);
 }
 
+int RenameLineHeight(HWND editor) {
+    int height = 0;
+    if (HDC dc = GetDC(editor)) {
+        const auto font = reinterpret_cast<HFONT>(SendMessageW(editor, WM_GETFONT, 0, 0));
+        const auto old = font ? SelectObject(dc, font) : nullptr;
+        TEXTMETRICW metrics{};
+        if (GetTextMetricsW(dc, &metrics)) height = metrics.tmHeight;
+        if (old && old != HGDI_ERROR) SelectObject(dc, old);
+        ReleaseDC(editor, dc);
+    }
+    return height;
+}
+
+void CenterWrappedRenameText(HWND editor) {
+    if (!(GetWindowLongPtrW(editor, GWL_STYLE) & ES_MULTILINE)) return;
+    RECT client{}, format{};
+    GetClientRect(editor, &client);
+    SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+    const int line = RenameLineHeight(editor);
+    const int lines = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
+    const LONG top = std::max(0L, (client.bottom - line * lines) / 2);
+    if (format.top == top) return;
+    format.top = top;
+    format.bottom = client.bottom;
+    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&format));
+    InvalidateRect(editor, nullptr, FALSE);
+}
+
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                 UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
@@ -19937,6 +20070,41 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // Its session stays alive until this procedure's final native NCDESTROY.
     const HWND overlay=state ? state->hwnd : nullptr;
     const bool current = state && state->rename.editor == hwnd;
+    // Own the border outside the EDIT's client area: native multiline borders
+    // inset every EM_SETRECT again. Single-line EDITs ignore EM_SETRECT, so
+    // center their client band using the selected HFONT's actual line metrics.
+    if (msg == WM_NCCALCSIZE && current) {
+        const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+        auto& client = wp ? reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] :
+            *reinterpret_cast<RECT*>(lp);
+        const auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        const int dpi = DpiOf(hwnd);
+        const LONG borderX = std::min<LONG>(GetSystemMetricsForDpi(SM_CXBORDER, dpi), (client.right-client.left)/2);
+        const LONG borderY = std::min<LONG>(GetSystemMetricsForDpi(SM_CYBORDER, dpi), (client.bottom-client.top)/2);
+        InflateRect(&client, -borderX, -borderY);
+        const int line = (style & ES_MULTILINE) ? 0 : RenameLineHeight(hwnd);
+        if (line > 0) {
+            const LONG padding = std::max(0L, (client.bottom - client.top - line) / 2);
+            client.top += padding;
+            client.bottom -= padding;
+        }
+        return result;
+    }
+    if (msg == WM_NCPAINT && current && state->rename.background) {
+        if (HDC dc = GetWindowDC(hwnd)) {
+            RECT window{}, client{};
+            GetWindowRect(hwnd, &window); GetClientRect(hwnd, &client);
+            MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&client), 2);
+            OffsetRect(&client, -window.left, -window.top);
+            OffsetRect(&window, -window.left, -window.top);
+            ExcludeClipRect(dc, client.left, client.top, client.right, client.bottom);
+            FillRect(dc, &window, state->rename.background);
+            SetDCBrushColor(dc, state->nativeEditForeground);
+            FrameRect(dc, &window, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            ReleaseDC(hwnd, dc);
+        }
+        return 0;
+    }
     // Notifications cover text mutations; paint also follows font/geometry
     // changes without enumerating each editor mutation message here.
     if (msg == WM_PAINT && current && !state->rename.finishing) {
@@ -19977,6 +20145,11 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // The session (and its font) are released only AFTER it has completed.
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameEditProc, id);
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+    if (current && msg == WM_SETFONT) {
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) CenterWrappedRenameText(hwnd);
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
@@ -20009,12 +20182,19 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
         !TabOwnsActiveView(state) || index >= state.total || size_t(index) >= state.entries.size() ||
         state.entries[size_t(index)].path != path) return;
     StopKeyboardSelectionAnimation(state);
-    EnsureVisible(state, index);
+    // The frame-child EDIT must be revealed before it is ever shown. An
+    // animated scroll can otherwise expose it over unrelated Explorer chrome.
+    if (state.manipulationFrameActive || state.touch.active) StopTouchpad(state, false);
+    FinishColumnTransition(state);
+    state.horizontalAnimating = false;
+    state.horizontalTarget = state.horizontalScroll;
+    AdvanceRowHeight(state, true);
+    SetScrollImmediate(state, RevealScrollTarget(state, index, state.scrollNow));
     RECT rc = RenameEditorRect(state, index);
     const std::wstring name = state.entries[static_cast<size_t>(index)].name;
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
-    const DWORD style = WS_CHILD | WS_CLIPSIBLINGS | WS_BORDER |
+    const DWORD style = WS_CHILD | WS_CLIPSIBLINGS |
         (state.gridView && state.cachedNativeMode != FVM_SMALLICON ? ES_MULTILINE | ES_AUTOVSCROLL : ES_AUTOHSCROLL) |
         (state.rtlLayout ? ES_RIGHT : ES_LEFT);
     HWND edit = CreateWindowExW(state.rtlLayout ? WS_EX_RTLREADING : 0,
@@ -20041,6 +20221,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     r.tab = state.activeTabHost;
     r.native = state.nativeHwnd;
     r.frameRect = rc;
+    RefreshRenamePalette(state);
     // Creation, input and overlay retirement run on this EDIT's owner thread.
     if (!SetWindowSubclass(edit, RenameEditProc,
             reinterpret_cast<UINT_PTR>(RenameEditProc), reinterpret_cast<DWORD_PTR>(&state))) {
@@ -20074,13 +20255,9 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     }
     SendMessageW(edit, EM_SETSEL, 0, end);
     RepositionRenameEdit(state);
-    if (r.editor != edit) return;
-    rc = r.frameRect;
+    if (r.editor != edit || !IsWindowVisible(edit)) return;
     // Two FRAME siblings: keep GPU list immediately below the editor, not
     // above it. DWM will composite EDIT text/caret on top of the DComp list.
-    SetWindowPos(edit, HWND_TOP, rc.left, rc.top,
-        rc.right - rc.left, rc.bottom - rc.top,
-        SWP_SHOWWINDOW | SWP_NOACTIVATE);
     PositionOverlayOverNative(state);
     SetWindowPos(edit, HWND_TOP, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -20232,21 +20409,42 @@ void RepositionRenameEdit(ViewState& state) {
             reinterpret_cast<DWORD_PTR>(state.hwnd)) != FALSE;
         if (!state.rename.parentSubclassInstalled) { CancelRename(state); return; }
     }
-    const RECT local = RenameEditorRect(state, state.rename.index);
-    RECT overlayArea = ContentViewport(state, true);
-    MapWindowPoints(state.hwnd, state.frameHwnd,
-        reinterpret_cast<POINT*>(&overlayArea), 2);
-    if (local.bottom <= overlayArea.top || local.top >= overlayArea.bottom ||
-        (!state.sections.empty() && local.top < overlayArea.top)) {
-        CancelRename(state);
+    // Reveal in the overlay's physical coordinates. A mirrored FRAME has a
+    // different X direction; map to its client coordinates only at placement.
+    RECT overlayArea = RenameViewport(state, false);
+    if (IsRectEmpty(&overlayArea)) {
+        SetPresentationVisibility(state.rename.editor, false);
         return;
     }
+    RECT local = RenameEditorRect(state, state.rename.index, false);
+    const LONG dx = local.left < overlayArea.left ? local.left - overlayArea.left :
+        std::max(0L, local.right - overlayArea.right);
+    if (dx && ColumnsPresented(state)) {
+        SetHorizontalScroll(state, state.horizontalScroll + (state.rtlLayout ? -dx : dx));
+        overlayArea = RenameViewport(state, false);
+        local = RenameEditorRect(state, state.rename.index, false);
+    }
+    const LONG dy = local.top < overlayArea.top ? local.top - overlayArea.top :
+        std::max(0L, local.bottom - overlayArea.bottom);
+    if (dy) {
+        SetScrollImmediate(state, state.scrollNow + dy);
+        overlayArea = RenameViewport(state, false);
+        local = RenameEditorRect(state, state.rename.index, false);
+    }
+    // If an icon/indent alone exceeds a tiny viewport, keep the EDIT usable
+    // inside that viewport after exhausting the real scroll range.
+    const LONG width = local.right - local.left, height = local.bottom - local.top;
+    OffsetRect(&local, std::clamp(local.left, overlayArea.left, std::max(overlayArea.left, overlayArea.right-width)) - local.left,
+        std::clamp(local.top, overlayArea.top, std::max(overlayArea.top, overlayArea.bottom-height)) - local.top);
+    MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
+    CenterWrappedRenameText(state.rename.editor);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
     if (EqualRect(&local, &state.rename.frameRect) && IsWindowVisible(state.rename.editor) &&
         GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) return;
     if (SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
-        local.right - local.left, local.bottom - local.top, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS))
+        local.right - local.left, local.bottom - local.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS | SWP_FRAMECHANGED))
         state.rename.frameRect = local;
 }
 
@@ -21132,6 +21330,7 @@ bool ApplyNativePresentation(ViewState& state) {
 void BeginDirectoryViewMode(ViewState& state, bool nativeReady) {
     state.directoryModePinned=false;
     state.nativeModeBeforeCommand.reset();
+    state.nativeMenuCommandPending=false;
     state.lastNativeModeProbe=0;
     const auto saved=state.folderCache.folders.find(state.folderPath);
     const bool cached=state.visible && saved!=state.folderCache.folders.end() && IsGpuViewMode(saved->second.viewMode.mode,state.thisPcGpu);
@@ -23472,7 +23671,7 @@ void InitializeOverlayFeatures(ViewState& state) {
         if (state.pendingAutomation) {
             ComPtr<IDispatch> browser = std::move(state.pendingAutomation);
             BindShellAutomation(state, browser.Get());
-        }
+        } else AttachShellSelectionEvents(state, nullptr);
         ReconcileShellGrouping(state, true);
         RefreshExplorerColumns(state);
         RefreshViewToggleForFrame(state.frameHwnd);
@@ -25599,6 +25798,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->token == static_cast<unsigned long long>(lParam)) {
             if (s->selectionEventMessageQueued)
                 s->selectionEventMessageQueued->store(false, std::memory_order_release);
+            if (s->enumerationEventMessageQueued &&
+                s->enumerationEventMessageQueued->exchange(false, std::memory_order_acq_rel) &&
+                s->visible && s->inScope && s->detailsViewActive && !s->optimisticStartedAt &&
+                !PresentationMinimized(*s) && TabOwnsActiveView(*s))
+                ForceRefresh(*s);
             if (s->folderView && s->inScope && TabOwnsActiveView(*s))
                 QueueNativeSelectionHint(*s);
         }
@@ -25774,11 +25978,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case kMsgShellVisibilityChanged:
         if (s && wParam == 2) {
             s->nativeModeSignalQueued = false;
-            // A sent button command can pump this probe inside its enclosing
+            // A sent native/button command can pump this probe inside its enclosing
             // input dispatch. The outer transaction will post it again on exit.
             if (s->viewControlDispatchDepth) return 0;
             if (IsIconic(s->frameHwnd) || !TabOwnsActiveView(*s)) {
                 s->nativeModeBeforeCommand.reset(); s->nativeViewCommandPending=false;
+                s->nativeMenuCommandPending=false;
                 if (s->viewControlFocusReturn) QueueInputFocusUpdate(hwnd);
                 return 0;
             }
@@ -25787,6 +25992,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             {
                 ScopedFlag applying(s->nativeModeApplying);
                 s->nativeModeHintPending = s->nativeViewCommandPending = false;
+                const bool nativeCommand = std::exchange(s->nativeMenuCommandPending, false);
                 const auto before=std::exchange(s->nativeModeBeforeCommand,{});
                 const auto sourceView=s->folderView;
                 const auto sourceToken=s->token;
@@ -25827,7 +26033,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     s->nativeHwnd==sourceNative && s->folderView.Get()==sourceView.Get() && s->visible && s->inScope &&
                     !s->optimisticStartedAt && !IsIconic(s->frameHwnd) && TabOwnsActiveView(*s)) {
                     s->nativeColumnsDirty = true;
-                    RefreshSortFromExplorer(*s, true, true);
+                    RefreshSortFromExplorer(*s, true, true, nativeCommand);
                     RefreshExplorerColumns(*s);
                 }
                 if (command && IsWindow(hwnd) && State(hwnd)==s && g_perf.load(std::memory_order_relaxed)) {
@@ -27365,9 +27571,7 @@ void DisposeOverlayState(ViewState* s) {
     s->shellAutomationBrowser.Reset();
     s->pendingAutomation.Reset();
     RestoreNativeContent(*s);
-    if (IsWindow(s->nativeHwnd) &&
-        GetPropW(s->nativeHwnd, kOverlayProperty) == hwnd)
-        RemovePropW(s->nativeHwnd, kOverlayProperty);
+    UnbindNativeViewInput(s->nativeHwnd, hwnd);
     StopScrollAnimation(*s);
     s->marqueeFading = false;
     UnregisterAnimationWindow(hwnd);
@@ -28455,11 +28659,14 @@ class ShellSelectionAutomationSink final : public IDispatch {
     const HWND native_;
     const unsigned long long epoch_;
     const std::shared_ptr<std::atomic<bool>> queued_;
+    const std::shared_ptr<std::atomic<bool>> enumerationQueued_;
 public:
     ShellSelectionAutomationSink(HWND overlay, HWND native,
                                  unsigned long long epoch,
-                                 std::shared_ptr<std::atomic<bool>> queued)
-        : overlay_(overlay), native_(native), epoch_(epoch), queued_(std::move(queued)) {}
+                                 std::shared_ptr<std::atomic<bool>> queued,
+                                 std::shared_ptr<std::atomic<bool>> enumerationQueued = {})
+        : overlay_(overlay), native_(native), epoch_(epoch), queued_(std::move(queued)),
+          enumerationQueued_(std::move(enumerationQueued)) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
         WindowCallbackGuard callback;
         if (!out) return E_POINTER;
@@ -28501,7 +28708,9 @@ public:
                                       DISPPARAMS*, VARIANT*,
                                       EXCEPINFO*, UINT*) override {
         WindowCallbackGuard callback;
-        if (id == DISPID_SELECTIONCHANGED &&
+        if (id == DISPID_FILELISTENUMDONE && enumerationQueued_)
+            enumerationQueued_->store(true, std::memory_order_release);
+        if ((id == DISPID_SELECTIONCHANGED || (id == DISPID_FILELISTENUMDONE && enumerationQueued_)) &&
             !g_unloading.load(std::memory_order_relaxed) &&
             IsWindow(overlay_) && !queued_->exchange(true, std::memory_order_acq_rel)) {
             // Do not call Shell COM or read a mutable ViewState inside a
@@ -28525,10 +28734,11 @@ void DetachShellSelectionEvents(ViewState& state) {
     state.selectionEventSource.Reset();
     state.selectionEventNativeView = nullptr;
     state.selectionEventMessageQueued.reset();
+    state.enumerationEventMessageQueued.reset();
 }
 
 bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
-    if (!browser || !state.folderView || !IsWindow(state.hwnd) ||
+    if (!state.folderView || !IsWindow(state.hwnd) ||
         !TabOwnsActiveView(state)) return false;
     const HWND hwnd=state.hwnd,native=state.nativeHwnd;
     const auto token=state.token;
@@ -28539,13 +28749,22 @@ bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
     state.selectionEventBindNext=GetTickCount64()+(200u<<state.selectionEventBindAttempts);
     const auto settled=[&] { if(current()) { state.selectionEventBindAttempts=0; state.selectionEventBindNext=0; } return true; };
     ComPtr<IWebBrowser2> webBrowser;
-    const HRESULT webResult=browser->QueryInterface(IID_PPV_ARGS(&webBrowser));
-    if (!current()) return false;
-    if (webResult==E_NOINTERFACE) return settled();
-    if (FAILED(webResult) || !webBrowser) return false;
     ComPtr<IDispatch> document;
-    if (FAILED(webBrowser->get_Document(document.GetAddressOf())) ||
-        !document || !current()) return false; // A slow Shell may publish its document later.
+    const HRESULT webResult=browser ? browser->QueryInterface(IID_PPV_ARGS(&webBrowser)) : E_NOINTERFACE;
+    if (!current()) return false;
+    if (SUCCEEDED(webResult) && webBrowser)
+        webBrowser->get_Document(document.GetAddressOf());
+    if (!current()) return false;
+    if (!document) {
+        // ExplorerBrowser and some tabs expose the same automation source on
+        // their native view without an IWebBrowser2 document. Bind once here,
+        // after first content, rather than querying it during input or paint.
+        ComPtr<IShellView> nativeView;
+        if (SUCCEEDED(view.As(&nativeView)))
+            nativeView->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&document));
+        if (!current()) return false;
+        if (!document) return browser && webResult!=E_NOINTERFACE ? false : settled();
+    }
     if (state.selectionEventCookie &&
         state.selectionEventSource.Get() == document.Get() &&
         state.selectionEventNativeView == state.nativeHwnd) return settled();
@@ -28562,9 +28781,11 @@ bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
     if (FAILED(connectionResult) || !connection) return false;
     ComPtr<IDispatch> sink;
     auto queued = std::make_shared<std::atomic<bool>>(false);
+    auto enumerationQueued = std::make_shared<std::atomic<bool>>(false);
     sink.Attach(static_cast<IDispatch*>(new ShellSelectionAutomationSink(
-        state.hwnd, state.nativeHwnd, state.token, queued)));
+        state.hwnd, state.nativeHwnd, state.token, queued, enumerationQueued)));
     state.selectionEventMessageQueued = queued;
+    state.enumerationEventMessageQueued = enumerationQueued;
     DWORD cookie = 0;
     const HRESULT adviseResult=connection->Advise(sink.Get(), &cookie);
     if (!current()) {
@@ -28573,12 +28794,14 @@ bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
     }
     if (FAILED(adviseResult) || !cookie) {
         state.selectionEventMessageQueued.reset();
+        state.enumerationEventMessageQueued.reset();
         return false;
     }
     state.selectionEventConnection = connection;
     state.selectionEventSource = document;
     state.selectionEventSink = sink;
     state.selectionEventMessageQueued = std::move(queued);
+    state.enumerationEventMessageQueued = std::move(enumerationQueued);
     state.selectionEventCookie = cookie;
     state.selectionEventNativeView = state.nativeHwnd;
     if (g_perf.load(std::memory_order_relaxed))
@@ -29183,7 +29406,7 @@ void RetryShellSubscriptions(ViewState& state, ULONGLONG now) {
     const auto browser=state.shellAutomationBrowser;
     if (browser && !state.navigationEventProbed) AttachShellAutomationEvents(state,browser.Get());
     if (State(hwnd)!=&state || state.token!=token) return;
-    if (browser && state.selectionEventBindAttempts && now>=state.selectionEventBindNext)
+    if (state.selectionEventBindAttempts && now>=state.selectionEventBindNext)
         AttachShellSelectionEvents(state,browser.Get());
     if (State(hwnd)!=&state || state.token!=token) return;
     if (!state.explorerNavigationProbed && state.shellBrowser)
@@ -29302,9 +29525,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // Keep the outgoing host clipped while the new Shell view binds.
             // All saved regions are restored together on native-mode toggle
             // or mod unload; no native placeholder may flash between views.
-            if (IsWindow(s->nativeHwnd) &&
-                GetPropW(s->nativeHwnd, kOverlayProperty) == overlay)
-                RemovePropW(s->nativeHwnd, kOverlayProperty);
+            UnbindNativeViewInput(s->nativeHwnd, overlay);
         }
         const HWND oldTabHost = s->activeTabHost;
         const HWND newTabHost = tabHost;
@@ -29352,7 +29573,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         // Do not consult the new Shell view's late-restored sorting preference
         // here. The new folder owns an independent unsorted/cached policy.
         // A sort chosen by the user may be tracked after it is committed.
-        SetPropW(native, kOverlayProperty, overlay);
+        BindNativeViewInput(native, overlay);
         if (IsThisPcLocation(path)) {
             if (!s->thisPcGpu || changedPath || wasOutside) {
                 if (!s->thisPcGpu) CacheDepartingFolder(*s);
@@ -29551,7 +29772,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     s->hwnd = overlay;
     g_instances.fetch_add(1);
     RegisterTabOverlay(frame, tabHost, overlay);
-    SetPropW(native, kOverlayProperty, overlay);
+    BindNativeViewInput(native, overlay);
     // Lifecycle/suppression hooks are prerequisites for startup, including
     // native-only initial modes. They must never depend on a first GPU frame.
     InitializeFrameShellEvents(*s);

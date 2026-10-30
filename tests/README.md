@@ -175,6 +175,26 @@ the real menu loop. It never switches desktops or touches the user's focus or
 clipboard. Actual WinUI mouse presentation, keyboard keytips and expanded
 submenus require live Explorer input verification; see the
 [native menu investigation](../docs/context-menus-0.9.287.md).
+It also invokes the active Shell view's own background-menu command provider
+through `IContextMenu`, using Windows-provided command offsets and column labels.
+Details/List/grid sorting, pinned layouts, large/medium/small icon sizes, queued
+view choices and grouping must reach the GPU model. Content/Tiles restore native
+presentation and returning to supported modes suppresses it again. Refresh must
+deliver the real native enumeration-complete event and revalidate GPU content
+and cached metadata in Details/List/grid. Native Group by property changes,
+direction reversals and None also verify surviving item positions, intermediate
+item/header geometry, outgoing headings, immutable presentation models and
+nonempty GPU heading sources across all three layouts. The mod's animation
+clock advances through its shared duration; Windows handles each real command.
+See the [grouping animation investigation](../docs/grouping-animation-0.9.302.md).
+These
+checks exercise real DefView command dispatch; they do not emulate mouse input
+in the modern presenter. The unload suite verifies that the native command
+subclass is removed before DLL retirement. See the
+[command-routing investigation](../docs/context-menu-commands-0.9.301.md).
+`--gpu-lifecycle --after-graphics` runs the complete graphics fixture before
+the lifecycle checks to help investigate failures that depend on prior tests.
+Lifecycle failures include the phase and a bounded history of actual callbacks.
 The graphics suite checks active/fading marquees above opaque item pixels and
 pinned group headings in LTR/RTL Details/List/grid. Mode and row transitions
 must put the marquee on the existing chrome plane using live viewport bounds.

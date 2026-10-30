@@ -1995,6 +1995,9 @@ int wmain(int argc,wchar_t** argv) {
         } else if (argc>1 && wcscmp(argv[1],L"--gpu-memory")==0) {
             TestGraphicsMemoryProbe();
         } else if (argc>1 && wcscmp(argv[1],L"--gpu-lifecycle")==0) {
+            if(argc>2 && wcscmp(argv[2],L"--after-graphics")==0) {
+                TestNativeSuppression(); TestGraphicsIsolation(fixture.wstring());
+            }
             TestGraphicsResourceLifecycle();
         } else if (argc>1 && wcscmp(argv[1],L"--trace-cpu")==0) {
             TestIdleTraceCpu();

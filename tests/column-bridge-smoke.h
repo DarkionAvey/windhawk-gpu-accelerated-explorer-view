@@ -87,7 +87,14 @@ struct Receipts {
                 if(!model->horizontalScrollbarAdmitted && model->columnContentWidth>model->client.right) ++self.deferredOverflow;
                 if(!self.admitted && model->horizontalScrollbarAdmitted && !state->horizontalScroll &&
                     (state->nativeColumnsDirty || state->deferColumnProviders || state->autoRefitPending ||
-                     model->columnTransitionActive || model->columnPresentationPending)) self.premature=true;
+                     model->columnTransitionActive || model->columnPresentationPending)) {
+                    if(!self.premature) std::cout<<"COLUMN PREMATURE model="<<model->sequence
+                        <<" folder="<<model->token<<"/"<<state->token<<" scan="<<model->directoryToken<<"/"<<state->directoryToken
+                        <<" dirty="<<state->nativeColumnsDirty<<" deferred="<<state->deferColumnProviders
+                        <<" fit="<<state->autoRefitPending<<" transition="<<model->columnTransitionActive
+                        <<" pending="<<model->columnPresentationPending<<" horizontal-motion="<<model->horizontalAnimating<<std::endl;
+                    self.premature=true;
+                }
                 self.admitted|=model->horizontalScrollbarAdmitted;
             }
         }
