@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.304
+// @version         0.9.305
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -542,6 +542,9 @@ std::atomic<ViewOption> g_filenameOnly{ViewOption::GridOnly};
 std::atomic<ViewOption> g_middleEllipsis{ViewOption::GridOnly};
 std::atomic<bool> g_listThumbnails{false};
 std::atomic<bool> g_animateHover{true};
+// Internal until exposed as "animated item interactions". Header sorting is
+// deliberate input; native context-menu sorting keeps its layout animation.
+std::atomic<bool> g_animateItemInteractions{false};
 std::atomic<COLORREF> g_selectionRgb{RGB(0, 120, 215)};
 std::atomic<bool> g_dynamicAccent{true};
 // One coherent, event-refreshed COLORREF background/foreground/alpha tuple.
@@ -2787,6 +2790,7 @@ struct ViewState {
     bool trackNativeSort = false; // Follow Shell changes after opting into sorting.
     bool preSortEnabled = g_preSort.load(std::memory_order_relaxed);
     bool nativeSortPending = false; // Retry a failed initial settings read on native readiness.
+    std::optional<SortSpec> instantInteractionSort; // One header intent, including replacement refreshes.
     // When navigating from a descendant to an ancestor, reveal the immediate
     // child on the return path. This selection stays stable while a cached
     // folder is revalidated by the worker.
@@ -9756,6 +9760,7 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
 }
 
 void InitializeFolderSort(ViewState& state, const std::wstring& path, bool provisional = false) {
+    state.instantInteractionSort.reset();
     state.preSortEnabled = g_preSort.load(std::memory_order_relaxed);
     state.sort = DefaultSort();
     state.sortInitialized = state.trackNativeSort = state.nativeSortPending = false;
@@ -9832,6 +9837,7 @@ bool ReconcileShellGrouping(ViewState& state, bool force = false, bool queueIfCh
 void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force = false,
                              bool acceptUntrackedSort = false) {
     if (!state.inScope || state.optimisticStartedAt) return;
+    if (acceptUntrackedSort) state.instantInteractionSort.reset(); // Explicit native/menu command.
     const bool groupingChanged=ReconcileShellGrouping(state, force, false);
     bool sortChanged=false;
     SortSpec updated;
@@ -9842,6 +9848,8 @@ void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force =
         sortChanged = pending || !state.sortInitialized || !SameSort(updated, state.sort);
         updated.userChosen = state.sort.userChosen || acceptUntrackedSort ||
             (state.sortInitialized && !SameSort(updated,state.sort));
+        if (state.instantInteractionSort && !SameSort(*state.instantInteractionSort,updated))
+            state.instantInteractionSort.reset();
         state.sort = std::move(updated);
         state.sortInitialized = true;
         if (SameSort(state.displayedSort,state.sort)) state.displayedSort.userChosen=state.sort.userChosen;
@@ -9862,6 +9870,7 @@ bool ReconcileSortSettings(ViewState& state) {
     const bool preSort=g_preSort.load(std::memory_order_relaxed);
     const bool changed=state.preSortEnabled!=preSort;
     const bool placementChanged=state.sort.placement!=placement;
+    if (changed || placementChanged) state.instantInteractionSort.reset();
     if (changed) {
         state.preSortEnabled=preSort;
         if (preSort) {
@@ -9902,16 +9911,21 @@ void SortByHeader(ViewState& state, int column) {
     if (state.visible && state.inScope && state.detailsViewActive)
         SuppressNativeContent(state);
     if (!current()) return;
+    SortSpec sort;
+    sort.key = key;
+    sort.direction = direction;
+    sort.kind = ClassifySort(key);
+    sort.placement = g_folderPlacement.load(std::memory_order_relaxed);
+    sort.explicitOrder = true;
+    sort.userChosen = true;
+    const auto previousInstantSort=state.instantInteractionSort;
+    // SetSortColumns may reenter native sort observation and queue a result.
+    // Tag the intended order before COM, then consume it at the shared commit.
+    state.instantInteractionSort = g_animateItemInteractions.load(std::memory_order_relaxed) ?
+        std::nullopt : std::optional<SortSpec>(sort);
     PipelineScope pipeline(state.background,L"native.sort",key.pid,static_cast<int>(direction));
     const HRESULT result=view->SetSortColumns(&requested,1);
     if (SUCCEEDED(result) && current()) {
-        SortSpec sort;
-        sort.key = key;
-        sort.direction = direction;
-        sort.kind = ClassifySort(key);
-        sort.placement = g_folderPlacement.load(std::memory_order_relaxed);
-        sort.explicitOrder = true;
-        sort.userChosen = true;
         state.trackNativeSort = true;
         state.nativeSortPending = false;
         if (!state.sortInitialized || !SameSort(sort, state.sort)) {
@@ -9921,6 +9935,8 @@ void SortByHeader(ViewState& state, int column) {
             else QueueDirectoryRefresh(state, true, true);
         }
         Redraw(state);
+    } else if (current() && state.instantInteractionSort && SameSort(*state.instantInteractionSort,sort)) {
+        state.instantInteractionSort=previousInstantSort;
     }
 }
 
@@ -10153,6 +10169,11 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
                          int sortRevealIndex = -1, bool completesDirectoryRequest = true,
                          bool requestData = true) {
     TabTraceSlowScope trace(L"directory names/selection commit", state.hwnd);
+    const bool instantInteraction=state.instantInteractionSort && SameSort(*state.instantInteractionSort,state.sort);
+    if (instantInteraction) {
+        StopRowTransition(state);
+        if (complete && error==ERROR_SUCCESS) state.instantInteractionSort.reset();
+    }
     if (complete) TraceSelectionIdentity(state, L"names.before");
     const bool allowSortReveal=!PointerDragActive(state) && !state.marqueeActive &&
         !state.manipulationFrameActive;
@@ -10432,7 +10453,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         state.nativeSelectionMessageQueued = PostMessageW(state.hwnd,
             kMsgNativeSelectionChanged,
             reinterpret_cast<WPARAM>(state.nativeHwnd), 0) != FALSE;
-    if (complete && error == ERROR_SUCCESS && state.loaded &&
+    if (!instantInteraction && complete && error == ERROR_SUCCESS && state.loaded &&
         SameSort(state.displayedSort, state.sort)) {
         if (groupingChanged || !state.sections.empty() || !oldHeaders.empty())
             StartGroupingTransition(state, std::move(oldViewport),
@@ -29609,7 +29630,15 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
         CommitItemSnapshot(state, std::move(result), false,
             requestData && state.firstContentSubmittedAt != 0);
     }
-    if (complete) state.displayedSort = state.sort;
+    if (complete) {
+        state.displayedSort = state.sort;
+        // A tiny This PC projection can keep the same rows despite a new key.
+        // It still completes the header intent, without a structural commit.
+        if (state.instantInteractionSort && SameSort(*state.instantInteractionSort,state.sort)) {
+            StopRowTransition(state);
+            state.instantInteractionSort.reset();
+        }
+    }
     // Unchanged rows still need their deferred services after first content.
     if (state.firstContentSubmittedAt) {
         if (requestData) RequestVisibleIcons(state);

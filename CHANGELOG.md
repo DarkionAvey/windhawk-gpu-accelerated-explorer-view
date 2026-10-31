@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.305
+
+- Apply column-header sorting without item movement animation; native context-menu
+  sorting remains animated. Keep an internal disabled item-interaction animation
+  switch for a future user option.
+
 ## 0.9.304
 
 - Speed up folder preprocessing with adaptive sorting of row indices, compact

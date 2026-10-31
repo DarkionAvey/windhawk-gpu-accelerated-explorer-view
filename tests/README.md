@@ -314,6 +314,10 @@ and [release history](../CHANGELOG.md) contain investigation details.
 ExplorerBrowser after saved Name/Size/Date sorts in both directions and a
 two-key sort. It also exercises cached returns, native/overlay switches,
 GPU header writes and the unsorted option. It never uses user folders or input.
+Header checks also cover instant reversals/grouped layouts, replacement worker
+generations, the internal interaction-animation switch and a native command
+superseding a pending header sort. The real native-menu suite verifies that
+context-menu reorders still animate.
 
 `--preprocessing` creates real private directories with 1,000, 10,000 and 50,000
 items, including folders, numeric and Unicode names, four extensions, different

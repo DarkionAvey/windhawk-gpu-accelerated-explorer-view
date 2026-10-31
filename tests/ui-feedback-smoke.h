@@ -292,7 +292,16 @@ static void TestUiFeedbackAudit(const std::wstring& directory) {
     OverlayProc(state.hwnd, WM_APP+64, 0, 0);
     view->queries = 0; const unsigned paints = coldScrollPaints;
     AdvanceAnimationFrame(state, true);
-    Check(state.entries[0].driveUsed == 25 && state.entries[0].detailsPending && queuedRequests() == 1,
+    const auto capacityRequests=queuedRequests();
+    if (state.entries[0].driveUsed!=25 || !state.entries[0].detailsPending || capacityRequests!=1)
+        std::cout<<"CAPACITY FEEDBACK used="<<state.entries[0].driveUsed
+            <<" pending="<<state.entries[0].detailsPending<<" requests="<<capacityRequests
+            <<" loaded="<<state.loaded<<" dirty="<<state.thisPcRowsDirty
+            <<" capture="<<state.nativeRowsNeedCapture<<" capturing="<<state.nativeRowsPending
+            <<" sort-pending="<<state.nativeSortPending<<" instant="<<bool(state.instantInteractionSort)
+            <<" epochs="<<state.entries[0].columnEpoch<<'/'<<state.columnEpoch
+            <<" property="<<state.entries[0].propertyEpoch<<'/'<<state.propertyEpoch<<'\n';
+    Check(state.entries[0].driveUsed == 25 && state.entries[0].detailsPending && capacityRequests == 1,
           "This PC capacity projection reset pending metadata or duplicated provider work");
     Check(!PeekMessageW(&message, state.hwnd, kMsgThisPcRows, kMsgThisPcRows, PM_REMOVE) &&
         coldScrollPaints == paints && view->queries == 0, "This PC enrichment reentered native maintenance or synchronous paint");

@@ -211,8 +211,8 @@ void ExerciseCommands(ProviderSelectionFixture::Browser& host) {
         Check(bool(IsWindowVisible(state.nativeHwnd))!=gpu && bool(IsWindowVisible(state.hwnd))==gpu,
             "native menu command broke exclusive native/GPU presentation");
     };
-    const auto invoke=[&](const wchar_t* parent,const wchar_t* verb) {
-        Commands command(state); command.Invoke(state,command.FindVerb(parent,verb)); settle();
+    const auto invoke=[&](const wchar_t* parent,const wchar_t* verb,bool finishMotion=true) {
+        Commands command(state); command.Invoke(state,command.FindVerb(parent,verb)); settle(finishMotion);
     };
     // Exercise native commands with pre-sorting disabled as well. No GPU
     // header/frame command has primed this opt-out policy.
@@ -225,10 +225,18 @@ void ExerciseCommands(ProviderSelectionFixture::Browser& host) {
         Check(ReadNativeViewMode(state,observed),"native command initial mode read");
         ApplyViewLayout(state,observed,false); state.directoryModePinned=true;
         for (const auto* verb : {L"sortdescending",L"sortascending"}) {
-            invoke(L"arrange",verb);
+            std::vector<std::wstring> before;
+            for (const auto& entry : state.entries) before.push_back(entry.path);
+            invoke(L"arrange",verb,false);
             SortSpec native;
             Check(ReadShellSort(state,native) && state.trackNativeSort && state.sort.explicitOrder &&
                 SameSort(native,state.sort) && SameSort(native,state.displayedSort),"menu direction did not reach GPU sorting without a header click");
+            const bool moved=before.size()==state.entries.size() &&
+                !std::equal(before.begin(),before.end(),state.entries.begin(),
+                    [](const std::wstring& path,const Entry& entry) {return path==entry.path;});
+            if (moved && mode==FVM_DETAILS)
+                Check(state.rowTransitionActive,"real native menu sorting lost its row animation");
+            StopRowTransition(state);
         }
         for (const auto& key : {PKEY_Size,PKEY_ItemNameDisplay}) {
             Commands command(state); command.Invoke(state,command.FindProperty(state,L"arrange",key)); settle();

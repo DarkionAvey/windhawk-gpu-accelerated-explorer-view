@@ -15,10 +15,11 @@ static void TestInitialSorting(const std::wstring& fixture) {
         CloseHandle(file);
     }
     const bool previous=g_preSort.exchange(true);
+    const bool interactions=g_animateItemInteractions.exchange(false);
     const auto placement=g_folderPlacement.exchange(FolderPlacement::ExplorerDefault);
-    struct Restore { bool preSort; FolderPlacement placement;
-        ~Restore() {g_preSort=preSort; g_folderPlacement=placement;}
-    } restore{previous,placement};
+    struct Restore { bool preSort,interactions; FolderPlacement placement;
+        ~Restore() {g_preSort=preSort; g_animateItemInteractions=interactions; g_folderPlacement=placement;}
+    } restore{previous,interactions,placement};
     {
     ProviderSelectionFixture::Browser host;
     auto& state=host.state;
@@ -26,10 +27,10 @@ static void TestInitialSorting(const std::wstring& fixture) {
     host.Navigate(root.wstring(),7);
     Check(state.preSortEnabled && state.sortInitialized && state.trackNativeSort &&
         state.sort.explicitOrder && SameSort(state.sort,state.displayedSort),"first folder ignored native sorting");
-    const auto settle=[&] {
+    const auto settle=[&](bool finishMotion=true) {
         Check(Eventually([&] {host.Pump(); ReceiveDirectoryResults(state);
             return state.loaded && !state.directoryPending;},30000),"initial sort publication");
-        StopRowTransition(state);
+        if (finishMotion) StopRowTransition(state);
     };
     const auto nativeOrder=[&] {
         std::vector<std::wstring> paths;
@@ -80,10 +81,41 @@ static void TestInitialSorting(const std::wstring& fixture) {
     state.deferColumnProviders=false; state.featureInitializationStep=std::max(3u,state.featureInitializationStep);
     FinishColumnTransition(state); RefreshExplorerColumns(state,true);
     Check(!state.columns.empty(),"native header columns");
-    SortByHeader(state,0); settle();
+    SortByHeader(state,0); settle(false);
+    Check(!state.rowTransitionActive && !state.instantInteractionSort,"header sort animated or retained its interaction intent");
     SortSpec updated;
     Check(ReadShellSort(state,updated) && SameSort(updated,state.sort) &&
         SameKey(updated.key,state.columns.front().key),"overlay header did not update native sorting");
+    // A reversal really moves the private rows. Replace its pending worker
+    // generation, as a concurrent refresh would, without losing input policy.
+    SortByHeader(state,0);
+    QueueDirectoryRefresh(state,true,true);
+    settle(false);
+    Check(!state.rowTransitionActive && state.rowMotion.empty() && !state.instantInteractionSort,
+        "replacement refresh animated a deliberate header sort");
+    auto order=nativeOrder();
+    for (int i=0;i<state.total;++i)
+        Check(_wcsicmp(order[i].c_str(),state.entries[i].path.c_str())==0,"instant header order differs from native");
+    // Keep the internal switch functional before it becomes a user option.
+    g_animateItemInteractions=true;
+    SortByHeader(state,0); settle(false);
+    Check(state.rowTransitionActive,"enabled item-interaction flag did not animate header sorting");
+    StopRowTransition(state); g_animateItemInteractions=false;
+    // An explicit native/menu command supersedes a still-pending header intent,
+    // even when it selects that same order. Use the real Shell setter.
+    SortByHeader(state,0);
+    SORTCOLUMN menu{state.sort.key,state.sort.direction};
+    Check(SUCCEEDED(state.folderView->SetSortColumns(&menu,1)),"native sort after pending header");
+    RefreshSortFromExplorer(state,true,true,true); settle(false);
+    Check(state.rowTransitionActive && !state.instantInteractionSort,"native menu inherited an instant header policy");
+    StopRowTransition(state);
+    Check(SUCCEEDED(state.folderView->SetGroupBy(PKEY_ItemTypeText,TRUE)),"private grouped header sort");
+    RefreshSortFromExplorer(state,true,true); settle();
+    SortByHeader(state,0); settle(false);
+    Check(!state.rowTransitionActive && state.groupHeaderMotion.empty() && !state.instantInteractionSort,
+        "grouped header sort animated items or group headings");
+    Check(SUCCEEDED(state.folderView->SetGroupBy(PKEY_Null,TRUE)),"private header group reset");
+    RefreshSortFromExplorer(state,true,true); settle();
     const SORTCOLUMN multiple[]={{PKEY_ItemTypeText,SORT_ASCENDING},{PKEY_DateModified,SORT_DESCENDING}};
     Check(SUCCEEDED(state.folderView->SetSortColumns(multiple,2)),"native secondary sort choice"); host.Pump();
     RefreshSortFromExplorer(state,true,true); settle();
@@ -115,5 +147,5 @@ static void TestInitialSorting(const std::wstring& fixture) {
     Check(Eventually([&] {
         std::error_code error; std::filesystem::remove_all(root,error); return !error;
     }),"initial sort fixture cleanup did not settle");
-    std::cout<<"PASS: first-entry/native saved sorting, cached returns, both view-switch directions, header writes and opt-out\n";
+    std::cout<<"PASS: saved/native sorting, cached returns, view switches, instant/grouped header writes, pending replacements, internal animation switch, animated native commands and opt-out\n";
 }
