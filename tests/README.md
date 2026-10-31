@@ -27,6 +27,15 @@ in previous-versions, including the published version, ordered by numeric versio
 The legacy mod.cpp baseline counts toward this limit; unrelated files and
 subdirectories are left alone. The published release's archive and latest copy
 are byte-identical.
+The build also generates `gpu-accelerated-explorer-view.minified.wh.cpp` for
+test-device installs. It removes ordinary C++ comments and collapses whitespace
+and code lines, retaining literal contents, token boundaries and preprocessor
+directives. Windhawk metadata and settings remain intact; the embedded README
+becomes a short generated-file notice. This export is marked read-only and is
+never used as an upstream source. Edit the numbered working source and rebuild;
+downstream edits are discarded. Both the regular and minified sources must link
+against the installed Windhawk host API before publication. Compiler fixtures
+also verify minification of macros, comments and string literals.
 Conflicting archives and downgrades fail without overwriting history. A failed
 run retains the working source and temporary binaries, and leaves latest.cpp
 unchanged, without pruning archives. Update CHANGELOG.md with the results after

@@ -1,4 +1,5 @@
 # Shared by the build, version starter and regression runner. Windows PowerShell 5.1+.
+. (Join-Path $PSScriptRoot 'minify.ps1')
 function Get-SourceHash([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -128,15 +129,25 @@ function Assert-ReleaseSources([string]$RepositoryRoot, [string]$SourcePath) {
     }
 }
 
-function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
+function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath, [string]$MinifiedPath) {
     Assert-ReleaseSources $RepositoryRoot $SourcePath
     $archive = Join-Path $RepositoryRoot 'previous-versions'
     New-Item -ItemType Directory -Path $archive -Force | Out-Null
     $staged = Join-Path $RepositoryRoot ('latest.' + [guid]::NewGuid().ToString('N') + '.tmp')
     $stagedExport = Join-Path $RepositoryRoot ('latest.export.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $stagedMinified = Join-Path $RepositoryRoot ('latest.minified.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         Copy-Item -LiteralPath $SourcePath -Destination $staged
         Copy-Item -LiteralPath $staged -Destination $stagedExport
+        $minifiedText = ConvertTo-MinifiedMod $SourcePath
+        if ($MinifiedPath) {
+            if ([IO.File]::ReadAllText($MinifiedPath) -cne $minifiedText) {
+                throw 'Minified source changed after validation; run the build again'
+            }
+            Copy-Item -LiteralPath $MinifiedPath -Destination $stagedMinified
+        } else {
+            [IO.File]::WriteAllText($stagedMinified, $minifiedText, [Text.UTF8Encoding]::new($false))
+        }
         $sources = @(Get-VersionSources $RepositoryRoot)
         $legacy = Join-Path $RepositoryRoot 'mod.cpp'
         if (Test-Path -LiteralPath $legacy) { $sources += Get-Item -LiteralPath $legacy }
@@ -161,7 +172,20 @@ function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
         } else {
             Move-Item -LiteralPath $stagedExport -Destination $export
         }
-        # Prune only after both published copies are in place. Include the
+        $minified = Join-Path $RepositoryRoot 'gpu-accelerated-explorer-view.minified.wh.cpp'
+        if (Test-Path -LiteralPath $minified) {
+            $attributes = [IO.File]::GetAttributes($minified)
+            try {
+                [IO.File]::SetAttributes($minified, ($attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+                [IO.File]::Replace($stagedMinified, $minified, [NullString]::Value)
+            } finally {
+                [IO.File]::SetAttributes($minified, ($attributes -bor [IO.FileAttributes]::ReadOnly))
+            }
+        } else {
+            Move-Item -LiteralPath $stagedMinified -Destination $minified
+            [IO.File]::SetAttributes($minified, ([IO.File]::GetAttributes($minified) -bor [IO.FileAttributes]::ReadOnly))
+        }
+        # Prune only after all published copies are in place. Include the
         # legacy baseline, but leave unrelated files and subdirectories alone.
         $history = @(Get-VersionSources $archive)
         $archivedLegacy = Join-Path $archive 'mod.cpp'
@@ -175,5 +199,6 @@ function Publish-ModRelease([string]$RepositoryRoot, [string]$SourcePath) {
     } finally {
         if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged }
         if (Test-Path -LiteralPath $stagedExport) { Remove-Item -LiteralPath $stagedExport }
+        if (Test-Path -LiteralPath $stagedMinified) { Remove-Item -LiteralPath $stagedMinified -Force }
     }
 }

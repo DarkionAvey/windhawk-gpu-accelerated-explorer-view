@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.306
+
+- Generate a read-only `gpu-accelerated-explorer-view.minified.wh.cpp` for
+  test-device installs, removing ordinary comments and collapsing code lines
+  while retaining Windhawk metadata and settings. Validate it before publishing.
+
 ## 0.9.305
 
 - Apply column-header sorting without item movement animation; native context-menu

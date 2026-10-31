@@ -18,7 +18,7 @@ try {
     $readme = Join-Path $fixture 'README.md'
     $text = '# User documentation' + "`n`n" + 'Literal $1, ${name}, backticks ` and Unicode ' + [char]0x062A + "`n"
     Write-Utf8 $readme $text
-    $original = "// @version         0.9.9`r`n// ==WindhawkModReadme==`r`n/*`r`nold`r`n*/`r`n// ==/WindhawkModReadme==`r`nint unchanged = 42;`r`n"
+    $original = "// ==WindhawkMod==`r`n// @id test-mod`r`n// @version         0.9.9`r`n// ==/WindhawkMod==`r`n// ==WindhawkModReadme==`r`n/*`r`nold`r`n*/`r`n// ==/WindhawkModReadme==`r`n// ==WindhawkModSettings==`r`n/*`r`n- test: true`r`n*/`r`n// ==/WindhawkModSettings==`r`nint unchanged = 42;`r`n"
     $old = Join-Path $fixture '0.9.9.cpp'
     Write-Utf8 $old $original
     $oldHash = (Get-SourceHash $old)
@@ -41,9 +41,15 @@ try {
     Publish-ModRelease $fixture $new
     $latest = Join-Path $fixture 'latest.cpp'
     $export = Join-Path $fixture 'gpu-accelerated-explorer-view.wh.cpp'
+    $minified = Join-Path $fixture 'gpu-accelerated-explorer-view.minified.wh.cpp'
     $archive = Join-Path $fixture 'previous-versions'
     Assert ((Get-SourceHash $latest) -eq $newHash) 'latest differs from the tested source'
     Assert ((Get-SourceHash $export) -eq $newHash) 'Windhawk export differs from the tested source'
+    $minifiedHash = Get-SourceHash $minified
+    Assert ((Get-Item -LiteralPath $minified).IsReadOnly) 'minified export is not read-only'
+    Assert ([IO.File]::ReadAllText($minified) -ceq (ConvertTo-MinifiedMod $latest)) 'minified export differs from the source'
+    Assert ([IO.File]::ReadAllText($minified).Contains("- test: true`r`n")) 'minification changed Windhawk settings'
+    Assert ([IO.File]::ReadAllText($minified).Contains('Read-only; edits are discarded on rebuild.')) 'minified export lacks generated-file notice'
     Assert ((Get-SourceHash (Join-Path $archive '0.9.9.cpp')) -eq $oldHash) 'historical bytes changed'
     Assert ((Get-SourceHash (Join-Path $archive '0.9.10.cpp')) -eq $newHash) 'archive differs from latest'
     Assert ((Get-SourceHash (Join-Path $archive 'mod.cpp')) -eq $legacyHash) 'legacy baseline changed below retention limit'
@@ -52,6 +58,8 @@ try {
     Publish-ModRelease $fixture $new
     Assert ((Get-SourceHash $latest) -eq $newHash) 'identical archive retry failed'
     Assert ((Get-SourceHash $export) -eq $newHash) 'identical archive retry changed the Windhawk export'
+    Assert ((Get-SourceHash $minified) -eq $minifiedHash) 'identical retry changed minification'
+    Assert ((Get-Item -LiteralPath $minified).IsReadOnly) 'retry lost read-only attribute'
     foreach ($patch in 1..18) {
         Write-Utf8 (Join-Path $archive ("0.8.$patch.cpp")) ($original.Replace('0.9.9', "0.8.$patch"))
     }
@@ -61,6 +69,7 @@ try {
     Assert ((Test-Path -LiteralPath $new) -and (Test-Path -LiteralPath $old)) 'archive conflict moved working files'
     Assert ((Get-SourceHash $latest) -eq $newHash) 'archive conflict changed latest'
     Assert ((Get-SourceHash $export) -eq $newHash) 'archive conflict changed the Windhawk export'
+    Assert ((Get-SourceHash $minified) -eq $minifiedHash) 'archive conflict changed the minified export'
     Assert (@(Get-VersionSources $archive).Count -eq 20) 'archive conflict pruned old versions'
     Assert ((Get-SourceHash (Join-Path $archive 'mod.cpp')) -eq $legacyHash) 'archive conflict pruned the baseline'
     Remove-Item -LiteralPath $old, $new
@@ -92,7 +101,7 @@ try {
     $tests = Join-Path $fixture 'tests'
     $fakeWindhawk = Join-Path $fixture 'portable Windhawk'
     New-Item -ItemType Directory -Path $scripts, $tests, (Join-Path $fakeWindhawk 'Compiler\bin') -Force | Out-Null
-    foreach ($name in @('repository.ps1', 'build.ps1')) {
+    foreach ($name in @('repository.ps1', 'build.ps1', 'minify.ps1', 'SourceMinifier.cs')) {
         Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) ('scripts\' + $name)) -Destination (Join-Path $scripts $name)
     }
     Write-Utf8 (Join-Path $fakeWindhawk 'Compiler\bin\clang++.exe') ''
@@ -106,6 +115,8 @@ try {
         Reject { & $build -WindhawkDirectory $fakeWindhawk } 'failed regression published a release'
         Assert ((Get-SourceHash $latest) -eq $newHash) 'failed tests changed latest'
         Assert ((Get-SourceHash $export) -eq $newHash) 'failed tests changed the Windhawk export'
+        Assert ((Get-SourceHash $minified) -eq $minifiedHash) 'failed tests changed the minified export'
+        Assert ((Get-Item -LiteralPath $minified).IsReadOnly) 'failed tests lost read-only attribute'
         Assert (Test-Path -LiteralPath $next) 'failed tests discarded the working source'
         Assert (!(Test-Path -LiteralPath (Join-Path $archive '0.9.11.cpp'))) 'failed tests archived the candidate'
         foreach ($name in $archiveHashes.Keys) {
@@ -114,8 +125,17 @@ try {
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); [IO.File]::AppendAllText($SourceFile, "changed during testing")'
         Reject { & $build -WindhawkDirectory $fakeWindhawk } 'source changed during testing was published'
         Assert ((Get-SourceHash $export) -eq $newHash) 'source-change guard published the Windhawk export'
+        Assert ((Get-SourceHash $minified) -eq $minifiedHash) 'source-change guard published the minified export'
         foreach ($name in $archiveHashes.Keys) {
             Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'source-change guard changed or pruned an archive'
+        }
+        Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory, $MinifiedSourceFile); [IO.File]::AppendAllText($MinifiedSourceFile, "changed during testing")'
+        Reject { & $build -WindhawkDirectory $fakeWindhawk } 'minified source changed during testing was published'
+        Assert ((Get-SourceHash $latest) -eq $newHash) 'minified-change guard published latest'
+        Assert ((Get-SourceHash $export) -eq $newHash) 'minified-change guard published the Windhawk export'
+        Assert ((Get-SourceHash $minified) -eq $minifiedHash) 'minified-change guard published the minified export'
+        foreach ($name in $archiveHashes.Keys) {
+            Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'minified-change guard changed or pruned an archive'
         }
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory)'
         & $build -WindhawkDirectory $fakeWindhawk
@@ -123,6 +143,11 @@ try {
         Assert ((Get-SourceHash $latest) -eq
             (Get-SourceHash (Join-Path $archive '0.9.11.cpp'))) 'final published/archive copies differ'
         Assert ((Get-SourceHash $export) -eq (Get-SourceHash $latest)) 'final Windhawk export differs from latest'
+        Assert ([IO.File]::ReadAllText($minified) -ceq (ConvertTo-MinifiedMod $latest)) 'final minified export differs from latest'
+        Assert ((Get-Item -LiteralPath $minified).IsReadOnly) 'final minified export is writable'
+        # Downstream edits are discarded, never selected as version-starter input.
+        (Get-Item -LiteralPath $minified).IsReadOnly = $false
+        Write-Utf8 $minified '// @version 99.0.0'
         $retained = @(Get-VersionSources $archive)
         $expectedNames = @(7..18 | ForEach-Object { "0.8.$_.cpp" }) + @('0.9.9.cpp', '0.9.10.cpp', '0.9.11.cpp')
         Assert (($retained.Name -join ',') -eq ($expectedNames -join ',')) 'retention did not keep the 15 numerically newest versions'
@@ -136,6 +161,8 @@ try {
         Assert ((Get-SourceHash $nestedSource) -eq $nestedHash) 'retention changed a nested source'
         Copy-Item -LiteralPath (Join-Path $archive '0.9.11.cpp') -Destination $next
         & $build -SourceFile '0.9.11.cpp' -WindhawkDirectory $fakeWindhawk
+        Assert ([IO.File]::ReadAllText($minified) -ceq (ConvertTo-MinifiedMod $latest)) 'rebuild incorporated downstream edits'
+        Assert ((Get-Item -LiteralPath $minified).IsReadOnly) 'rebuild did not restore read-only attribute'
         Assert ((@(Get-VersionSources $archive).Name -join ',') -eq ($retained.Name -join ',')) 'retention is not idempotent at 15 versions'
         Assert ((Split-Path -Leaf (New-ModVersion $fixture)) -eq '0.9.12.cpp') 'version creation failed after pruning'
     } finally { Set-Location -LiteralPath $outside.Path }
@@ -145,7 +172,7 @@ try {
         Assert ((Resolve-WindhawkDirectory) -eq $fakeWindhawk) 'WINDHAWK_HOME was not used'
         Reject { Resolve-WindhawkDirectory (Join-Path $fixture 'missing installation') } 'bad explicit toolchain silently fell back'
     } finally { $env:WINDHAWK_HOME = $previousWindhawk }
-    Write-Output 'PASS: README sync, version preservation, 15-version retention, archive conflicts, failed-test guard, source-change guard, portable paths and release publication'
+    Write-Output 'PASS: README sync, version preservation, 15-version retention, archive conflicts, failed-test guard, source-change guard, portable paths, read-only minification and release publication'
 } finally {
     # Recursive cleanup is restricted to this uniquely named private fixture.
     $resolved = [IO.Path]::GetFullPath($fixture)

@@ -1,7 +1,8 @@
 param(
     [string]$WindhawkDirectory,
     [string]$SourceFile = 'latest.cpp',
-    [string[]]$TestArguments = @()
+    [string[]]$TestArguments = @(),
+    [string]$MinifiedSourceFile
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
@@ -52,6 +53,23 @@ $modFlags += '-fstack-usage'
 & $compiler @modFlags '-shared' (Join-Path $testDirectory 'mod-build.cpp') '-o' $modDll $hostLibrary @libraries
 if ($LASTEXITCODE -ne 0) { throw "Windhawk host DLL build failed: $LASTEXITCODE" }
 Write-Output "PASS: linked $SourceFile against installed Windhawk host API"
+if ($MinifiedSourceFile) {
+    if (![IO.Path]::IsPathRooted($MinifiedSourceFile)) {
+        $MinifiedSourceFile = Join-Path (Split-Path -Parent $testDirectory) $MinifiedSourceFile
+    }
+    $MinifiedSourceFile = (Resolve-Path -LiteralPath $MinifiedSourceFile).ProviderPath
+    if ((Get-ModVersion $MinifiedSourceFile) -ne $sourceVersion) { throw 'Minified version differs from the selected source' }
+    $minifiedConfiguration = Join-Path $outputDirectory 'minified-selected-source.h'
+    [IO.File]::WriteAllText($minifiedConfiguration,
+        $configurationText.Replace($sourcePath.Replace('\', '/'), $MinifiedSourceFile.Replace('\', '/')),
+        [Text.UTF8Encoding]::new($false))
+    $minifiedFlags = @($modFlags | ForEach-Object { if ($_ -eq $configuration) { $minifiedConfiguration } else { $_ } })
+    $minifiedDll = Join-Path $outputDirectory 'minified-mod-build.dll'
+    & $compiler @minifiedFlags '-shared' (Join-Path $testDirectory 'mod-build.cpp') '-o' $minifiedDll $hostLibrary @libraries
+    if ($LASTEXITCODE -ne 0) { throw "Minified Windhawk host DLL build failed: $LASTEXITCODE" }
+    & (Join-Path $testDirectory 'minification-regression.ps1') -Compiler $compiler -OutputDirectory $outputDirectory
+    Write-Output 'PASS: linked minified source against installed Windhawk host API'
+}
 $stackReports = @(Get-ChildItem -LiteralPath $outputDirectory -Filter '*.su' -File)
 if (!$stackReports.Count) { throw 'Mod compiler did not produce stack-usage diagnostics' }
 $callbackStacks = foreach ($stackReport in $stackReports) {
@@ -103,6 +121,7 @@ try {
     if ($testsPassed) {
         if (Test-Path -LiteralPath $executable) { Remove-Item -LiteralPath $executable -Force }
         if (Test-Path -LiteralPath $modDll) { Remove-Item -LiteralPath $modDll -Force }
+        if ($minifiedDll) { Remove-Item -LiteralPath $minifiedDll, $minifiedConfiguration -Force }
         foreach ($stackReport in $stackReports) { Remove-Item -LiteralPath $stackReport.FullName }
         Remove-Item -LiteralPath $configuration
         if ($unloadExe -and (Test-Path -LiteralPath $unloadExe)) { Remove-Item -LiteralPath $unloadExe -Force }
