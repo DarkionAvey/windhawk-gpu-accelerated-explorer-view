@@ -71,6 +71,17 @@ void Selection(const std::wstring& fixture) {
     Tap(input,state,rowPoint(1)); Tap(input,state,rowPoint(1));
     Check(count()==1 && !state.optimisticStartedAt && state.folderPath==folder.wstring(),
         "rapid checkbox taps activated a file");
+    const auto first=LayoutRowVisual(state,0,1.f);
+    const auto gutter=SelectionCheckboxHitRect(state,LayoutItem(state,first),first);
+    const POINT gutterTop{LogicalX(state,LONG(gutter.left+1.f)),LONG(ceilf(gutter.top))};
+    const POINT gutterBottom{gutterTop.x,LONG(ceilf(gutter.bottom)-1.f)};
+    SetTouchInputMode(state,false);
+    Check(SelectionCheckboxAt(state,gutterTop)==0 && SelectionCheckboxAt(state,gutterBottom)==0,
+        "mouse checkbox gutter missed the full native item height");
+    Tap(input,state,gutterTop);
+    Check(count()==2 && state.selectedFlags[0] && state.selectedFlags[1],"checkbox top margin cleared another native selection");
+    Tap(input,state,gutterBottom);
+    Check(count()==1 && !state.selectedFlags[0] && state.selectedFlags[1],"checkbox bottom margin cleared another native selection");
     const auto bodyPoint=[&](int row) {
         const auto item=LayoutItem(state,LayoutRowVisual(state,row,1.f));
         return POINT{LogicalX(state,LONG(item.text.left+state.fontPx)),LONG((item.text.top+item.text.bottom)*.5f)};
@@ -293,10 +304,10 @@ void Pixels() {
     }
     std::cout<<"CHECKBOX instant visibility, normal theme borders, bold centered ticks, stable layout, DPI and RTL passed"<<std::endl;
 }
-void TouchGridTargets(const std::wstring& fixture) {
-    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(UINT mode:{UINT(FVM_SMALLICON),UINT(FVM_ICON)}) {
+void ItemTargets(const std::wstring& fixture) {
+    for(UINT dpi:{96u,192u}) for(bool rtl:{false,true}) for(UINT mode:{UINT(FVM_DETAILS),UINT(FVM_LIST),UINT(FVM_SMALLICON),UINT(FVM_ICON)}) {
         StyleFixture::Session style; StyleFixture::dpi=dpi;
-        PresentationFixture::Tab tab(L"touch checkbox targets",6,rtl,true);
+        PresentationFixture::Tab tab(L"checkbox targets",6,rtl,IsIconViewMode(mode));
         auto& state=tab.state;
         auto* native=SelectionUiFixture::Setup(tab,fixture);
         TouchInputTest::Install(state);
@@ -313,18 +324,31 @@ void TouchGridTargets(const std::wstring& fixture) {
         UpdateMetrics(state); UpdateColumns(state);
         TouchInputTest::Device input; TouchInputTest::Reset(state,input);
         SetTouchInputMode(state,true);
-        const auto item=LayoutItem(state,LayoutRowVisual(state,0,1.f));
-        const auto hit=SelectionCheckboxHitRect(state,item);
-        Check(hit.left>=item.cell.left && hit.top>=item.cell.top && hit.right<=item.cell.right && hit.bottom<=item.cell.bottom &&
-            hit.right<=item.cell.left+(item.cell.right-item.cell.left)*.5f+.01f,"touch checkbox escaped its cell or consumed the opening area");
-        Check(hit.right-hit.left>item.checkbox.right-item.checkbox.left,"touch grid checkbox target was not enlarged");
+        const auto visual=LayoutRowVisual(state,0,1.f);
+        const auto item=LayoutItem(state,visual);
+        const auto hit=SelectionCheckboxHitRect(state,item,visual);
+        if(state.gridView) {
+            Check(hit.left>=item.cell.left && hit.top>=item.cell.top && hit.right<=item.cell.right && hit.bottom<=item.cell.bottom &&
+                hit.right<=item.cell.left+(item.cell.right-item.cell.left)*.5f+.01f,"checkbox escaped its cell or consumed the opening area");
+            Check(fabsf(hit.right-hit.left-std::min((item.checkbox.right-item.checkbox.left)*2.f,(item.cell.right-item.cell.left)*.5f))<.01f &&
+                fabsf(hit.bottom-hit.top-std::min((item.checkbox.bottom-item.checkbox.top)*2.f,item.cell.bottom-item.cell.top))<.01f,
+                "grid checkbox target did not double within its item bounds");
+        } else Check(hit.top==visual.top && hit.bottom==visual.top+visual.height && hit.right==item.icon.left,
+            "list checkbox target did not span its row height and reserved gutter");
         const POINT extended{LogicalX(state,LONG(hit.right-1.f)),LONG((hit.top+hit.bottom)*.5f)};
         Check(SelectionCheckboxAt(state,extended)==0,"enlarged touch target lost its mirrored hit identity");
+        SetTouchInputMode(state,false);
+        Check(SelectionCheckboxAt(state,extended)==0,"mouse checkbox retained its exact-square hit target");
+        if(!state.gridView) for(LONG y:{LONG(ceilf(hit.top)),LONG(ceilf(hit.bottom)-1.f)})
+            Check(SelectionCheckboxAt(state,POINT{extended.x,y})==0,"mouse checkbox missed a row's vertical edge");
+        Check(SelectionCheckboxAt(state,POINT{extended.x,LONG(ceilf(visual.top+visual.height))})!=0,
+            "checkbox hit target spilled into the following item");
+        Tap(input,state,Center(state,LayoutItem(state,LayoutRowVisual(state,1,1.f)).checkbox)); WaitForPreparedSelection(state);
         Tap(input,state,extended); WaitForPreparedSelection(state);
-        Check(state.selectedFlags[0] && commands->calls.empty(),"touch margin opened a single-click item instead of checking it");
+        Check(state.selectedFlags[0] && state.selectedFlags[1] && commands->calls.empty(),"checkbox margin cleared another selection or opened the item");
         Tap(input,state,extended); WaitForPreparedSelection(state);
-        Check(!state.selectedFlags[0] && commands->calls.empty(),"repeated touch margin tap activated rather than toggled");
-        const POINT opening{LogicalX(state,LONG(item.cell.right-Scale96(6,dpi))),LONG((item.cell.top+item.cell.bottom)*.5f)};
+        Check(!state.selectedFlags[0] && state.selectedFlags[1] && commands->calls.empty(),"repeated checkbox margin tap cleared another selection or activated the item");
+        const POINT opening{LogicalX(state,LONG(state.gridView ? item.cell.right-Scale96(6,dpi) : item.text.left+state.fontPx)),LONG((item.cell.top+item.cell.bottom)*.5f)};
         Check(SelectionCheckboxAt(state,opening)==-1 && RowFromPoint(state,opening.y,opening.x)==0,"touch checkbox left no opening target");
         Tap(input,state,opening); WaitForPreparedSelection(state);
         Check(commands->calls.size()==1,"single-click activation outside the checkbox target stopped working");
@@ -333,10 +357,10 @@ void TouchGridTargets(const std::wstring& fixture) {
         Tap(input,state,opening); Tap(input,state,opening); WaitForPreparedSelection(state);
         Check(commands->calls.size()==1,"double-tap activation outside the checkbox target stopped working");
         SetTouchInputMode(state,false);
-        Check(SelectionCheckboxAt(state,extended)==-1,"touch hit padding remained active for mouse input");
+        Check(SelectionCheckboxAt(state,extended)==0,"enlarged target changed when switching input devices");
         StopTouch(state);
     }
-    std::cout<<"CHECKBOX bounded touch grid targets, single-click safety and separate double-tap opening; DPI/RTL passed"<<std::endl;
+    std::cout<<"CHECKBOX full-height list gutters, doubled bounded grid targets, preserved multiselection, separate item opening; mouse geometry/native touch, DPI/RTL passed"<<std::endl;
 }
 }
 static void TestSelectionCheckboxes(const std::wstring& fixture) {
@@ -352,5 +376,5 @@ static void TestSelectionCheckboxes(const std::wstring& fixture) {
     Check(ReadShellClickPolicy().checkSelect==(native.fAutoCheckSelect!=0),"checkbox policy differs from Windows");
     CheckboxTest::Selection(fixture);
     CheckboxTest::Pixels();
-    CheckboxTest::TouchGridTargets(fixture);
+    CheckboxTest::ItemTargets(fixture);
 }

@@ -16,9 +16,10 @@ actions awaiting a result complete asynchronously; changed selection, membership
 or navigation cancels an obsolete action. Empty folders hide the header control.
 Item checkmarks read the same Shell-synchronized flags used by selection highlights.
 This includes native-view imports, Ctrl toggles and provisional/committed marquees.
-Touch grid hits use a 40 epx target clipped to the actual cell and its leading
-half; the trailing half retains single-click/double-tap activation. Mouse hits
-retain the visual checkbox bounds. Visual geometry does not change input modes.
+List hits span the row's actual height and reserved checkbox gutter up to the
+icon. Grid hits double the visible checkbox bounds for mouse and touch, clipped
+to the actual cell and its leading half; the trailing half retains single-click/
+double-tap activation. Visual geometry does not change input modes.
 
 A private Windows 11 ExplorerBrowser probe rejected standard
 `OLECMDID_SELECTALL` (`OLECMDERR_E_NOTSUPPORTED`), null Shell-item selection and

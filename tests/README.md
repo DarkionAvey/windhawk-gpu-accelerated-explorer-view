@@ -82,9 +82,10 @@ Withhold the actual checker worker to verify nonblocking UI input, then exercise
 directory-watch insertions, removals, empty/repopulated folders and a real native
 selection followed by a native/GPU view round trip.
 Ctrl-modified item taps and native marquees share the mouse selection path.
-Grid checks also cover enlarged touch targets clipped to the leading half of
-each cell, captured single-click/default activation and separate double-tap
-opening areas at both DPIs and reading directions.
+Target checks cover full-height list gutters, doubled grid targets clipped to
+each cell's leading half, mouse hit geometry, native touch toggles preserving
+other selections, and separate single-click/double-tap opening areas at both
+DPIs and reading directions.
 Offscreen presentation readback checks list/grid checkbox pixels, instant
 checked-item visibility, dark/light/high-contrast normal borders, bold ticks, stable
 input-mode geometry and mirrored hit targets at 96/192 DPI. These are

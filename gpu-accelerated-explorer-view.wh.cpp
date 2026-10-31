@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.313
+// @version         0.9.314
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -11136,16 +11136,16 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     return g;
 }
 
-D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item) {
+D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item,const RowVisual& visual) {
     auto box=item.checkbox;
-    if (!state.gridView || state.pointingDevice!=PointingDevice::Touch) return box;
-    // Windows' 40 epx touch target, clipped to this cell's leading half.
-    // Compact cells can use their height; the trailing half still opens items.
+    if (!state.gridView) return D2D1::RectF(ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state),
+        visual.top,item.icon.left,visual.top+visual.height);
+    // Double the visible box for either input device, within this cell's
+    // leading half. The trailing half remains available to open the item.
     const float width=std::max(0.f,item.cell.right-item.cell.left);
     const float height=std::max(0.f,item.cell.bottom-item.cell.top);
     if (width<=0.f || height<=0.f) return {};
-    const float target=float(Scale96(40,ViewDpi(state)));
-    const float w=std::min(target,width*.5f),h=std::min(target,height);
+    const float w=std::min((box.right-box.left)*2.f,width*.5f),h=std::min((box.bottom-box.top)*2.f,height);
     const float left=std::clamp((box.left+box.right-w)*.5f,item.cell.left,item.cell.left+width*.5f-w);
     const float top=std::clamp((box.top+box.bottom-h)*.5f,item.cell.top,item.cell.bottom-h);
     return D2D1::RectF(left,top,left+w,top+h);
@@ -22600,8 +22600,9 @@ int SelectionCheckboxAt(ViewState& state, POINT point) {
             contains(HeaderSelectionCheckbox(state)) ? -2 : -1;
     const int row=RowFromPoint(state,point.y,point.x);
     if (row<0) return -1;
-    const auto item=LayoutItem(state,LayoutRowVisual(state,row,1.f));
-    return contains(SelectionCheckboxHitRect(state,item)) ? row : -1;
+    const auto visual=LayoutRowVisual(state,row,1.f);
+    const auto item=LayoutItem(state,visual);
+    return contains(SelectionCheckboxHitRect(state,item,visual)) ? row : -1;
 }
 
 // A Shell drag that originated in this overlay must not be handed back to

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.314
+
+- Extend list-item checkbox targets across the full row height and reserved
+  checkbox gutter. Double grid checkbox targets for mouse and touch, bounded
+  to each item's leading half so the remaining area still opens the item.
+
 ## 0.9.313
 
 - Prepare new tabs' GPU content in the background so activation can show their
