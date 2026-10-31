@@ -52,6 +52,22 @@ contain spaces or Unicode. Relative source paths are rooted at the repository.
 
 ## Focused or historical tests
 
+`--checkboxes` exercises selection against a private native ExplorerBrowser
+using Windows' real touch recognizer. It covers disjoint item toggles, repeated
+taps, the Shell Select All command, clearing selection and movement cancellation.
+Withhold the actual checker worker to verify nonblocking UI input, then exercise
+directory-watch insertions, removals, empty/repopulated folders and a real native
+selection followed by a native/GPU view round trip.
+Ctrl-modified item taps and native marquees share the mouse selection path.
+Grid checks also cover enlarged touch targets clipped to the leading half of
+each cell, captured single-click/default activation and separate double-tap
+opening areas at both DPIs and reading directions.
+Offscreen presentation readback checks list/grid checkbox pixels, instant
+checked-item visibility, dark/light/high-contrast normal borders, bold ticks, stable
+input-mode geometry and mirrored hit targets at 96/192 DPI. These are
+component checks; live Explorer mouse/touch device behavior still needs hardware
+validation. No global Explorer settings, user files, clipboard or focus change.
+
 `--rename` includes native EDIT paint color checks for dark/light/high contrast,
 font-metric centering with custom fonts and wrapped names, immediate reveal
 from both horizontal edges, and actual window resize/move containment.

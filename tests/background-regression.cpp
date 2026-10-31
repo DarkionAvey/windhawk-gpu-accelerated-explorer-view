@@ -1895,6 +1895,7 @@ static void TestPreviewInput() {
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"
+#include "checkbox-smoke.h"
 #include "rename-appearance-smoke.h"
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
@@ -2078,6 +2079,8 @@ int wmain(int argc,wchar_t** argv) {
             TestSwipeCompositor();
         } else if (argc>1 && wcscmp(argv[1],L"--touch")==0) {
             TestTouchInput(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--checkboxes")==0) {
+            TestSelectionCheckboxes(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {
             TestNativeSuppression();
             TestGraphicsIsolation(fixture.wstring());
@@ -2092,6 +2095,7 @@ int wmain(int argc,wchar_t** argv) {
         TestStatusButtonLayout();
         TestUserOptions();
         TestTouchInput(fixture.wstring());
+        TestSelectionCheckboxes(fixture.wstring());
         TestResolvedStyles();
         TestStyleEvents(fixture.wstring());
         TestPeriodicCapacityRefresh();

@@ -396,7 +396,15 @@ static void TestTimingReadiness(const std::wstring& directory) {
         state.shellAutomationBrowser.Reset(); state.navigationEventSource.Reset();
         state.explorerNavigationSource.Reset();
     }
-    Check(GetFocus()==actualFocus && GetForegroundWindow()==actualForeground,"timing tests changed user focus");
+    const HWND finalFocus=GetFocus(),finalForeground=GetForegroundWindow();
+    if(finalFocus!=actualFocus || finalForeground!=actualForeground) {
+        DWORD beforeProcess=0,afterProcess=0;
+        GetWindowThreadProcessId(actualForeground,&beforeProcess); GetWindowThreadProcessId(finalForeground,&afterProcess);
+        std::cout<<"TIMING FOCUS before="<<actualFocus<<" after="<<finalFocus
+            <<" foreground-before="<<actualForeground<<" foreground-after="<<finalForeground
+            <<" process-before="<<beforeProcess<<" process-after="<<afterProcess<<" fixture-process="<<GetCurrentProcessId()<<std::endl;
+    }
+    Check(finalFocus==actualFocus && finalForeground==actualForeground,"timing tests changed user focus");
     CancelRename(state); CancelAutoRefit(state); Stop(state.background); DropTarget(state);
     UnregisterAnimationWindow(state.hwnd);
     SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(original));

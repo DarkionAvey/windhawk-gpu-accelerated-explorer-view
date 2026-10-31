@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.309
+
+- Show and hide item checkboxes instantly. Use the same size and normal theme
+  border in both states, with a larger, bolder, centered tick when checked.
+
+## 0.9.308
+
+- Keep checked item boxes visible after mouse hover ends and when switching
+  from touch to mouse. Add a Windows-background-colored border to checked boxes
+  so their boundaries remain clear on selected items.
+
+## 0.9.307
+
+- Honor Explorer's item-checkbox setting with modern rounded checkboxes, mouse
+  hover and touch visibility, and 80 ms fades without shifting item contents.
+- Add a Name-header checkbox to select or clear all items. Assess its state on
+  the tab's background presentation worker, follow item and native selection
+  changes, and hide it in empty folders. Mirror grid checkboxes in RTL.
+- Enlarge touch hit targets for grid checkboxes within each item's leading half,
+  preserving a separate opening area and Explorer's single-click preference.
+
 ## 0.9.306
 
 - Generate a read-only `gpu-accelerated-explorer-view.minified.wh.cpp` for

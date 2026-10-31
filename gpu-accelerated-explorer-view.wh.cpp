@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.306
+// @version         0.9.309
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -35,6 +35,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touchscreen Input** — Swipe vertically to scroll with any finger count. When the directory fits vertically, one-finger swipes select by marquee. Move horizontally with one finger for marquee selection, or two fingers to scroll columns. With swipe navigation enabled, movement beyond either column edge starts Back or Forward. Pinch to resize, tap to select, and double-tap to open. Hold and release for the Shell menu, or hold and move to drag files. Scrollbars stay small when idle, retain large touch hit areas, and grow smoothly while engaged.
 - **Explorer Click Preferences** — Honors Windows' double-click speed and File Explorer's single-click activation, point-to-select, and icon-title underline settings.
+- **Item Checkboxes** — Honors Explorer's **Use check boxes to select items** option. Checked boxes stay visible; unchecked boxes appear on mouse hover or throughout the view for touch. The Name header selects or clears all items.
 - **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
 - **Folder Sorting** — Uses Explorer's saved sort order when opening folders. Disable **Use Explorer sorting when opening folders** under **Columns and sorting** to show unsorted items sooner. Sorting changes stay synchronized between views.
 
@@ -185,6 +186,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <shdispid.h>
 #include <exdisp.h>
 #include <exdispid.h>
+#include <docobj.h>
 #include <ocidl.h>
 #include <olectl.h>
 #include <oleauto.h>
@@ -690,6 +692,7 @@ struct SwipeIndicator {
 };
 
 struct TouchInput {
+    int checkbox = -1; // Initial checkbox identity; manipulation still uses the native recognizer.
     bool active = false, consumed = false, control = false, replaying = false;
     bool panningFeedback = false, holding = false, inertia = false, down = false;
     bool dragPending = false, dragPosted = false, dragPromoted = false, controlDouble = false;
@@ -930,11 +933,13 @@ ShellVisibilityPolicy ReadShellVisibilityPolicy() {
 struct ShellClickPolicy {
     bool singleClick = false;
     bool underlineHot = false, underlineCold = false;
+    bool checkSelect = false;
 };
 ShellClickPolicy ReadShellClickPolicy() {
     SHELLSTATE settings{}; settings.fDoubleClickInWebView = -1;
-    SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW,FALSE);
+    SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW | SSF_AUTOCHECKSELECT,FALSE);
     ShellClickPolicy policy;
+    policy.checkSelect = settings.fAutoCheckSelect != 0;
     policy.singleClick = !settings.fDoubleClickInWebView;
     if (!policy.singleClick) return policy;
     DWORD mode = 2, bytes = sizeof(mode);
@@ -2460,6 +2465,7 @@ public:
     SelectionFlags& operator=(const std::vector<unsigned char>& values) {assign(values.begin(),values.end()); return *this;}
     size_t size() const {return store ? store->size : 0;}
     bool empty() const {return !size();}
+    bool SharesStorage(const SelectionFlags& other) const {return store==other.store;}
     unsigned char back() const {return Get(size()-1);}
     unsigned char operator[](size_t i) const {return Get(i);}
     Reference operator[](size_t i) {return {this,i};}
@@ -2935,6 +2941,10 @@ struct ViewState {
     bool mouseTracking = false, pointerInside = true;
     ShellClickPolicy clickPolicy;
     PointingDevice pointingDevice = PointingDevice::Mouse;
+    // Owner-only press identity: -2 is the Name header, -1 is no checkbox press.
+    int checkboxPress = -1;
+    std::wstring checkboxPressItem;
+    unsigned long long checkboxPressEpoch = 0, checkboxPressToken = 0;
     POINT passiveMousePosition{};
     bool pointerHoverSuppressed = false;
     std::optional<POINT> keyboardPointerPosition; // Screen coordinates survive layout/scroll changes.
@@ -2986,6 +2996,13 @@ struct ViewState {
     // Only content painted in the preceding viewport is eligible to fade.
     // Navigation/hidden surfaces discard these observations, never cache them.
     std::map<std::wstring, ItemOpacityMotion, ClipboardPathLess> itemOpacityRows;
+    SelectionFlags checkboxSelection;
+    size_t checkboxSelectedCount = 0;
+    int checkboxSummaryTotal = -1, checkboxSummaryState = -1;
+    bool checkboxHeaderActionPending = false;
+    SelectionFlags checkboxHeaderActionSelection;
+    int checkboxHeaderActionTotal = 0;
+    unsigned long long checkboxHeaderActionToken = 0, checkboxHeaderActionEpoch = 0;
     unsigned long long itemOpacityToken = 0, itemOpacityPaint = 0;
     LARGE_INTEGER itemOpacityNow{};
     bool itemOpacityAnimating = false;
@@ -3271,6 +3288,7 @@ struct ViewState {
     bool deferColumnProviders = true; // Clear after the first names/empty-folder submission.
     DWORD enumerationError = ERROR_SUCCESS;
     ComPtr<ID2D1Factory1> d2dFactory;
+    ComPtr<ID2D1PathGeometry> selectionCheckGlyph;
     ComPtr<ID3D11Device> d3d;
     ComPtr<IDXGIDevice> dxgiDevice;
     ComPtr<IDXGIFactory2> dxgiFactory;
@@ -3443,7 +3461,7 @@ struct SwipeFeedbackSnapshot {
     X(keyboardSelectionTo) X(keyboardSelectionStartedQpc) X(hoverAnimationActive) X(hoverFromRow) X(hoverToRow) \
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
-    X(hovered) X(clickPolicy) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
+    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
@@ -3497,6 +3515,9 @@ struct PresentationReceipt {
     int itemsPerRow=1;
     UINT imageTextureLimit=kPlatformImageDimension;
     unsigned long long clipboardSequence=0,observerAcknowledged=0,styleRevision=0;
+    SelectionFlags checkboxSelection;
+    size_t checkboxSelectedCount=0;
+    int checkboxTotal=-1,checkboxState=-1;
     std::vector<ExplorerColumn> columnPoses;
     std::shared_ptr<const ViewState::GroupIntents> groupIntents;
     LARGE_INTEGER groupFrame{};
@@ -3592,6 +3613,7 @@ bool StartPresentation(ViewState& state);
 void SubmitPresentation(ViewState& state);
 void SynchronizePresentationGeneration(ViewState& state);
 void ConsumePresentation(ViewState& state);
+void CompleteHeaderCheckboxAction(ViewState& state);
 void ReleasePresentation(ViewState& state,bool stop=false);
 
 // A single reset point for all explicit selection, native view changes,
@@ -3724,6 +3746,7 @@ float GroupHeadingHeight(const ViewState& state) {
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
 }
+float SelectionCheckboxSpace(const ViewState& state);
 void LayoutGroupSections(ViewState& state) {
     state.itemsPerRow = 1;
     if (state.gridView) {
@@ -3734,13 +3757,14 @@ void LayoutGroupSections(ViewState& state) {
         // integer column boundary partway through an otherwise smooth zoom.
         const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
         const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float minimum = DriveTiles(state) ?
+        const float checkboxSpace = (DriveTiles(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state) : 0.f;
+        const float minimum = checkboxSpace + (DriveTiles(state) ?
             std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
                 icon + font * 12.f + Scale96(24, dpi)) :
             state.cachedNativeMode == FVM_SMALLICON ?
             std::max(Scale96(180, dpi) * font / std::max(1.f, static_cast<float>(Scale96(15, dpi))),
                 icon + font * 6.f) :
-            std::max(static_cast<float>(Scale96(96, dpi)), icon + Scale96(32, dpi));
+            std::max(static_cast<float>(Scale96(96, dpi)), icon + Scale96(32, dpi)));
         float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
         auto extent = [&](int columns) {
             const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
@@ -4138,7 +4162,7 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
 bool PointerDragActive(const ViewState& state) {
     return !state.columnWiggleAwaitRelease &&
         (state.draggingScrollbar || state.draggingHorizontal ||
-         state.dragDivider >= 0 || state.columnDragArmed || state.marqueePossible);
+         state.dragDivider >= 0 || state.columnDragArmed || state.marqueePossible || state.checkboxPress!=-1);
 }
 
 bool NeedsAnimationFrames(const ViewState& state) {
@@ -4419,7 +4443,9 @@ void DiscardCompletedMouseClick(ViewState& state) {
 }
 
 void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
-    if (folderChanged) ++state.mouseFolderEpoch;
+    if (folderChanged) {++state.mouseFolderEpoch; state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
+    state.checkboxPress = -1;
+    state.checkboxPressItem.clear();
     state.mousePressActive = false;
     state.mousePressControl = false;
     state.mousePressShift = false;
@@ -5666,6 +5692,8 @@ unsigned SystemStyleChangeMask(UINT message, WPARAM action, LPARAM area) {
         const auto name=reinterpret_cast<const wchar_t*>(area);
         if (!name || !*name) return action==0 ? kStyleColors | kStyleFonts | kStyleInput : 0;
         if (_wcsicmp(name,L"ShellState")==0 ||
+            _wcsicmp(name,L"Advanced")==0 ||
+            _wcsicmp(name,L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced")==0 ||
             _wcsicmp(name,L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\IconUnderline")==0 ||
             _wcsicmp(name,L"Software\\Microsoft\\Internet Explorer\\Main")==0)
             return kStyleInput;
@@ -10956,16 +10984,24 @@ float InlineDriveLabelWidth(float available, float label, int dpi) {
     // A track is optional; never shrink the shared label band to keep it.
     return available >= InlineDriveContentWidth(label,dpi) ? std::ceil(label+1.f) : 0.f;
 }
+// A fixed Fluent control band at the window DPI, independent of input mode,
+// font zoom and checkbox opacity. Compact grids reserve the same leading band.
+float SelectionCheckboxSize(const ViewState& state) {
+    return static_cast<float>(Scale96(20, ViewDpi(state)));
+}
+float SelectionCheckboxSpace(const ViewState& state) {
+    return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
+}
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
-    return start + Scale96(16, dpi) + IconPixelSize(state, header) + Scale96(10, dpi);
+    return start + SelectionCheckboxSpace(state) + Scale96(16, dpi) + IconPixelSize(state, header) + Scale96(10, dpi);
 }
 
 // One item layout feeds drawing, selection, rename and pointer geometry.
 // Coordinates are logical; the existing Fill/Text/icon paths mirror RTL.
 struct ItemGeometry {
-    D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{};
+    D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{}, checkbox{};
     bool wrapped = false;
 };
 ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
@@ -10981,7 +11017,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const bool tiles = DriveTiles(state);
         const bool compact = tiles || state.cachedNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
-        const float iconX = compact ? g.cell.left + pad :
+        const float iconX = compact ? g.cell.left + pad + SelectionCheckboxSpace(state) :
             (g.cell.left + g.cell.right - side) * .5f;
         const float iconY = compact ? visual.top + (state.rowPx-side)*.5f : visual.top + pad;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
@@ -11004,15 +11040,56 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
                 g.text.right, g.usage.bottom + gap + line);
         }
     } else {
-        const float iconX = ColumnsPresented(state) ? NameColumnStart(state) + Scale96(16, dpi) :
-            start + Scale96(16, dpi);
+        const float iconX = (ColumnsPresented(state) ? NameColumnStart(state) : start) +
+            Scale96(16, dpi) + SelectionCheckboxSpace(state);
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
             NameContentEnd(state)-8.f,
             visual.top+state.rowPx);
     }
+    if (state.clickPolicy.checkSelect) {
+        const float inset = state.gridView ? std::min(float(Scale96(6,dpi)),std::max(0.f,g.cell.right-g.cell.left)*.125f) : 0.f;
+        const float available = state.gridView ? std::max(0.f,(g.cell.right-g.cell.left)*.5f-inset) : SelectionCheckboxSize(state);
+        const float size = std::min({SelectionCheckboxSize(state),std::max(0.f,state.rowPx-Scale96(4,dpi)),available});
+        const float left = state.gridView ? g.cell.left + inset :
+            (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi);
+        const float top = state.gridView && !DriveTiles(state) && state.cachedNativeMode != FVM_SMALLICON ?
+            g.cell.top + Scale96(4,dpi) : visual.top + (state.rowPx-size)*.5f;
+        g.checkbox = D2D1::RectF(left,top,left+size,top+size);
+    }
     return g;
+}
+
+D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item) {
+    auto box=item.checkbox;
+    if (!state.gridView || state.pointingDevice!=PointingDevice::Touch) return box;
+    // Windows' 40 epx touch target, clipped to this cell's leading half.
+    // Compact cells can use their height; the trailing half still opens items.
+    const float width=std::max(0.f,item.cell.right-item.cell.left);
+    const float height=std::max(0.f,item.cell.bottom-item.cell.top);
+    if (width<=0.f || height<=0.f) return {};
+    const float target=float(Scale96(40,ViewDpi(state)));
+    const float w=std::min(target,width*.5f),h=std::min(target,height);
+    const float left=std::clamp((box.left+box.right-w)*.5f,item.cell.left,item.cell.left+width*.5f-w);
+    const float top=std::clamp((box.top+box.bottom-h)*.5f,item.cell.top,item.cell.bottom-h);
+    return D2D1::RectF(left,top,left+w,top+h);
+}
+
+D2D1_RECT_F HeaderSelectionCheckbox(ViewState& state) {
+    const float size = SelectionCheckboxSize(state);
+    const float left = NameColumnStart(state) + Scale96(12,ViewDpi(state));
+    const float top = ColumnHeaderOffset(state,ViewDpi(state)) +
+        (Scale96(kHeader96,ViewDpi(state))-size)*.5f;
+    return D2D1::RectF(left,top,left+size,top+size);
+}
+
+int HeaderSelectionCheckboxState(const ViewState& state) {
+    if (!state.clickPolicy.checkSelect || state.total<=0) return -1;
+    // Only a worker result for this exact immutable selection/membership may
+    // authorize a click. -3 means the tab's worker has not assessed it yet.
+    if (state.checkboxSummaryTotal!=state.total || !state.checkboxSelection.SharesStorage(state.selectedFlags)) return -3;
+    return state.checkboxSummaryState;
 }
 
 struct DriveBarGeometry {
@@ -13947,6 +14024,7 @@ void DropTarget(ViewState& state) {
     state.compositionSurfacePoolUsed=false;
     if (state.d2dDevice) state.d2dDevice->ClearResources(0);
     state.d2dDevice.Reset();
+    state.selectionCheckGlyph.Reset();
     state.d2dFactory.Reset();
     state.dxgiFactory.Reset();
     // Flush deferred driver references only after releasing middleware resources.
@@ -15146,6 +15224,7 @@ void SetTouchInputMode(ViewState& state, bool touch) {
             state.pointerInside = false;
             ClearPointerHover(state,false);
         }
+        Redraw(state);
     }
     UpdateTouchScrollbars(state);
 }
@@ -15926,6 +16005,23 @@ void ResetItemContentOpacity(ViewState& state) {
     state.itemOpacityAnimating = false;
 }
 
+// Runs on the tab's existing presentation worker after adopting its immutable
+// model. UI capture only shares COW selection storage; it never scans rows.
+void AssessHeaderCheckboxSelection(ViewState& state) {
+    if (!state.clickPolicy.checkSelect) {
+        state.checkboxSelection.clear(); state.checkboxSelectedCount=0;
+        state.checkboxSummaryTotal=state.total; state.checkboxSummaryState=-1;
+        return;
+    }
+    if (!state.checkboxSelection.SharesStorage(state.selectedFlags)) {
+        state.checkboxSelectedCount=std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1);
+        state.checkboxSelection=state.selectedFlags;
+    }
+    if (state.total<=0) state.checkboxSelectedCount=0;
+    state.checkboxSummaryTotal=state.total;
+    state.checkboxSummaryState=state.total<=0 ? -1 : state.checkboxSelectedCount==size_t(state.total) ? 1 : 0;
+}
+
 float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = false) {
     const bool dim = (entry.attributes & FILE_ATTRIBUTE_HIDDEN) ||
         (g_dimDotFiles.load(std::memory_order_relaxed) && !entry.name.empty() && entry.name.front() == L'.') ||
@@ -15964,6 +16060,53 @@ float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = f
     const float opacity = sample();
     state.itemOpacityAnimating |= motion.started.QuadPart != 0;
     return opacity;
+}
+
+// Fluent-style rounded boxes and a single filled check path. Native colors
+// were captured on the owner; paint performs no theme, Shell or registry calls.
+void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, float opacity) {
+    if (!VisibleOpacity(opacity) || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    if (state.rtlLayout) {
+        const float left = state.paintWidth-rect.right;
+        rect.right = state.paintWidth-rect.left; rect.left = left;
+    }
+    const float unit = (rect.right-rect.left)/20.f;
+    const float border = std::min(std::max(1.f,unit),(rect.right-rect.left)*.5f);
+    const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
+        rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
+    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const unsigned foreground = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
+    state.brush->SetColor(Packed(checked ? ThemeRgb(COLORREF(palette&0xFFFFFF)) : foreground,
+        opacity*(checked ? 1.f : .08f)));
+    state.target->FillRoundedRectangle(shape,state.brush.Get());
+    state.brush->SetColor(Packed(foreground,opacity*.8f));
+    state.target->DrawRoundedRectangle(shape,state.brush.Get(),border);
+    if (!checked) return;
+    state.brush->SetColor(Packed(ThemeRgb(COLORREF((palette>>24)&0xFFFFFF)),opacity));
+    if (!state.selectionCheckGlyph && state.d2dFactory) {
+        ComPtr<ID2D1PathGeometry> path,filled; ComPtr<ID2D1GeometrySink> sink;
+        ComPtr<ID2D1StrokeStyle> stroke;
+        if (SUCCEEDED(state.d2dFactory->CreatePathGeometry(&path)) && SUCCEEDED(path->Open(&sink))) {
+            sink->BeginFigure(D2D1::Point2F(4.5f,10.5f),D2D1_FIGURE_BEGIN_HOLLOW);
+            const D2D1_POINT_2F points[]={{8.5f,14.5f},{15.5f,5.5f}};
+            sink->AddLines(points,ARRAYSIZE(points)); sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            if (SUCCEEDED(sink->Close()) && SUCCEEDED(state.d2dFactory->CreateStrokeStyle(
+                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,
+                    D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,&stroke)) &&
+                SUCCEEDED(state.d2dFactory->CreatePathGeometry(&filled))) {
+                sink.Reset();
+                if (SUCCEEDED(filled->Open(&sink)) && SUCCEEDED(path->Widen(3.2f,stroke.Get(),nullptr,sink.Get())) &&
+                    SUCCEEDED(sink->Close())) state.selectionCheckGlyph = std::move(filled);
+            }
+        }
+    }
+    if (state.selectionCheckGlyph) {
+        D2D1_MATRIX_3X2_F previous{}; state.target->GetTransform(&previous);
+        state.target->SetTransform(D2D1::Matrix3x2F::Scale(unit,unit)*
+            D2D1::Matrix3x2F::Translation(rect.left,rect.top)*previous);
+        state.target->FillGeometry(state.selectionCheckGlyph.Get(),state.brush.Get());
+        state.target->SetTransform(previous);
+    }
 }
 
 // DWM uses the same absolute QPC origin and cubic as the existing input/hit
@@ -17190,6 +17333,18 @@ void Paint(ViewState& state) {
                     SameKey(col.key, state.sort.key);
                 const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
                 const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, listEnd, dpi);
+                const int checked = HeaderSelectionCheckboxState(state);
+                if (checked>=0 && ClassifySort(col.key)==SortKind::Name) {
+                    const auto box = HeaderSelectionCheckbox(state);
+                    // Narrow/reordered/scrolled Name columns retain their own clip.
+                    const float l = std::max(from,listStart), r = std::min(to,listEnd);
+                    if (r>l) {
+                        state.target->PushAxisAlignedClip(state.rtlLayout ?
+                            D2D1::RectF(w-r,0.f,w-l,header) : D2D1::RectF(l,0.f,r,header),D2D1_ANTIALIAS_MODE_ALIASED);
+                        DrawSelectionCheckbox(state,box,checked!=0,fade);
+                        state.target->PopAxisAlignedClip();
+                    }
+                }
                 if (caption.right > caption.left)
                     Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
                          headerColor, true, fade, sorted);
@@ -17575,6 +17730,17 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
+        const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
+        if (state.clickPolicy.checkSelect && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
+            const float l = ColumnsPresented(state) && !state.gridView ? std::max(listStart,NameColumnStart(state)) : listStart;
+            const float r = ColumnsPresented(state) && !state.gridView ? NameContentEnd(state) : listEnd;
+            if (r>l) {
+                state.target->PushAxisAlignedClip(state.rtlLayout ? D2D1::RectF(w-r,header,w-l,contentBottom) :
+                    D2D1::RectF(l,header,r,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
+                DrawSelectionCheckbox(state,geometry.checkbox,checked,v.opacity);
+                state.target->PopAxisAlignedClip();
+            }
+        }
         if (usage.visible) {
             const auto& bar = usage.track;
             const float radius = (bar.bottom - bar.top) * .5f;
@@ -19801,6 +19967,33 @@ void SelectAllKeyboardItems(ViewState& state) {
     // Import whichever selection actually belongs to the native view.
     PostMessageW(state.hwnd, kMsgAdoptNativeSelectAll,
         reinterpret_cast<WPARAM>(state.nativeHwnd), static_cast<LPARAM>(state.token));
+}
+
+void SelectAllCheckboxItems(ViewState& state) {
+    if (state.optimisticStartedAt || !state.folderView || !state.loaded || !TabOwnsActiveView(state)) return;
+    ComPtr<IShellView> view;
+    if (!state.shellBrowser || FAILED(state.shellBrowser->QueryActiveShellView(&view)) ||
+        !view) return;
+    HWND actual=nullptr;
+    if (FAILED(view->GetWindow(&actual)) || actual!=state.nativeHwnd) return;
+    // ShlObj declares this IID on IShellFolderView, but the bundled MinGW
+    // headers omit its __mingw_uuidof specialization and IID constant.
+    constexpr IID iidShellFolderView{0x37A378C0,0xF82D,0x11CE,{0xAE,0x65,0x08,0x00,0x2B,0x2E,0x12,0x62}};
+    ComPtr<IShellFolderView> folderView;
+    ComPtr<IOleCommandTarget> commands;
+    view->QueryInterface(iidShellFolderView,reinterpret_cast<void**>(folderView.GetAddressOf()));
+    if (!folderView && FAILED(view.As(&commands))) return;
+    const HWND owner=state.hwnd, native=state.nativeHwnd;
+    const auto lifetime=state.lifetimeToken, token=state.token;
+    BeginNativeSelectAll(state);
+    // Invoke Shell's actual Select All command; no fake Ctrl key state,
+    // per-item PIDL work, or assumption about the hidden native row order.
+    const HRESULT hr=folderView ? folderView->Select(SFVS_SELECT_ALLITEMS) :
+        commands->Exec(nullptr,OLECMDID_SELECTALL,OLECMDEXECOPT_DODEFAULT,nullptr,nullptr);
+    if (auto* live=State(owner); live && live->lifetimeToken==lifetime && live->token==token && live->nativeHwnd==native) {
+        PostMessageW(owner,kMsgAdoptNativeSelectAll,reinterpret_cast<WPARAM>(native),static_cast<LPARAM>(token));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] checkbox Select All hr=0x%08X",static_cast<unsigned>(hr));
+    }
 }
 
 void InvertKeyboardSelection(ViewState& state) {
@@ -22249,6 +22442,25 @@ int RowFromPoint(ViewState& state, int y, int x) {
     return RowAtDocument(state, y - state.headerPx + state.scrollNow, LogicalX(state, x) - ListStartX(state));
 }
 
+// -2 = Name header, -1 = background, otherwise the authoritative item row.
+// Test logical bounds, so grid corner placement and hit targets mirror together.
+int SelectionCheckboxAt(ViewState& state, POINT point) {
+    if (!state.clickPolicy.checkSelect || !InsideListX(state,point.x) ||
+        OnScrollbar(state,point.x,point.y) || OnHorizontalBar(state,point.x,point.y)) return -1;
+    const float x=static_cast<float>(LogicalX(state,point.x));
+    const auto contains=[&](const D2D1_RECT_F& box) {
+        const float end=ColumnsPresented(state) && !state.gridView ? NameContentEnd(state) : ListEndX(state);
+        return x>=box.left && x< std::min(box.right,end) && point.y>=box.top && point.y<box.bottom;
+    };
+    if (point.y<ColumnHeaderHeight(state))
+        return state.columnsView && state.total>0 && DividerAt(state,point.x,point.y)<0 &&
+            contains(HeaderSelectionCheckbox(state)) ? -2 : -1;
+    const int row=RowFromPoint(state,point.y,point.x);
+    if (row<0) return -1;
+    const auto item=LayoutItem(state,LayoutRowVisual(state,row,1.f));
+    return contains(SelectionCheckboxHitRect(state,item)) ? row : -1;
+}
+
 // A Shell drag that originated in this overlay must not be handed back to
 // Explorer as a copy/move into its original location. Shell background targets
 // may otherwise attempt to copy a file over itself and show an error dialog.
@@ -24375,6 +24587,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
 #define APPLY_PRESENTATION(name) state.name=model.name;
     PRESENTATION_MODEL_FIELDS(APPLY_PRESENTATION)
 #undef APPLY_PRESENTATION
+    AssessHeaderCheckboxSelection(state);
     state.presentationOnly=true; state.presentationSequence=model.sequence;
     state.presentationRowRevision=model.rowSceneRevision; state.presentationColumnOrigin=model.columnIntentOrigin;
     state.presentationClient=model.client; state.presentationDpi=model.dpi; state.presentationFont=model.font;
@@ -24516,6 +24729,10 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->foregroundFrames=state.swipeCompositionSerial;
     receipt->contentPending=NeedsAnimationPaint(state,true,false) ||
         (state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive);
+    receipt->checkboxSelection=state.checkboxSelection;
+    receipt->checkboxSelectedCount=state.checkboxSelectedCount;
+    receipt->checkboxTotal=state.checkboxSummaryTotal;
+    receipt->checkboxState=state.checkboxSummaryState;
     for(size_t i=0;i<state.swipeComposition.size();++i) {
         receipt->foregroundVisuals[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].visual.Get());
         receipt->foregroundFades[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].fade.Get());
@@ -24844,7 +25061,19 @@ void ConsumePresentation(ViewState& state) {
         return;
     }
     if(receipt->token!=state.token || receipt->directoryToken!=state.directoryToken) return;
+    if (!receipt->failed && receipt->checkboxTotal==state.total && receipt->checkboxSelection.SharesStorage(state.selectedFlags)) {
+        state.checkboxSelection=receipt->checkboxSelection;
+        state.checkboxSelectedCount=receipt->checkboxSelectedCount;
+        state.checkboxSummaryTotal=receipt->checkboxTotal;
+        state.checkboxSummaryState=receipt->checkboxState;
+        const HWND owner=state.hwnd;
+        const auto lifetime=state.lifetimeToken, token=state.token;
+        CompleteHeaderCheckboxAction(state);
+        auto* live=State(owner);
+        if (live!=&state || live->lifetimeToken!=lifetime || live->token!=token) return;
+    }
     if(receipt->failed) {
+        state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();
         state.graphicsFailure=receipt->failure; state.graphicsFailureStage=receipt->failureStage;
         state.graphicsReady=false; state.graphicsSuspended=true;
         if(!InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
@@ -24957,6 +25186,83 @@ bool IsTouchMouseInput() {
 bool TouchControlAt(ViewState& state, POINT point) {
     return point.y < ColumnHeaderHeight(state) ||
         OnScrollbar(state, point.x, point.y) || OnHorizontalBar(state, point.x, point.y);
+}
+
+void CompleteHeaderCheckboxAction(ViewState& state) {
+    if (!state.checkboxHeaderActionPending) return;
+    const bool current=state.visible && state.inScope && state.loaded && !state.namesPreview && state.clickPolicy.checkSelect &&
+        !state.optimisticStartedAt && TabOwnsActiveView(state) &&
+        state.checkboxHeaderActionToken==state.token && state.checkboxHeaderActionEpoch==state.mouseFolderEpoch &&
+        state.checkboxHeaderActionTotal==state.total && state.checkboxHeaderActionSelection.SharesStorage(state.selectedFlags);
+    const int checked=current ? HeaderSelectionCheckboxState(state) : -1;
+    if (checked==-3) return; // A paced worker receipt will complete it.
+    state.checkboxHeaderActionPending=false;
+    state.checkboxHeaderActionSelection.clear();
+    if (checked==1) ClearSelectionForFolderMenu(state);
+    else if (checked==0) SelectAllCheckboxItems(state);
+}
+
+void RequestHeaderCheckboxToggle(ViewState& state) {
+    // Two clicks on the same unassessed snapshot cancel each other. Selection
+    // changes or navigation invalidate an outstanding request by identity.
+    const bool cancel=state.checkboxHeaderActionPending && state.checkboxHeaderActionTotal==state.total &&
+        state.checkboxHeaderActionSelection.SharesStorage(state.selectedFlags);
+    state.checkboxHeaderActionPending=!cancel;
+    state.checkboxHeaderActionSelection=cancel ? SelectionFlags{} : state.selectedFlags;
+    state.checkboxHeaderActionTotal=state.total;
+    state.checkboxHeaderActionToken=state.token;
+    state.checkboxHeaderActionEpoch=state.mouseFolderEpoch;
+    Redraw(state);
+    CompleteHeaderCheckboxAction(state);
+}
+
+bool HandleSelectionCheckboxInput(ViewState& state, UINT message, POINT point) {
+    if (message==WM_KEYDOWN || message==WM_SYSKEYDOWN || message==WM_CANCELMODE) {
+        state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();
+    }
+    if (state.checkboxPress!=-1 && (message==WM_CANCELMODE || message==WM_KEYDOWN || message==WM_SYSKEYDOWN)) {
+        ResetMouseClickSequence(state);
+        if (GetCapture()==state.hwnd) ReleaseCapture();
+    }
+    if (state.checkboxPress != -1 && message==WM_MOUSEMOVE) {
+        UpdatePointerHover(state,point);
+        return true;
+    }
+    if (state.checkboxPress != -1 && message==WM_LBUTTONUP) {
+        const int pressed=state.checkboxPress;
+        const bool valid=state.visible && state.inScope && state.loaded && !state.namesPreview && TabOwnsActiveView(state) &&
+            !state.optimisticStartedAt && state.checkboxPressEpoch==state.mouseFolderEpoch &&
+            state.checkboxPressToken==state.token && SelectionCheckboxAt(state,point)==pressed &&
+            (pressed==-2 || (size_t(pressed)<state.entries.size() &&
+                state.checkboxPressItem==state.entries[size_t(pressed)].path));
+        ResetMouseClickSequence(state);
+        ReleasePointerCapture(state,point);
+        if (valid) {
+            if (pressed>=0) SelectWithModifiers(state,pressed,true,false);
+            else RequestHeaderCheckboxToggle(state);
+        }
+        return true;
+    }
+    if (message!=WM_LBUTTONDOWN && message!=WM_LBUTTONDBLCLK) return false;
+    const int hit=SelectionCheckboxAt(state,point);
+    if (hit==-1) return false;
+    if (hit>=0) {state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
+    ResetMouseClickSequence(state);
+    if (!state.loaded || state.namesPreview || state.optimisticStartedAt || !state.visible || !state.inScope || !TabOwnsActiveView(state)) return true;
+    if (state.pendingNativeSelection) CancelNativeSelectionPreparation(state);
+    if (state.rowTransitionActive) StopRowTransition(state);
+    const HWND owner=state.hwnd;
+    const auto epoch=state.mouseFolderEpoch;
+    if (state.rename.editor) FinishRename(state,true);
+    if (State(owner)!=&state || state.mouseFolderEpoch!=epoch) return true;
+    SetFocus(IsWindow(state.nativeHwnd) ? state.nativeHwnd : state.hwnd);
+    if (State(owner)!=&state || state.mouseFolderEpoch!=epoch) return true;
+    state.checkboxPress=hit;
+    state.checkboxPressEpoch=state.mouseFolderEpoch;
+    state.checkboxPressToken=state.token;
+    if (hit>=0) state.checkboxPressItem=state.entries[size_t(hit)].path;
+    SetCapture(state.hwnd);
+    return true;
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -25145,6 +25451,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                 double(event.currentContactCount),event.interactionId == INTERACTION_ID_MANIPULATION ?
                     event.arguments.manipulation.delta.scale : 1.}});
         if (event.interactionId == INTERACTION_ID_HOLD) {
+            if (state.touch.checkbox!=-1) {KillTimer(hwnd,kTouchHoldTimerId); continue;}
             if (canceled && state.touch.scrollbarAxis >= 0) {
                 state.touch.holding = false;
                 state.touch.scrollbarMenuEligible = false;
@@ -25161,6 +25468,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_TAP && !canceled && TouchItemValid(state)) {
+            if (state.touch.checkbox!=-1 && SelectionCheckboxAt(state,point)!=state.touch.checkbox) continue;
             if (state.touch.control) {
                 if (state.touch.doubleDivider >= 0) {
                     // Ninput can finish a double tap while the second raw
@@ -25194,6 +25502,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_SECONDARY_TAP && !canceled && TouchItemValid(state)) {
+            if (state.touch.checkbox!=-1) continue;
             if ((state.touch.scrollbarAxis >= 0 || OnScrollbar(state, point.x, point.y) ||
                  OnHorizontalBar(state, point.x, point.y)) &&
                 (!state.touch.scrollbarMenuEligible || !state.touch.holding)) continue;
@@ -25356,7 +25665,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
 
 void ArmTouchHold(ViewState& state, const std::shared_ptr<TouchRecognizer>& session) {
     if (!state.touch.down || session->contacts.size() != 1 ||
-        state.touch.consumed || state.touch.holdDeadline) return;
+        state.touch.consumed || state.touch.holdDeadline || state.touch.checkbox!=-1) return;
     // The recognizer exposes its effective threshold after first input has
     // initialized device calibration. One deadline, no empirical polling.
     float delay = 0.f;
@@ -25511,6 +25820,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             MapUiPoint(nullptr, hwnd, point);
             SetTouchInputMode(state, true);
             ClearPointerHover(state);
+            state.touch.checkbox=SelectionCheckboxAt(state,point);
             state.touch.control = std::count_if(frame,frame+pointers,[](const auto& p) {
                 return p.pointerType == PT_TOUCH && (p.pointerFlags & POINTER_FLAG_INCONTACT) &&
                     !(p.pointerFlags & POINTER_FLAG_UP);
@@ -25886,6 +26196,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     }
+    if (s && HandleSelectionCheckboxInput(*s,msg,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)})) return 0;
     switch (msg) {
     case kMsgRetireGraphics:
         if (s && s->lifetimeToken==static_cast<unsigned long long>(wParam)) {
@@ -26094,8 +26405,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (s->target || s->presenter) MakeTextFormats(*s);
             }
             if (changes & kStyleInput) {
+                s->checkboxHeaderActionPending=false; s->checkboxHeaderActionSelection.clear();
+                const bool checkSelect=s->clickPolicy.checkSelect;
                 s->clickPolicy = ReadShellClickPolicy();
+                if (s->checkboxPress!=-1 && GetCapture()==hwnd) ReleaseCapture();
                 ResetMouseClickSequence(*s);
+                if (checkSelect!=s->clickPolicy.checkSelect) {
+                    LayoutGroupSections(*s); ClampScroll(*s); RepositionRenameEdit(*s);
+                }
                 TRACKMOUSEEVENT cancel{sizeof(cancel),TME_CANCEL|TME_HOVER,hwnd,0};
                 TrackMouseEvent(&cancel);
             }
@@ -27285,7 +27602,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON)) && TabOwnsActiveView(*s)) {
             const int row = InsideListX(*s,GET_X_LPARAM(lParam)) ?
                 RowFromPoint(*s,GET_Y_LPARAM(lParam),GET_X_LPARAM(lParam)) : -1;
-            if (row >= 0 && row == s->hovered)
+            if (row >= 0 && row == s->hovered &&
+                SelectionCheckboxAt(*s,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)})==-1)
                 SelectWithModifiers(*s,row,(wParam & MK_CONTROL)!=0,(wParam & MK_SHIFT)!=0);
         }
         return 0;
