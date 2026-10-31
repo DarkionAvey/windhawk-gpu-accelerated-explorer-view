@@ -1,5 +1,11 @@
 # Building and testing
 
+`--new-tabs` checks hidden first-content preparation, cached activation through
+real Windows tab show/reorder events, independent input-free startup wakes,
+native fallback and preservation of navigation-pane bounds during native
+create/layout transactions. Fixtures use private windows/files and substituted
+focus; they do not establish live Explorer presentation timing.
+
 Requires Windows 11 x64 and a Windhawk installation containing its bundled
 Compiler and x64 Engine import library. No Python, Codex runtime, fixed drive
 letter or user-specific folder is required by the build or regression scripts.
@@ -51,6 +57,23 @@ fails instead of silently falling back to another installation. Paths may
 contain spaces or Unicode. Relative source paths are rooted at the repository.
 
 ## Focused or historical tests
+
+`native-tab-command-trace.wh.cpp` is a temporary Windhawk diagnostic, not a
+regression test. Enable its debug logging, use the native **Open in new tab**
+menu item once and middle-click a folder once, then save the `[TabTrace]` lines
+and disable it. It records command initialization/execution, browser flags,
+tab creation and module-offset stacks while passing native arguments and return
+values through unchanged. It does not log folder names or PIDL contents.
+
+`--additional-gestures` uses Windows' native touch recognizer and a private
+ExplorerBrowser to check two-finger taps on items, below the last item and in
+both side margins across Details/List/grid, 96/144 DPI and LTR/RTL. It checks
+the shared right-click route, staggered release, cancellation, three-finger
+and disabled taps, native folder selection/PIDL resolution, rejection of new-tab
+requests in a tabless host without window activation, provider selection, orphaned capture recovery and parent navigation
+within a private hierarchy. Mouse hit testing and
+navigation cancellation are component checks; this does not inject desktop
+mouse input or establish live Explorer behavior. Clipboard/focus stay substituted.
 
 `--checkboxes` exercises selection against a private native ExplorerBrowser
 using Windows' real touch recognizer. It covers disjoint item toggles, repeated

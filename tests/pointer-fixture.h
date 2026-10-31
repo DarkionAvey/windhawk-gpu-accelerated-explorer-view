@@ -10,6 +10,7 @@
 #include <winrt/Windows.UI.Core.h>
 namespace PointerFixture {
 inline thread_local bool enabled = false, held = true;
+inline thread_local int otherHeld = 0;
 inline thread_local POINT screen{};
 inline BOOL WINAPI Cursor(LPPOINT output) {
     if (!enabled) return ::GetCursorPos(output);
@@ -18,6 +19,8 @@ inline BOOL WINAPI Cursor(LPPOINT output) {
 }
 inline SHORT WINAPI Key(int key) {
     if (enabled && key == VK_LBUTTON) return held ? SHORT(0x8000) : 0;
+    if (enabled && (key==VK_RBUTTON || key==VK_MBUTTON || key==VK_XBUTTON1 || key==VK_XBUTTON2))
+        return key==otherHeld ? SHORT(0x8000) : 0;
     return ::GetAsyncKeyState(key);
 }
 inline void At(HWND hwnd, POINT point) {
@@ -26,9 +29,10 @@ inline void At(HWND hwnd, POINT point) {
 }
 struct Session {
     bool previousEnabled=enabled, previousHeld=held;
+    int previousOtherHeld=otherHeld;
     POINT previousScreen=screen;
-    Session() { enabled=held=true; }
-    ~Session() { enabled=previousEnabled; held=previousHeld; screen=previousScreen; }
+    Session() { enabled=held=true; otherHeld=0; }
+    ~Session() { enabled=previousEnabled; held=previousHeld; otherHeld=previousOtherHeld; screen=previousScreen; }
 };
 }
 #define GetCursorPos PointerFixture::Cursor

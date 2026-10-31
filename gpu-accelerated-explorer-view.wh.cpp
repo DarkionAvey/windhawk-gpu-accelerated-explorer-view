@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.309
+// @version         0.9.313
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -22,7 +22,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 
 - Replicates explorer views using hardware accelerated graphics: Details list and icons grid, including thumbnails, sorting and grouping.
 - Animated interactions: grouping, sorting, selecting/cutting/copying files, and many more.
-- Smooth scrolling, touchscreen and touchpad gestures, and inertia scrolling.
+- Smooth scrolling, touchscreen and touchpad gestures.
 - RTL language support.
 - Optional button to switch back to native Explorer view; **Ctrl+Alt+F9** also works when the button is hidden.
 - Prioritizes responsiveness and animations over efficiency.
@@ -33,11 +33,15 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
-- **Touchscreen Input** — Swipe vertically to scroll with any finger count. When the directory fits vertically, one-finger swipes select by marquee. Move horizontally with one finger for marquee selection, or two fingers to scroll columns. With swipe navigation enabled, movement beyond either column edge starts Back or Forward. Pinch to resize, tap to select, and double-tap to open. Hold and release for the Shell menu, or hold and move to drag files. Scrollbars stay small when idle, retain large touch hit areas, and grow smoothly while engaged.
-- **Explorer Click Preferences** — Honors Windows' double-click speed and File Explorer's single-click activation, point-to-select, and icon-title underline settings.
-- **Item Checkboxes** — Honors Explorer's **Use check boxes to select items** option. Checked boxes stay visible; unchecked boxes appear on mouse hover or throughout the view for touch. The Name header selects or clears all items.
-- **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
-- **Folder Sorting** — Uses Explorer's saved sort order when opening folders. Disable **Use Explorer sorting when opening folders** under **Columns and sorting** to show unsorted items sooner. Sorting changes stay synchronized between views.
+- **Touch support** — Multi touch support with modern interactions.
+- **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
+
+## Touch gestures
+- Swipe horizontally with one finger to start marquee selection. 
+- Two finger horizontal swipes will start Back or Forward gestures (disabled by default). 
+- Pinch to resize, tap to select, and double-tap to open. 
+- For context menu: press and hold, or tap with two fingers. 
+- The scrollbars remain large and easy to drag (even if they appear small, their trigger area remains comfortably large)
 
 ## Report bugs
 Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
@@ -145,6 +149,16 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $name: Jump by item when dragging the vertical scrollbar
       $description: On = jump by whole items; off = smooth scrolling while dragging the vertical thumb.
   $name: Scrolling and navigation
+- Gestures:
+    - doubleClickUp: true
+      $name: Double-click empty space to go up
+      $description: Double-click below the last item or in either side margin to go up one folder.
+    - middleClickNewTab: true
+      $name: Middle-click folders to open in a new tab
+    - twoFingerContextMenu: true
+      $name: Two-finger tap for context menus
+      $description: On a touchscreen, tap an item or empty space with two fingers to show the same context menu as right-click.
+  $name: Additional mouse and touch gestures
 - Columns:
     - preSort: true
       $name: Use Explorer sorting when opening folders
@@ -538,6 +552,7 @@ std::atomic<bool> g_smooth{true};
 std::atomic<bool> g_showNativeViewToggleButton{true};
 std::atomic<bool> g_touchpadDirectManipulation{true};
 std::atomic<bool> g_touchpadSwipeNavigation{false};
+std::atomic<bool> g_doubleClickUp{true}, g_middleClickNewTab{true}, g_twoFingerContextMenu{true};
 std::atomic<UINT> g_wheelLines{3};
 enum class ViewOption { GridOnly, AlwaysOn, AlwaysOff };
 std::atomic<ViewOption> g_filenameOnly{ViewOption::GridOnly};
@@ -679,6 +694,7 @@ struct ScrollbarMotion {
 };
 enum class TouchGesture { Pending, Vertical, Horizontal, Marquee, Pinch };
 enum class PointingDevice { Mouse, Touch, Pen, Touchpad };
+enum class ClickSource { Mouse, Injected, Touch };
 // Unit-mass damped springs in DIPs (scale/alpha are unitless). A common QPC
 // origin makes the immutable owner/render snapshots evaluate the same motion.
 struct SwipeSpring { double value=0., velocity=0., target=0.; float stiffness=450.f, damping=.65f; };
@@ -696,7 +712,7 @@ struct TouchInput {
     bool active = false, consumed = false, control = false, replaying = false;
     bool panningFeedback = false, holding = false, inertia = false, down = false;
     bool dragPending = false, dragPosted = false, dragPromoted = false, controlDouble = false;
-    bool scrollbarMenuEligible = false;
+    bool scrollbarMenuEligible = false, multiTapDelivered = false;
     unsigned long long epoch = 0;
     unsigned long long generation = 0;
     UINT32 primary = 0;
@@ -1700,6 +1716,7 @@ struct CallbackObjectLifetime {
 struct TouchRecognizer {
     CallbackObjectLifetime lifetime;
     HINTERACTIONCONTEXT context = nullptr;
+    HINTERACTIONCONTEXT tapContext = nullptr;
     std::array<INTERACTION_CONTEXT_OUTPUT2, 16> output{};
     unsigned outputCount = 0;
     bool overflow = false, stopping = false;
@@ -1711,11 +1728,11 @@ struct TouchRecognizer {
     UINT64 performance = 0;
     DWORD time = 0;
     ~TouchRecognizer() {
-        if (context) {
-            stopping = true;
-            StopInteractionContext(context);
-            RegisterOutputCallbackInteractionContext2(context, nullptr, nullptr);
-            DestroyInteractionContext(context);
+        stopping = true;
+        for (auto handle : {context,tapContext}) if (handle) {
+            StopInteractionContext(handle);
+            RegisterOutputCallbackInteractionContext2(handle, nullptr, nullptr);
+            DestroyInteractionContext(handle);
         }
     }
     static void CALLBACK Output(void* client, const INTERACTION_CONTEXT_OUTPUT2* value) {
@@ -1725,9 +1742,20 @@ struct TouchRecognizer {
         if (self.outputCount < self.output.size()) self.output[self.outputCount++] = *value;
         else self.overflow = true;
     }
+    static void CALLBACK TapOutput(void* client, const INTERACTION_CONTEXT_OUTPUT2* value) {
+        WindowCallbackGuard callback;
+        if (value && value->interactionId==INTERACTION_ID_TAP && value->contactCount==2)
+            Output(client,value);
+    }
+    HRESULT Process(UINT32 count, const POINTER_INFO* frame) {
+        HRESULT hr=ProcessPointerFramesInteractionContext(context,1,count,frame);
+        if (SUCCEEDED(hr)) hr=ProcessPointerFramesInteractionContext(tapContext,1,count,frame);
+        return hr;
+    }
     void Stop() {
         stopping = true;
         if (context) StopInteractionContext(context);
+        if (tapContext) StopInteractionContext(tapContext);
         stopping = false;
         contacts.clear(); outputCount = 0; overflow = false;
     }
@@ -3078,7 +3106,7 @@ struct ViewState {
     bool pendingSelectionContextMenu = false;
     bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
-    struct DeferredSelectionKey { WPARAM key = 0; DWORD modifiers = 0; };
+    struct DeferredSelectionKey { WPARAM key = 0; DWORD modifiers = 0; bool newTab = false; };
     std::deque<DeferredSelectionKey> deferredSelectionKeys;
     std::vector<std::wstring> nativeSelectionPaths;
     std::wstring nativeFocusedPath;
@@ -3133,6 +3161,8 @@ struct ViewState {
     ULONGLONG mouseClickTick = 0;
     int mousePressRow = -1;
     int mouseClickRow = -1;
+    ClickSource mousePressSource = ClickSource::Mouse, mouseClickSource = ClickSource::Mouse;
+    bool mousePressBackground = false, mouseClickBackground = false;
     // The first divider click belongs to this folder and this tab's divider
     // before a WM_LBUTTONDBLCLK can request an animated fit.
     int dividerClickIndex = -1;
@@ -3284,6 +3314,8 @@ struct ViewState {
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
     ULONGLONG startupStartedAt = 0;
     ULONGLONG firstContentSubmittedAt = 0;
+    bool preparingTab = false; // Prepare one hidden first-content surface; then use normal standby.
+    bool tabSurfaceWakeQueued = false;
     ComPtr<IDispatch> pendingAutomation;
     bool deferColumnProviders = true; // Clear after the first names/empty-folder submission.
     DWORD enumerationError = ERROR_SUCCESS;
@@ -4437,12 +4469,20 @@ void ClearImmediateBackHint(ViewState& state) {
 // pairing therefore cannot by itself prove that two presses hit the SAME row
 // in the SAME directory. Invalidate the pair at every dataset/tab transition.
 void DiscardCompletedMouseClick(ViewState& state) {
+    state.mouseClickBackground = false;
     state.mouseClickRow = -1;
     state.mouseClickEpoch = 0;
     state.mouseClickTick = 0;
 }
 
+ClickSource CurrentClickSource(const ViewState& state) {
+    if (state.touch.replaying) return ClickSource::Touch;
+    INPUT_MESSAGE_SOURCE source{};
+    return GetCurrentInputMessageSource(&source) && source.originId==IMO_INJECTED ? ClickSource::Injected : ClickSource::Mouse;
+}
+
 void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
+    state.mousePressBackground = false;
     if (folderChanged) {++state.mouseFolderEpoch; state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
     state.checkboxPress = -1;
     state.checkboxPressItem.clear();
@@ -5143,7 +5183,7 @@ static HWND FolderContentHost(HWND native) {
 
 // Our intentionally hidden ancestor does not invalidate the live Shell view.
 // Explicitly hidden Shell views still fail this test before that ancestor.
-bool NativeViewAvailable(HWND hwnd) {
+bool NativeViewAvailable(HWND hwnd, HWND backgroundTab = nullptr) {
     if (IsWindowVisible(hwnd)) return true;
     // Shell can hide the selected content host while iconic. After unloading
     // an older overlay there may be no owner property left on that host.
@@ -5153,9 +5193,9 @@ bool NativeViewAvailable(HWND hwnd) {
     for (HWND current = hwnd; current && IsWindow(current); current = GetParent(current)) {
         if (IsSuppressedNativeHost(current)) return true;
         if (!(GetWindowLongPtrW(current, GWL_STYLE) & WS_VISIBLE) &&
-            current != minimizedHost) return false;
+            current != minimizedHost && current != backgroundTab) return false;
     }
-    return minimizedHost != nullptr;
+    return minimizedHost != nullptr || (backgroundTab && IsChild(backgroundTab,hwnd));
 }
 
 // Keep the native presentation child's real layout while its host is hidden.
@@ -5361,8 +5401,42 @@ void ArmTabSwitchProbe(HWND frame, const wchar_t* reason);
 void TraceTabHostSnapshot(HWND frame, const wchar_t* source);
 void PresentCachedTabSurface(ViewState& state);
 
+HWND OverlayStackPredecessor(const ViewState& state) {
+    if(state.rename.editor && IsWindow(state.rename.editor) &&
+        GetParent(state.rename.editor)==state.frameHwnd && IsWindowVisible(state.rename.editor)) return state.rename.editor;
+    return IsWindowVisible(state.viewToggle) ? state.viewToggle : nullptr;
+}
+
+thread_local bool t_overlayStacking=false;
+
+HWND FirstVisibleFrameChild(HWND frame) {
+    HWND first=GetWindow(frame,GW_CHILD);
+    while(first && !IsWindowVisible(first)) first=GetWindow(first,GW_HWNDNEXT);
+    return first;
+}
+
+bool OverlayStackingNeeded(const ViewState& state, HWND pinned) {
+    return FirstVisibleFrameChild(state.frameHwnd)!=(pinned ? pinned : state.hwnd) ||
+        (pinned && GetWindow(state.hwnd,GW_HWNDPREV)!=pinned);
+}
+
+void EnsureOverlayStacking(ViewState& state) {
+    if(t_overlayStacking) return;
+    const HWND pinned=OverlayStackPredecessor(state);
+    if(!OverlayStackingNeeded(state,pinned)) return;
+    ScopedFlag repair(t_overlayStacking);
+    // An adjacent editor/button can itself be below a newly created native
+    // sibling. Raise the pinned control as well, retaining both rectangles.
+    if(pinned && FirstVisibleFrameChild(state.frameHwnd)!=pinned)
+        SetWindowPos(pinned,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    SetWindowPos(state.hwnd,pinned ? pinned : HWND_TOP,0,0,0,0,
+        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+}
+
 bool PositionOverlayOverNative(ViewState& state, bool top = true) {
     if (PresentationMinimized(state)) return false;
+    const bool active=TabOwnsActiveView(state);
+    if(!active && state.preparingTab) top=false;
     const auto pending = [&](const wchar_t* reason) {
         // Layout/ownership can be transient during a Shell view handoff.
         // Preserve the user's GPU preference and retry through frame pacing.
@@ -5380,7 +5454,7 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         return false;
     };
     if (!IsWindow(state.frameHwnd) || !IsWindow(state.nativeHwnd) ||
-        !IsWindow(state.hwnd) || !TabOwnsActiveView(state)) return pending(L"presentation.pending.ownership[kept,rows]");
+        !IsWindow(state.hwnd) || (!active && !state.preparingTab)) return pending(L"presentation.pending.ownership[kept,rows]");
     // Suppression precedes even the size check: a zero-sized view may be
     // populated and shown by Explorer before its next GPU-side layout pass.
     if (state.visible && state.inScope && state.detailsViewActive && state.pendingShellView &&
@@ -5407,14 +5481,12 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         current.bottom - current.top != height;
     // A rename editor is a FRAME sibling, not a composited child of the
     // overlay. Keep it above the GPU HWND throughout position/top repairs.
-    const HWND edit = state.rename.editor && IsWindow(state.rename.editor) &&
-        GetParent(state.rename.editor) == owner &&
-        IsWindowVisible(state.rename.editor) ? state.rename.editor : nullptr;
-    const HWND pinned = edit ? edit :
-        (IsWindowVisible(state.viewToggle) ? state.viewToggle : nullptr);
-    const bool behind = pinned ? GetWindow(state.hwnd, GW_HWNDPREV) != pinned :
-        GetWindow(owner, GW_CHILD) != state.hwnd;
+    const HWND pinned = OverlayStackPredecessor(state);
+    const bool behind = OverlayStackingNeeded(state,pinned);
     if (moved || (top && behind)) {
+        ScopedFlag repair(t_overlayStacking,t_overlayStacking || top);
+        if(top && pinned && FirstVisibleFrameChild(owner)!=pinned)
+            SetWindowPos(pinned,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowPos(state.hwnd, top ? (pinned ? pinned : HWND_TOP) : nullptr,
             rect.left, rect.top, width, height,
             SWP_NOACTIVATE | (top ? 0 : SWP_NOZORDER));
@@ -5741,6 +5813,9 @@ void LoadSettings() {
     g_emptyRows.store(Wh_GetIntSetting(L"Appearance.showEmptyRows") != 0);
     g_zebraOpacity.store(std::clamp(Wh_GetIntSetting(L"Appearance.zebraOpacity"), 0, 100));
     g_smooth.store(Wh_GetIntSetting(L"Navigation.smoothScrolling") != 0);
+    g_doubleClickUp.store(Wh_GetIntSetting(L"Gestures.doubleClickUp") != 0);
+    g_middleClickNewTab.store(Wh_GetIntSetting(L"Gestures.middleClickNewTab") != 0);
+    g_twoFingerContextMenu.store(Wh_GetIntSetting(L"Gestures.twoFingerContextMenu") != 0);
     g_showNativeViewToggleButton.store(Wh_GetIntSetting(L"Navigation.showNativeViewToggleButton") != 0);
     g_touchpadDirectManipulation.store(
         Wh_GetIntSetting(L"Navigation.touchpadDirectManipulation") != 0);
@@ -13872,8 +13947,8 @@ void ProfileGpuMemory(ViewState& state, const wchar_t* reason, bool force=false,
 bool InactiveGraphics(const ViewState& state) {
     if(state.presentationOnly) return !state.presentationActive || !state.visible || !state.inScope || !state.detailsViewActive;
     return !state.visible || !state.inScope || !state.detailsViewActive || PresentationMinimized(state) ||
-        !TabOwnsActiveView(state) || (!PresentationVisible(state) &&
-            !state.nativePresentationPending && !state.initialModePending);
+        (!state.preparingTab && (!TabOwnsActiveView(state) || (!PresentationVisible(state) &&
+            !state.nativePresentationPending && !state.initialModePending)));
 }
 void QueueInactiveGraphicsRelease(ViewState& state) {
     if(state.presenter && !state.presentationOnly) {
@@ -20051,6 +20126,8 @@ struct NativeFileCommandScope {
 HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
                                  const ViewState::DeferredSelectionKey& key) {
     if (!native) return E_NOINTERFACE;
+    if (key.newTab && !g_middleClickNewTab.load(std::memory_order_relaxed))
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     PipelineScope pipeline(state.background,L"file.selection.key",key.key,state.token);
     NativeFileCommandScope commandScope(&state);
     const HWND owner=state.hwnd, frame=state.frameHwnd, target=state.nativeHwnd;
@@ -20059,6 +20136,51 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
     HWND window=nullptr;
     if (FAILED(native->GetWindow(&window)) || window!=target)
         return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    if (key.newTab) {
+        auto* live=State(owner);
+        if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken || live->nativeHwnd!=target ||
+            !live->visible || live->optimisticStartedAt || !TabOwnsActiveView(*live) ||
+            g_unloading.load(std::memory_order_acquire)) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        const auto selection=live->selectedFlags;
+        const HWND tab=live->activeTabHost;
+        const auto browser=live->shellBrowser;
+        const auto folderView=live->folderView;
+        HWND browserWindow=nullptr;
+        if (tab==frame || !IsWindow(tab) || GetAncestor(tab,GA_ROOT)!=frame ||
+            !browser || FAILED(browser->GetWindow(&browserWindow)) || browserWindow!=tab)
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        // Reuse the native selection prepared by the tab's existing PIDL lane,
+        // including provider folders. No context-menu extensions are loaded.
+        ComPtr<IShellItemArray> items;
+        ComPtr<IShellItem> item;
+        DWORD count=0;
+        HRESULT hr=folderView ? folderView->GetSelection(FALSE,&items) : E_NOINTERFACE;
+        if (FAILED(hr) || !items || FAILED(hr=items->GetCount(&count))) return FAILED(hr) ? hr : E_FAIL;
+        if (count!=1) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        if (FAILED(hr=items->GetItemAt(0,&item))) return hr;
+        PIDLIST_ABSOLUTE raw=nullptr;
+        if (FAILED(hr=SHGetIDListFromObject(item.Get(),&raw))) return hr;
+        OwnedPidl identity(raw);
+        live=State(owner);
+        if (!identity || !live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
+            live->nativeHwnd!=target || live->activeTabHost!=tab || live->shellBrowser.Get()!=browser.Get() ||
+            live->folderView.Get()!=folderView.Get() || !live->selectedFlags.SharesStorage(selection) ||
+            !live->visible || live->optimisticStartedAt || !TabOwnsActiveView(*live) ||
+            !g_middleClickNewTab.load(std::memory_order_relaxed) || g_unloading.load(std::memory_order_acquire))
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        // Tracing native Open in new tab shows BrowseObject(0x411), followed
+        // asynchronously by AddTab/AddTabAtIndex on the owning frame. Match
+        // that request on its real tab browser; Explorer queues tab creation.
+        // The 0x400 disposition is also used by Explorer Column View:
+        // https://github.com/ramensoftware/windhawk-mods/blob/main/mods/explorer-column-view.wh.cpp
+        constexpr UINT kNativeNewTabBrowse=0x00000400;
+        constexpr UINT flags=SBSP_ABSOLUTE | SBSP_SAMEBROWSER | SBSP_OPENMODE | kNativeNewTabBrowse;
+        PipelineScope invocation(live->background,L"folder.newTab.browse",viewToken,0);
+        hr=browser->BrowseObject(identity.get(),flags);
+        Wh_Log(L"[GPU gestures] folder new-tab browse hwnd=%p tab=%p flags=0x%08X hr=0x%08X",
+            owner,tab,flags,static_cast<unsigned>(hr));
+        return hr;
+    }
     ComPtr<IContextMenu> command;
     HRESULT resolved;
     {
@@ -21121,18 +21243,24 @@ void BeginOptimisticNavigation(ViewState& state, const std::wstring& path,
 void MaybeDisplayImmediateBack(HWND overlay, const wchar_t* reason);
 void RollbackOptimisticNavigation(HWND overlay, const std::wstring& destination);
 
-void Open(ViewState& state, int index) {
+void Open(ViewState& state, int index, bool newTab = false) {
     if (index < 0 || index >= state.total || state.optimisticStartedAt ||
         (state.thisPcGpu && !ShellRowsInteractive(state) &&
          !state.entries[static_cast<size_t>(index)].shellIdentity)) return;
+    if (newTab && (!g_middleClickNewTab.load(std::memory_order_relaxed) ||
+        !state.entries[static_cast<size_t>(index)].folder || IsRecycleBinLocation(state.folderPath) ||
+        !state.loaded || !ShellRowsInteractive(state) || !state.visible || !TabOwnsActiveView(state))) return;
+    const HWND ownerBeforeSelection = state.hwnd;
+    const auto lifetimeBeforeSelection = state.lifetimeToken, epochBeforeSelection = state.mouseFolderEpoch;
+    const std::wstring tabItem = newTab ? state.entries[static_cast<size_t>(index)].path : std::wstring{};
     // The first click already synchronized Explorer's PIDL selection. Avoid
     // doing those Shell COM calls a second time on double-click navigation.
-    if (state.selected != index ||
+    if (newTab || state.selected != index ||
         index >= static_cast<int>(state.selectedFlags.size()) ||
         !state.selectedFlags[static_cast<size_t>(index)]) {
         // Single-click selection has its own native synchronization; for a
         // double-click on a *folder*, don't pay for that COM round-trip first.
-        if (state.entries[static_cast<size_t>(index)].folder && !state.namespaceIdentities) {
+        if (!newTab && state.entries[static_cast<size_t>(index)].folder && !state.namespaceIdentities) {
             state.selectedFlags.assign(state.entries.size(), 0);
             state.selectedFlags[static_cast<size_t>(index)] = 1;
             state.selected = state.anchor = index;
@@ -21140,6 +21268,9 @@ void Open(ViewState& state, int index) {
             Redraw(state);
         } else Select(state, index);
     }
+    if (newTab && (State(ownerBeforeSelection)!=&state || state.lifetimeToken!=lifetimeBeforeSelection ||
+        state.mouseFolderEpoch!=epochBeforeSelection || size_t(index)>=state.entries.size() ||
+        state.entries[size_t(index)].path!=tabItem || !state.visible || !TabOwnsActiveView(state))) return;
     const std::wstring path = state.entries[static_cast<size_t>(index)].path;
     const bool folder = state.entries[static_cast<size_t>(index)].folder;
     if (IsRecycleBinLocation(state.folderPath)) {
@@ -21155,7 +21286,7 @@ void Open(ViewState& state, int index) {
         ShellExecuteExW(&invoke);
         return;
     }
-    if (state.thisPcGpu) {
+    if (state.thisPcGpu && !newTab) {
         if (!state.shellBrowser || !state.entries[static_cast<size_t>(index)].shellIdentity) return;
         const auto identity = state.entries[static_cast<size_t>(index)].shellIdentity;
         ResetMouseClickSequence(state);
@@ -21164,13 +21295,13 @@ void Open(ViewState& state, int index) {
         if (FAILED(hr)) ClearNavigationProbe(state);
         return;
     }
-    if (!folder || state.namespaceIdentities) {
+    if (!folder || state.namespaceIdentities || newTab) {
         // A provider row's FOLDER flag does not imply a disk directory:
         // streams can also be containers and may require materialization.
         // Let the live native view choose its own default action and site.
         // Reuse native selection verification and its asynchronous PIDL lane.
         // No path-based forced verb, wrong working directory, or per-file loop.
-        ViewState::DeferredSelectionKey key{VK_RETURN,0};
+        ViewState::DeferredSelectionKey key{VK_RETURN,0,newTab};
         if (state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(key); return; }
         if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
         if (!SyncNativeSelection(state)) {
@@ -21185,7 +21316,8 @@ void Open(ViewState& state, int index) {
         auto* live=State(owner);
         if (!live || live->token!=token || live->lifetimeToken!=lifetime) return;
         const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
-        if (FAILED(hr)) Wh_Log(L"[GPU selection] default command failed hr=0x%08X",static_cast<unsigned>(hr));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] %s command failed hr=0x%08X",
+            newTab ? L"new-tab" : L"default",static_cast<unsigned>(hr));
         return;
     }
 
@@ -21639,7 +21771,7 @@ void UpdateDirectory(ViewState& state) {
     }
 }
 
-void ScanShellWindow(HWND explorerFrame);
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr);
 
 ViewState* State(HWND hwnd) {
     // A process-wide foreground/WinEvent can name another Explorer UI thread.
@@ -22209,7 +22341,7 @@ void ClearSwipeFeedback(ViewState& state) {
 
 // Validate that this view still belongs to the active Explorer tab. Do not
 // issue a history command to an inactive tab or merely the closest frame.
-void NavigateCurrentShellTab(ViewState& state, bool backward) {
+void NavigateCurrentShellTab(ViewState& state, UINT navigation) {
     // Never carry an editor into another directory, even if the next Shell
     // view takes time to bind. Cancellation is not a rename commit.
     CancelRename(state);
@@ -22236,7 +22368,7 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
     // Prepare the same known cached return as native Back input BEFORE the
     // Shell call. BrowseObject can announce/rebind the destination reentrantly,
     // at which point the departing path and its Back hint are already gone.
-    if (backward) MaybeDisplayImmediateBack(overlay, L"swipe Back");
+    if (navigation == SBSP_NAVIGATEBACK) MaybeDisplayImmediateBack(overlay, L"Back");
     live = current();
     if (!live) return;
     const auto previewToken = live->token;
@@ -22244,13 +22376,12 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
     // Start bounded Shell rebind checks before BrowseObject can replace
     // SHELLDLL_DefView; the frame-owned GPU window remains on top throughout.
     ScheduleNavigationProbe(*live);
-    const HRESULT hr = browser->BrowseObject(nullptr,
-        backward ? SBSP_NAVIGATEBACK : SBSP_NAVIGATEFORWARD);
+    const HRESULT hr = browser->BrowseObject(nullptr, navigation);
     if (FAILED(hr)) {
         live = current();
         if (live && live->token == previewToken && !preview.empty())
             RollbackOptimisticNavigation(overlay, preview);
-        Wh_Log(L"[GPU overlay] swipe history navigation failed hr=0x%08X",
+        Wh_Log(L"[GPU overlay] folder navigation failed hr=0x%08X",
                static_cast<unsigned>(hr));
     }
 }
@@ -22440,6 +22571,18 @@ int RowFromPoint(ViewState& state, int y, int x) {
     const RECT viewport = ContentViewport(state, true);
     if (y < viewport.top || y >= viewport.bottom) return -1;
     return RowAtDocument(state, y - state.headerPx + state.scrollNow, LogicalX(state, x) - ListStartX(state));
+}
+
+// Use the shared viewport and hit testing in every layout, including mirrored
+// margins. Headers, group headings and scrollbars are controls, not empty space.
+bool EmptySpaceAt(ViewState& state, POINT point) {
+    RECT client{};
+    GetClientRect(state.hwnd, &client);
+    const RECT viewport = ContentViewport(state, true);
+    return PtInRect(&client, point) && point.y >= viewport.top && point.y < viewport.bottom &&
+        !OnScrollbar(state,point.x,point.y) && !OnHorizontalBar(state,point.x,point.y) &&
+        GroupHeaderAtPoint(state,point.x,point.y) < 0 &&
+        (!InsideListX(state,point.x) || RowFromPoint(state,point.y,point.x) < 0);
 }
 
 // -2 = Name header, -1 = background, otherwise the authoritative item row.
@@ -23116,6 +23259,14 @@ void ReleasePointerCapture(ViewState& state, POINT pos) {
     ReleaseCapture();
 }
 
+void ReleaseOrphanedMouseCapture(ViewState& state, bool deliveredButtonDown) {
+    if (deliveredButtonDown || state.touch.active || state.touch.replaying ||
+        state.shellDragRunning || GetCapture()!=state.hwnd) return;
+    const bool held=((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+        GetAsyncKeyState(VK_MBUTTON) | GetAsyncKeyState(VK_XBUTTON1) | GetAsyncKeyState(VK_XBUTTON2)) & 0x8000)!=0;
+    if (!held) ReleaseCapture();
+}
+
 // Scrolling and folder navigation can put new content under a stationary
 // pointer without WM_MOUSEMOVE. Reconcile only on demand, never on an idle
 // timer. Ignore other foreground windows and active drag operations.
@@ -23462,6 +23613,7 @@ UINT g_bootstrapAttachMessage = 0;
 HANDLE g_bootstrapStopEvent = nullptr;
 HANDLE g_bootstrapThread = nullptr;
 struct BootstrapPendingFrame {
+    HWND frame = nullptr;
     HWND eventSource = nullptr;
     ULONGLONG started = 0;
     unsigned attempt = 0;
@@ -23484,17 +23636,21 @@ struct BootstrapObserverState {
 thread_local BootstrapObserverState* t_bootstrapPending = nullptr;
 
 void CheckOverlaySize(HWND frame);
-void HandleColdAttach(HWND frame) {
+HWND OverlayForTab(HWND tabHost);
+void HandleColdAttach(HWND frame, HWND requestedTab = nullptr) {
+    const HWND key=requestedTab ? requestedTab : frame;
+    const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
     if (!g_unloading.load(std::memory_order_acquire) && IsExplorerFrame(frame) &&
         BelongsToThisProcess(frame) &&
-        GetWindowThreadProcessId(frame, nullptr) == GetCurrentThreadId() && !IsIconic(frame) && !OverlayUnder(frame)) {
+        GetWindowThreadProcessId(frame, nullptr) == GetCurrentThreadId() && !IsIconic(frame) &&
+        IsWindow(target) && (target==frame || GetAncestor(target,GA_ROOT)==frame) && !OverlayForTab(target)) {
         if (g_perf.load(std::memory_order_relaxed))
-            Wh_Log(L"[GPU startup] COLD_WAKE frame=%p iconic=%d thread=%lu",
-                frame, IsIconic(frame), GetCurrentThreadId());
-        ScanShellWindow(frame);
-        CheckOverlaySize(frame);
+            Wh_Log(L"[GPU startup] COLD_WAKE frame=%p tab=%p background=%d thread=%lu",
+                frame,target,target!=ActiveExplorerTab(frame),GetCurrentThreadId());
+        ScanShellWindow(frame,requestedTab ? target : nullptr);
+        if(target==ActiveExplorerTab(frame)) CheckOverlaySize(frame);
     }
-    RemovePropW(frame, kBootstrapQueuedProperty);
+    RemovePropW(key, kBootstrapQueuedProperty);
 }
 
 // Explorer may consume a registered message before DispatchMessageW. Claim
@@ -23506,27 +23662,32 @@ LRESULT CALLBACK ColdAttachGetMessageHook(int code, WPARAM removal, LPARAM data)
         if (g_bootstrapAttachMessage && msg.message == g_bootstrapAttachMessage &&
             IsExplorerFrame(msg.hwnd) && BelongsToThisProcess(msg.hwnd)) {
             const HWND frame = msg.hwnd;
+            const HWND target=reinterpret_cast<HWND>(msg.wParam);
             msg.message = WM_NULL;
             msg.wParam = msg.lParam = 0;
-            HandleColdAttach(frame);
+            HandleColdAttach(frame,target);
         }
     }
     return CallNextHookEx(nullptr, code, removal, data);
 }
 
-void PostColdAttach(HWND frame) {
+void PostColdAttach(HWND frame, HWND requestedTab = nullptr) {
     // The observer is the only writer setting this property; the owner STA
     // clears it after handling the queued scan, including failure paths.
-    if (GetPropW(frame, kBootstrapQueuedProperty)) return;
-    if (!SetPropW(frame, kBootstrapQueuedProperty, reinterpret_cast<HANDLE>(1))) return;
-    if (!PostMessageW(frame, g_bootstrapAttachMessage, 0, 0))
-        RemovePropW(frame, kBootstrapQueuedProperty);
+    const HWND key=requestedTab ? requestedTab : frame;
+    if (GetPropW(key, kBootstrapQueuedProperty)) return;
+    if (!SetPropW(key, kBootstrapQueuedProperty, reinterpret_cast<HANDLE>(1))) return;
+    if (!PostMessageW(frame, g_bootstrapAttachMessage, reinterpret_cast<WPARAM>(requestedTab), 0))
+        RemovePropW(key, kBootstrapQueuedProperty);
 }
 
-bool QueueColdAttach(HWND frame, HWND source) {
+bool QueueColdAttach(HWND frame, HWND source, HWND requestedTab = nullptr) {
+    const HWND key=requestedTab ? requestedTab : frame;
+    const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
     if (!t_bootstrapPending || !g_bootstrapAttachMessage ||
         !IsExplorerFrame(frame) || !BelongsToThisProcess(frame) ||
-        WatchRegisteredOverlay(ActiveExplorerTab(frame))) return false;
+        !IsWindow(target) || (target!=frame && GetAncestor(target,GA_ROOT)!=frame) ||
+        WatchRegisteredOverlay(target)) return false;
     const DWORD thread = GetWindowThreadProcessId(frame, nullptr);
     auto& threads = t_bootstrapPending->threads;
     auto foundThread = threads.find(thread);
@@ -23550,15 +23711,15 @@ bool QueueColdAttach(HWND frame, HWND source) {
         threads.emplace(thread, std::move(subscription));
     }
     auto& pending = t_bootstrapPending->pending;
-    RemovePropW(frame,kColdAttachResolvedProperty);
-    const auto found = pending.find(frame);
+    RemovePropW(key,kColdAttachResolvedProperty);
+    const auto found = pending.find(key);
     // Multiple CREATE/SHOW notifications are normal during one layout.
     // Don't rearm a retry chain for the same view, and don't force extra
     // work on another frame's already-present GPU surface.
     if (found != pending.end() &&
         (found->second.eventSource == source ||
          (GetTickCount64() == found->second.started))) return true;
-    pending[frame] = {source, GetTickCount64(), 0};
+    pending[key] = {frame, source, GetTickCount64(), 0};
     return true;
 }
 
@@ -23590,6 +23751,13 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
             _wcsicmp(parentClass, L"SHELLDLL_DefView") != 0) return;
     }
     const HWND frame = frameEvent ? changed : GetAncestor(changed, GA_ROOT);
+    // New Shell tabs need their own startup request even while another tab
+    // already has a renderer. CREATE is sufficient; retries retain this tab's
+    // identity until its browser/view is ready, without waiting for input.
+    if (tabEvent) {
+        if(QueueColdAttach(frame,changed,changed)) PostColdAttach(frame,changed);
+        return;
+    }
     if (HWND overlay = WatchRegisteredOverlay(ActiveExplorerTab(frame))) {
         if (viewEvent || contentEvent)
             PostMessageW(overlay, kMsgNativeRowsHint, 0, reinterpret_cast<LPARAM>(changed));
@@ -23600,7 +23768,12 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
 }
 
 BOOL CALLBACK BootstrapExistingFrame(HWND frame, LPARAM) {
-    if (IsWindowVisible(frame)) QueueColdAttach(frame, frame);
+    if (IsWindowVisible(frame)) {
+        const HWND first=FindWindowExW(frame,nullptr,L"ShellTabWindowClass",nullptr);
+        if(!first) QueueColdAttach(frame,frame);
+        for(HWND tab=first;tab;tab=FindWindowExW(frame,tab,L"ShellTabWindowClass",nullptr))
+            QueueColdAttach(frame,tab,tab);
+    }
     return TRUE;
 }
 
@@ -23627,11 +23800,12 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
         const ULONGLONG now = GetTickCount64();
         DWORD waitMs = INFINITE;
         for (auto it = pending.begin(); it != pending.end();) {
-            const HWND frame = it->first;
+            const HWND key = it->first;
             auto& task = it->second;
-            if (!IsWindow(frame) || !IsWindowVisible(frame) ||
-                WatchRegisteredOverlay(ActiveExplorerTab(frame)) ||
-                GetPropW(frame,kColdAttachResolvedProperty)) {
+            const HWND frame=task.frame;
+            const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
+            if (!IsWindow(key) || !IsWindow(frame) || !IsWindowVisible(frame) ||
+                WatchRegisteredOverlay(target) || GetPropW(key,kColdAttachResolvedProperty)) {
                 it = pending.erase(it);
                 continue;
             }
@@ -23639,7 +23813,7 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
             if (now >= due) {
                 // The native Shell view can still be initializing. Explorer's
                 // own STA receives and performs every Shell discovery scan.
-                PostColdAttach(frame);
+                PostColdAttach(frame,key==frame ? nullptr : key);
                 task.nextAttemptAt=now+retryIntervals[std::min<size_t>(task.attempt,ARRAYSIZE(retryIntervals)-1)];
                 task.attempt=std::min<unsigned>(task.attempt+1,ARRAYSIZE(retryIntervals)-1);
             }
@@ -23662,7 +23836,12 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
     }
     t_bootstrapPending = nullptr;
     EnumWindows(+[](HWND frame,LPARAM)->BOOL {
-        if (BelongsToThisProcess(frame)) RemovePropW(frame,kColdAttachResolvedProperty);
+        if (BelongsToThisProcess(frame)) {
+            RemovePropW(frame,kColdAttachResolvedProperty);
+            EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
+                RemovePropW(child,kColdAttachResolvedProperty); return TRUE;
+            },0);
+        }
         return TRUE;
     },0);
     if (hook) UnhookWinEvent(hook);
@@ -23697,8 +23876,12 @@ void StopColdAttachObserver() {
         g_bootstrapStopEvent = nullptr;
     }
     EnumWindows([](HWND frame, LPARAM) -> BOOL {
-        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame))
+        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
             RemovePropW(frame, kBootstrapQueuedProperty);
+            EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
+                RemovePropW(child,kBootstrapQueuedProperty); return TRUE;
+            },0);
+        }
         return TRUE;
     }, 0);
 }
@@ -25073,10 +25256,12 @@ void ConsumePresentation(ViewState& state) {
         if (live!=&state || live->lifetimeToken!=lifetime || live->token!=token) return;
     }
     if(receipt->failed) {
+        const bool preparing=state.preparingTab;
+        state.preparingTab=false;
         state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();
         state.graphicsFailure=receipt->failure; state.graphicsFailureStage=receipt->failureStage;
         state.graphicsReady=false; state.graphicsSuspended=true;
-        if(!InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
+        if(preparing || !InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
         return;
     }
     if(receipt->ready) {
@@ -25146,6 +25331,7 @@ void ConsumePresentation(ViewState& state) {
         // Only accepted content from the current view/directory can release
         // it. A loading frame or a departing-directory receipt cannot.
         if(!state.firstContentSubmittedAt) state.firstContentSubmittedAt=GetTickCount64();
+        state.preparingTab=false;
         if(state.deferColumnProviders) {
             state.deferColumnProviders=false; state.lastColumnsProbe=0;
             PipelineEvent(*state.background,{.operation=L"columns.providers.ready[step,dirty,rows,first]",
@@ -25299,6 +25485,19 @@ bool StartTouchRecognizer(ViewState& state) {
         INTERACTION_CONTEXT_PROPERTY_INTERACTION_UI_FEEDBACK, TRUE);
     if (SUCCEEDED(hr)) hr = RegisterOutputCallbackInteractionContext2(session->context,
         TouchRecognizer::Output, session.get());
+    // Enabling multi-finger taps on the manipulation context makes Ninput
+    // withhold small pinches/pans as candidate taps. Keep the existing context
+    // unchanged and recognize only two-contact taps alongside it. Both contexts
+    // share calibrated packets, the bounded output queue and the tab's lifetime.
+    if (SUCCEEDED(hr)) hr = CreateInteractionContext(&session->tapContext);
+    const INTERACTION_CONTEXT_CONFIGURATION taps[] = {
+        {INTERACTION_ID_TAP,INTERACTION_CONFIGURATION_FLAG_TAP | INTERACTION_CONFIGURATION_FLAG_TAP_MULTIPLE_FINGER}
+    };
+    if (SUCCEEDED(hr)) hr = SetInteractionConfigurationInteractionContext(session->tapContext,ARRAYSIZE(taps),taps);
+    if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->tapContext,INTERACTION_CONTEXT_PROPERTY_MEASUREMENT_UNITS,1);
+    if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->tapContext,INTERACTION_CONTEXT_PROPERTY_FILTER_POINTERS,FALSE);
+    if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->tapContext,INTERACTION_CONTEXT_PROPERTY_INTERACTION_UI_FEEDBACK,FALSE);
+    if (SUCCEEDED(hr)) hr = RegisterOutputCallbackInteractionContext2(session->tapContext,TouchRecognizer::TapOutput,session.get());
     if (FAILED(hr)) {
         Wh_Log(L"[GPU touch] recognizer initialization failed hr=0x%08X; restoring native input", unsigned(hr));
         return false;
@@ -25437,10 +25636,12 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
         StopTouch(state); return;
     }
     for (unsigned i = 0; i < count; ++i) {
-        if (State(hwnd) != expected || expected->mouseFolderEpoch != epoch ||
-            !expected->touch.active || expected->touch.epoch != epoch || expected->touch.generation != generation ||
-            !expected->visible || !TabOwnsActiveView(*expected)) return;
         const auto& event = output[i];
+        if (State(hwnd) != expected || expected->mouseFolderEpoch != epoch ||
+            expected->touch.epoch != epoch || expected->touch.generation != generation ||
+            (!expected->touch.active && !(event.interactionId==INTERACTION_ID_TAP && event.contactCount==2 &&
+                !expected->touch.down && expected->touch.gesture==TouchGesture::Pending)) ||
+            !expected->visible || !TabOwnsActiveView(*expected)) return;
         if (event.inputType != PT_TOUCH) continue;
         const bool canceled = (event.interactionFlags & INTERACTION_FLAG_CANCEL) != 0;
         const bool ended = (event.interactionFlags & INTERACTION_FLAG_END) != 0;
@@ -25468,6 +25669,22 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_TAP && !canceled && TouchItemValid(state)) {
+            if (state.touch.contacts > 1) {
+                // Native recognition owns tap timing and movement tolerance.
+                // Anchor to the first finger, never the centroid between rows.
+                // Consume multi-finger taps even with the option disabled.
+                if (state.touch.contacts == 2 && !state.touch.multiTapDelivered && state.touch.gesture==TouchGesture::Pending &&
+                    g_twoFingerContextMenu.load(std::memory_order_relaxed)) {
+                    POINT origin = state.touch.start;
+                    if (MapUiPoint(nullptr,hwnd,origin) && !TouchControlAt(state,origin) &&
+                        GroupHeaderAtPoint(state,origin.x,origin.y) < 0) {
+                        state.touch.consumed = true;
+                        state.touch.multiTapDelivered = true;
+                        ReplayTouchMouse(state, WM_RBUTTONUP, origin);
+                    }
+                }
+                continue;
+            }
             if (state.touch.checkbox!=-1 && SelectionCheckboxAt(state,point)!=state.touch.checkbox) continue;
             if (state.touch.control) {
                 if (state.touch.doubleDivider >= 0) {
@@ -25487,7 +25704,8 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             // interval as mouse clicks and the shared item hit identity, using
             // packet time rather than dispatch. Each tap's contact movement
             // tolerance remains native; don't impose a mouse-sized touch target.
-            const bool paired = !state.clickPolicy.singleClick && state.mouseClickTick && state.mouseClickEpoch == epoch &&
+            const bool paired = !state.clickPolicy.singleClick && state.mouseClickSource==ClickSource::Touch &&
+                state.mouseClickTick && state.mouseClickEpoch == epoch &&
                 state.mouseClickRow == state.touch.row &&
                 DWORD(state.touch.time-DWORD(state.mouseClickTick)) <= GetDoubleClickTime();
             const UINT press = paired ? WM_LBUTTONDBLCLK : WM_LBUTTONDOWN;
@@ -25502,11 +25720,21 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_SECONDARY_TAP && !canceled && TouchItemValid(state)) {
-            if (state.touch.checkbox!=-1) continue;
+            // A second-contact tap can also be reported as a secondary tap.
+            // Apply the same option and one-menu rule as simultaneous taps.
+            if (state.touch.contacts > 1) {
+                if (state.touch.contacts!=2 || state.touch.multiTapDelivered || state.touch.gesture!=TouchGesture::Pending ||
+                    !g_twoFingerContextMenu.load(std::memory_order_relaxed)) continue;
+                point=state.touch.start;
+                if (!MapUiPoint(nullptr,hwnd,point) || TouchControlAt(state,point) ||
+                    GroupHeaderAtPoint(state,point.x,point.y)>=0) continue;
+            }
+            if (state.touch.contacts<=1 && state.touch.checkbox!=-1) continue;
             if ((state.touch.scrollbarAxis >= 0 || OnScrollbar(state, point.x, point.y) ||
                  OnHorizontalBar(state, point.x, point.y)) &&
                 (!state.touch.scrollbarMenuEligible || !state.touch.holding)) continue;
             state.touch.consumed = true;
+            if (state.touch.contacts==2) state.touch.multiTapDelivered = true;
             if (state.touch.control) {
                 ReplayTouchMouse(state, WM_CAPTURECHANGED, {});
                 if (State(hwnd) != expected || state.touch.generation != generation) return;
@@ -25917,7 +26145,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             KillTimer(hwnd,kTouchHoldTimerId);
         }
         if (state.touch.control) {
-            const HRESULT hr = ProcessPointerFramesInteractionContext(session->context, 1, pointers, frame);
+            const HRESULT hr = session->Process(pointers, frame);
             if (FAILED(hr)) { StopTouch(state); SetActive(hwnd,false); return; }
             DrainTouchOutput(state, session);
             if (State(hwnd) != expected || state.touch.generation != generation) return;
@@ -25935,7 +26163,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 state.touch.active = false;
             }
         } else {
-            const HRESULT hr = ProcessPointerFramesInteractionContext(session->context, 1, pointers, frame);
+            const HRESULT hr = session->Process(pointers, frame);
             if (FAILED(hr)) {
                 Wh_Log(L"[GPU touch] native packet rejected hr=0x%08X pointer=%u frame=%u",unsigned(hr),first.pointerId,first.frameId);
                 StopTouch(state); SetActive(hwnd,false); return;
@@ -26182,6 +26410,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
          msg == WM_CHAR || msg == WM_CONTEXTMENU)) {
         if (msg == WM_LBUTTONDOWN) {
             ResetMouseClickSequence(*s);
+            s->mousePressSource = CurrentClickSource(*s);
             s->mousePressActive = previewRow >= 0;
             s->mousePressRow = previewRow;
             s->mousePressEpoch = s->mouseFolderEpoch;
@@ -26189,6 +26418,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->mousePressActive && s->mousePressRow == previewRow &&
                 s->mousePressEpoch == s->mouseFolderEpoch && previewRow >= 0) {
                 s->mouseClickRow = previewRow;
+                s->mouseClickSource = s->mousePressSource;
                 s->mouseClickEpoch = s->mouseFolderEpoch;
                 s->mouseClickTick = GetTickCount64();
             }
@@ -26613,8 +26843,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         live->token != viewToken || live->nativeHwnd != target ||
                         !GpuSelectionMatches(*live, *prepared)) break;
                     const HRESULT hr = InvokeNativeFileKey(*live,native.Get(),key);
-                    if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred native command failed hr=0x%08X",
-                        static_cast<unsigned>(hr));
+                    if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred %s command failed hr=0x%08X",
+                        key.newTab ? L"new-tab" : L"native",static_cast<unsigned>(hr));
                 }
                 ViewState* live = IsWindow(hwnd) ? State(hwnd) : nullptr;
                 if (menu && live && live->token == viewToken && live->nativeHwnd == target &&
@@ -26636,12 +26866,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case kMsgThisPcRows:
-        if (s && s->thisPcGpu && s->visible && TabOwnsActiveView(*s)) {
+        if (s && s->thisPcGpu && s->visible && (TabOwnsActiveView(*s) || s->preparingTab)) {
             if (s->nativeRowsNeedCapture && !s->nativeRowsPending) RequestNativeRows(*s);
             if (s->thisPcRowsDirty && !s->nativeRowsPending) {
                 if (s->loaded && s->nativeRowsComplete) QueueVisibleDataFrame(*s);
                 else RefreshThisPcRows(*s);
             }
+            if(s->preparingTab && s->presenter) SubmitPresentation(*s);
         }
         if (s) s->nativeRowsMessageQueued = false;
         return 0;
@@ -26769,6 +27000,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case kMsgTabActivated:
+        if(s) s->tabSurfaceWakeQueued=false;
         // Existing tabs have independent, already-presented surfaces. No
         // synchronous Shell COM or directory scan is permitted on activation.
         // wParam=2 is an HWND-only wake from the low-priority observer or a
@@ -26868,7 +27100,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && s->visible && !s->emptyNative &&
             static_cast<unsigned long long>(lParam) == s->mouseFolderEpoch &&
             g_touchpadSwipeNavigation.load(std::memory_order_relaxed))
-            NavigateCurrentShellTab(*s, wParam != 0);
+            NavigateCurrentShellTab(*s, wParam ? SBSP_NAVIGATEBACK : SBSP_NAVIGATEFORWARD);
         return 0;
     case kMsgTouchDrag:
         if (s && WPARAM(s->lifetimeToken) == wParam && LPARAM(s->touch.generation) == lParam &&
@@ -27171,7 +27403,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->lastFolderNativePresentAfter=0;
                 if (!s->lastFolderNativePending.empty()) PostMessageW(hwnd,kMsgLastFolderSelection,0,0);
             }
-            if (s->initialModePending && s->visible && TabOwnsActiveView(*s)) PrepareInitialOverlay(*s);
+            if (s->initialModePending && s->visible && (TabOwnsActiveView(*s) || s->preparingTab)) PrepareInitialOverlay(*s);
             if (s->nativePresentationPending && s->visible && TabOwnsActiveView(*s)) ApplyNativePresentation(*s);
             if (s->thisPcGpu && s->nativeRowsNeedCapture && !s->nativeRowsPending &&
                 s->visible && TabOwnsActiveView(*s)) QueueNativeRows(*s, false);
@@ -27461,6 +27693,25 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         return 0;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDBLCLK:
+        if (s) {
+            if ((wParam & (MK_LBUTTON | MK_RBUTTON)) || s->mousePressActive ||
+                PointerDragActive(*s) || s->shellDragRunning) return 0;
+            ResetMouseClickSequence(*s);
+            const POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+            if (!g_middleClickNewTab.load(std::memory_order_relaxed) || !s->visible || !s->inScope ||
+                !s->detailsViewActive || !s->loaded || !ShellRowsInteractive(*s) || s->optimisticStartedAt ||
+                TouchControlAt(*s,point) || !InsideListX(*s,point.x)) return 0;
+            if (s->rowTransitionActive) StopRowTransition(*s);
+            const int row = RowFromPoint(*s,point.y,point.x);
+            if (row < 0 || size_t(row) >= s->entries.size() || !s->entries[size_t(row)].folder ||
+                IsRecycleBinLocation(s->folderPath)) return 0;
+            // Dispatch on press, with no capture or pending button state: injected
+            // selection clicks, focus changes and missing UP cannot trap input.
+            Open(*s,row,true);
+        }
+        return 0;
     case WM_LBUTTONDOWN:
         if (s && s->pendingNativeSelection) CancelNativeSelectionPreparation(*s);
         if (s && s->optimisticStartedAt && !scrollbarButton) {
@@ -27486,8 +27737,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ResetMouseClickSequence(*s);
             s->mousePressActive = true;
             s->mousePressEpoch = s->mouseFolderEpoch;
+            s->mousePressSource = CurrentClickSource(*s);
             const int pressX = GET_X_LPARAM(lParam);
             const int pressY = GET_Y_LPARAM(lParam);
+            s->mousePressBackground = g_doubleClickUp.load(std::memory_order_relaxed) &&
+                !s->touch.replaying && !(wParam & (MK_CONTROL | MK_SHIFT)) &&
+                EmptySpaceAt(*s,POINT{pressX,pressY});
             if (pressY >= s->headerPx && InsideListX(*s, pressX) &&
                 !OnScrollbar(*s, pressX, pressY) &&
                 !OnHorizontalBar(*s, pressX, pressY))
@@ -27568,6 +27823,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_MOUSEMOVE:
+        // A canceled/replaced button sequence can lose its UP (for example
+        // when another input handler injects a click). A real button-free move
+        // must not leave capture trapping the rest of the Explorer frame.
+        if (s) {
+            ReleaseOrphanedMouseCapture(*s,(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))!=0);
+            if (State(hwnd)!=s) return 0;
+        }
         // The wiggle has already docked. Hold capture solely to swallow UP;
         // ignore all further drag movements until that button is released.
         if (s && s->columnWiggleAwaitRelease) return 0;
@@ -27625,12 +27887,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         // The overlay HWND survives navigation. The UP after a double-click
         // may arrive when the *next* directory has already been painted.
-        if (!s || !s->mousePressActive ||
-            s->mousePressEpoch != s->mouseFolderEpoch) return 0;
+        if (!s) return 0;
+        if (!s->mousePressActive || s->mousePressEpoch != s->mouseFolderEpoch) {
+            ReleaseOrphanedMouseCapture(*s,(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))!=0);
+            return 0;
+        }
         // Only a previously selected item press can become an OLE drag.
         // The click (if no drag occurred) applies its modifiers on release.
         const bool pressControl = s->mousePressControl;
         const bool pressShift = s->mousePressShift;
+        const auto pressSource = s->mousePressSource;
         if (s->shellDragRow >= 0) {
             const int pressed = s->shellDragRow;
             const bool sameItem = s->mousePressRow == pressed &&
@@ -27656,6 +27922,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (sameItem && s->mouseFolderEpoch == epoch &&
                 !s->optimisticStartedAt) {
                 s->mouseClickRow = pressed;
+                s->mouseClickSource = pressSource;
                 s->mouseClickEpoch = epoch;
                 s->mouseClickTick = GetTickCount64();
                 if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,pressed);
@@ -27676,6 +27943,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool completedBackgroundClick = s->marqueePossible &&
             !s->marqueeActive && s->mousePressRow < 0 &&
             (!releaseInsideContent || releaseRow < 0);
+        const bool completedGestureBackground = completedBackgroundClick && s->mousePressBackground &&
+            EmptySpaceAt(*s,POINT{releaseX,releaseY});
         const int completedRow = s->mousePressRow;
         const ULONGLONG completedEpoch = s->mouseFolderEpoch;
         const bool completedMarquee = s->marqueePossible && s->marqueeActive;
@@ -27724,11 +27993,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (completedBackgroundClick &&
                 s->mouseFolderEpoch == completedEpoch && !s->optimisticStartedAt)
                 ClearSelectionForFolderMenu(*s);
+            if (completedGestureBackground && s->mouseFolderEpoch==completedEpoch && !s->optimisticStartedAt) {
+                s->mouseClickBackground = true;
+                s->mouseClickSource = pressSource;
+                s->mouseClickEpoch = completedEpoch;
+                s->mouseClickTick = GetTickCount64();
+            }
             if (completedRowClick && s->mouseFolderEpoch == completedEpoch &&
                 !s->optimisticStartedAt) {
                 SelectWithModifiers(*s, completedRow, pressControl, pressShift);
                 if (s->mouseFolderEpoch == completedEpoch) {
                     s->mouseClickRow = completedRow;
+                    s->mouseClickSource = pressSource;
                     s->mouseClickEpoch = completedEpoch;
                     s->mouseClickTick = GetTickCount64();
                     if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,completedRow);
@@ -27979,11 +28255,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const int row = y >= s->headerPx && InsideListX(*s, x) &&
                 !OnScrollbar(*s, x, y) && !OnHorizontalBar(*s, x, y)
                 ? RowFromPoint(*s, y, x) : -1;
+            const bool up = g_doubleClickUp.load(std::memory_order_relaxed) && !s->touch.replaying &&
+                !(wParam & (MK_CONTROL | MK_SHIFT)) && EmptySpaceAt(*s,POINT{x,y}) &&
+                s->mouseClickBackground && s->mouseClickEpoch==s->mouseFolderEpoch &&
+                s->mouseClickSource==CurrentClickSource(*s) &&
+                s->mouseClickTick && GetTickCount64()-s->mouseClickTick<=GetDoubleClickTime();
+            if (up) {
+                ResetMouseClickSequence(*s);
+                NavigateCurrentShellTab(*s,SBSP_PARENT | SBSP_SAMEBROWSER);
+                return 0;
+            }
             if (s->clickPolicy.singleClick && row >= 0) {
                 OverlayProc(hwnd,WM_LBUTTONDOWN,wParam,lParam);
                 return 0;
             }
             const bool sameFolderRow = row >= 0 && row == s->mouseClickRow &&
+                s->mouseClickSource==CurrentClickSource(*s) &&
                 s->mouseClickEpoch == s->mouseFolderEpoch &&
                 s->mouseClickTick &&
                 (s->touch.replaying || GetTickCount64() - s->mouseClickTick <= GetDoubleClickTime());
@@ -28108,7 +28395,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     !(GetKeyState(VK_MENU) & 0x8000) &&
                     !(GetKeyState(VK_SHIFT) & 0x8000) &&
                     !(lParam & (1LL << 30)))
-                    NavigateCurrentShellTab(*s, true);
+                    NavigateCurrentShellTab(*s, SBSP_NAVIGATEBACK);
                 return 0;
             case VK_F2:
                 if (!control && !shift && !(lParam & (1LL << 30)))
@@ -28467,6 +28754,7 @@ void PresentCachedTabSurface(ViewState& state) {
     // Present cached pixels first. The owner message then uses exactly the
     // F5/menu path; duplicate activation hints cannot restart provider work.
     QueueResumeRefresh(state);
+    QueueFeatureInitialization(state);
     if (trace)
         Wh_Log(L"[GPU tabs] PRESENT tick=%llu tab=%p gpu=%p native=%p was-visible=%d now-visible=%d loaded=%d rows=%d position=%llu ms show=%llu ms top=%llu ms total=%llu ms folder=%s",
             static_cast<unsigned long long>(started), state.activeTabHost, state.hwnd,
@@ -28602,6 +28890,18 @@ void SuppressAppearingNativeSurface(HWND changed, DWORD event) {
     if (!view) return;
     const HWND frame=GetAncestor(view,GA_ROOT);
     if (!IsExplorerFrame(frame)) return;
+    // A new background view is a frame sibling on modern Explorer. USER can
+    // place it above the current frame-owned GPU surface before discovery.
+    // Repair the current tab's HWND order synchronously; never borrow its
+    // suppression ownership for the new tab or query Shell from this callback.
+    if(auto* current=State(OverlayUnder(frame)); current && current->nativeHwnd!=view &&
+        current->visible && current->inScope && current->detailsViewActive && PresentationVisible(*current)) {
+        const HWND before=GetWindow(current->hwnd,GW_HWNDPREV);
+        EnsureOverlayStacking(*current);
+        if(before!=GetWindow(current->hwnd,GW_HWNDPREV))
+            PipelineEvent(*current->background,{.operation=L"tab.creation.preserve.surface",.a=event,
+                .b=reinterpret_cast<UINT_PTR>(view)});
+    }
     HWND overlay=OverlayForNative(view,frame);
     if (!overlay) overlay=OverlayUnder(frame);
     auto* owner=overlay ? State(overlay) : nullptr;
@@ -28641,6 +28941,21 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
     ReleaseSRWLockShared(&g_shellHookLock);
     if(!owns) return;
+    // USER reports a child z-order change on its parent. Explorer can select
+    // an already-visible tab this way, without a tab-host SHOW event.
+    if(event==EVENT_OBJECT_REORDER && !childId &&
+        (objectId==OBJID_WINDOW || objectId==OBJID_CLIENT)) {
+        wchar_t cls[64]{};
+        const bool tabHost=GetClassNameW(changed,cls,ARRAYSIZE(cls)) && !_wcsicmp(cls,L"ShellTabWindowClass");
+        if(changed==frame || tabHost) {
+            if(auto* selected=State(OverlayUnder(frame)); selected && selected->visible && selected->inScope && selected->detailsViewActive) {
+                if(PresentationVisible(*selected)) EnsureOverlayStacking(*selected);
+                else if(!selected->tabSurfaceWakeQueued)
+                    selected->tabSurfaceWakeQueued=PostMessageW(selected->hwnd,kMsgTabActivated,2,
+                        static_cast<LPARAM>(GetTickCount64()))!=FALSE;
+            }
+        }
+    }
     if(!GetPropW(changed,kViewToggleOwnerProperty) &&
         (event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_HIDE || event==EVENT_OBJECT_DESTROY ||
          (event==EVENT_OBJECT_LOCATIONCHANGE && objectId==OBJID_WINDOW))) {
@@ -30090,7 +30405,7 @@ void RetryShellSubscriptions(ViewState& state, ULONGLONG now) {
 }
 
 void PrepareInitialOverlay(ViewState& state) {
-    if (!state.folderView || !state.visible || !TabOwnsActiveView(state) ||
+    if (!state.folderView || !state.visible || (!TabOwnsActiveView(state) && !state.preparingTab) ||
         state.overlayInitializing) return;
     GraphicsContinuation continuation(state);
     ScopedFlag initializing(state.overlayInitializing);
@@ -30109,8 +30424,17 @@ void PrepareInitialOverlay(ViewState& state) {
     state.initialModePending = false;
     ApplyViewLayout(state,{mode,state.nativeIconSize},false);
     if (!state.detailsViewActive) {
+        state.preparingTab=false;
         RestoreNativeContent(state);
         UnregisterAnimationWhenIdle(state);
+        return;
+    }
+    // Use the dedicated native content host even while preparing a hidden
+    // surface. A zero-sized/unfinished host is not a whole-frame viewport.
+    // Its real layout notifications and existing frame lane retry startup.
+    if(state.preparingTab && !PositionOverlayOverNative(state,false)) {
+        state.initialModePending=true;
+        RegisterViewAnimation(state);
         return;
     }
     state.visibility = ReadShellVisibilityPolicy();
@@ -30147,7 +30471,7 @@ void PrepareInitialOverlay(ViewState& state) {
 
 void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ComPtr<IShellFolder>& folder, ComPtr<IShellBrowser>& shellBrowser,
-                const std::wstring& path) {
+                const std::wstring& path, bool prepareTab = false) {
     if (g_unloading.load(std::memory_order_acquire) || !native || !IsWindow(native) ||
         !IsSupportedLocation(path) ||
         !BelongsToThisProcess(native)) return;
@@ -30157,8 +30481,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     if (!IsExplorerFrame(frame)) return;
     const HWND tabHost = BrowserTabHost(shellBrowser.Get(), native, frame);
     if (g_unloading.load(std::memory_order_acquire)) return;
-    if (!tabHost || tabHost != ActiveExplorerTab(frame) ||
-        !NativeViewAvailable(native)) return;
+    if (!tabHost || (!prepareTab && tabHost != ActiveExplorerTab(frame)) ||
+        !NativeViewAvailable(native,prepareTab ? tabHost : nullptr)) return;
     HWND overlay = OverlayForTab(tabHost);
     if (overlay && GetWindowThreadProcessId(overlay, nullptr) !=
                        GetCurrentThreadId()) return;
@@ -30420,6 +30744,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     s->nativeHwnd = native;
     s->frameHwnd = frame;
     s->activeTabHost = tabHost;
+    s->preparingTab = prepareTab && tabHost != ActiveExplorerTab(frame);
     s->folderView = view;
     s->shellBrowser = shellBrowser;
     s->folder = folder;
@@ -30460,7 +30785,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     SetTimer(overlay, kTimerId, 250, nullptr);
 }
 
-void ScanShellWindow(HWND explorerFrame) {
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
     if (g_unloading.load() || !IsWindow(explorerFrame) ||
         GetPropW(explorerFrame, kShellScanProperty)) return;
     struct ScanGuard {
@@ -30468,11 +30793,14 @@ void ScanShellWindow(HWND explorerFrame) {
         ~ScanGuard() { if (IsWindow(frame)) RemovePropW(frame, kShellScanProperty); }
     } guard{explorerFrame};
     if (!SetPropW(explorerFrame, kShellScanProperty, reinterpret_cast<HANDLE>(1))) return;
-    SynchronizeTabSurfaces(explorerFrame);
+    const HWND targetTab=requestedTab ? requestedTab : ActiveExplorerTab(explorerFrame);
+    if (!IsWindow(targetTab) || (targetTab!=explorerFrame && GetAncestor(targetTab,GA_ROOT)!=explorerFrame)) return;
+    const bool preparing=requestedTab && targetTab!=ActiveExplorerTab(explorerFrame);
+    if (!preparing) SynchronizeTabSurfaces(explorerFrame);
     // The DispatchMessage hook, WinEvent and short navigation timer all run
     // on this STA. Never let them independently scan during one layout burst.
     // A genuinely NEW SHELLDLL_DefView resets this gate when first observed.
-    if (HWND overlay = OverlayUnder(explorerFrame)) {
+    if (HWND overlay = OverlayForTab(targetTab)) {
         if (ViewState* state = State(overlay)) {
             const ULONGLONG now = GetTickCount64();
             if (state->lastShellScanAt && now == state->lastShellScanAt)
@@ -30504,15 +30832,14 @@ void ScanShellWindow(HWND explorerFrame) {
             previous = now;
         }
     } stage(explorerFrame);
-    // A selected tab's browser can supply its own current view cheaply.
-    // Never consult an inactive tab's Shell browser for this frame; on tab
-    // activation without a matching overlay, use normal Shell discovery.
-    if (HWND overlay = OverlayUnder(explorerFrame)) {
+    // Use only the requested tab's browser. Ordinary discovery targets the
+    // selected tab; a cold request may explicitly prepare a background tab.
+    if (HWND overlay = OverlayForTab(targetTab)) {
         if (ViewState* s = State(overlay); s && s->shellBrowser) {
             ComPtr<IShellView> active;
             HWND native = nullptr;
             const bool matchingTab = BrowserTabHost(s->shellBrowser.Get(),
-                native, explorerFrame) == ActiveExplorerTab(explorerFrame);
+                native, explorerFrame) == targetTab;
             if (g_unloading.load(std::memory_order_acquire)) return;
             stage.Mark(L"cached browser resolve tab host");
             const HRESULT activeResult = matchingTab ?
@@ -30625,8 +30952,8 @@ void ScanShellWindow(HWND explorerFrame) {
         }
         stage.Mark(L"QueryService");
         // ShellWindows exposes one entry per Explorer tab but each entry's
-        // IWebBrowser2::HWND is the same frame. Reject inactive tab browsers
-        // *before* expensive view/property COM work.
+        // IWebBrowser2::HWND is the same frame. Reject other tab browsers
+        // before view/property COM work, including explicit cold preparation.
         HWND browserTab = nullptr;
         const HRESULT hostResult = shellBrowser->GetWindow(&browserTab);
         stage.Mark(L"IShellBrowser GetWindow");
@@ -30635,7 +30962,7 @@ void ScanShellWindow(HWND explorerFrame) {
         const bool qualifiedTab = browserTab &&
             GetClassNameW(browserTab, browserClass, ARRAYSIZE(browserClass)) &&
             _wcsicmp(browserClass, L"ShellTabWindowClass") == 0;
-        if (qualifiedTab && browserTab != ActiveExplorerTab(explorerFrame))
+        if (qualifiedTab && browserTab != targetTab)
             continue;
         ComPtr<IShellView> shellView;
         const HRESULT activeResult = shellBrowser->QueryActiveShellView(shellView.GetAddressOf());
@@ -30645,23 +30972,23 @@ void ScanShellWindow(HWND explorerFrame) {
         const HRESULT nativeResult = shellView->GetWindow(&native);
         stage.Mark(L"discovered IShellView GetWindow");
         if (FAILED(nativeResult) || !native ||
-            GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native) ||
+            GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native,preparing ? targetTab : nullptr) ||
             BrowserTabHost(shellBrowser.Get(), native, explorerFrame) !=
-                ActiveExplorerTab(explorerFrame))
+                targetTab)
             continue;
         ComPtr<IFolderView2> view;
         const HRESULT viewResult=shellView.As(&view);
         if (FAILED(viewResult) || !view) {
             if (viewResult!=E_NOINTERFACE) break; // Still unresolved, not proof of unsupported content.
-            SetPropW(explorerFrame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
-            if (HWND overlay = OverlayUnder(explorerFrame))
+            SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     DeactivateOutsideScope(*state);
             break;
         }
         ComPtr<IShellFolder> folder;
         std::wstring path;
-        if (HWND overlay=OverlayUnder(explorerFrame))
+        if (HWND overlay=OverlayForTab(targetTab))
             if (auto state=State(overlay); state && state->pendingShellView &&
                 IsWindow(state->pendingShellView) && native!=state->pendingShellView) continue;
         const bool pathResolved = GetFolderPath(view.Get(),path,folder);
@@ -30671,15 +30998,15 @@ void ScanShellWindow(HWND explorerFrame) {
             break;
         }
         if (!IsSupportedLocation(path))
-            SetPropW(explorerFrame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
         if (IsSupportedLocation(path)) {
-            AttachView(native,view,folder,shellBrowser,path);
+            AttachView(native,view,folder,shellBrowser,path,preparing);
             stage.Mark(L"AttachView discovered tab");
-            if (HWND overlay = OverlayUnder(explorerFrame))
+            if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     BindShellAutomation(*state, disp.Get());
             stage.Mark(L"AttachShellAutomationEvents/SelectionChanged");
-        } else if (HWND overlay = OverlayUnder(explorerFrame)) {
+        } else if (HWND overlay = OverlayForTab(targetTab)) {
             if (ViewState* state = State(overlay))
                 DeactivateOutsideScope(*state);
         }
@@ -31193,7 +31520,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     if (msg && g_bootstrapAttachMessage &&
         msg->message == g_bootstrapAttachMessage &&
         IsExplorerFrame(msg->hwnd)) {
-        HandleColdAttach(msg->hwnd);
+        HandleColdAttach(msg->hwnd,reinterpret_cast<HWND>(msg->wParam));
         return 0; // Do not forward the private registered message to Shell.
     }
     // Reuse the existing per-frame scan state for diagnostic input timestamps:

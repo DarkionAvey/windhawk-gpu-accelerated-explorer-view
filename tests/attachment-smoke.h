@@ -136,6 +136,34 @@ static void TestColdAttachWake() {
         Check(PeekMessageW(&msg, frame, g_bootstrapAttachMessage, g_bootstrapAttachMessage, PM_REMOVE) &&
             msg.message == g_bootstrapAttachMessage, "cold wake hook survived observer shutdown");
     }
+    // A known frame must still wake independently for newly created tabs.
+    cls.lpszClassName=L"ShellTabWindowClass"; RegisterClassW(&cls);
+    HWND original=CreateWindowExW(0,cls.lpszClassName,L"",WS_CHILD|WS_VISIBLE,0,0,640,480,
+        frame,nullptr,cls.hInstance,nullptr);
+    HWND gpu=CreateWindowExW(0,L"STATIC",L"known tab",WS_CHILD|WS_VISIBLE,0,0,640,480,
+        frame,nullptr,cls.hInstance,nullptr);
+    Check(original && gpu,"known cold-wake tab");
+    RegisterTabOverlay(frame,original,gpu);
+    StartColdAttachObserver();
+    std::array<HWND,2> incoming{};
+    for(auto& tab:incoming) tab=CreateWindowExW(0,cls.lpszClassName,L"",WS_CHILD,0,0,640,480,
+        frame,nullptr,cls.hInstance,nullptr);
+    Check(incoming[0] && incoming[1] && Eventually([&] {
+        return GetPropW(incoming[0],kBootstrapQueuedProperty) && GetPropW(incoming[1],kBootstrapQueuedProperty);
+    }),"known frame did not queue independent new-tab startup wakes");
+    std::array<bool,2> seen{}; MSG wake{};
+    Check(Eventually([&] {
+        while(PeekMessageW(&wake,frame,g_bootstrapAttachMessage,g_bootstrapAttachMessage,PM_NOREMOVE)) {
+            const HWND tab=reinterpret_cast<HWND>(wake.wParam);
+            Check(tab==incoming[0] || tab==incoming[1],"new-tab wake lost its target identity");
+            Check(PeekMessageW(&wake,frame,g_bootstrapAttachMessage,g_bootstrapAttachMessage,PM_REMOVE) &&
+                wake.message==WM_NULL && !GetPropW(tab,kBootstrapQueuedProperty),"new-tab wake depended on DispatchMessage/input");
+            seen[tab==incoming[1]]=true;
+        }
+        return seen[0] && seen[1];
+    }),"a new-tab startup wake was consumed by its peer");
+    StopColdAttachObserver();
+    UnregisterTabOverlay(frame,original,gpu); StopTabVisibilityObserver();
     DestroyWindow(frame);
     OleUninitialize();
     std::cout << "PASS: startup wake survives message filtering without DispatchMessage or input, including minimized enable and repeated observer shutdown/restart\n";
@@ -1194,4 +1222,135 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     g_writeFactory.Reset();
     OleUninitialize();
     std::cout << "PASS: production attachment, native/GPU toggles, read-only Recycle Bin scope/enumeration/Details/List/grid/PIDL menu, namespace-to-filesystem navigation and minimized dispose/reattach/restore\n";
+}
+
+static void TestBackgroundTabStartup(const std::wstring& fixture) {
+    const auto root=std::filesystem::path(fixture)/L"background-tabs";
+    const auto currentPath=root/L"current", incomingPath=root/L"incoming";
+    Check(std::filesystem::create_directories(currentPath) && std::filesystem::create_directory(incomingPath),"private tab directories");
+    for(const auto& folder:{currentPath,incomingPath}) for(int n=0;n<(folder==currentPath ? 16 : 3);++n) {
+        const auto path=folder/(L"row"+std::to_wstring(n)+L".txt");
+        HANDLE file=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+        Check(file!=INVALID_HANDLE_VALUE,"private tab file"); CloseHandle(file);
+    }
+    const auto directory=currentPath.wstring(), destination=incomingPath.wstring();
+    Check(SUCCEEDED(OleInitialize(nullptr)),"background tab STA");
+    Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"background tab fonts");
+    WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
+    for(const auto name:{L"CabinetWClass",L"ShellTabWindowClass",L"CtrlNotifySink",L"SHELLDLL_DefView"}) {
+        cls.lpszClassName=name; RegisterClassW(&cls);
+    }
+    cls.lpszClassName=kOverlayClass; cls.lpfnWndProc=OverlayProc; RegisterClassW(&cls);
+    const bool toggle=g_showNativeViewToggleButton.exchange(true);
+    HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"CabinetWClass",L"private background tabs",
+        WS_POPUP|WS_VISIBLE,-32000,-32000,640,480,nullptr,nullptr,cls.hInstance,nullptr);
+    Check(frame!=nullptr,"background tab frame");
+    FocusFixture::Session focus(frame,nullptr);
+    ViewState* watched=nullptr;
+    const auto pump=[&] {MSG msg{}; while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {
+        const auto before=watched ? watched->directoryToken : 0;
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+        if(watched && before!=watched->directoryToken)
+            std::cout<<"TAB FIXTURE refresh message="<<std::hex<<msg.message<<" target="<<msg.hwnd<<std::dec
+                <<" generation="<<before<<"->"<<watched->directoryToken<<'\n';
+    }};
+    ComPtr<IFolderView2> view; auto* response=new AttachmentFolderView; view.Attach(response);
+    ComPtr<IShellItem> item;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(directory.c_str(),nullptr,IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&response->folder))),"background tab folder");
+    ComPtr<IFolderView2> incomingView; auto* incomingResponse=new AttachmentFolderView; incomingView.Attach(incomingResponse);
+    ComPtr<IShellItem> incomingItem;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(destination.c_str(),nullptr,IID_PPV_ARGS(&incomingItem))) &&
+        SUCCEEDED(incomingItem->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&incomingResponse->folder))),"incoming tab folder");
+    ComPtr<IShellBrowser> browser;
+    const auto makeTab=[&](bool visible) {
+        return CreateWindowExW(0,L"ShellTabWindowClass",L"",WS_CHILD|(visible ? WS_VISIBLE : 0),
+            0,0,640,480,frame,nullptr,cls.hInstance,nullptr);
+    };
+    const auto makeView=[&](HWND parent) {
+        HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,0,0,640,480,parent,nullptr,cls.hInstance,nullptr);
+        HWND native=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,640,480,host,nullptr,cls.hInstance,nullptr);
+        Check(host && native,"background native hierarchy"); return native;
+    };
+    HWND original=makeTab(true), native=makeView(original);
+    HWND navigation=CreateWindowExW(0,WC_TREEVIEWW,L"private navigation pane",WS_CHILD|WS_VISIBLE,
+        0,0,120,480,original,nullptr,cls.hInstance,nullptr);
+    Check(navigation!=nullptr,"background tab navigation pane");
+    RECT content{},pane{}; GetClientRect(original,&content); GetWindowRect(navigation,&pane);
+    MapWindowPoints(nullptr,original,reinterpret_cast<POINT*>(&pane),2);
+    content.left=pane.right;
+    Check(SetWindowPos(GetParent(native),nullptr,content.left,content.top,content.right-content.left,content.bottom-content.top,
+        SWP_NOACTIVATE|SWP_NOZORDER),"initial content host bounds");
+    AttachView(native,view,response->folder,browser,directory);
+    auto* current=State(OverlayForTab(original));
+    Check(current && Eventually([&] {pump();return current->loaded && current->firstContentSubmittedAt;}),"initial tab content");
+    watched=current;
+    for(bool hostVisible:{false,true}) {
+        Check(Eventually([&] {pump();return current->loaded && !current->directoryPending && !current->tabResumeRefreshQueued;}),
+            "current tab did not finish its prior activation refresh");
+        const auto token=current->token, generation=current->directoryToken;
+        HWND tab=makeTab(false);
+        if(hostVisible) SetWindowPos(tab,HWND_BOTTOM,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        // Real CREATE/SHOW broadcasts occur before pumping. Modern Explorer
+        // can create the new native view as an independent frame sibling.
+        RECT before{},after{}; GetWindowRect(current->hwnd,&before);
+        RECT temporary{}; GetClientRect(original,&temporary);
+        // A native transaction can temporarily expand the dedicated host.
+        // CREATE must repair only stacking, retaining committed GPU bounds.
+        Check(SetWindowPos(GetParent(native),nullptr,0,0,temporary.right,temporary.bottom,
+            SWP_NOACTIVATE|SWP_NOZORDER),"transient content host bounds");
+        HWND foreign=makeView(frame);
+        GetWindowRect(current->hwnd,&after);
+        Check(EqualRect(&before,&after),"native CREATE adopted transient whole-tab geometry over the navigation pane");
+        HWND first=GetWindow(frame,GW_CHILD);
+        while(first && !IsWindowVisible(first)) first=GetWindow(first,GW_HWNDNEXT);
+        Check(IsWindowVisible(current->viewToggle) && first==current->viewToggle &&
+            GetWindow(current->hwnd,GW_HWNDPREV)==current->viewToggle && IsWindowVisible(current->hwnd),
+            "new frame-sibling native view covered the current GPU surface before event delivery");
+        Check(SetWindowPos(GetParent(native),nullptr,content.left,content.top,content.right-content.left,content.bottom-content.top,
+            SWP_NOACTIVATE|SWP_NOZORDER),"settled content host bounds");
+        DestroyWindow(GetParent(foreign));
+        HWND incoming=makeView(tab);
+        if(!hostVisible) Check(SetWindowPos(GetParent(incoming),nullptr,0,0,0,0,
+            SWP_NOACTIVATE|SWP_NOZORDER),"unfinished background host geometry");
+        AttachView(incoming,incomingView,incomingResponse->folder,browser,destination,true);
+        auto* next=State(OverlayForTab(tab));
+        Check(next!=nullptr,"background attachment did not create a tab-owned renderer");
+        Check(!IsWindowVisible(next->hwnd),"background attachment exposed its GPU window");
+        Check(ActiveExplorerTab(frame)==original,"background attachment changed the selected tab");
+        if(!hostVisible) {
+            Check(next->initialModePending && !next->presenter,"unfinished background geometry started a placeholder-sized renderer");
+            Check(SetWindowPos(GetParent(incoming),nullptr,content.left,content.top,content.right-content.left,content.bottom-content.top,
+                SWP_NOACTIVATE|SWP_NOZORDER),"background host geometry completion");
+        }
+        Check(Eventually([&] {pump();return next->loaded && next->firstContentSubmittedAt && !next->preparingTab;}),
+            "background tab did not submit first content without activation or input");
+        Check(IsWindowVisible(current->hwnd),"background preparation hid the current GPU window");
+        Check(current->token==token && current->directoryToken==generation,"background preparation changed the current directory generation");
+        Check(current->folderPath==directory && current->total==16 && next->folderPath==destination && next->total==3,
+            "background startup borrowed another tab's directory model");
+        HWND top=GetWindow(frame,GW_CHILD);
+        while(top && !IsWindowVisible(top)) top=GetWindow(top,GW_HWNDNEXT);
+        Check(top==current->viewToggle && GetWindow(current->hwnd,GW_HWNDPREV)==current->viewToggle,
+            "background preparation placed another visible sibling over the current GPU window/button");
+        Check(!IsWindowVisible(incoming),"background preparation exposed its native content");
+        const auto accepted=next->presentationAcceptedSequence;
+        SetWindowPos(tab,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        Check(Eventually([&] {pump();return IsWindowVisible(next->hwnd);}),"real tab reorder/show did not activate its prepared surface without input");
+        Check(!IsWindowVisible(incoming) && next->firstContentSubmittedAt && accepted,
+            "prepared tab activation exposed native content or lacked cached content");
+        SetWindowPos(original,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        ShowWindow(tab,SW_HIDE); SynchronizeTabSurfaces(frame,true);
+        DestroyWindow(next->hwnd); DestroyWindow(tab); pump();
+    }
+    Check(!FocusFixture::sets,"background tab startup changed focus");
+    watched=nullptr;
+    DestroyWindow(frame); StopTabVisibilityObserver();
+    std::vector<std::shared_ptr<TabBackground>> retiring;
+    {std::lock_guard lock(g_backgroundLifetimeMutex); if(g_backgroundLifetimes)
+        for(const auto& work:*g_backgroundLifetimes) if(work->stopping.load() && work->presentation.thread) retiring.push_back(work);}
+    for(const auto& work:retiring) Check(WaitForSingleObject(work->presentation.thread,10000)==WAIT_OBJECT_0,"background renderer teardown");
+    g_showNativeViewToggleButton=toggle; g_writeFactory.Reset(); OleUninitialize();
+    std::cout<<"PASS: hidden and visible background tab hosts prepare independent first-content surfaces without input; real native sibling creation preserves current pixels, activation uses cached content and teardown drains\n";
 }

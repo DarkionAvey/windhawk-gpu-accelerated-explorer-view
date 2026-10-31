@@ -686,8 +686,10 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
             FrameInputFixture::pending=QS_KEY;
             markQueued(); SendMessageW(state.hwnd,kMsgFrame,0,0);
             Check(state.framePaintPending,"hide fixture did not retain its input-deferred frame");
-            SetPresentationVisibility(state.hwnd,false);
-            Check(!state.framePaintPending && !stillQueued(),"hiding stranded an input-deferred frame latch");
+            Check(SetPresentationVisibility(state.hwnd,false),"deferred frame fixture could not hide its window");
+            Check(!IsWindowVisible(state.hwnd),"deferred frame fixture window stayed visible");
+            Check(!state.framePaintPending,"hiding stranded an input-deferred paint latch");
+            Check(!stillQueued(),"hidden view retained a queued animation wake");
             FrameInputFixture::pending=0;
             SetPresentationVisibility(state.hwnd,true);
             const int restored=state.paintCalls;

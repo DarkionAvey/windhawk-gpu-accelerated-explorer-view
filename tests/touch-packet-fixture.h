@@ -16,23 +16,28 @@ namespace TouchFixture {
 inline thread_local bool enabled=false;
 inline thread_local bool failCreate=false, rejectPackets=false, promotionSucceeds=true, promoted=false;
 inline thread_local std::vector<INTERACTION_CONTEXT_OUTPUT2> recognized;
+inline thread_local std::vector<INTERACTION_CONTEXT_OUTPUT2> tapRecognized;
 inline thread_local unsigned begins=0,updates=0,ends=0,processCalls=0,promotions=0,drags=0;
 inline thread_local DWORD owner=0,callbackThread=0;
 inline thread_local LONG overX=0,overY=0;
 inline thread_local BOOL inertia=FALSE,animatedEnd=FALSE;
 inline thread_local std::function<void()> duringDrag;
 inline thread_local std::vector<std::wstring> dragPaths;
-struct Binding {INTERACTION_CONTEXT_OUTPUT_CALLBACK2 callback=nullptr; void* client=nullptr; float deceleration=0.f;};
+struct Binding {INTERACTION_CONTEXT_OUTPUT_CALLBACK2 callback=nullptr; void* client=nullptr; float deceleration=0.f; bool tapsOnly=false;};
 inline thread_local std::map<HINTERACTIONCONTEXT,std::unique_ptr<Binding>> bindings;
 inline void CALLBACK Observe(void* value,const INTERACTION_CONTEXT_OUTPUT2* output) {
     auto& binding=*static_cast<Binding*>(value);
-    callbackThread=GetCurrentThreadId(); recognized.push_back(*output);
+    callbackThread=GetCurrentThreadId();
+    (binding.tapsOnly ? tapRecognized : recognized).push_back(*output);
     if(binding.callback) binding.callback(binding.client,output);
 }
 inline HRESULT WINAPI Register(HINTERACTIONCONTEXT context,INTERACTION_CONTEXT_OUTPUT_CALLBACK2 callback,void* client) {
     if(!enabled) return ::RegisterOutputCallbackInteractionContext2(context,callback,client);
     auto& binding=bindings[context]; if(!binding) binding=std::make_unique<Binding>();
     *binding={callback,client};
+    INTERACTION_CONTEXT_CONFIGURATION manipulation{INTERACTION_ID_MANIPULATION};
+    if(SUCCEEDED(::GetInteractionConfigurationInteractionContext(context,1,&manipulation)))
+        binding->tapsOnly=!(manipulation.enable & INTERACTION_CONFIGURATION_FLAG_MANIPULATION);
     return ::RegisterOutputCallbackInteractionContext2(context,Observe,binding.get());
 }
 inline HRESULT WINAPI Destroy(HINTERACTIONCONTEXT context) {
@@ -43,7 +48,11 @@ inline HRESULT WINAPI Create(HINTERACTIONCONTEXT* context) {
     return ::CreateInteractionContext(context);
 }
 inline HRESULT WINAPI Process(HINTERACTIONCONTEXT context,UINT32 rows,UINT32 columns,const POINTER_INFO* info) {
-    if(enabled) {++processCalls; if(rejectPackets) return E_INVALIDARG;}
+    if(enabled) {
+        const auto found=bindings.find(context);
+        if(found==bindings.end() || !found->second->tapsOnly) ++processCalls;
+        if(rejectPackets) return E_INVALIDARG;
+    }
     const auto hr=::ProcessPointerFramesInteractionContext(context,rows,columns,info);
     // Snapshot the effective native value after processing returns and before
     // production can stop the recognizer. Stop resets this per-interaction value.
@@ -99,9 +108,9 @@ struct Session {
     Session() {
         enabled=promotionSucceeds=true; failCreate=rejectPackets=promoted=false;
         begins=updates=ends=processCalls=promotions=drags=0; owner=GetCurrentThreadId();
-        recognized.clear(); dragPaths.clear(); duringDrag={};
+        recognized.clear(); tapRecognized.clear(); dragPaths.clear(); duringDrag={};
     }
-    ~Session() {enabled=previous; recognized.clear(); duringDrag={};}
+    ~Session() {enabled=previous; recognized.clear(); tapRecognized.clear(); duringDrag={};}
 };
 }
 #define CreateInteractionContext TouchFixture::Create

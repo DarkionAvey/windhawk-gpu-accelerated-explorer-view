@@ -20,7 +20,9 @@
 #include "menu-fixture.h"
 #include "style-fixture.h"
 #include "touch-packet-fixture.h"
+#include "tab-activation-fixture.h"
 #include GPU_OVERLAY_SOURCE
+#undef ShellExecuteExW
 #undef CreateInteractionContext
 #undef RegisterOutputCallbackInteractionContext2
 #undef DestroyInteractionContext
@@ -1895,6 +1897,7 @@ static void TestPreviewInput() {
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"
+#include "additional-gestures-smoke.h"
 #include "checkbox-smoke.h"
 #include "rename-appearance-smoke.h"
 #include "swipe-compositor-smoke.h"
@@ -2079,6 +2082,10 @@ int wmain(int argc,wchar_t** argv) {
             TestSwipeCompositor();
         } else if (argc>1 && wcscmp(argv[1],L"--touch")==0) {
             TestTouchInput(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--additional-gestures")==0) {
+            TestAdditionalGestures(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--new-tabs")==0) {
+            TestBackgroundTabStartup(fixture.wstring()); TestColdAttachWake();
         } else if (argc>1 && wcscmp(argv[1],L"--checkboxes")==0) {
             TestSelectionCheckboxes(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {
@@ -2095,6 +2102,7 @@ int wmain(int argc,wchar_t** argv) {
         TestStatusButtonLayout();
         TestUserOptions();
         TestTouchInput(fixture.wstring());
+        TestAdditionalGestures(fixture.wstring());
         TestSelectionCheckboxes(fixture.wstring());
         TestResolvedStyles();
         TestStyleEvents(fixture.wstring());
@@ -2157,6 +2165,7 @@ int wmain(int argc,wchar_t** argv) {
         TestPreviewInput();
         TestNativeStartupPipeline(fixture.wstring());
         TestColdAttachWake();
+        TestBackgroundTabStartup(fixture.wstring());
         TestAttachedLifecycle(fixture.wstring());
         TestTypeSearchPrefix();
         TestUiFeedbackAudit(fixture.wstring());

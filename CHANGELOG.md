@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.313
+
+- Prepare new tabs' GPU content in the background so activation can show their
+  own cached surface without waiting for interaction.
+- Preserve the current list's bounds and stacking while Explorer creates a new
+  tab, including layouts with a navigation pane.
+
+## 0.9.312
+
+- Use Explorer's native tab navigation for middle-clicked folders, bypassing
+  context-menu loading that could show a busy cursor without opening a tab.
+
+## 0.9.311
+
+- Route folder middle-clicks through the owning Explorer tab's native command
+  instead of Shell activation, which could open a separate window.
+
+## 0.9.310
+
+- Add three default-enabled options under **Additional mouse and touch gestures**: double-click
+  empty space or side margins to go up, middle-click folders to open in a new
+  tab, and tap with two fingers on a touchscreen for the same item or folder
+  context menu as right-click.
+
 ## 0.9.309
 
 - Show and hide item checkboxes instantly. Use the same size and normal theme
