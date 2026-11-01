@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.334
+
+- Visiting an empty folder no longer discards the cached text layouts of
+  filenames, so the next folder's names appear without being re-measured.
+
 ## 0.9.333
 
 - Keep two-finger swipes on their chosen action until release or cancellation.

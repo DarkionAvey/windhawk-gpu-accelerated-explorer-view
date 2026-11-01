@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.333
+// @version         0.9.334
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -3664,6 +3664,11 @@ struct ViewState {
     int textFormatDpi = 0;
     ComPtr<IDWriteTextFormat> headerFormat;
     ComPtr<IDWriteTextFormat> sortedHeaderFormat;
+    // The empty-folder caption owns its centered layout. Mutating the shared
+    // body format's alignment would version every cached filename layout.
+    ComPtr<IDWriteTextLayout> emptyCaptionLayout;
+    ComPtr<IDWriteTextFormat> emptyCaptionFormat;
+    D2D1_SIZE_F emptyCaptionSize{};
     ULONGLONG lastViewCheck = 0;
     ULONGLONG lastLog = 0;
     double paintTotalMs = 0;
@@ -18808,13 +18813,27 @@ void Paint(ViewState& state) {
         !state.rowTransitionActive && !g_emptyFolderCaption.empty() &&
         header < contentBottom && state.textFormat) {
         // Center the localized caption across the entire visible list row,
-        // not just the Name column. Reuse the regular body font and Text()
-        // pipeline, then restore its normal filename alignment immediately.
-        const DWRITE_TEXT_ALIGNMENT previous = state.textFormat->GetTextAlignment();
-        if (SUCCEEDED(state.textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER))) {
-            Text(state, g_emptyFolderCaption, listStart, header,
-                listEnd, std::min(header + row, contentBottom), nameColor);
-            state.textFormat->SetTextAlignment(previous);
+        // not just the Name column, in the regular body font. Its own layout
+        // follows format and size changes; the shared format stays untouched.
+        const float left = state.rtlLayout ? w - listEnd : listStart;
+        const float right = state.rtlLayout ? w - listStart : listEnd;
+        const float width = roundf(right - left), height = roundf(std::min(header + row, contentBottom) - header);
+        if (width > 0.f && height > 0.f && g_writeFactory) {
+            if (state.emptyCaptionFormat != state.textFormat ||
+                state.emptyCaptionSize.width != width || state.emptyCaptionSize.height != height) {
+                state.emptyCaptionLayout.Reset();
+                if (SUCCEEDED(g_writeFactory->CreateTextLayout(g_emptyFolderCaption.c_str(),
+                        static_cast<UINT32>(g_emptyFolderCaption.size()), state.textFormat.Get(),
+                        width, height, &state.emptyCaptionLayout)))
+                    state.emptyCaptionLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                state.emptyCaptionFormat = state.textFormat;
+                state.emptyCaptionSize = D2D1::SizeF(width, height);
+            }
+            if (state.emptyCaptionLayout) {
+                state.brush->SetColor(Packed(nameColor, 1.f));
+                state.target->DrawTextLayout(SnapDrawPoint(state.target.Get(), D2D1::Point2F(left, header)),
+                    state.emptyCaptionLayout.Get(), state.brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
         }
     }
     uiComparisonRow=true;

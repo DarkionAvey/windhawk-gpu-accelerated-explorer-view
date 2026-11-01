@@ -369,5 +369,33 @@ static void TestTextRaster(State& state) {
     Check(!state.retiredTextLayouts.empty(),"font change synchronously discarded the old raster cache");
     for(int i=0;i<100 && !state.retiredTextLayouts.empty();++i) Paint(state);
     Check(state.retiredTextLayouts.empty(),"retired text resources stopped draining");
+    if constexpr (requires { state.emptyCaptionLayout; }) {
+        // An empty folder's centered caption owns its layout: the shared body
+        // format keeps its alignment, warm filename layouts stay warm across
+        // its paints, and the caption itself is not rebuilt per frame.
+        const std::wstring warm=L"Warm filename that survives an empty folder.txt";
+        const auto* before=ResolveTextLayout(state,warm,210.f,28.f);
+        const auto generation=state.textLayouts[0].generation;
+        auto entries=std::move(state.entries); const int total=state.total;
+        const bool loaded=state.loaded, preview=state.namesPreview;
+        const auto selection=state.selectedFlags;
+        const auto caption=g_emptyFolderCaption;
+        if(g_emptyFolderCaption.empty()) g_emptyFolderCaption=L"This private folder is empty.";
+        state.entries.clear(); state.total=0; state.selectedFlags.clear();
+        state.loaded=true; state.namesPreview=false;
+        Check(Eventually([&] {Paint(state); return state.emptyCaptionLayout!=nullptr;}),"empty folder caption was not drawn");
+        const auto captionLayout=state.emptyCaptionLayout;
+        for(int i=0;i<3;++i) Paint(state);
+        Check(state.textFormat->GetTextAlignment()==DWRITE_TEXT_ALIGNMENT_LEADING &&
+            state.textLayouts[0].generation==generation && ResolveTextLayout(state,warm,210.f,28.f)==before,
+            "empty folder caption versioned the shared filename layouts");
+        Check(state.emptyCaptionLayout==captionLayout &&
+            state.emptyCaptionLayout->GetTextAlignment()==DWRITE_TEXT_ALIGNMENT_CENTER,
+            "empty folder caption rebuilt or lost its own centered layout");
+        g_emptyFolderCaption=caption;
+        state.entries=std::move(entries); state.total=total; state.selectedFlags=selection;
+        state.loaded=loaded; state.namesPreview=preview;
+        Paint(state);
+    }
     std::cout<<"PASS: shared text raster pixels, trimming/wrapping/RTL, opacity, native resized/fresh layout equivalence, geometry variants, intrinsic reuse during auto-fit, metadata continuity across font changes, cold budget and paced glyph retirement\n";
 }
