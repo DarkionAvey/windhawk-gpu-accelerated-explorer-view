@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.327
+
+- Cache rendered text in shared GPU texture pages instead of one texture per
+  string, so far more text stays cached in less graphics memory and fewer
+  textures are created while scrolling.
+
 ## 0.9.326
 
 - While copied or cut items wiggle in an otherwise still view, redraw and

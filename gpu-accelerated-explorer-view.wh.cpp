@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.326
+// @version         0.9.327
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -897,9 +897,126 @@ struct SelectionShape {
     std::array<D2D1_RECT_F,8> lines{};
     unsigned count = 0;
 };
+// Text coverage masks share A8 pages instead of one GPU texture per value.
+// Shelves pack cells of one rounded height; every cell keeps a transparent
+// gutter, so filtered sampling never reads a neighbor. Empty shelves split
+// and merge, keeping pages usable across zoom-driven height changes.
+struct GlyphAtlas {
+    static constexpr UINT gutter = 1, shelfStep = 8;
+    struct Shelf { UINT top = 0, height = 0; std::vector<std::pair<UINT,UINT>> free; }; // Sorted x, width.
+    struct Page { ComPtr<ID2D1Bitmap1> bitmap; std::vector<Shelf> shelves; UINT used = 0; size_t live = 0; };
+    UINT side = 0;
+    std::vector<Page> pages;
+    // Glyph positions are fractional; offsetting them by a cell origin can
+    // move glyphs between subpixel buckets. Masks rasterize at the origin of
+    // this surface, then copy into their cell bit-for-bit.
+    ComPtr<ID2D1Bitmap1> scratch;
+    unsigned long long serial = 0;
+    size_t PageBytes() const { return size_t(side)*side; }
+    bool Fits(UINT width, UINT height) const {
+        return width && height && width<=side && (height+shelfStep-1)/shelfStep*shelfStep<=side;
+    }
+    bool Empty(const Shelf& shelf) const {
+        return shelf.free.size()==1 && shelf.free.front().first==0 && shelf.free.front().second==side;
+    }
+    // CPU placement only; the caller creates a missing page's GPU surface.
+    bool Place(Page& page, UINT width, UINT height, UINT& x, UINT& y) {
+        if (!Fits(width,height)) return false;
+        const UINT rounded = (height+shelfStep-1)/shelfStep*shelfStep;
+        const auto take = [&](Shelf& shelf) {
+            for (auto it=shelf.free.begin(); it!=shelf.free.end(); ++it) if (it->second>=width) {
+                x=it->first; y=shelf.top; it->first+=width; it->second-=width;
+                if (!it->second) shelf.free.erase(it);
+                return true;
+            }
+            return false;
+        };
+        for (auto& shelf : page.shelves) if (shelf.height==rounded && take(shelf)) return true;
+        Shelf* best = nullptr;
+        for (auto& shelf : page.shelves)
+            if (shelf.height>rounded && Empty(shelf) && (!best || shelf.height<best->height)) best=&shelf;
+        if (best) {
+            const size_t at = static_cast<size_t>(best-page.shelves.data());
+            Shelf rest{best->top+rounded,best->height-rounded,{{0,side}}};
+            best->height=rounded;
+            page.shelves.insert(page.shelves.begin()+static_cast<std::ptrdiff_t>(at+1),std::move(rest));
+            return take(page.shelves[at]);
+        }
+        if (page.used+rounded>side) return false;
+        page.shelves.push_back({page.used,rounded,{{0,side}}});
+        page.used+=rounded;
+        return take(page.shelves.back());
+    }
+    void Release(size_t index, UINT x, UINT y, UINT width) {
+        if (index>=pages.size()) return;
+        auto& page = pages[index];
+        const auto shelf = std::find_if(page.shelves.begin(),page.shelves.end(),[&](const Shelf& s) { return s.top==y; });
+        if (shelf!=page.shelves.end()) {
+            auto& free = shelf->free;
+            auto it = free.insert(std::lower_bound(free.begin(),free.end(),std::pair<UINT,UINT>{x,0}),{x,width});
+            if (it+1!=free.end() && it->first+it->second==(it+1)->first) { it->second+=(it+1)->second; free.erase(it+1); }
+            if (it!=free.begin() && (it-1)->first+(it-1)->second==it->first) { (it-1)->second+=it->second; free.erase(it); }
+            // Merge adjacent empty shelves; a trailing empty shelf returns its rows.
+            for (size_t i=0; i+1<page.shelves.size();)
+                if (Empty(page.shelves[i]) && Empty(page.shelves[i+1])) {
+                    page.shelves[i].height+=page.shelves[i+1].height;
+                    page.shelves.erase(page.shelves.begin()+static_cast<std::ptrdiff_t>(i+1));
+                } else ++i;
+            if (!page.shelves.empty() && Empty(page.shelves.back())) {
+                page.used=page.shelves.back().top; page.shelves.pop_back();
+            }
+        }
+        // No live cell remains, and retired masks are already drained: release
+        // the page surface. A later mask recreates and clears it.
+        if (page.live && !--page.live) { page.bitmap.Reset(); page.shelves.clear(); page.used=0; }
+    }
+};
+// One reserved atlas cell. Its area returns only when the owning raster is
+// destroyed: after paced retirement, never while a queued draw can read it.
+class GlyphSlot {
+    std::weak_ptr<GlyphAtlas> atlas;
+    size_t page = 0;
+    UINT x = 0, y = 0, width = 0, height = 0; // Outer cell including gutter.
+    unsigned long long serial = 0;
+public:
+    GlyphSlot() = default;
+    GlyphSlot(const std::shared_ptr<GlyphAtlas>& owner, size_t index, UINT left, UINT top, UINT w, UINT h)
+        : atlas(owner), page(index), x(left), y(top), width(w), height(h), serial(++owner->serial) {}
+    GlyphSlot(GlyphSlot&& other) noexcept { *this=std::move(other); }
+    GlyphSlot& operator=(GlyphSlot&& other) noexcept {
+        if (this!=&other) {
+            Reset();
+            atlas=std::move(other.atlas); page=other.page; x=other.x; y=other.y;
+            width=std::exchange(other.width,0u); height=other.height; serial=other.serial;
+        }
+        return *this;
+    }
+    GlyphSlot(const GlyphSlot&) = delete;
+    GlyphSlot& operator=(const GlyphSlot&) = delete;
+    ~GlyphSlot() { Reset(); }
+    explicit operator bool() const { return width!=0; }
+    unsigned long long Serial() const { return serial; }
+    size_t Page() const { return page; }
+    D2D1_RECT_U Cell() const { return D2D1::RectU(x,y,x+width,y+height); }
+    D2D1_RECT_F Source() const {
+        const UINT g = GlyphAtlas::gutter;
+        return D2D1::RectF(float(x+g),float(y+g),float(x+width-g),float(y+height-g));
+    }
+    D2D1_SIZE_U Size() const { return D2D1::SizeU(width-2*GlyphAtlas::gutter,height-2*GlyphAtlas::gutter); }
+    void Reset() {
+        if (!width) return;
+        if (const auto owner=atlas.lock()) owner->Release(page,x,y,width);
+        width=0; atlas.reset();
+    }
+};
 struct TextLayoutCache {
     struct Raster {
-        ComPtr<ID2D1Bitmap1> bitmap;
+        ComPtr<ID2D1Bitmap1> bitmap; // An atlas page when slot is set.
+        GlyphSlot slot;
+        // Stable identity of this mask's pixels, independent of page sharing.
+        unsigned long long Identity() const {
+            return slot ? slot.Serial() : static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(bitmap.Get()));
+        }
         unsigned long long rendering = 0;
         float width = 0.f, height = 0.f;
         unsigned long long used = 0;
@@ -3489,6 +3606,7 @@ struct ViewState {
     ComPtr<ID2D1DeviceContext> target;
     ComPtr<ID2D1DeviceContext> textRasterTarget;
     ComPtr<ID2D1SolidColorBrush> textRasterBrush;
+    std::shared_ptr<GlyphAtlas> glyphAtlas; // Pages on this tab's D2D device.
     ComPtr<IDWriteRenderingParams> textRenderingParams;
     HMONITOR textRenderingMonitor = nullptr;
     unsigned long long textRenderingRevision = 0, textRenderingSerial = 0;
@@ -12828,6 +12946,9 @@ size_t GlyphAllocationEstimate(UINT32 width, UINT32 height) {
     return ((static_cast<size_t>(width)*height + page-1)/page)*page;
 }
 constexpr size_t kGlyphCacheBudget = 64*1024*1024; // All four caches plus pending retirement, per tab.
+// A8 page edge: 1 MiB per page keeps small folders cheap while a page still
+// holds hundreds of typical cells; the texture limit can only lower it.
+constexpr UINT32 kGlyphAtlasSide = 1024;
 size_t GlyphCacheBytes(const ViewState& state) {
     size_t bytes=state.retiredRasterBytes;
     for (const auto& cache : state.textLayouts) bytes+=cache.rasterBytes;
@@ -14433,6 +14554,7 @@ void DropTarget(ViewState& state) {
     state.retiredTextLayouts.clear();
     state.retiredRasterBytes=0;
     state.retiredIconBitmaps.clear(); state.retiredIconBitmapBytes=0;
+    state.glyphAtlas.reset(); // Every slot above is gone; pages belong to this device.
     if (state.textRasterTarget) state.textRasterTarget->SetTarget(nullptr);
     state.textRasterBrush.Reset(); state.textRasterTarget.Reset();
     state.thumbnailBrush.Reset();
@@ -14748,6 +14870,45 @@ void Fill(ViewState& state, float l, float t, float r, float b,
 }
 
 
+// Reserves an atlas cell in an existing page, or in a new page while pages
+// stay within the glyph budget. S_FALSE means every allowed page is full.
+HRESULT ReserveGlyphSlot(ViewState& state, UINT width, UINT height,
+                         ComPtr<ID2D1Bitmap1>& bitmap, GlyphSlot& slot) {
+    auto& atlas = *state.glyphAtlas;
+    UINT x = 0, y = 0;
+    for (size_t i = 0; i < atlas.pages.size(); ++i) {
+        auto& page = atlas.pages[i];
+        if (!page.bitmap || !atlas.Place(page,width,height,x,y)) continue;
+        ++page.live; bitmap = page.bitmap;
+        slot = GlyphSlot(state.glyphAtlas,i,x,y,width,height);
+        return S_OK;
+    }
+    const size_t allowed = std::max<size_t>(1, kGlyphCacheBudget/atlas.PageBytes());
+    const size_t present = static_cast<size_t>(std::count_if(atlas.pages.begin(),atlas.pages.end(),
+        [](const auto& page) { return bool(page.bitmap); }));
+    if (present >= allowed) return S_FALSE;
+    auto released = std::find_if(atlas.pages.begin(),atlas.pages.end(),[](const auto& page) { return !page.bitmap; });
+    const size_t index = released != atlas.pages.end() ? static_cast<size_t>(released-atlas.pages.begin()) : atlas.pages.size();
+    ComPtr<ID2D1Bitmap1> surface;
+    const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+    HRESULT hr = state.textRasterTarget->CreateBitmap(D2D1::SizeU(atlas.side,atlas.side),nullptr,0,&props,&surface);
+    if (FAILED(hr)) return hr;
+    state.textRasterTarget->SetTarget(surface.Get());
+    state.textRasterTarget->BeginDraw();
+    state.textRasterTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
+    hr = state.textRasterTarget->EndDraw();
+    state.textRasterTarget->SetTarget(nullptr);
+    if (FAILED(hr)) return hr;
+    if (index == atlas.pages.size()) atlas.pages.emplace_back();
+    auto& page = atlas.pages[index];
+    page = {}; page.bitmap = std::move(surface);
+    if (!atlas.Place(page,width,height,x,y)) return S_FALSE; // Caller bounds cells to one page.
+    ++page.live; bitmap = page.bitmap;
+    slot = GlyphSlot(state.glyphAtlas,index,x,y,width,height);
+    return S_OK;
+}
+
 // Cache the expensive DWrite-to-D2D traversal, not just shaped layouts. Command
 // lists only move this cost to EndDraw. A8 coverage masks bypass that traversal
 // while FillOpacityMask applies text gamma, live color and live opacity. A
@@ -14785,9 +14946,11 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
             intrinsic=true;
         }
     }
-    const auto draw = [&](ID2D1Bitmap1* bitmap) {
+    const auto draw = [&](const TextLayoutCache::Raster& raster) {
         shaped.displayed = true;
-        const auto size=bitmap->GetPixelSize();
+        ID2D1Bitmap1* bitmap=raster.bitmap.Get();
+        const auto size=raster.slot ? raster.slot.Size() : bitmap->GetPixelSize();
+        const auto source=raster.slot ? raster.slot.Source() : D2D1::RectF();
         // Like the ordinary DWrite pixel-snapped path, retain crisp glyphs
         // when scroll/row animation supplies fractional screen coordinates.
         const auto origin=SnapDrawPoint(state.target.Get(),D2D1::Point2F(x,y));
@@ -14797,7 +14960,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
         state.target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         state.brush->SetColor(Packed(color,opacity));
         static_cast<ID2D1RenderTarget*>(state.target.Get())->FillOpacityMask(bitmap,
-            state.brush.Get(),D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL,&destination,nullptr);
+            state.brush.Get(),D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL,&destination,raster.slot ? &source : nullptr);
         state.target->SetAntialiasMode(antialias);
         if (state.uiTraceDrawItem && filename)
             PipelineEvent(*state.background,{.operation=L"ui.text.raster[opacity,width,height,color]",
@@ -14812,7 +14975,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
             raster.underline != bool(underline)) continue;
         raster.used = ++state.textRasterTick;
         raster.painted = state.graphicsPaintSerial;
-        draw(raster.bitmap.Get());
+        draw(raster);
         if (p.recording) ++p.textHits;
         return true;
     }
@@ -14849,7 +15012,15 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     }
     ConfigureTextTarget(state,state.textRasterTarget.Get());
     const auto size = D2D1::SizeU(static_cast<UINT32>(ceilf(width)), static_cast<UINT32>(ceilf(height)));
-    const size_t bytes = GlyphAllocationEstimate(size.width,size.height);
+    if (!state.glyphAtlas) {
+        state.glyphAtlas = std::make_shared<GlyphAtlas>();
+        state.glyphAtlas->side = std::min<UINT32>(kGlyphAtlasSide, state.textRasterTarget->GetMaximumBitmapSize());
+    }
+    // Ordinary values share atlas pages; an exceptionally large one keeps a
+    // standalone texture, charged at the allocation granularity.
+    const UINT atlasWidth = size.width+2*GlyphAtlas::gutter, atlasHeight = size.height+2*GlyphAtlas::gutter;
+    const bool atlased = state.glyphAtlas->Fits(atlasWidth,atlasHeight);
+    const size_t bytes = atlased ? size_t(atlasWidth)*atlasHeight : GlyphAllocationEstimate(size.width,size.height);
     const size_t budget = kGlyphCacheBudget;
     // Reuse the shaping cache's LRU and accounting. There is no second cache
     // index, worker, cross-tab lock or all-directory sweep on a rendered frame.
@@ -14879,25 +15050,79 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     raster.underline = underline != FALSE;
     raster.used=++state.textRasterTick; raster.bytes=bytes;
     raster.painted=state.graphicsPaintSerial;
-    const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
-        D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
-    HRESULT hr = state.textRasterTarget->CreateBitmap(size,nullptr,0,&props,&raster.bitmap);
+    HRESULT hr = S_OK;
+    if (atlased) {
+        hr = ReserveGlyphSlot(state,atlasWidth,atlasHeight,raster.bitmap,raster.slot);
+        if (hr == S_FALSE) {
+            // Every page is full. Retire this cache's least recent masks not
+            // drawn in this frame; their cells return after paced cleanup.
+            for (auto it = cache.recent.rbegin(); it != cache.recent.rend(); ++it) {
+                const auto victim = cache.layouts.find(*it);
+                if (victim == cache.layouts.end() || &victim->second == &shaped || !victim->second.rasterBytes ||
+                    std::any_of(victim->second.rasters.begin(),victim->second.rasters.end(),
+                        [&](const auto& old) { return old.painted == state.graphicsPaintSerial; })) continue;
+                cache.rasterBytes -= victim->second.rasterBytes;
+                cache.recent.erase(std::next(it).base());
+                RetireTextLayout(state,std::move(victim->second));
+                cache.layouts.erase(victim);
+                break;
+            }
+            if (!state.retiredRasterBytes) return false;
+            state.textRasterPending=true;
+            if (deferCold && p.recording) ++p.textDeferred;
+            return deferCold;
+        }
+    } else {
+        const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+        hr = state.textRasterTarget->CreateBitmap(size,nullptr,0,&props,&raster.bitmap);
+    }
+    auto& scratch = state.glyphAtlas->scratch;
+    if (SUCCEEDED(hr) && raster.slot && (!scratch ||
+        scratch->GetPixelSize().width < size.width || scratch->GetPixelSize().height < size.height)) {
+        const auto current = scratch ? scratch->GetPixelSize() : D2D1::SizeU();
+        const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+        scratch.Reset();
+        hr = state.textRasterTarget->CreateBitmap(D2D1::SizeU(std::max(current.width,size.width),
+            std::max(current.height,size.height)),nullptr,0,&props,&scratch);
+    }
     if (SUCCEEDED(hr)) {
         if (intrinsic) layout->SetMaxWidth(width);
-        state.textRasterTarget->SetTarget(raster.bitmap.Get());
         state.textRasterTarget->BeginDraw();
+        state.textRasterTarget->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (raster.slot) {
+            // A reused cell still holds its previous value: clear it with its
+            // gutter. The mask itself renders exactly like a standalone bitmap.
+            const auto cell = raster.slot.Cell();
+            state.textRasterTarget->SetTarget(raster.bitmap.Get());
+            state.textRasterTarget->PushAxisAlignedClip(D2D1::RectF(float(cell.left),float(cell.top),
+                float(cell.right),float(cell.bottom)),D2D1_ANTIALIAS_MODE_ALIASED);
+            state.textRasterTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
+            state.textRasterTarget->PopAxisAlignedClip();
+            state.textRasterTarget->SetTarget(scratch.Get());
+            state.textRasterTarget->PushAxisAlignedClip(D2D1::RectF(0.f,0.f,float(size.width),float(size.height)),
+                D2D1_ANTIALIAS_MODE_ALIASED);
+        } else state.textRasterTarget->SetTarget(raster.bitmap.Get());
         state.textRasterTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
         state.textRasterBrush->SetColor(Packed(0xFFFFFF));
         state.textRasterTarget->DrawTextLayout(D2D1::Point2F(),layout,
             state.textRasterBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        if (raster.slot) state.textRasterTarget->PopAxisAlignedClip();
         hr=state.textRasterTarget->EndDraw();
         state.textRasterTarget->SetTarget(nullptr);
+        if (SUCCEEDED(hr) && raster.slot) {
+            const auto source = raster.slot.Source();
+            const auto destination = D2D1::Point2U(UINT32(source.left),UINT32(source.top));
+            const auto area = D2D1::RectU(0,0,size.width,size.height);
+            hr = raster.bitmap->CopyFromBitmap(&destination,scratch.Get(),&area);
+        }
         if (intrinsic) layout->SetMaxWidth(cellWidth);
     }
     QueryPerformanceCounter(&ended);
     state.textRasterBuildTicks += ended.QuadPart-started.QuadPart;
     if (FAILED(hr)) { state.textRasterUnavailable=true; return false; }
-    draw(raster.bitmap.Get());
+    draw(raster);
     if (shaped.rasters.size() >= std::max<size_t>(4,state.columns.size()+1)) {
         const auto victim=std::min_element(shaped.rasters.begin(),shaped.rasters.end(),
             [](const auto& a,const auto& b) { return a.used<b.used; });

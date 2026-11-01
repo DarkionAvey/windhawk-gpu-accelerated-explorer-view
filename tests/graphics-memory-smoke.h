@@ -137,13 +137,14 @@ static void TestGraphicsResourceLifecycle() {
                 <<" visible="<<event.visible<<" operations="<<event.operations<<std::endl;
         Check(settled,"standby scene/cache retirement did not finish on frame completion");
     };
-    const auto pixels=[&](ViewState& state,ID2D1Bitmap* source) {
+    // Atlas masks share a page; read only the mask's own cell.
+    const auto pixels=[&](ViewState& state,ID2D1Bitmap* source,std::optional<D2D1_RECT_U> area={}) {
         ComPtr<ID2D1Bitmap1> cpu;
-        const auto size=source->GetPixelSize();
+        const auto size=area ? D2D1::SizeU(area->right-area->left,area->bottom-area->top) : source->GetPixelSize();
         const auto format=source->GetPixelFormat();
         const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,format);
         Check(SUCCEEDED(state.target->CreateBitmap(size,nullptr,0,&props,&cpu)) &&
-            SUCCEEDED(cpu->CopyFromBitmap(nullptr,source,nullptr)),"warm bitmap readback");
+            SUCCEEDED(cpu->CopyFromBitmap(nullptr,source,area ? &*area : nullptr)),"warm bitmap readback");
         D2D1_MAPPED_RECT map{};
         Check(SUCCEEDED(cpu->Map(D2D1_MAP_OPTIONS_READ,&map)),"warm bitmap map");
         const size_t rowBytes=size.width*(format.format==DXGI_FORMAT_A8_UNORM ? 1 : 4);
@@ -188,9 +189,11 @@ static void TestGraphicsResourceLifecycle() {
             const auto found=state->textLayouts[0].layouts.find(state->entries[0].name);
             return found!=state->textLayouts[0].layouts.end() && !found->second.rasters.empty() && icon.painted==state->lastAcceptedPaint;
         }),"visible name/icon did not become ready before hide");
-        auto glyph=state->textLayouts[0].layouts.at(state->entries[0].name).rasters.back().bitmap;
+        const auto& glyphRaster=state->textLayouts[0].layouts.at(state->entries[0].name).rasters.back();
+        auto glyph=glyphRaster.bitmap; const auto glyphId=glyphRaster.Identity();
+        const auto glyphCell=glyphRaster.slot ? std::optional<D2D1_RECT_U>(glyphRaster.slot.Cell()) : std::nullopt;
         auto visibleIcon=icon.bitmap;
-        const auto glyphPixels=pixels(*state,glyph.Get());
+        const auto glyphPixels=pixels(*state,glyph.Get(),glyphCell);
         const auto iconPixels=pixels(*state,visibleIcon.Get());
         auto& offscreen=state->icons[L"memory-fixture:offscreen"];
         offscreen.pixels.width=offscreen.pixels.height=32; offscreen.pixels.stride=128;
@@ -253,9 +256,9 @@ static void TestGraphicsResourceLifecycle() {
             !state->graphicsSuspended && state->visible && state->inScope && state->selected==0 &&
             state->entries[0].name==L"retained private model","hidden tab lost its warm image or retained offscreen cache/scene");
         Check(icon.bitmap.Get()==visibleIcon.Get() && !offscreen.bitmap && offscreen.pixels.Ready() &&
-            state->textLayouts[0].layouts.at(state->entries[0].name).rasters.back().bitmap.Get()==glyph.Get(),
+            state->textLayouts[0].layouts.at(state->entries[0].name).rasters.back().Identity()==glyphId,
             "standby discarded visible glyph/icon textures or CPU icon data");
-        Check(pixels(*state,glyph.Get())==glyphPixels && pixels(*state,visibleIcon.Get())==iconPixels,
+        Check(pixels(*state,glyph.Get(),glyphCell)==glyphPixels && pixels(*state,visibleIcon.Get())==iconPixels,
             "composition recycling/driver trim changed visible glyph or icon pixels");
         // A stray WM_PAINT must not touch the ready hidden image.
         const auto hiddenPaint=state->graphicsPaintSerial;
@@ -274,7 +277,7 @@ static void TestGraphicsResourceLifecycle() {
     auto savedFormat=resumed.textFormat;
     auto savedDevice=resumed.d3d; auto savedSwapchain=resumed.swapChain;
     auto savedComposition=resumed.composition;
-    auto savedGlyph=resumed.textLayouts[0].layouts.at(resumed.entries[0].name).rasters.back().bitmap;
+    const auto savedGlyph=resumed.textLayouts[0].layouts.at(resumed.entries[0].name).rasters.back().Identity();
     for(unsigned cycle=0;cycle<12;++cycle) {
         const auto before=resumed.graphicsPaintSerial;
         const auto cachedFrame=pixels(resumed,resumed.backbuffer.Get());
@@ -286,7 +289,7 @@ static void TestGraphicsResourceLifecycle() {
         Check(pixels(resumed,resumed.backbuffer.Get())==cachedFrame,
             "cached tab frame changed before repaint on return");
         Paint(resumed);
-        Check(resumed.textLayouts[0].layouts.at(resumed.entries[0].name).rasters.back().bitmap.Get()==savedGlyph.Get(),
+        Check(resumed.textLayouts[0].layouts.at(resumed.entries[0].name).rasters.back().Identity()==savedGlyph,
             "tab return rebuilt the visible glyph texture");
         ShowWindow(resumed.hwnd,SW_HIDE); settle(resumed,"cached return");
         Check(resumed.composition.Get()==savedComposition.Get(),"ordinary tab return recycled composition without an animation pool");
@@ -332,7 +335,7 @@ static void TestGraphicsResourceLifecycle() {
     Check(g_gpuDevices.load()==initialDevices+20,"standby did not preserve tab-owned graphics domains");
     Check(!adapter || final.CurrentUsage<=2688ULL*1024*1024,
         "20 warm 4K tabs retained oversized scene/driver allocations");
-    savedGlyph.Reset(); savedSwapchain.Reset(); savedDevice.Reset(); savedComposition.Reset(); savedFormat.Reset();
+    savedSwapchain.Reset(); savedDevice.Reset(); savedComposition.Reset(); savedFormat.Reset();
     for(auto& state : tabs) {
         DropTarget(*state);
         SetWindowLongPtrW(state->hwnd,GWLP_USERDATA,0);

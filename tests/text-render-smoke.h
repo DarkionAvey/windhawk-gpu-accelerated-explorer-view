@@ -78,9 +78,9 @@ static void TestTextRaster(State& state) {
     capture(shared,true,false,120,0xFFFFFF,1); capture(shared,true,false,210,0xFFFFFF,1);
     auto& variants=state.textLayouts[0].layouts.at(shared).rasters;
     Check(variants.size()==2,"identical text in different columns lost its geometry variants");
-    auto first=variants[0].bitmap.Get(); auto second=variants[1].bitmap.Get();
+    const auto first=variants[0].Identity(), second=variants[1].Identity();
     capture(shared,true,false,120,0xFFFFFF,1); capture(shared,true,false,210,0xFFFFFF,1);
-    Check(variants.size()==2 && variants[0].bitmap.Get()==first && variants[1].bitmap.Get()==second,
+    Check(variants.size()==2 && variants[0].Identity()==first && variants[1].Identity()==second,
         "unchanged text rebuilt its glyph surfaces");
     const float oldFont=state.fontPx;
     state.fontPx=16.f;
@@ -88,7 +88,7 @@ static void TestTextRaster(State& state) {
         state.rtlLayout=rtl; Check(MakeTextFormats(state),"intrinsic text format");
         state.columnTransitionActive=true;
         const std::wstring shortText=rtl ? L"زهرة.txt" : L"Flower.jpg";
-        ID2D1Bitmap1* mask=nullptr;
+        unsigned long long mask=0;
         for(float width : {160.f,210.f,300.f,180.f}) {
             const auto reference=capture(shortText,false,false,width,0xFFFFFF,1);
             const auto drawn=capture(shortText,true,false,width,0xFFFFFF,1);
@@ -98,9 +98,9 @@ static void TestTextRaster(State& state) {
             }
             Check(coverage>0 && error<coverage*.12,"intrinsic raster changed text placement during auto-fit");
             auto& masks=state.textLayouts[0].layouts.at(shortText).rasters;
-            Check(masks.size()==1 && (!mask || masks.front().bitmap.Get()==mask),
+            Check(masks.size()==1 && (!mask || masks.front().Identity()==mask),
                 "stable text rebuilt its raster for intermediate column widths");
-            mask=masks.front().bitmap.Get();
+            mask=masks.front().Identity();
         }
         state.columnTransitionActive=false;
     }
@@ -240,19 +240,128 @@ static void TestTextRaster(State& state) {
     // GPU masks until the existing after-paint cleanup, just like font changes.
     const std::wstring retiring=L"A sufficiently long cached label with many clipped geometry variants";
     capture(retiring,true,false,50,0xFFFFFF,1);
-    const auto firstMask=state.textLayouts[0].layouts.at(retiring).rasters.front().bitmap.Get();
+    const auto firstMask=state.textLayouts[0].layouts.at(retiring).rasters.front().Identity();
     for(float width : {60.f,70.f,80.f,90.f,100.f}) capture(retiring,true,false,width,0xFFFFFF,1);
-    const auto retained=[&](ID2D1Bitmap1* mask) {
+    const auto retained=[&](unsigned long long mask) {
         return std::any_of(state.retiredTextLayouts.begin(),state.retiredTextLayouts.end(),
             [&](const auto& old) { return std::any_of(old.rasters.begin(),old.rasters.end(),
-                [&](const auto& raster) { return raster.bitmap.Get()==mask; }); });
+                [&](const auto& raster) { return raster.Identity()==mask; }); });
     };
     Check(retained(firstMask),"raster variant eviction released its GPU mask inside text drawing");
-    const auto lruMask=state.textLayouts[0].layouts.at(retiring).rasters.front().bitmap.Get();
+    const auto lruMask=state.textLayouts[0].layouts.at(retiring).rasters.front().Identity();
     for(int i=0;i<4096;++i)
         ResolveTextLayout(state,L"audit shaped value "+std::to_wstring(i),90,100);
     Check(!state.textLayouts[0].layouts.contains(retiring) && retained(lruMask),
         "text LRU eviction released GPU masks before paced cleanup");
+    if constexpr (requires { state.glyphAtlas; }) {
+        // Shared A8 pages: many values share a page without overlapping cells,
+        // each mask equals a standalone render of its layout (also in a reused
+        // cell), and a retired cell returns only after paced cleanup.
+        using Cell = std::pair<ID2D1Bitmap1*,D2D1_RECT_U>;
+        const auto sameCell=[](const Cell& a,const Cell& b) {
+            return a.first==b.first && a.second.left==b.second.left && a.second.top==b.second.top &&
+                a.second.right==b.second.right && a.second.bottom==b.second.bottom;
+        };
+        const auto value=[](const wchar_t* prefix,int i) {
+            return prefix+std::to_wstring(i)+L" atlas cell value long enough to be trimmed";
+        };
+        const auto drawValues=[&](const wchar_t* prefix,int count) {
+            state.target->BeginDraw(); ConfigureTextTarget(state,state.target.Get());
+            for(int i=0;i<count;++i) Text(state,value(prefix,i),20,20,160,48,0xFFFFFF);
+            Check(SUCCEEDED(state.target->EndDraw()),"atlas text draw");
+        };
+        const auto rasterOf=[&](const std::wstring& text) -> const TextLayoutCache::Raster& {
+            const auto& rasters=state.textLayouts[0].layouts.at(text).rasters;
+            Check(rasters.size()==1 && rasters.front().slot,"atlas value has no shared-page cell");
+            return rasters.front();
+        };
+        const auto cellOf=[&](const std::wstring& text) {
+            const auto& raster=rasterOf(text); return Cell{raster.bitmap.Get(),raster.slot.Cell()};
+        };
+        const auto readA8=[&](ID2D1Bitmap1* source,const D2D1_RECT_U& area) {
+            ComPtr<ID2D1Bitmap1> cpu;
+            const auto size=D2D1::SizeU(area.right-area.left,area.bottom-area.top);
+            const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+            Check(SUCCEEDED(state.target->CreateBitmap(size,nullptr,0,&props,&cpu)) &&
+                SUCCEEDED(cpu->CopyFromBitmap(nullptr,source,&area)),"atlas readback");
+            D2D1_MAPPED_RECT map{}; Check(SUCCEEDED(cpu->Map(D2D1_MAP_OPTIONS_READ,&map)),"atlas map");
+            std::vector<BYTE> bytes(size_t(size.width)*size.height);
+            for(UINT y=0;y<size.height;++y) memcpy(bytes.data()+size_t(y)*size.width,map.bits+y*map.pitch,size.width);
+            cpu->Unmap(); return bytes;
+        };
+        const auto matchesStandalone=[&](const std::wstring& text) {
+            const auto& raster=rasterOf(text);
+            const auto size=raster.slot.Size();
+            auto* layout=ResolveTextLayout(state,text,raster.width,raster.height);
+            ComPtr<ID2D1Bitmap1> alone;
+            const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+            Check(layout && SUCCEEDED(state.textRasterTarget->CreateBitmap(size,nullptr,0,&props,&alone)),"standalone mask");
+            ConfigureTextTarget(state,state.textRasterTarget.Get());
+            state.textRasterTarget->SetTarget(alone.Get()); state.textRasterTarget->BeginDraw();
+            state.textRasterTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
+            state.textRasterBrush->SetColor(Packed(0xFFFFFF));
+            state.textRasterTarget->DrawTextLayout(D2D1::Point2F(),layout,state.textRasterBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            Check(SUCCEEDED(state.textRasterTarget->EndDraw()),"standalone mask draw");
+            state.textRasterTarget->SetTarget(nullptr);
+            const auto cell=raster.slot.Cell();
+            const auto framed=readA8(raster.bitmap.Get(),cell);
+            const UINT w=cell.right-cell.left,h=cell.bottom-cell.top;
+            for(UINT y=0;y<h;++y) for(UINT x=0;x<w;++x)
+                if((!x || !y || x+1==w || y+1==h) && framed[size_t(y)*w+x]) return false; // Gutter stays clear.
+            const auto source=raster.slot.Source();
+            return readA8(raster.bitmap.Get(),D2D1::RectU(UINT(source.left),UINT(source.top),UINT(source.right),UINT(source.bottom)))==
+                readA8(alone.Get(),D2D1::RectU(0,0,size.width,size.height));
+        };
+        const auto retire=[&](const std::wstring& text) {
+            auto& cache=state.textLayouts[0]; auto found=cache.layouts.find(text);
+            cache.rasterBytes-=found->second.rasterBytes; cache.recent.erase(found->second.recent);
+            RetireTextLayout(state,std::move(found->second)); cache.layouts.erase(found);
+        };
+        drawValues(L"Atlas A",240);
+        std::vector<Cell> cells; std::set<ID2D1Bitmap1*> pages;
+        for(int i=0;i<240;++i) { cells.push_back(cellOf(value(L"Atlas A",i))); pages.insert(cells.back().first); }
+        bool overlap=false;
+        for(size_t i=0;i<cells.size();++i) for(size_t j=i+1;j<cells.size();++j) {
+            const auto& a=cells[i].second; const auto& b=cells[j].second;
+            overlap|=cells[i].first==cells[j].first && a.left<b.right && b.left<a.right && a.top<b.bottom && b.top<a.bottom;
+        }
+        Check(pages.size()<=4 && !overlap,"text masks did not share atlas pages or their cells overlapped");
+        Check(matchesStandalone(value(L"Atlas A",0)) && matchesStandalone(value(L"Atlas A",239)),
+            "atlas mask differs from a standalone render of its layout");
+        std::vector<Cell> retiredCells;
+        for(int i=0;i<240;i+=2) { retiredCells.push_back(cells[size_t(i)]); retire(value(L"Atlas A",i)); }
+        drawValues(L"Atlas B",60);
+        for(int i=0;i<60;++i) {
+            const auto cell=cellOf(value(L"Atlas B",i));
+            Check(std::none_of(retiredCells.begin(),retiredCells.end(),[&](const Cell& old) { return sameCell(old,cell); }),
+                "atlas reused a retired cell before paced cleanup");
+        }
+        while(!state.retiredTextLayouts.empty()) DrainRetiredGraphics(state);
+        drawValues(L"Atlas C",60);
+        int reused=0;
+        for(int i=0;i<60;++i) {
+            const auto cell=cellOf(value(L"Atlas C",i));
+            if(std::any_of(retiredCells.begin(),retiredCells.end(),[&](const Cell& old) { return sameCell(old,cell); })) {
+                ++reused;
+                Check(matchesStandalone(value(L"Atlas C",i)),"reused atlas cell kept pixels from its previous value");
+            }
+        }
+        Check(reused>0,"drained atlas cells were never reused");
+        // Shelf allocator: an emptied middle shelf splits for a shorter value,
+        // and releasing everything returns the whole page.
+        GlyphAtlas atlas; atlas.side=128; atlas.pages.emplace_back();
+        auto& page=atlas.pages.back(); page.bitmap=rasterOf(value(L"Atlas A",1)).bitmap; // Reference only.
+        UINT x=0,y=0; std::vector<std::array<UINT,2>> placed;
+        for(UINT h : {16u,32u,8u}) { Check(atlas.Place(page,128,h,x,y),"atlas shelf placement"); ++page.live; placed.push_back({x,y}); }
+        Check(placed[0][1]==0 && placed[1][1]==16 && placed[2][1]==48,"atlas shelves were not stacked");
+        atlas.Release(0,placed[1][0],placed[1][1],128);
+        Check(atlas.Place(page,128,8,x,y) && y==16,"emptied shelf was not split for a shorter value");
+        ++page.live; placed[1]={x,y};
+        for(const auto& p : placed) atlas.Release(0,p[0],p[1],128);
+        Check(!page.live && !page.bitmap && page.shelves.empty() && !page.used,"emptied atlas page kept its shelves or surface");
+    }
     state.target->SetTarget(original.Get());
     // A real font change transfers old surfaces; paced paints must drain them.
     Check(MakeTextFormats(state),"text font refresh");
