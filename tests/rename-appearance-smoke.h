@@ -218,7 +218,7 @@ void Zoom(PresentationFixture::Tab& tab) {
 struct PaintColors {
     HWND editor;
     COLORREF text=CLR_INVALID, background=CLR_INVALID, brush=CLR_INVALID;
-    unsigned calls=0;
+    unsigned calls=0, onscreen=0; // Paint requests against a window rather than an off-screen DC.
 };
 LRESULT CALLBACK ObserveColors(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     auto& colors=*reinterpret_cast<PaintColors*>(data);
@@ -228,7 +228,11 @@ LRESULT CALLBACK ObserveColors(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_P
         Check(GetObjectW(reinterpret_cast<HBRUSH>(result),sizeof(brush),&brush),"native EDIT paint brush");
         colors.text=GetTextColor(reinterpret_cast<HDC>(wp));
         colors.background=GetBkColor(reinterpret_cast<HDC>(wp)); colors.brush=brush.lbColor; ++colors.calls;
-    }
+        // Only a window DC that can reach visible pixels counts. This private
+        // frame is off-screen, where USER clips every paint to nothing.
+        RECT visible{};
+        if(GetObjectType(reinterpret_cast<HDC>(wp))!=OBJ_MEMDC &&
+            GetClipBox(reinterpret_cast<HDC>(wp),&visible)!=NULLREGION) ++colors.onscreen;    }
     return result;
 }
 void Palette(ViewState& state) {
@@ -241,6 +245,9 @@ void Palette(ViewState& state) {
     Check(colors.calls && colors.text==state.nativeEditForeground &&
         colors.background==state.nativeEditBackground && colors.brush==state.nativeEditBackground,
         "native EDIT paint did not use the cached theme background/text/brush");
+    // A full repaint must erase and draw off-screen, then copy once. Erasing
+    // the window itself lets DWM compose an empty field between the steps.
+    Check(!colors.onscreen,"rename field erased/painted on screen instead of through one buffered copy");
 }
 }
 

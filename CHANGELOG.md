@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.329
+
+- Fix brief flashes of the list while resizing: Explorer's own window layout
+  no longer rises above the GPU view, even for a single frame.
+- Fix flicker inside the rename field: it now repaints off-screen and appears
+  in one step instead of being erased first.
+
+## 0.9.328
+
+- While dragging a window edge, keep one set of grown GPU buffers instead of
+  rebuilding them at every intermediate size; the exact size is restored when
+  the drag ends.
+
 ## 0.9.327
 
 - Cache rendered text in shared GPU texture pages instead of one texture per

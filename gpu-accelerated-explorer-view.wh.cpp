@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.327
+// @version         0.9.329
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -282,6 +282,7 @@ HRESULT CreatePixelAlignedVisual(IDCompositionDevice* device,IDCompositionVisual
 }
 constexpr wchar_t kOverlayProperty[] = L"WindhawkExplorerGpuOverlayOwnsShellView";
 constexpr wchar_t kViewToggleOwnerProperty[] = L"WindhawkExplorerGpuViewToggleOwner";
+constexpr wchar_t kRenameEditorProperty[] = L"WindhawkExplorerGpuRenameEditor"; // Frame-child EDIT in a GPU stack.
 constexpr wchar_t kSuppressedHostProperty[] = L"WindhawkGpuSuppressedFolderHost";
 constexpr wchar_t kNativeViewportProperty[] = L"WindhawkGpuNativeViewport";
 constexpr wchar_t kNativeVisibilityIntentProperty[] = L"WindhawkGpuNativeVisibilityIntent";
@@ -3525,6 +3526,7 @@ struct ViewState {
     unsigned graphicsOperations = 0; // Native/COM dispatch can reenter any graphics scope.
     ULONGLONG lastGpuMemoryLog = 0;
     bool resizeDeferred = false;
+    bool presentationFrameSizing = false; // Lane copy of the owner's interactive sizing state.
     bool hardwareTarget = false;
     int wheelRemainder = 0;
     ULONGLONG lastRefresh = 0;
@@ -3697,6 +3699,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     unsigned long long sequence=0,lifetime=0;
     LARGE_INTEGER columnIntentOrigin{};
     RECT client{}; int dpi=96; LOGFONTW font{};
+    bool frameSizing=false; // The frame is between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE.
     bool active=false,inputFocus=false,selectionFeedback=false;
     HWND renameEditor=nullptr; int renameIndex=-1;
     float documentHeight=0.f;
@@ -5115,17 +5118,20 @@ BOOL WINAPI NativeShowWindowAsyncHook(HWND hwnd, int command) {
     if (command != SW_HIDE) return TRUE;
     return SetPresentationVisibility(hwnd, false, true);
 }
+HWND KeepBelowOverlayStack(HWND hwnd, HWND after, UINT flags);
 BOOL WINAPI NativeSetWindowPosHook(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
     ApiCallbackGuard callback(ApiHook::Position);
     // Keep the owner-thread geometry interceptor in the transaction, including
     // callers that would otherwise skip WM_WINDOWPOSCHANGING.
     if (GetPropW(hwnd, kNativeViewportProperty)) flags &= ~SWP_NOSENDCHANGING;
+    after = KeepBelowOverlayStack(hwnd, after, flags);
     return g_setWindowPosOriginal(hwnd, after, x, y, cx, cy, ConstrainNativePosition(hwnd, flags));
 }
 HDWP WINAPI NativeDeferWindowPosHook(HDWP batch, HWND hwnd, HWND after,
                                     int x, int y, int cx, int cy, UINT flags) {
     ApiCallbackGuard callback(ApiHook::DeferredPosition);
     if (GetPropW(hwnd, kNativeViewportProperty)) flags &= ~SWP_NOSENDCHANGING;
+    after = KeepBelowOverlayStack(hwnd, after, flags);
     return g_deferWindowPosOriginal(batch, hwnd, after, x, y, cx, cy, ConstrainNativePosition(hwnd, flags));
 }
 
@@ -5646,6 +5652,13 @@ bool PositionOverlayWindows(ViewState& state,const RECT* overlayBounds=nullptr,
     }
     restack&=!t_overlayStacking;
     if(!changed && !restack) return true;
+    // Evidence for reactive repairs: which sibling sat above the stack top.
+    std::shared_ptr<const std::wstring> above;
+    if(restack && g_pipelineTracing.load(std::memory_order_relaxed))
+        if(const HWND sibling=PreviousVisibleSibling(windows[0].hwnd)) {
+            wchar_t cls[64]{}; GetClassNameW(sibling,cls,ARRAYSIZE(cls));
+            above=std::make_shared<const std::wstring>(cls);
+        }
     ScopedFlag repair(t_overlayStacking);
     HDWP batch=BeginDeferWindowPos(static_cast<int>(count));
     if(!batch) return false;
@@ -5666,7 +5679,8 @@ bool PositionOverlayWindows(ViewState& state,const RECT* overlayBounds=nullptr,
     }
     const bool applied=EndDeferWindowPos(batch)!=FALSE;
     PipelineEvent(*state.background,{.operation=L"ui.window.batch[count,restack,geometry,success]",
-        .a=reinterpret_cast<UINT_PTR>(state.hwnd),.v={double(count),double(restack),double(changed),double(applied)}},true);
+        .a=reinterpret_cast<UINT_PTR>(state.hwnd),.v={double(count),double(restack),double(changed),double(applied)},
+        .note=above},true);
     return applied;
 }
 
@@ -14639,6 +14653,12 @@ HRESULT CreatePresentationBuffers(ViewState& state,UINT width,UINT height) {
     return S_OK;
 }
 
+// Interactive frame sizing, as observed by the owner or the lane's model.
+bool FrameSizing(const ViewState& state) {
+    return state.presentationOnly ? state.presentationFrameSizing :
+        GetPropW(state.frameHwnd,kFrameSizingProperty) != nullptr;
+}
+
 bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if(state.presenter && !state.presentationOnly) { Redraw(state); return true; }
     GraphicsContinuation continuation(state);
@@ -14650,6 +14670,22 @@ bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if (width == 0 || height == 0) return true;
     const auto current = state.backbuffer ? state.backbuffer->GetPixelSize() : D2D1_SIZE_U{};
     if (current.width == width && current.height == height) {state.resizeDeferred=false; return true;}
+    // While the user drags a frame edge, buffers only grow, and a growing
+    // axis extends to the monitor's work area at once. Paint clears the whole
+    // buffer and draws only the client, so the excess stays transparent and
+    // outside the window. WM_EXITSIZEMOVE requests the exact size again.
+    if (FrameSizing(state) && current.width && current.height) {
+        if (current.width >= width && current.height >= height) {state.resizeDeferred=false; return true;}
+        MONITORINFO monitor{sizeof(monitor)};
+        if (GetMonitorInfoW(MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST),&monitor)) {
+            const UINT limit = state.target->GetMaximumBitmapSize();
+            const UINT workWidth = UINT(std::max<LONG>(0,monitor.rcWork.right-monitor.rcWork.left));
+            const UINT workHeight = UINT(std::max<LONG>(0,monitor.rcWork.bottom-monitor.rcWork.top));
+            if (width > current.width) width = std::max(width,std::min(workWidth,limit));
+            if (height > current.height) height = std::max(height,std::min(workHeight,limit));
+        }
+        width = std::max(width,current.width); height = std::max(height,current.height);
+    }
     // Shell view replacement/top-order repairs can send WM_SIZE during a
     // mode reversal. The swap chain still contains the last ordinary frame,
     // with its old header offset. Keep the committed scene until Paint has
@@ -17112,8 +17148,12 @@ bool PrepareModeComposition(ViewState& state) {
     // commits. Never expose the canonical source bitmap between reversals.
     ClearModeComposition(state,false);
     auto size = state.backbuffer->GetPixelSize();
-    if (!size.width || !size.height || size.width!=static_cast<UINT>(client.right) ||
+    // Buffers grown during interactive sizing are wider than the client;
+    // planes still match the client. Otherwise a mismatch is a pending resize.
+    const UINT clientWidth = static_cast<UINT>(std::max<LONG>(0,client.right));
+    if (!clientWidth || !size.width || !size.height || size.width<clientWidth || (size.width!=clientWidth && !FrameSizing(state)) ||
         state.columns.size() != state.columnMotion.size()) return false;
+    size.width = clientWidth;
     mode.started = state.columnTransitionStartedQpc;
     mode.header = static_cast<float>(Scale96(kHeader96,ViewDpi(state)));
     mode.size = {client.right,client.bottom};
@@ -21685,6 +21725,27 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         }
         return 0;
     }
+    // A native EDIT erases its whole client, then draws text. This frame child
+    // paints into a surface DWM can compose between the two, flashing an empty
+    // field. Fill the same parent-provided brush and text off-screen, then copy
+    // once. Typing's direct line updates never erase and stay native.
+    if (msg == WM_ERASEBKGND && current) return 1;
+    if (msg == WM_PAINT && current && !wp) {
+        PAINTSTRUCT paint{};
+        const HDC target = BeginPaint(hwnd, &paint);
+        if (!target) return 0;
+        HDC buffer = nullptr;
+        const HPAINTBUFFER painting = GetPropW(hwnd, kRenameEditorProperty) == reinterpret_cast<HANDLE>(2) ?
+            BeginBufferedPaint(target, &paint.rcPaint, BPBF_COMPATIBLEBITMAP, nullptr, &buffer) : nullptr;        const HDC dc = painting ? buffer : target;
+        auto brush = reinterpret_cast<HBRUSH>(SendMessageW(GetParent(hwnd), WM_CTLCOLOREDIT,
+            reinterpret_cast<WPARAM>(dc), reinterpret_cast<LPARAM>(hwnd)));
+        if (!brush) brush = GetSysColorBrush(COLOR_WINDOW);
+        FillRect(dc, &paint.rcPaint, brush);
+        DefSubclassProc(hwnd, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+        if (painting) EndBufferedPaint(painting, TRUE);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
     // Painting/drag selection must never resize or reformat the native EDIT.
     // EN_CHANGE, font, viewport and animation events own those operations.
     if (msg == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE)) {
@@ -21720,7 +21781,10 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     }
     // Always call the genuine EDIT window procedure through WM_NCDESTROY.
     // The session (and its font) are released only AFTER it has completed.
-    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameEditProc, id);
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, RenameEditProc, id);
+        if (RemovePropW(hwnd, kRenameEditorProperty) == reinterpret_cast<HANDLE>(2)) BufferedPaintUnInit();
+    }
     if (current && (msg==WM_SIZE || msg==WM_SETFONT || msg==EM_SETRECT || msg==EM_SETRECTNP))
         state->rename.requestedTextRectValid=false;
     if (current && (msg==WM_SETFONT || msg==WM_SETTEXT)) state->rename.layoutValid=false;
@@ -21818,9 +21882,13 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     r.frameRect = rc;
     EnsurePipelineTrace(state);
     RefreshRenamePalette(state);
+    // Buffered paint is per-thread; this session holds one balanced reference
+    // (value 2) until the editor's NCDESTROY, independent of the view toggle.
+    SetPropW(edit, kRenameEditorProperty, reinterpret_cast<HANDLE>(SUCCEEDED(BufferedPaintInit()) ? 2 : 1));
     // Creation, input and overlay retirement run on this EDIT's owner thread.
     if (!SetWindowSubclass(edit, RenameEditProc,
             reinterpret_cast<UINT_PTR>(RenameEditProc), reinterpret_cast<DWORD_PTR>(&state))) {
+        if (RemovePropW(edit, kRenameEditorProperty) == reinterpret_cast<HANDLE>(2)) BufferedPaintUnInit();
         CloseRenameEditor(state);
         Wh_Log(L"[GPU rename] EDIT subclass failed");
         return;
@@ -24356,6 +24424,40 @@ std::vector<HWND> FrameOverlays(HWND frame) {
     return windows;
 }
 
+// Explorer re-lays out its own frame children, continuously while sizing, and
+// can raise one above the active tab's GPU stack (overlay, view toggle, rename
+// editor). The reorder repair restores the stack only afterwards, so DWM could
+// compose a frame with Explorer's window covering the list. Insert such a
+// sibling directly below the stack instead: the same final order, Explorer's
+// own relative order preserved, and no covered frame. Any thread; HWNDs only.
+HWND KeepBelowOverlayStack(HWND hwnd, HWND after, UINT flags) {
+    if ((flags & SWP_NOZORDER) || t_overlayStacking || g_unloading.load(std::memory_order_relaxed) ||
+        after == HWND_BOTTOM || after == HWND_TOPMOST || after == HWND_NOTOPMOST) return after;
+    const HWND frame = GetAncestor(hwnd, GA_PARENT);
+    if (!frame || GetPropW(hwnd, kViewToggleOwnerProperty) || GetPropW(hwnd, kRenameEditorProperty) ||
+        !IsExplorerFrame(frame)) return after;
+    HWND overlay = nullptr;
+    for (HWND candidate : FrameOverlays(frame)) {
+        if (candidate == hwnd) return after;
+        if (!overlay && GetParent(candidate) == frame && IsWindowVisible(candidate)) overlay = candidate;
+    }
+    if (!overlay || after == overlay) return after;
+    // HWND_TOP, or any window above the overlay, would place hwnd above it.
+    bool above = after == HWND_TOP;
+    for (HWND sibling = GetWindow(overlay, GW_HWNDPREV); !above && sibling; sibling = GetWindow(sibling, GW_HWNDPREV))
+        above = sibling == after;
+    if (!above) return after;
+    if (g_pipelineTracing.load(std::memory_order_relaxed) &&
+        GetWindowThreadProcessId(overlay, nullptr) == GetCurrentThreadId())
+        if (auto* state = State(overlay)) {
+            wchar_t cls[64]{}; GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+            PipelineEvent(*state->background,{.operation=L"ui.window.keepBelow[flags]",
+                .a=reinterpret_cast<UINT_PTR>(hwnd),.b=reinterpret_cast<UINT_PTR>(after),
+                .v={double(flags)},.note=std::make_shared<const std::wstring>(cls)},true);
+        }
+    return overlay;
+}
+
 void RegisterTabOverlay(HWND frame, HWND host, HWND hwnd) {
     AcquireSRWLockExclusive(&g_tabRegistryLock);
     g_tabOverlaysByFrame[frame].push_back(hwnd);
@@ -24970,7 +25072,12 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
     if (msg == WM_EXITSIZEMOVE)
         for (HWND overlay : FrameOverlays(hwnd))
-            if (auto state=State(overlay)) QueueColumnFit(*state);
+            if (auto state=State(overlay)) {
+                QueueColumnFit(*state);
+                // Sizing kept grown buffers; the next frame restores exact ones.
+                if (!state->presenter) state->resizeDeferred = true;
+                Redraw(*state);
+            }
     if (msg == WM_SIZE || msg == WM_WINDOWPOSCHANGED || msg == WM_DPICHANGED || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE)
         RefreshViewToggleForFrame(hwnd, true, msg != WM_WINDOWPOSCHANGED);
     if (msg == WM_ACTIVATE || msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
@@ -25628,6 +25735,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     model->inputFocus=OverlayHasInputFocus(state);
     model->selectionFeedback=SelectionFeedbackVisible(state);
     ViewClientRect(state,&model->client); model->dpi=ViewDpi(state);
+    model->frameSizing=GetPropW(state.frameHwnd,kFrameSizingProperty)!=nullptr;
     if(!state.presentationFont.lfFaceName[0] || state.presentationDpi!=model->dpi) {
         state.presentationFont=NativeHeaderFont(state); state.presentationDpi=model->dpi;
     }
@@ -25812,6 +25920,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     state.presentationOnly=true; state.presentationSequence=model.sequence;
     state.presentationRowRevision=model.rowSceneRevision; state.presentationColumnOrigin=model.columnIntentOrigin;
     state.presentationClient=model.client; state.presentationDpi=model.dpi; state.presentationFont=model.font;
+    state.presentationFrameSizing=model.frameSizing;
     state.presentationActive=model.active; state.inputFocusIndicators=model.inputFocus;
     state.selectionFeedbackVisible=model.selectionFeedback;
     state.rename.editor=model.renameEditor; state.rename.index=model.renameIndex;
@@ -29584,6 +29693,7 @@ void DisposeOverlayState(ViewState* s) {
         const HWND edit=s->rename.editor;
         // Disposal is deferred to the outermost owner-thread callback.
         RemoveWindowSubclass(edit,RenameEditProc,reinterpret_cast<UINT_PTR>(RenameEditProc));
+        if (RemovePropW(edit,kRenameEditorProperty)==reinterpret_cast<HANDLE>(2)) BufferedPaintUnInit();
         SendMessageW(edit,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),FALSE);
         SetPresentationVisibility(edit,false);
         FinalizeDestroyedRenameEditor(*s,edit);

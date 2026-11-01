@@ -54,6 +54,58 @@ static void TestResizePresentation(HWND frame,const std::wstring& fixture) {
             "failed font refresh discarded usable formats or forgot the replacement");
         Check(EnsureTarget(state) && !state.textFormatsDirty && state.textFormat!=body,
             "font replacement did not recover through ordinary target readiness");
+        if constexpr (requires { state.presentationFrameSizing; }) {
+            // Interactive sizing through the real frame subclass: the first
+            // growth allocates once, bounded by the monitor work area; later
+            // steps inside it keep that chain; the excess stays transparent;
+            // WM_EXITSIZEMOVE restores exact buffers.
+            const auto id=reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass);
+            RegisterTabOverlay(frame,frame,state.hwnd);
+            Check(SetWindowSubclass(frame,ExplorerFrameSubclass,id,0),"interactive sizing frame subclass");
+            const auto accept=[&](const char* message) {
+                Check(Eventually([&] {Paint(state); return !state.presentPending && state.presentedSwapChain==state.swapChain;}),message);
+            };
+            const auto bufferSize=[&] { DXGI_SWAP_CHAIN_DESC1 d{}; Check(SUCCEEDED(state.swapChain->GetDesc1(&d)),"sizing chain"); return SIZE{LONG(d.Width),LONG(d.Height)}; };
+            const auto resize=[&](SIZE size) {
+                Check(SetWindowPos(state.hwnd,nullptr,0,0,size.cx,size.cy,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"interactive sizing bounds");
+            };
+            SendMessageW(frame,WM_ENTERSIZEMOVE,0,0);
+            resize({860,540}); accept("first interactive size was not accepted");
+            const auto grown=state.swapChain; const auto grownSize=bufferSize();
+            MONITORINFO monitor{sizeof(monitor)};
+            Check(GetMonitorInfoW(MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST),&monitor),"sizing monitor");
+            const LONG limit=LONG(state.target->GetMaximumBitmapSize());
+            const LONG workWidth=monitor.rcWork.right-monitor.rcWork.left, workHeight=monitor.rcWork.bottom-monitor.rcWork.top;
+            Check(grownSize.cx==std::max(860L,std::min(workWidth,limit)) && grownSize.cy==std::max(540L,std::min(workHeight,limit)),
+                "interactive growth did not extend to the monitor work area");
+            for(const auto size:{SIZE{900,560},SIZE{700,400},SIZE{880,530}}) {
+                resize(size); accept("interactive step was not accepted");
+                if(size.cx<=grownSize.cx && size.cy<=grownSize.cy)
+                    Check(state.swapChain==grown,"interactive step inside grown buffers rebuilt the swap chain");
+            }
+            // Transparent beyond the 880x530 client, inside the grown buffer.
+            if(grownSize.cx>880 && grownSize.cy>530) {
+                ComPtr<ID2D1Bitmap1> strip;
+                const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+                const UINT right=UINT(std::min<LONG>(grownSize.cx,880+64)), bottom=UINT(std::min<LONG>(grownSize.cy,530+64));
+                const auto area=D2D1::RectU(0,0,right,bottom);
+                Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(right,bottom),nullptr,0,&props,&strip)) &&
+                    SUCCEEDED(strip->CopyFromBitmap(nullptr,state.backbuffer.Get(),&area)),"sizing excess readback");
+                D2D1_MAPPED_RECT mapped{}; Check(SUCCEEDED(strip->Map(D2D1_MAP_OPTIONS_READ,&mapped)),"sizing excess map");
+                bool clear=true;
+                for(UINT y=0;y<bottom;++y) for(UINT x=0;x<right;++x)
+                    if((x>=880 || y>=530) && mapped.bits[y*mapped.pitch+x*4+3]) clear=false;
+                strip->Unmap();
+                Check(clear,"grown buffer showed pixels outside the client");
+            }
+            SendMessageW(frame,WM_EXITSIZEMOVE,0,0);
+            accept("final size after interactive sizing was not accepted");
+            const auto exact=bufferSize();
+            Check(state.swapChain!=grown && exact.cx==880 && exact.cy==530,"interactive sizing kept oversized buffers");
+            RemoveWindowSubclass(frame,ExplorerFrameSubclass,id);
+            UnregisterTabOverlay(frame,frame,state.hwnd);
+        }
         RemoveWindowSubclass(state.hwnd,ResizeOverlaySubclass,1);
         SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
         UnregisterAnimationWindow(state.hwnd); DropTarget(state); DestroyWindow(state.hwnd);

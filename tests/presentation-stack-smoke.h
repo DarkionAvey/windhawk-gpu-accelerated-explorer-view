@@ -68,6 +68,27 @@ void CheckStable(ViewState& state,bool rename) {
         <<" intermediate="<<probe.intermediate<<" sizes="<<probe.sizes<<std::endl;
     Check(Ordered(state) && !probe.intermediate && !probe.sizes,
         "stack repair exposed intermediate owned-window order or resized the viewport");
+    {
+        // Explorer's own raise of a frame child reaches the hooked positioning
+        // calls. It lands directly below the stack: never above it, even
+        // transiently, and the stack itself is not repositioned.
+        probe.positions=probe.sizes=probe.intermediate=0;
+        const UINT flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE;
+        Check(NativeSetWindowPosHook(foreign,HWND_TOP,0,0,0,0,flags),"Explorer-style frame child raise");
+        Check(Ordered(state) && GetWindow(state.hwnd,GW_HWNDNEXT)==foreign,"frame child raise covered the GPU stack");
+        HWND top=nullptr;
+        for(HWND child=GetWindow(frame,GW_CHILD);child && !top;child=GetWindow(child,GW_HWNDNEXT))
+            if(IsWindowVisible(child)) top=child;
+        Check(NativeSetWindowPosHook(foreign,top,0,0,0,0,flags) && Ordered(state) &&
+            GetWindow(state.hwnd,GW_HWNDNEXT)==foreign,"frame child placed after a stack window covered the stack");
+        HDWP batch=BeginDeferWindowPos(1);
+        batch=batch ? NativeDeferWindowPosHook(batch,foreign,HWND_TOP,0,0,0,0,flags) : nullptr;
+        Check(batch && EndDeferWindowPos(batch) && Ordered(state) && GetWindow(state.hwnd,GW_HWNDNEXT)==foreign,
+            "deferred frame child raise covered the GPU stack");
+        Check(!probe.positions && !probe.sizes,"preventing a frame child raise repositioned the GPU stack");
+        Check(NativeSetWindowPosHook(foreign,HWND_BOTTOM,0,0,0,0,flags) && GetWindow(foreign,GW_HWNDNEXT)==nullptr,
+            "explicit bottom placement of a frame child was altered");
+    }
     DestroyWindow(foreign);
     for(HWND child:{state.rename.editor,state.viewToggle,state.hwnd}) if(child)
         RemoveWindowSubclass(child,Observe,1);
