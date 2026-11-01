@@ -78,7 +78,7 @@ static void TestAppearanceRefinements(HWND frame, const std::wstring& fixture) {
     }
     UpdateColumns(state);
     auto textBounds=[&](const ExplorerColumn& column,bool header) {
-        return ColumnTextBounds(state,size_t(&column-state.columns.data()),header,ListStartX(state),ListEndX(state),DpiOf(state.hwnd));
+        return ColumnTextBounds(state,size_t(&column-state.columns.data()),header,ListStartX(state),DpiOf(state.hwnd));
     };
     const auto caption=textBounds(state.columns[1],true);
     Check(caption.left-ListStartX(state)-state.columns[1].start==Scale96(16,DpiOf(state.hwnd)) &&
@@ -90,7 +90,9 @@ static void TestAppearanceRefinements(HWND frame, const std::wstring& fixture) {
             state.sort.explicitOrder=true; state.sort.key=column.key;
             const auto header=textBounds(column,true), body=textBounds(column,false);
             Check(header.left==body.left,"column caption and body have different X origins");
-            Check(header.right<=ListEndX(state) && body.right<=ListEndX(state),"column text escaped the viewport");
+            Check(header.right==ListStartX(state)+column.end-scroll-Scale96(kColumnFitSortInset96,DpiOf(state.hwnd)) &&
+                body.right==ListStartX(state)+column.end-scroll-(ClassifySort(column.key)==SortKind::Name ? 8.f : 6.f),
+                "column trimming followed the viewport instead of the column");
         }
     }
     state.horizontalScroll=0; state.sort.explicitOrder=false;

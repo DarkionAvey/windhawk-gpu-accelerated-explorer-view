@@ -58,6 +58,12 @@ contain spaces or Unicode. Relative source paths are rooted at the repository.
 
 ## Focused or historical tests
 
+`--graphics` includes private offscreen pixel comparisons for Details metadata
+and captions during real window resizing and horizontal scroll reversals in
+LTR/RTL. Visible glyphs must match the fully exposed column; the window edge
+clips text without changing its ellipsis. These checks do not establish live
+Explorer presentation behavior.
+
 `native-tab-command-trace.wh.cpp` is a temporary Windhawk diagnostic, not a
 regression test. Enable its debug logging, use the native **Open in new tab**
 menu item once and middle-click a folder once, then save the `[TabTrace]` lines

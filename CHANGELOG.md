@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.323
+
+- Keep Details column text and headers at their full column width while
+  horizontally scrolling, clipping at the window edge without changing ellipses.
+
 ## 0.9.322
 
 - Fix stale filename-only highlight widths after folder, sort, rename and font

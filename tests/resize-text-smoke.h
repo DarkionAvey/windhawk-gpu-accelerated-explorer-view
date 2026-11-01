@@ -147,13 +147,13 @@ static void TestResizeText(HWND frame) {
         const auto body=state.textFormat, header=state.headerFormat, sorted=state.sortedHeaderFormat;
         // Read the same full metadata columns in logical coordinates. RTL
         // moves them with the window; every cell must retain identical pixels.
-        auto pixels=[&] {
-            const auto first=state.columns[1].start+ListStartX(state)+8.f;
-            const auto last=state.columns[2].end+ListStartX(state)-6.f;
+        auto pixels=[&](float first=-1.f,float last=-1.f,bool caption=false) {
+            if(first<0.f) first=state.columns[1].start+ListStartX(state)+8.f;
+            if(last<0.f) last=state.columns[2].end+ListStartX(state)-6.f;
             const UINT32 width=static_cast<UINT32>(last-first);
-            const UINT32 height=static_cast<UINT32>(state.rowPx*8);
+            const UINT32 height=static_cast<UINT32>(caption ? state.headerPx-1.f : state.rowPx*8);
             const UINT32 x=static_cast<UINT32>(rtl ? state.paintWidth-last : first);
-            const UINT32 y=static_cast<UINT32>(state.headerPx);
+            const UINT32 y=caption ? 0 : static_cast<UINT32>(state.headerPx);
             ComPtr<ID2D1Bitmap1> cpu;
             const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 state.backbuffer->GetPixelFormat());
@@ -192,6 +192,46 @@ static void TestResizeText(HWND frame) {
             Check(state.frameProfile.textDeferred==0,"window resize deferred metadata that was already visible");
         }
         state.frameProfile.recording=false;
+        // Compare the same visible glyphs with a fully exposed reference. USER
+        // delivers real resize notifications; scrolling uses the production
+        // thumb/pan path. No input is injected into the user's desktop.
+        // Rounded zebra backgrounds resize with the viewport independently of
+        // text, so exclude them from these glyph comparisons.
+        const bool zebra=g_zebra.exchange(false);
+        for(size_t columnIndex=1;columnIndex<state.columns.size();++columnIndex) {
+            state.sort.explicitOrder=true; state.sort.key=state.columns[columnIndex].key;
+            for(int n=0;n<100;++n) {draw(); if(!state.textRasterPending) break;}
+            const auto cell=ColumnTextBounds(state,columnIndex,false,ListStartX(state),ViewDpi(state));
+            const auto* text=ColumnCellText(state.entries[0],state.columns[columnIndex].key,
+                state.columnEpoch,state.propertyEpoch);
+            Check(text && !text->empty(),"scroll text fixture missing metadata");
+            const float first=roundf(cell.left);
+            const float span=std::max(1.f,floorf(ColumnTextWidth(state,*text,false)*.5f));
+            const auto reference=pixels(first,first+span);
+            const auto captionReference=pixels(first,first+span,true);
+            RECT client{}; GetClientRect(state.hwnd,&client);
+            const int narrow=client.right-static_cast<int>(ListEndX(state)-(first+span));
+            Check(SetWindowPos(state.hwnd,nullptr,0,0,narrow,600,
+                SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"scroll text narrow window");
+            Check(HorizontalBar(state).usable,"scroll text did not expose the horizontal scrollbar");
+            for(float requested:{0.f,span,floorf(span*.5f),0.f}) {
+                SetHorizontalScroll(state,requested);
+                for(int n=0;n<100;++n) {draw(); if(!state.textRasterPending) break;}
+                Check(!state.textRasterPending,"scroll text did not warm");
+                const float shifted=first-state.horizontalScroll;
+                const auto shown=pixels(shifted,shifted+span);
+                if(shown!=reference) std::cout<<"SCROLL TEXT rtl="<<rtl<<" column="<<columnIndex
+                    <<" requested/actual="<<requested<<"/"<<state.horizontalScroll<<std::endl;
+                Check(shown==reference,
+                    "horizontal scrolling re-trimmed metadata at the window edge");
+                Check(pixels(shifted,shifted+span,true)==captionReference,
+                    "horizontal scrolling re-trimmed a column caption at the window edge");
+            }
+            Check(SetWindowPos(state.hwnd,nullptr,0,0,1000,600,
+                SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"scroll text restore window");
+            SetHorizontalScroll(state,0.f); draw();
+        }
+        g_zebra=zebra; state.sort.explicitOrder=false;
         const auto propertyEpoch=state.propertyEpoch, columnEpoch=state.columnEpoch;
         // Exercise both real input handlers, including the first settled paint
         // and the READY notification after fingers lift. No property invalidation
@@ -230,5 +270,5 @@ static void TestResizeText(HWND frame) {
         SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0); DestroyWindow(state.hwnd);
     }
     g_autoRefitColumns=refit;
-    std::cout<<"PASS: LTR/RTL resize and wheel/pinch zoom retain populated metadata through settled/READY paints; actual font changes still refresh\n";
+    std::cout<<"PASS: LTR/RTL resize, horizontal clipping/scroll reversal and wheel/pinch zoom preserve populated metadata/header glyphs; actual font changes still refresh\n";
 }

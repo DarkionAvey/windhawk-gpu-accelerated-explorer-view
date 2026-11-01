@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.322
+// @version         0.9.323
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -12951,9 +12951,11 @@ const std::wstring* ColumnCellText(const Entry& entry,
 
 // Headers and body cells share their text origin during column edits and
 // horizontal scrolling. Mode transitions retain the header's Details bounds.
+// Layout against the full column; the surrounding paint clip owns viewport
+// occlusion. Scrolling must not change trimming or cached glyph widths.
 // Name retains its icon/indent alignment.
 D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
-                           float listStart, float listEnd, int dpi) {
+                           float listStart, int dpi) {
     const auto& column = PresentedColumn(state,columnIndex);
     const auto [start, end] = ColumnBounds(state, columnIndex, header);
     const float from = listStart + start - state.horizontalScroll;
@@ -12967,7 +12969,7 @@ D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
     const float headerOffset = header ? ColumnHeaderOffset(state,dpi) : 0.f;
     return D2D1::RectF(from + leading,
         headerOffset,
-        (state.modeComposition.painting && state.modeComposition.widths ? to : std::min(to, listEnd)) - trailing,
+        to - trailing,
         header ? headerOffset + Scale96(kHeader96,dpi) : state.rowPx);
 }
 
@@ -13198,7 +13200,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
 
         // Match the existing Paint() caption geometry (including the sort
         // chevron), not an invented width or a second fitting algorithm.
-        const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, listEnd, dpi);
+        const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, dpi);
         const float captionStart = caption.left;
         const float captionEnd = caption.right;
         if (!column.title.empty()) {
@@ -13209,7 +13211,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
                 return true;
         }
 
-        const auto content = ColumnTextBounds(state, columnIndex, false, listStart, listEnd, dpi);
+        const auto content = ColumnTextBounds(state, columnIndex, false, listStart, dpi);
         const float driveLabel=name && state.thisPcGpu ? SharedInlineDriveLabelWidth(state) : 0.f;
         for (size_t j = 0; j < sample.count; ++j) {
             const int row = sample.At(j);
@@ -17671,7 +17673,7 @@ void Paint(ViewState& state) {
                 const bool sorted = state.sort.explicitOrder &&
                     SameKey(col.key, state.sort.key);
                 const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
-                const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, listEnd, dpi);
+                const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, dpi);
                 const int checked = HeaderSelectionCheckboxState(state);
                 if (checked>=0 && ClassifySort(col.key)==SortKind::Name) {
                     const auto box = HeaderSelectionCheckbox(state);
@@ -17687,10 +17689,9 @@ void Paint(ViewState& state) {
                 if (caption.right > caption.left)
                     Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
                          headerColor, true, fade, sorted);
-                const float visibleEnd = compositionFrame.Widths() ? to : std::min(to, listEnd);
                 if (compositionFrame.Widths()) compositionFrame.Column(columnIndex,true);
-                if (sorted && visibleEnd - std::max(0.f, from) >= arrowRoom)
-                    DrawHeaderSortChevron(state, visibleEnd,
+                if (sorted && to - from >= arrowRoom)
+                    DrawHeaderSortChevron(state, to,
                         state.sort.direction == SORT_DESCENDING, headerColor, fade);
                 if (compositionFrame.Widths() || to <= listEnd)
                     Fill(state, to - .5f, headerOffset, to + .5f, headerBottom, headerColor,
@@ -17712,12 +17713,12 @@ void Paint(ViewState& state) {
                          static_cast<float>(Scale96(5, ViewDpi(state))));
                     const bool sorted = state.sort.explicitOrder &&
                         SameKey(col.key, state.sort.key);
-                    const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, listEnd, dpi);
+                    const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, dpi);
                     if (caption.right > caption.left)
                         Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
                              headerColor, true, 1.f, sorted);
-                    if (sorted && clipRight - clipLeft >= arrowRoom)
-                        DrawHeaderSortChevron(state, clipRight,
+                    if (sorted && right - left >= arrowRoom)
+                        DrawHeaderSortChevron(state, right,
                             state.sort.direction == SORT_DESCENDING, headerColor, 1.f);
                 }
             }
@@ -18181,7 +18182,7 @@ void Paint(ViewState& state) {
                 const auto& col = PresentedColumn(state,columnIndex);
                 if (col.opacity <= 0.f) continue;
                 if (ClassifySort(col.key) == SortKind::Name) continue;
-                const auto cell = ColumnTextBounds(state, columnIndex, false, listStart, listEnd, dpi);
+                const auto cell = ColumnTextBounds(state, columnIndex, false, listStart, dpi);
                 const float left = cell.left, right = cell.right;
                 if (right <= left || (!compositionFrame.Widths() && (right <= 0.f || left >= listEnd))) continue;
                 const std::wstring* text = ColumnCellText(e, col.key,
