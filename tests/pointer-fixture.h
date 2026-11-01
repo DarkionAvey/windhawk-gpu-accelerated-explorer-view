@@ -18,6 +18,10 @@ inline BOOL WINAPI Cursor(LPPOINT output) {
     return TRUE;
 }
 inline SHORT WINAPI Key(int key) {
+    // Fixture buttons are logical; GetAsyncKeyState reports physical ones.
+    // Keep results independent of the machine's swapped-button setting.
+    if (enabled && GetSystemMetrics(SM_SWAPBUTTON))
+        key = key == VK_LBUTTON ? VK_RBUTTON : key == VK_RBUTTON ? VK_LBUTTON : key;
     if (enabled && key == VK_LBUTTON) return held ? SHORT(0x8000) : 0;
     if (enabled && (key==VK_RBUTTON || key==VK_MBUTTON || key==VK_XBUTTON1 || key==VK_XBUTTON2))
         return key==otherHeld ? SHORT(0x8000) : 0;

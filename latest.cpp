@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.323
+// @version         0.9.324
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -7442,12 +7442,27 @@ std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
     return result;
 }
 
+// Detail workers resolve one row per job, normally with a shared parent.
+// Keep that parent's folder and Size column for one directory generation
+// instead of rebinding from the desktop and rescanning every column per row.
+// Owned by a single worker and released inside its apartment.
+struct ShellSizeBinding {
+    unsigned long long token = 0;
+    OwnedPidl parent;
+    ComPtr<IShellFolder2> folder;
+    UINT column = 0;
+    bool hasColumn = false;
+    void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
+};
+
 // Use the folder's formatted column rather than formatting its raw property
 // ourselves. This keeps Shell size/formatting hooks (including Better file
 // sizes) on their normal path, without importing another mod's calculations.
 // Bind in the requesting provider worker's apartment; never use the live view.
 bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
-                         std::wstring& text) {
+                         std::wstring& text, ShellSizeBinding& binding,
+                         unsigned long long token) {
+    if (binding.token != token) { binding.Reset(); binding.token = token; }
     PIDLIST_ABSOLUTE parsed = nullptr;
     if (!identity) {
         const HRESULT hr = SHParseDisplayName(path.c_str(), nullptr, &parsed, 0, nullptr);
@@ -7456,23 +7471,36 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     }
     OwnedPidl owned(parsed);
     if (!identity || ILIsEmpty(identity)) return false;
-    ComPtr<IShellFolder2> folder;
-    PCUITEMID_CHILD child = nullptr;
-    if (FAILED(SHBindToParent(identity, IID_PPV_ARGS(&folder), &child)) || !folder)
-        return false;
-    for (UINT column = 0; column < kMaxShellColumns; ++column) {
-        PROPERTYKEY key{};
-        if (FAILED(folder->MapColumnToSCID(column, &key))) break;
-        if (!SameKey(key, PKEY_Size)) continue;
-        SHELLDETAILS details{};
-        if (FAILED(folder->GetDetailsOf(child, column, &details))) return false;
-        PWSTR formatted = nullptr;
-        const HRESULT hr = StrRetToStrW(&details.str, child, &formatted);
-        if (SUCCEEDED(hr)) text = formatted ? formatted : L"";
-        CoTaskMemFree(formatted);
-        return SUCCEEDED(hr); // An empty folder size is authoritative too.
+    PCUITEMID_CHILD child = ILFindLastID(identity);
+    const size_t parentBytes = static_cast<size_t>(
+        reinterpret_cast<const BYTE*>(child) - reinterpret_cast<const BYTE*>(identity));
+    const bool sameParent = binding.parent &&
+        ILGetSize(binding.parent.get()) == parentBytes + sizeof(USHORT) &&
+        memcmp(binding.parent.get(), identity, parentBytes) == 0;
+    if (!sameParent) {
+        // Failures are remembered for this parent too, so a provider without
+        // a Size column is not rescanned for every remaining row.
+        binding.Reset();
+        OwnedPidl parent(ILCloneFull(identity));
+        if (!parent || !ILRemoveLastID(parent.get())) return false;
+        binding.parent = std::move(parent);
+        PCUITEMID_CHILD ignored = nullptr;
+        if (FAILED(SHBindToParent(identity, IID_PPV_ARGS(&binding.folder), &ignored)) || !binding.folder)
+            return false;
+        for (UINT column = 0; column < kMaxShellColumns; ++column) {
+            PROPERTYKEY key{};
+            if (FAILED(binding.folder->MapColumnToSCID(column, &key))) break;
+            if (SameKey(key, PKEY_Size)) { binding.column = column; binding.hasColumn = true; break; }
+        }
     }
-    return false;
+    if (!binding.folder || !binding.hasColumn) return false;
+    SHELLDETAILS details{};
+    if (FAILED(binding.folder->GetDetailsOf(child, binding.column, &details))) return false;
+    PWSTR formatted = nullptr;
+    const HRESULT hr = StrRetToStrW(&details.str, child, &formatted);
+    if (SUCCEEDED(hr)) text = formatted ? formatted : L"";
+    CoTaskMemFree(formatted);
+    return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
 // Device-independent storage metadata. Shell storage providers expose either
@@ -8252,6 +8280,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     std::shared_ptr<FolderChangeStamp> observedFolder;
     unsigned long long observedToken = 0;
     bool watchNotified = false;
+    ShellSizeBinding sizeBinding; // Declared after the apartment; released before it.
     for (;;) {
         if (watchLane && work.watchGeneration.load(std::memory_order_acquire) != observedToken)
             observedFolder.reset();
@@ -8329,6 +8358,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 break;
             }
         }
+        // An idle detail lane keeps no provider folder alive between demands.
+        if (detailsLane && !haveDetail) sizeBinding.Reset();
         if(statusButtons) {
             const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
                 work.statusButtonGeneration.load(std::memory_order_acquire)==statusButtons->token;};
@@ -8539,12 +8570,17 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             }
             if (directory.namespaceFolder && !directory.enumerated) {
                 if (directory.captureNativeCatalog && !directory.nativeCatalogChecked) {
-                    ExclusiveSrwLock lock(work.directoryLock);
-                    if (DirectoryJobCurrent(work,directory.token)) {
+                    {
+                        ExclusiveSrwLock lock(work.directoryLock);
+                        if (!DirectoryJobCurrent(work,directory.token)) continue;
                         work.nativeCatalogRequest=std::make_shared<DirectoryJob>(std::move(directory));
-                        PostMessageW(work.hwnd,kMsgNativeCatalog,0,0);
+                        if (PostMessageW(work.hwnd,kMsgNativeCatalog,0,0)) continue;
+                        // The owner cannot receive the request; enumerate here
+                        // rather than leaving this generation without rows.
+                        directory=std::move(*work.nativeCatalogRequest);
+                        work.nativeCatalogRequest.reset();
                     }
-                    continue;
+                    directory.nativeCatalogChecked=true;
                 }
                 NativeRowsJob job;
                 job.token = directory.token;
@@ -8787,7 +8823,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         ColumnCell cell; cell.key = key;
                         bool resolved=false;
                         if (SameKey(key, PKEY_Size))
-                            resolved = ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text);
+                            resolved = ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text,
+                                sizeBinding, detail.token);
                         if (!resolved) {
                             if (!store)
                                 EntryPropertyStore(req.path, req.shellIdentity.get(),
@@ -8816,7 +8853,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 if (hasColumn(PKEY_DateModified)) v.date = FormatFileTime(req.modified);
                 if (hasColumn(PKEY_ItemTypeText)) v.type = GetTypeName(typeNames, req.path, req.folder);
                 if (hasColumn(PKEY_Size) &&
-                    !ReadShellSizeDetail(req.path, nullptr, v.size) && !req.folder)
+                    !ReadShellSizeDetail(req.path, nullptr, v.size, sizeBinding, detail.token) && !req.folder)
                     v.size = FormatSize(req.size);
                 v.columnEpoch = detail.columnEpoch;
                 // Only displayed columns are queried on this tab's property
@@ -9012,6 +9049,21 @@ bool RetireCachedEntries(ViewState& state, Entries& entries, bool nonblocking = 
     return true;
 }
 
+// Owner-STA slices are bounded by elapsed time. GetTickCount64 advances in
+// ~16 ms steps and cannot measure a 1 ms budget, so a slice could run for a
+// whole tick or stop after a single batch. Use the QPC clock instead.
+class OwnerSliceBudget {
+    LONGLONG deadline = 0;
+public:
+    explicit OwnerSliceBudget(const ViewState& state, double milliseconds = 1.) {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        double frequency = state.qpcFrequency;
+        if (frequency <= 0.) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); frequency = double(f.QuadPart); }
+        deadline = now.QuadPart + LONGLONG(frequency * milliseconds / 1000.);
+    }
+    bool Remaining() const { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); return now.QuadPart < deadline; }
+};
+
 void CancelNativeCatalog(ViewState& state) {
     state.nativeCatalogCapture.Reset(); // Release the live enumerator on its owner STA.
     if (state.nativeCatalogJob) RetireCachedEntries(state,state.nativeCatalogJob->nativeChildren);
@@ -9060,8 +9112,9 @@ void AdvanceNativeCatalog(ViewState& state) {
         else { state.nativeCatalogCount=count; state.nativeCatalogCapture=std::move(items); }
     }
     const auto enumerator=state.nativeCatalogCapture;
-    const ULONGLONG started=GetTickCount64();
-    for (unsigned copied=0; !complete && copied<64 && GetTickCount64()-started<1;) {
+    // Every slice copies at least one batch; the rest is bounded by time.
+    const OwnerSliceBudget budget(state);
+    for (bool first=true; !complete && (first || budget.Remaining()); first=false) {
         PITEMID_CHILD children[16]{}; ULONG fetched=0;
         const HRESULT hr=enumerator->Next(ARRAYSIZE(children),children,&fetched);
         const bool valid=current();
@@ -9070,20 +9123,25 @@ void AdvanceNativeCatalog(ViewState& state) {
             if (valid && child) job->nativeChildren.push_back(std::move(child));
         }
         if (!valid) return;
-        copied+=fetched;
         complete=hr!=S_OK || !fetched;
         available=SUCCEEDED(hr);
     }
-    if (!complete) { PostMessageW(owner,kMsgNativeCatalog,0,0); return; }
+    // A rejected continuation would strand this generation with no rows.
+    // Fall back to the worker's own enumeration instead.
+    if (!complete) {
+        if (PostMessageW(owner,kMsgNativeCatalog,0,0)) return;
+        available=false;
+    }
     if (available) {
         int count=-1;
-        const HRESULT hr=view->ItemCount(SVGIO_ALLVIEW,&count);
+        HRESULT hr=view->ItemCount(SVGIO_ALLVIEW,&count);
         if (!current()) return;
         if (SUCCEEDED(hr) && (count!=state.nativeCatalogCount || size_t(count)!=job->nativeChildren.size())) {
             state.nativeCatalogCapture.Reset();
             RetireCachedEntries(state,job->nativeChildren);
-            PostMessageW(owner,kMsgNativeCatalog,0,0); // Model changed during capture; take a fresh snapshot.
-            return;
+            // Model changed during capture; take a fresh snapshot.
+            if (PostMessageW(owner,kMsgNativeCatalog,0,0)) return;
+            hr=E_FAIL;
         }
         available=SUCCEEDED(hr);
     }
@@ -18883,8 +18941,8 @@ bool ValidatePreparedSelection(ViewState& state, const std::shared_ptr<PreparedN
             state.nativeHwnd==job->native && state.folderView.Get()==view.Get();
     };
     if (!current() || !view) return false;
-    const ULONGLONG started=GetTickCount64();
-    for (unsigned copied=0; job->validationCursor<job->children.size() && copied<64 && GetTickCount64()-started<1; ++copied) {
+    const OwnerSliceBudget budget(state);
+    for (bool first=true; job->validationCursor<job->children.size() && (first || budget.Remaining()); first=false) {
         auto& child=job->children[job->validationCursor++];
         const bool valid=NativeSelectionTarget(view.Get(),child.get());
         if (!current()) return false;
@@ -25032,7 +25090,9 @@ bool UpdateCapturedPointer(ViewState& state, std::optional<POINT> delivered = {}
     const bool frameTick = !delivered.has_value();
     const bool captured = GetCapture() == state.hwnd;
     const bool touch = state.touch.active && (state.touch.control || state.touch.gesture == TouchGesture::Marquee);
-    const bool held = touch ? state.touch.down : (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    // GetAsyncKeyState reports physical buttons; honor swapped primary buttons.
+    const bool held = touch ? state.touch.down :
+        (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0;
     POINT point = delivered.value_or(POINT{});
     if (frameTick && (!captured || !held || !state.visible || !state.detailsViewActive))
         return true; // A delivered UP/capture change owns completion/commit.

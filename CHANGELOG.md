@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.324
+
+- Read Shell-formatted sizes without rebinding the parent folder and
+  rescanning its columns for every row.
+- Bound provider-folder catalog and selection validation slices by real
+  elapsed time, and fall back to background enumeration if Explorer's
+  message queue rejects a continuation instead of leaving a folder empty.
+- Track drags correctly with swapped primary and secondary mouse buttons.
+
 ## 0.9.323
 
 - Keep Details column text and headers at their full column width while
