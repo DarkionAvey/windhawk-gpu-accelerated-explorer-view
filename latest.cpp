@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.324
+// @version         0.9.325
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -664,6 +664,7 @@ SortSpec DefaultSort() {
 struct ColumnCell {
     PROPERTYKEY key{};
     std::wstring text;
+    bool operator==(const ColumnCell& other) const { return SameProperty(key,other.key) && text==other.text; }
 };
 struct ExplorerColumn {
     PROPERTYKEY key{};
@@ -790,6 +791,10 @@ struct ExtraSortValue {
         return SameProperty(key,other.key) && text==other.text && number==other.number && kind==other.kind;
     }
 };
+// Memberwise value equality for row snapshots; identities compare by owner.
+bool operator==(const FILETIME& a, const FILETIME& b) {
+    return a.dwLowDateTime==b.dwLowDateTime && a.dwHighDateTime==b.dwHighDateTime;
+}
 // Refresh baselines retain only comparison data, without presentation cells,
 // formatted metadata, grouping strings or in-flight enrichment state.
 struct EntrySortKey {
@@ -806,6 +811,7 @@ struct EntrySortKey {
     ULONGLONG byteSize = 0;
     bool folder = false;
     SharedPidl shellIdentity; // Immutable identity for targeted provider rechecks.
+    bool operator==(const EntrySortKey&) const = default;
 };
 struct Entry : EntrySortKey {
     std::wstring date, type, size;
@@ -825,6 +831,8 @@ struct Entry : EntrySortKey {
     bool detailsPending = false;
     unsigned long long detailsPendingEpoch = 0; // Older slow properties cannot block new columns.
     unsigned long long detailsPendingToken = 0; // Pending work from other folder visits is stale.
+    // Every field participates, so presentation reuse cannot miss a new one.
+    bool operator==(const Entry&) const = default;
 };
 
 bool SameEntryIdentity(const Entry& a, const Entry& b) {
@@ -2039,7 +2047,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
         std::shared_ptr<const NamespaceIdentities>, std::shared_ptr<const std::vector<Entry>>,
         std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates,
-        std::vector<SharedPidl>>;
+        std::vector<SharedPidl>, std::vector<std::shared_ptr<const Entry>>>;
     std::deque<RetiredPayload> retiredEntries;
     bool directoryNotificationQueued = false, detailNotificationQueued = false;
     SRWLOCK iconLock = SRWLOCK_INIT;
@@ -2533,7 +2541,31 @@ public:
 struct PresentationItem {
     int index=-1, group=-1;
     bool selected=false;
-    Entry entry;
+    std::shared_ptr<const Entry> entry;
+};
+// Sparse rows near the viewport, sorted by index. Each submitted model shares
+// one immutable list with its render lane; neither side copies row values.
+struct PresentationItems {
+    std::vector<PresentationItem> rows;
+    const PresentationItem* Find(int index) const {
+        const auto found=std::lower_bound(rows.begin(),rows.end(),index,
+            [](const PresentationItem& item,int value) { return item.index<value; });
+        return found!=rows.end() && found->index==index ? &*found : nullptr;
+    }
+};
+// Every ViewState input of an image cache key. Keys are pure functions of this
+// and the row, so a captured row may reuse them while both are unchanged.
+struct IconKeyContext {
+    UINT size=32;
+    bool gridView=false, thumbnails=false;
+    bool operator==(const IconKeyContext&) const = default;
+};
+// The owner's last captured viewport row. Unchanged rows are shared by the
+// next model instead of being copied again on Explorer's thread.
+struct PresentationRowCache {
+    std::shared_ptr<const Entry> entry;
+    IconKeyContext icons;
+    std::array<std::wstring,2> iconKeys; // Exact image, then association fallback.
 };
 struct ViewState {
     // The bridge state is owner-STA-only. A presentation instance contains
@@ -2552,7 +2584,8 @@ struct ViewState {
     LOGFONTW presentationFont{};
     float presentationDocumentHeight=0.f, presentationGroupOrigin=0.f;
     bool presentationActive=true;
-    std::map<int,PresentationItem> presentationItems;
+    std::shared_ptr<const PresentationItems> presentationItems;
+    std::unordered_map<int,PresentationRowCache> presentationRows; // Owner capture reuse only.
     std::unordered_map<std::wstring,int> presentationGroups;
     std::vector<int> presentationSectionIndices;
     std::list<std::wstring> presentationIconRecent;
@@ -3542,7 +3575,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     HWND renameEditor=nullptr; int renameIndex=-1;
     float documentHeight=0.f;
     std::shared_ptr<const std::vector<Entry>> directory;
-    std::map<int,PresentationItem> items;
+    std::shared_ptr<const PresentationItems> items;
     std::vector<ViewState::GroupSection> sections;
     std::vector<int> sectionIndices;
     unsigned long long observerId=0;
@@ -3653,9 +3686,9 @@ void RegisterViewAnimation(ViewState& state) { if(!state.presentationOnly) Regis
 void UnregisterViewAnimation(ViewState& state) { if(!state.presentationOnly) UnregisterAnimationWindow(state.hwnd); }
 const Entry& ModelEntry(const ViewState& state,int index) {
     if(!state.presentationOnly) return state.entries[size_t(index)];
-    const auto found=state.presentationItems.find(index);
     static const Entry empty;
-    if(found!=state.presentationItems.end()) return found->second.entry;
+    if(const auto* item=state.presentationItems ? state.presentationItems->Find(index) : nullptr;item && item->entry)
+        return *item->entry;
     return state.presentationEntries && index>=0 && size_t(index)<state.presentationEntries->size() ?
         (*state.presentationEntries)[size_t(index)] : empty;
 }
@@ -3664,8 +3697,8 @@ bool ModelSelected(const ViewState& state,int index) {
 }
 int ModelGroup(const ViewState& state,int index) {
     if(state.presentationOnly && !state.presentationEntries) {
-        const auto found=state.presentationItems.find(index);
-        return found==state.presentationItems.end() ? -1 : found->second.group;
+        const auto* item=state.presentationItems ? state.presentationItems->Find(index) : nullptr;
+        return item ? item->group : -1;
     }
     return index>=0 && size_t(index)<state.rowGroup.size() ? state.rowGroup[size_t(index)] : -1;
 }
@@ -3796,9 +3829,12 @@ bool ViewOptionEnabled(const ViewState& state, const std::atomic<ViewOption>& op
     const auto value = option.load(std::memory_order_relaxed);
     return value == ViewOption::AlwaysOn || (value == ViewOption::GridOnly && state.gridView);
 }
+bool FileThumbnails(const ViewState& state) {
+    return state.gridView ? state.cachedNativeMode != FVM_SMALLICON :
+        g_listThumbnails.load(std::memory_order_relaxed);
+}
 bool UsesThumbnails(const ViewState& state, const Entry& entry) {
-    return !entry.folder && (state.gridView ? state.cachedNativeMode != FVM_SMALLICON :
-        g_listThumbnails.load(std::memory_order_relaxed));
+    return !entry.folder && FileThumbnails(state);
 }
 float GroupHeadingHeight(const ViewState& state) {
     return state.gridView ? std::max(24.f, state.fontPx * 1.5f + 8.f) : state.rowPx;
@@ -3986,7 +4022,8 @@ std::vector<int> VisibleItemRows(const ViewState& state, float overscanRows = 2.
     const float to = state.scrollNow +
         std::max(0.f, client.bottom - state.headerPx) + pad;
     if(state.presentationOnly && !state.presentationEntries) {
-        for(const auto& [index,item]:state.presentationItems) {
+        if(state.presentationItems) for(const auto& item:state.presentationItems->rows) {
+            const int index=item.index;
             const float top=DocumentRowTop(state,index),height=DisplayRowHeight(state,index);
             if(top+height>=from && top<=to && height>.01f) rows.push_back(index);
         }
@@ -6540,19 +6577,23 @@ UINT IconRequestSize(const ViewState& state) {
     });
     return chosen;
 }
-std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& lookup,
+IconKeyContext MakeIconKeyContext(const ViewState& state) {
+    return {IconRequestSize(state),state.gridView,FileThumbnails(state)};
+}
+std::wstring IconKey(const IconKeyContext& context, const Entry& e, std::wstring& lookup,
                      bool& useAttrs, bool associationOnly = false, UINT previewLimit = 0) {
     auto key = IconKey(e, lookup, useAttrs, associationOnly);
+    const bool thumbnail = !e.folder && context.thumbnails;
     if (!associationOnly && ((e.shellIdentity && e.path.starts_with(L"windhawk:pidl:")) ||
-        UsesThumbnails(state,e))) {
+        thumbnail)) {
         // A thumbnail is per item, unlike its immediate shared filetype icon.
         // The same provider lane supplies either result, with identical
         // cancellation, visible priority, upload pacing and cache lifetime.
         key = lookup = e.path;
         useAttrs = false;
     }
-    const bool listThumbnail = !associationOnly && !state.gridView && UsesThumbnails(state,e);
-    UINT size = IconRequestSize(state);
+    const bool listThumbnail = !associationOnly && !context.gridView && thumbnail;
+    UINT size = context.size;
     // The shared Shell image list contains at most a 256px jumbo icon. Larger
     // requests cannot add detail there; per-item image factories stay adaptive.
     if(useAttrs) size=std::min(size,256u);
@@ -6561,6 +6602,10 @@ std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& looku
     // Larger tiers can reuse the identical decorated grid image unchanged.
     if (size > 32 || listThumbnail) key = L"@" + std::to_wstring(size) + L"|" + key;
     return key;
+}
+std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& lookup,
+                     bool& useAttrs, bool associationOnly = false, UINT previewLimit = 0) {
+    return IconKey(MakeIconKeyContext(state),e,lookup,useAttrs,associationOnly,previewLimit);
 }
 
 int VisibleRows(ViewState& state);
@@ -25329,41 +25374,74 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     // Keep packet work bounded even for a giant Home/End jump. Names between
     // the endpoints remain available to the lane through the immutable base.
     constexpr size_t maxRows=4096;
-    for(int i:rows) if(i>=0 && i<state.total && model->items.size()<maxRows) {
+    // A row still holding the same complete value and key inputs is shared
+    // with the previous model. Comparison reads in place; only entering or
+    // changed rows allocate a copy and image keys on Explorer's owner thread.
+    const auto iconContext=MakeIconKeyContext(state);
+    const bool renamePreview=state.renamePreviewToken==state.token && !state.renamePreviewPath.empty();
+    auto items=std::make_shared<PresentationItems>();
+    std::unordered_map<int,PresentationRowCache> captured;
+    captured.reserve(std::min(rows.size(),maxRows));
+    items->rows.reserve(std::min(rows.size(),maxRows));
+    for(int i:rows) if(i>=0 && i<state.total && items->rows.size()<maxRows) {
+        const Entry& source=state.entries[size_t(i)];
         const int group=ModelGroup(state,i);
         const auto mapped=groups.find(group);
-        model->items.emplace(i,PresentationItem{i,mapped==groups.end() ? -1 : mapped->second,
-            ModelSelected(state,i),state.entries[size_t(i)]});
-        if (state.renamePreviewToken == state.token && !state.renamePreviewPath.empty() &&
-            model->items.at(i).entry.path == state.renamePreviewPath)
-            model->items.at(i).entry.name = state.renamePreviewName;
+        auto& row=captured[i];
+        bool reused=false;
+        if(renamePreview && source.path==state.renamePreviewPath) {
+            auto preview=std::make_shared<Entry>(source);
+            preview->name=state.renamePreviewName;
+            row.entry=std::move(preview);
+        } else if(const auto found=state.presentationRows.find(i);found!=state.presentationRows.end() &&
+            found->second.entry && *found->second.entry==source) {
+            row=std::move(found->second); reused=true;
+        } else row.entry=std::make_shared<const Entry>(source);
+        if(!reused || !(row.icons==iconContext)) {
+            for(size_t fallback=0;fallback<row.iconKeys.size();++fallback) {
+                std::wstring path; bool attrs=false;
+                row.iconKeys[fallback]=IconKey(iconContext,*row.entry,path,attrs,fallback!=0);
+            }
+            row.icons=iconContext;
+        }
+        items->rows.push_back({i,mapped==groups.end() ? -1 : mapped->second,ModelSelected(state,i),row.entry});
     }
+    // Departing rows are usually still owned by an earlier model. Free them
+    // on the tab lane when this cache was their last owner.
+    std::vector<std::shared_ptr<const Entry>> departed;
+    for(auto& [index,row]:state.presentationRows)
+        if(row.entry && row.entry.use_count()==1) departed.push_back(std::move(row.entry));
+    state.presentationRows.swap(captured);
+    RetireCachedEntries(state,departed);
+    model->items=items;
     // Membership only: ordered comparisons repeatedly walk long shared PIDL
-    // prefixes for every nearby row on Explorer's owner thread.
-    std::unordered_set<std::wstring> keys;
-    const auto image=[&](std::wstring key) -> const std::wstring& {
-        const auto [stored,inserted]=keys.insert(std::move(key));
-        if(inserted) {
-            const IconRecord* icon=nullptr;
-            if(*stored==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
-            else if(const auto found=state.icons.find(*stored);found!=state.icons.end()) icon=&found->second;
-            if(icon && icon->pixels.Ready()) model->images.push_back({*stored,icon->pixels,icon->requestedSize,icon->association});
-        }
-        return *stored;
+    // prefixes for every nearby row on Explorer's owner thread. Views refer to
+    // the row cache or to keys owned below for the rest of this capture.
+    std::unordered_set<std::wstring_view> keys;
+    std::deque<std::wstring> owned;
+    const auto image=[&](const std::wstring& key) {
+        if(!keys.insert(key).second) return;
+        const IconRecord* icon=nullptr;
+        if(key==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
+        else if(const auto found=state.icons.find(key);found!=state.icons.end()) icon=&found->second;
+        if(icon && icon->pixels.Ready()) model->images.push_back({key,icon->pixels,icon->requestedSize,icon->association});
     };
-    const auto icons=[&](const Entry& entry) {
-        for(bool fallback:{false,true}) {
-            std::wstring path; bool attrs=false;
-            auto key=IconKey(state,entry,path,attrs,fallback);
-            if(keys.contains(key)) continue;
-            const auto& captured=image(std::move(key));
+    const auto icons=[&](const Entry& entry,const std::array<std::wstring,2>* cached) {
+        for(size_t fallback=0;fallback<2;++fallback) {
+            const std::wstring* key=cached ? &(*cached)[fallback] : nullptr;
+            if(!key) {
+                std::wstring path; bool attrs=false;
+                key=&owned.emplace_back(IconKey(iconContext,entry,path,attrs,fallback!=0));
+            }
+            if(keys.contains(*key)) continue;
+            image(*key);
             std::wstring fallbackKey;
-            if(FindIconRecord(state,captured,true,false,&fallbackKey,true)) image(std::move(fallbackKey));
+            if(FindIconRecord(state,*key,true,false,&fallbackKey,true)) image(owned.emplace_back(std::move(fallbackKey)));
         }
     };
-    for(const auto& [index,item]:model->items) icons(item.entry);
-    for(const auto& ghost:model->disappearingRows) icons(ghost.entry);
-    image(kDefaultFolderIconKey);
+    for(const auto& item:items->rows) icons(*item.entry,&state.presentationRows.at(item.index).iconKeys);
+    for(const auto& ghost:model->disappearingRows) icons(ghost.entry,nullptr);
+    image(owned.emplace_back(kDefaultFolderIconKey));
     return model;
 }
 
@@ -25617,7 +25695,7 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->groupIntents=state.presentationGroupIntents;
     receipt->groups=state.groupAnimating; receipt->groupFrame=state.groupFrameQpc;
     receipt->glyphBytes=GlyphCacheBytes(state); receipt->imageBytes=state.iconCacheBytes;
-    receipt->overrides=state.presentationItems.size(); receipt->modelRows=state.presentationEntries ? state.presentationEntries->size() : 0;
+    receipt->overrides=state.presentationItems ? state.presentationItems->rows.size() : 0; receipt->modelRows=state.presentationEntries ? state.presentationEntries->size() : 0;
     if(lane->diagnostics.load(std::memory_order_relaxed)) for(int i:VisibleItemRows(state,0.f)) {
         const auto& entry=ModelEntry(state,i);
         receipt->samples.push_back({i,SelectionPathHash(entry.path),SelectionPathHash(entry.name),ModelSelected(state,i),
@@ -29239,6 +29317,12 @@ void DisposeOverlayState(ViewState* s) {
     ForgetDirectory(*s);
     ClearFolderSnapshots(*s);
     RetireCachedEntries(*s, s->presentationEntries);
+    {
+        std::vector<std::shared_ptr<const Entry>> rows;
+        for (auto& [index,row] : s->presentationRows) if (row.entry) rows.push_back(std::move(row.entry));
+        s->presentationRows.clear();
+        RetireCachedEntries(*s, rows);
+    }
     RetireCachedEntries(*s, s->entries);
     RetireCachedEntries(*s, s->retiredIconPixels);
     {

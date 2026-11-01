@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.325
+
+- Reduce Explorer UI-thread work during scrolling and animations: each frame
+  now reuses unchanged nearby rows and their image keys instead of copying
+  them again, and the renderer shares that row list without another copy.
+
 ## 0.9.324
 
 - Read Shell-formatted sizes without rebinding the parent folder and

@@ -146,7 +146,7 @@ static void TestDenseProviderFrames() {
         QueryPerformanceCounter(&begin);
         for(int n=0;n<12;++n) {
             const auto model=CapturePresentationModel(s);
-            Check(model->items.size()==1003 && model->images.size()==513,
+            Check(model->items && model->items->rows.size()==1003 && model->images.size()==513,
                 "dense provider snapshot lost nearby rows or ready icons");
         }
         QueryPerformanceCounter(&end);

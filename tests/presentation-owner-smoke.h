@@ -223,7 +223,7 @@ static void TestPresentationOwners() {
         std::shared_ptr<const PresentationModel> queued;
         {std::lock_guard lock(a.state.presenter->mutex); queued=a.state.presenter->pending;}
         Check(queued && queued->sequence==a.state.presentationSequence && queued->directory==a.state.presentationEntries &&
-            queued->items.size()<4096,"render mailbox retained obsolete frames or copied the directory per frame");
+            queued->items && queued->items->rows.size()<4096,"render mailbox retained obsolete frames or copied the directory per frame");
         const auto pixelIdentity=a.state.defaultFolderIcon.pixels.data.Identity();
         Check(!queued->images.empty() && queued->images.back().pixels.data.Identity()==pixelIdentity,
             "frame copied thumbnail bytes instead of sharing immutable pixels");
@@ -231,6 +231,39 @@ static void TestPresentationOwners() {
         a.state.clipboardPaths.insert(a.state.entries[0].path);
         Check(queued->selectedFlags[0] && queued->images.back().pixels.data[0]==255 && queued->clipboard.empty(),
             "selection, clipboard or pixel mutation changed an immutable pending frame");
+        {
+            // Consecutive packets share unchanged nearby rows. An in-place
+            // change replaces only its row; key inputs refresh reused rows.
+            const auto first=CapturePresentationModel(a.state),second=CapturePresentationModel(a.state);
+            Check(first->items && second->items && !first->items->rows.empty() &&
+                std::equal(first->items->rows.begin(),first->items->rows.end(),
+                    second->items->rows.begin(),second->items->rows.end(),
+                    [](const auto& x,const auto& y) {return x.index==y.index && x.entry==y.entry;}),
+                "an unchanged viewport copied its rows into the next packet");
+            const int changed=second->items->rows.front().index;
+            auto& source=a.state.entries[size_t(changed)];
+            const Entry original=source;
+            source.folder=false;
+            const auto third=CapturePresentationModel(a.state);
+            bool replaced=false,shared=true;
+            for(const auto& row:third->items->rows) {
+                const auto* before=second->items->Find(row.index);
+                if(row.index==changed) replaced=before && before->entry!=row.entry && !row.entry->folder && before->entry->folder;
+                else shared=shared && before && before->entry==row.entry;
+            }
+            Check(replaced && shared,"row reuse missed an in-place change or copied unchanged neighbors");
+            const auto previousKey=a.state.presentationRows.at(changed).iconKeys[0];
+            const bool listThumbnails=g_listThumbnails.exchange(!g_listThumbnails.load());
+            const auto fourth=CapturePresentationModel(a.state);
+            std::wstring lookup; bool attrs=false;
+            const auto expected=IconKey(a.state,source,lookup,attrs);
+            g_listThumbnails=listThumbnails;
+            const auto* reused=fourth->items->Find(changed);
+            Check(reused && reused->entry==third->items->Find(changed)->entry &&
+                a.state.presentationRows.at(changed).iconKeys[0]==expected && expected!=previousKey,
+                "a reused row kept image keys from an obsolete thumbnail policy");
+            source=original;
+        }
         a.state.entries[0].name=L"Fresh visible metadata"; a.state.clipboardPaths.clear();
         SubmitPresentation(a.state); const auto latest=a.state.presentationSequence;
         b.Start();

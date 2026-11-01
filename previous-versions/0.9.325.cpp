@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.310
+// @version         0.9.325
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -35,6 +35,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
+- **Shell Size Text** — The Size column uses Shell formatting and can pick up folder sizes from [Better file sizes in Explorer details](https://windhawk.net/mods/explorer-details-better-file-sizes). Refresh after changing that mod's settings. Size sorting and grouping use the overlay's own rules.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
@@ -423,6 +424,7 @@ constexpr UINT kMsgRetireGraphics = WM_APP + 69;
 constexpr UINT kMsgFilesystemChanged = WM_APP + 70;
 constexpr UINT kMsgFlushDirectoryChanges = WM_APP + 71;
 constexpr UINT kMsgPresentationReady = WM_APP + 72;
+constexpr UINT kMsgNativeCatalog = WM_APP + 73;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -662,6 +664,7 @@ SortSpec DefaultSort() {
 struct ColumnCell {
     PROPERTYKEY key{};
     std::wstring text;
+    bool operator==(const ColumnCell& other) const { return SameProperty(key,other.key) && text==other.text; }
 };
 struct ExplorerColumn {
     PROPERTYKEY key{};
@@ -788,6 +791,10 @@ struct ExtraSortValue {
         return SameProperty(key,other.key) && text==other.text && number==other.number && kind==other.kind;
     }
 };
+// Memberwise value equality for row snapshots; identities compare by owner.
+bool operator==(const FILETIME& a, const FILETIME& b) {
+    return a.dwLowDateTime==b.dwLowDateTime && a.dwHighDateTime==b.dwHighDateTime;
+}
 // Refresh baselines retain only comparison data, without presentation cells,
 // formatted metadata, grouping strings or in-flight enrichment state.
 struct EntrySortKey {
@@ -804,6 +811,7 @@ struct EntrySortKey {
     ULONGLONG byteSize = 0;
     bool folder = false;
     SharedPidl shellIdentity; // Immutable identity for targeted provider rechecks.
+    bool operator==(const EntrySortKey&) const = default;
 };
 struct Entry : EntrySortKey {
     std::wstring date, type, size;
@@ -823,6 +831,8 @@ struct Entry : EntrySortKey {
     bool detailsPending = false;
     unsigned long long detailsPendingEpoch = 0; // Older slow properties cannot block new columns.
     unsigned long long detailsPendingToken = 0; // Pending work from other folder visits is stale.
+    // Every field participates, so presentation reuse cannot miss a new one.
+    bool operator==(const Entry&) const = default;
 };
 
 bool SameEntryIdentity(const Entry& a, const Entry& b) {
@@ -1482,6 +1492,9 @@ struct DirectoryJob {
     std::wstring path;
     bool allowInitialPreview = false; // Cold filesystem loads; provisional names precede layout.
     bool enumerated = false;
+    bool captureNativeCatalog = false, nativeCatalogChecked = false;
+    bool nativeCatalogAvailable = false;
+    std::vector<SharedPidl> nativeChildren;
     std::vector<Entry> enumeratedEntries;
     DWORD enumerationError = ERROR_SUCCESS;
     size_t previewRows = 64; // Captured viewport + overhang, bounded independently of directory size.
@@ -1651,6 +1664,7 @@ struct PreparedNativeSelection {
     OwnedPidl folder;
     std::vector<Entry> entries;
     std::vector<OwnedPidl> children;
+    size_t validationCursor = 0;
     bool imported = false, revealUnchanged = false, preserveViewport = false;
     bool compareObserved = false;
     int expectedCount = 0;
@@ -2023,6 +2037,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     bool registered = false; // Protected by the lifetime regulator's mutex.
     SRWLOCK directoryLock = SRWLOCK_INIT;
     std::deque<DirectoryJob> directoryJobs, layoutJobs, capacityJobs;
+    std::shared_ptr<DirectoryJob> nativeCatalogRequest;
     std::deque<DetailJob> detailJobs;
     std::deque<NativeRowsJob> nativeRowsJobs;
     std::deque<ColumnCatalogJob> columnCatalogJobs;
@@ -2031,7 +2046,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<DirectoryResult> directoryResults;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
         std::shared_ptr<const NamespaceIdentities>, std::shared_ptr<const std::vector<Entry>>,
-        std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates>;
+        std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates,
+        std::vector<SharedPidl>, std::vector<std::shared_ptr<const Entry>>>;
     std::deque<RetiredPayload> retiredEntries;
     bool directoryNotificationQueued = false, detailNotificationQueued = false;
     SRWLOCK iconLock = SRWLOCK_INIT;
@@ -2525,7 +2541,31 @@ public:
 struct PresentationItem {
     int index=-1, group=-1;
     bool selected=false;
-    Entry entry;
+    std::shared_ptr<const Entry> entry;
+};
+// Sparse rows near the viewport, sorted by index. Each submitted model shares
+// one immutable list with its render lane; neither side copies row values.
+struct PresentationItems {
+    std::vector<PresentationItem> rows;
+    const PresentationItem* Find(int index) const {
+        const auto found=std::lower_bound(rows.begin(),rows.end(),index,
+            [](const PresentationItem& item,int value) { return item.index<value; });
+        return found!=rows.end() && found->index==index ? &*found : nullptr;
+    }
+};
+// Every ViewState input of an image cache key. Keys are pure functions of this
+// and the row, so a captured row may reuse them while both are unchanged.
+struct IconKeyContext {
+    UINT size=32;
+    bool gridView=false, thumbnails=false;
+    bool operator==(const IconKeyContext&) const = default;
+};
+// The owner's last captured viewport row. Unchanged rows are shared by the
+// next model instead of being copied again on Explorer's thread.
+struct PresentationRowCache {
+    std::shared_ptr<const Entry> entry;
+    IconKeyContext icons;
+    std::array<std::wstring,2> iconKeys; // Exact image, then association fallback.
 };
 struct ViewState {
     // The bridge state is owner-STA-only. A presentation instance contains
@@ -2544,7 +2584,8 @@ struct ViewState {
     LOGFONTW presentationFont{};
     float presentationDocumentHeight=0.f, presentationGroupOrigin=0.f;
     bool presentationActive=true;
-    std::map<int,PresentationItem> presentationItems;
+    std::shared_ptr<const PresentationItems> presentationItems;
+    std::unordered_map<int,PresentationRowCache> presentationRows; // Owner capture reuse only.
     std::unordered_map<std::wstring,int> presentationGroups;
     std::vector<int> presentationSectionIndices;
     std::list<std::wstring> presentationIconRecent;
@@ -3103,6 +3144,13 @@ struct ViewState {
     ComPtr<IEnumIDList> nativeSelectionCapture;
     std::shared_ptr<PreparedNativeSelection> nativeSelectionCaptureJob;
     std::shared_ptr<PreparedNativeSelection> confirmedNativeSelection;
+    SelectionFlags verifiedSelectionFlags;
+    int verifiedSelectionRow = -1, verifiedSelectionAnchor = -1;
+    unsigned long long verifiedSelectionToken = 0, verifiedSelectionDirectory = 0, verifiedSelectionOrder = 0;
+    ComPtr<IEnumIDList> nativeCatalogCapture;
+    std::shared_ptr<DirectoryJob> nativeCatalogJob;
+    HWND nativeCatalogView = nullptr;
+    int nativeCatalogCount = -1;
     bool pendingSelectionContextMenu = false;
     bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
@@ -3110,7 +3158,12 @@ struct ViewState {
     std::deque<DeferredSelectionKey> deferredSelectionKeys;
     std::vector<std::wstring> nativeSelectionPaths;
     std::wstring nativeFocusedPath;
-    struct WidthEntry {float available=0.f, width=0.f, font=0.f;};
+    struct WidthEntry {
+        float available=0.f, width=0.f, font=0.f;
+        std::wstring name;
+        unsigned long long face=0;
+        bool middleTrim=false;
+    };
     std::unordered_map<int, WidthEntry> widthCache;
     TextLayoutCache textLayouts[4]; // Body, header, sorted header, wrapped icon labels.
     struct {
@@ -3131,6 +3184,7 @@ struct ViewState {
     struct RenameSession {
         HWND editor = nullptr;
         HFONT font = nullptr;
+        unsigned fontRenderingRevision = 0;
         HBRUSH background = nullptr;
         COLORREF backgroundColor = CLR_INVALID;
         int index = -1;
@@ -3140,6 +3194,13 @@ struct ViewState {
         UINT_PTR epoch = 0;
         bool finishing = false;
         bool positioning = false;
+        unsigned nativeDispatchDepth = 0;
+        bool textLayoutDirty = false;
+        RECT requestedTextRect{};
+        bool requestedTextRectValid = false;
+        SIZE layoutPreferred{}, layoutAvailable{}, layoutPadding{}, layoutSize{};
+        bool layoutValid = false;
+        bool zoomHidden = false, zoomRetargeting = false, restoreZoomFocus = false;
         bool parentSubclassInstalled = false;
         HWND notificationHost = nullptr;
         bool creationSticky = false; // Ignore non-pointer Shell focus transitions.
@@ -3314,6 +3375,8 @@ struct ViewState {
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
     ULONGLONG startupStartedAt = 0;
     ULONGLONG firstContentSubmittedAt = 0;
+    bool preparingTab = false; // Prepare one hidden first-content surface; then use normal standby.
+    bool tabSurfaceWakeQueued = false;
     ComPtr<IDispatch> pendingAutomation;
     bool deferColumnProviders = true; // Clear after the first names/empty-folder submission.
     DWORD enumerationError = ERROR_SUCCESS;
@@ -3512,7 +3575,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     HWND renameEditor=nullptr; int renameIndex=-1;
     float documentHeight=0.f;
     std::shared_ptr<const std::vector<Entry>> directory;
-    std::map<int,PresentationItem> items;
+    std::shared_ptr<const PresentationItems> items;
     std::vector<ViewState::GroupSection> sections;
     std::vector<int> sectionIndices;
     unsigned long long observerId=0;
@@ -3623,9 +3686,9 @@ void RegisterViewAnimation(ViewState& state) { if(!state.presentationOnly) Regis
 void UnregisterViewAnimation(ViewState& state) { if(!state.presentationOnly) UnregisterAnimationWindow(state.hwnd); }
 const Entry& ModelEntry(const ViewState& state,int index) {
     if(!state.presentationOnly) return state.entries[size_t(index)];
-    const auto found=state.presentationItems.find(index);
     static const Entry empty;
-    if(found!=state.presentationItems.end()) return found->second.entry;
+    if(const auto* item=state.presentationItems ? state.presentationItems->Find(index) : nullptr;item && item->entry)
+        return *item->entry;
     return state.presentationEntries && index>=0 && size_t(index)<state.presentationEntries->size() ?
         (*state.presentationEntries)[size_t(index)] : empty;
 }
@@ -3634,8 +3697,8 @@ bool ModelSelected(const ViewState& state,int index) {
 }
 int ModelGroup(const ViewState& state,int index) {
     if(state.presentationOnly && !state.presentationEntries) {
-        const auto found=state.presentationItems.find(index);
-        return found==state.presentationItems.end() ? -1 : found->second.group;
+        const auto* item=state.presentationItems ? state.presentationItems->Find(index) : nullptr;
+        return item ? item->group : -1;
     }
     return index>=0 && size_t(index)<state.rowGroup.size() ? state.rowGroup[size_t(index)] : -1;
 }
@@ -3766,9 +3829,12 @@ bool ViewOptionEnabled(const ViewState& state, const std::atomic<ViewOption>& op
     const auto value = option.load(std::memory_order_relaxed);
     return value == ViewOption::AlwaysOn || (value == ViewOption::GridOnly && state.gridView);
 }
+bool FileThumbnails(const ViewState& state) {
+    return state.gridView ? state.cachedNativeMode != FVM_SMALLICON :
+        g_listThumbnails.load(std::memory_order_relaxed);
+}
 bool UsesThumbnails(const ViewState& state, const Entry& entry) {
-    return !entry.folder && (state.gridView ? state.cachedNativeMode != FVM_SMALLICON :
-        g_listThumbnails.load(std::memory_order_relaxed));
+    return !entry.folder && FileThumbnails(state);
 }
 float GroupHeadingHeight(const ViewState& state) {
     return state.gridView ? std::max(24.f, state.fontPx * 1.5f + 8.f) : state.rowPx;
@@ -3956,7 +4022,8 @@ std::vector<int> VisibleItemRows(const ViewState& state, float overscanRows = 2.
     const float to = state.scrollNow +
         std::max(0.f, client.bottom - state.headerPx) + pad;
     if(state.presentationOnly && !state.presentationEntries) {
-        for(const auto& [index,item]:state.presentationItems) {
+        if(state.presentationItems) for(const auto& item:state.presentationItems->rows) {
+            const int index=item.index;
             const float top=DocumentRowTop(state,index),height=DisplayRowHeight(state,index);
             if(top+height>=from && top<=to && height>.01f) rows.push_back(index);
         }
@@ -4507,6 +4574,7 @@ void CancelTouchMarquee(ViewState& state);
 void UpdateTouchScrollbars(ViewState& state);
 void ClearSwipeFeedback(ViewState& state);
 void RetargetSwipeFeedback(ViewState& state,bool released,bool committed);
+void RepositionRenameEdit(ViewState& state);
 void StopTouch(ViewState& state) {
     const bool control = state.touch.control;
     const bool owned = state.touch.active || state.touch.primary;
@@ -4537,6 +4605,7 @@ void StopTouch(ViewState& state) {
         if (GetCapture() == state.hwnd) ReleaseCapture();
     }
     UpdateTouchScrollbars(state);
+    RepositionRenameEdit(state);
     if (feedback) Redraw(state); // Retire the preview on the independent render owner too.
 }
 void ResetMouseGestureForNavigation(ViewState& state) {
@@ -4761,6 +4830,7 @@ static void StopTouchpad(ViewState& state, bool releaseResources = true) {
     MSG pending{};
     while (PeekMessageW(&pending, state.hwnd, kMsgManipulationPan,
                         kMsgManipulationNavigate, PM_REMOVE)) {}
+    RepositionRenameEdit(state);
     if (!releaseResources) return;
     if (state.manipulationViewport) {
         if (state.manipulationCookie) {
@@ -5181,7 +5251,7 @@ static HWND FolderContentHost(HWND native) {
 
 // Our intentionally hidden ancestor does not invalidate the live Shell view.
 // Explicitly hidden Shell views still fail this test before that ancestor.
-bool NativeViewAvailable(HWND hwnd) {
+bool NativeViewAvailable(HWND hwnd, HWND backgroundTab = nullptr) {
     if (IsWindowVisible(hwnd)) return true;
     // Shell can hide the selected content host while iconic. After unloading
     // an older overlay there may be no owner property left on that host.
@@ -5191,9 +5261,9 @@ bool NativeViewAvailable(HWND hwnd) {
     for (HWND current = hwnd; current && IsWindow(current); current = GetParent(current)) {
         if (IsSuppressedNativeHost(current)) return true;
         if (!(GetWindowLongPtrW(current, GWL_STYLE) & WS_VISIBLE) &&
-            current != minimizedHost) return false;
+            current != minimizedHost && current != backgroundTab) return false;
     }
-    return minimizedHost != nullptr;
+    return minimizedHost != nullptr || (backgroundTab && IsChild(backgroundTab,hwnd));
 }
 
 // Keep the native presentation child's real layout while its host is hidden.
@@ -5399,8 +5469,92 @@ void ArmTabSwitchProbe(HWND frame, const wchar_t* reason);
 void TraceTabHostSnapshot(HWND frame, const wchar_t* source);
 void PresentCachedTabSurface(ViewState& state);
 
+thread_local bool t_overlayStacking=false;
+
+HWND PreviousVisibleSibling(HWND hwnd) {
+    while((hwnd=GetWindow(hwnd,GW_HWNDPREV)) && !IsWindowVisible(hwnd)) {}
+    return hwnd;
+}
+
+bool OverlayStackingNeeded(const ViewState& state) {
+    HWND previous=nullptr;
+    for(HWND child:{state.rename.editor,state.viewToggle,state.hwnd}) {
+        if(!child || GetParent(child)!=state.frameHwnd || (child!=state.hwnd && !IsWindowVisible(child))) continue;
+        if(PreviousVisibleSibling(child)!=previous) return true;
+        previous=child;
+    }
+    return false;
+}
+
+// Rename, chrome and GPU content share one order and one USER transaction.
+// Hidden frame children never require a repair. Position-only and Z-only work
+// retains valid pixels; ordinary layout must not discard/reframe the editor.
+bool PositionOverlayWindows(ViewState& state,const RECT* overlayBounds=nullptr,
+    const RECT* renameBounds=nullptr,const RECT* toggleBounds=nullptr) {
+    struct Placement { HWND hwnd; const RECT* bounds; UINT flags; };
+    std::array<Placement,3> windows{};
+    size_t count=0;
+    const auto append=[&](HWND hwnd,const RECT* bounds) {
+        if(!hwnd || GetParent(hwnd)!=state.frameHwnd ||
+            (hwnd!=state.hwnd && !bounds && !IsWindowVisible(hwnd))) return;
+        windows[count++]={hwnd,bounds,SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER};
+    };
+    append(state.rename.editor,renameBounds); append(state.viewToggle,toggleBounds); append(state.hwnd,overlayBounds);
+    if(!count) return false;
+    bool restack=false,changed=false;
+    HWND previous=nullptr;
+    for(size_t i=0;i<count;++i) {
+        auto& window=windows[i];
+        restack|=PreviousVisibleSibling(window.hwnd)!=previous;
+        previous=window.hwnd;
+        if(window.bounds) {
+            RECT current{}; GetWindowRect(window.hwnd,&current);
+            MapWindowPoints(HWND_DESKTOP,state.frameHwnd,reinterpret_cast<POINT*>(&current),2);
+            if(current.left!=window.bounds->left || current.top!=window.bounds->top) window.flags&=~SWP_NOMOVE;
+            if(current.right-current.left!=window.bounds->right-window.bounds->left ||
+                current.bottom-current.top!=window.bounds->bottom-window.bounds->top) window.flags&=~SWP_NOSIZE;
+            if(window.hwnd!=state.hwnd && !IsWindowVisible(window.hwnd)) window.flags|=SWP_SHOWWINDOW;
+        }
+        changed|=(window.flags&(SWP_NOMOVE|SWP_NOSIZE))!=(SWP_NOMOVE|SWP_NOSIZE) || (window.flags&SWP_SHOWWINDOW);
+    }
+    restack&=!t_overlayStacking;
+    if(!changed && !restack) return true;
+    ScopedFlag repair(t_overlayStacking);
+    HDWP batch=BeginDeferWindowPos(static_cast<int>(count));
+    if(!batch) return false;
+    previous=HWND_TOP;
+    for(size_t i=0;i<count;++i) {
+        auto& window=windows[i];
+        if(restack) window.flags&=~SWP_NOZORDER;
+        if((window.flags&(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER))==(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER) &&
+            !(window.flags&SWP_SHOWWINDOW)) {previous=window.hwnd; continue;}
+        const RECT rect=window.bounds ? *window.bounds : RECT{};
+        PipelineEvent(*state.background,{.operation=L"ui.window.position[x,y,width,height]",
+            .a=reinterpret_cast<UINT_PTR>(window.hwnd),.b=window.flags,
+            .v={double(rect.left),double(rect.top),double(rect.right-rect.left),double(rect.bottom-rect.top)}},true);
+        batch=DeferWindowPos(batch,window.hwnd,previous,rect.left,rect.top,
+            rect.right-rect.left,rect.bottom-rect.top,window.flags);
+        if(!batch) return false;
+        previous=window.hwnd;
+    }
+    const bool applied=EndDeferWindowPos(batch)!=FALSE;
+    PipelineEvent(*state.background,{.operation=L"ui.window.batch[count,restack,geometry,success]",
+        .a=reinterpret_cast<UINT_PTR>(state.hwnd),.v={double(count),double(restack),double(changed),double(applied)}},true);
+    return applied;
+}
+
+void EnsureOverlayStacking(ViewState& state) {
+    if(t_overlayStacking) return;
+    if(!PositionOverlayWindows(state)) {
+        state.nativePresentationPending=true;
+        RegisterViewAnimation(state);
+    }
+}
+
 bool PositionOverlayOverNative(ViewState& state, bool top = true) {
     if (PresentationMinimized(state)) return false;
+    const bool active=TabOwnsActiveView(state);
+    if(!active && state.preparingTab) top=false;
     const auto pending = [&](const wchar_t* reason) {
         // Layout/ownership can be transient during a Shell view handoff.
         // Preserve the user's GPU preference and retry through frame pacing.
@@ -5418,7 +5572,7 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         return false;
     };
     if (!IsWindow(state.frameHwnd) || !IsWindow(state.nativeHwnd) ||
-        !IsWindow(state.hwnd) || !TabOwnsActiveView(state)) return pending(L"presentation.pending.ownership[kept,rows]");
+        !IsWindow(state.hwnd) || (!active && !state.preparingTab)) return pending(L"presentation.pending.ownership[kept,rows]");
     // Suppression precedes even the size check: a zero-sized view may be
     // populated and shown by Explorer before its next GPU-side layout pass.
     if (state.visible && state.inScope && state.detailsViewActive && state.pendingShellView &&
@@ -5445,17 +5599,12 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         current.bottom - current.top != height;
     // A rename editor is a FRAME sibling, not a composited child of the
     // overlay. Keep it above the GPU HWND throughout position/top repairs.
-    const HWND edit = state.rename.editor && IsWindow(state.rename.editor) &&
-        GetParent(state.rename.editor) == owner &&
-        IsWindowVisible(state.rename.editor) ? state.rename.editor : nullptr;
-    const HWND pinned = edit ? edit :
-        (IsWindowVisible(state.viewToggle) ? state.viewToggle : nullptr);
-    const bool behind = pinned ? GetWindow(state.hwnd, GW_HWNDPREV) != pinned :
-        GetWindow(owner, GW_CHILD) != state.hwnd;
+    const bool behind = OverlayStackingNeeded(state);
     if (moved || (top && behind)) {
-        SetWindowPos(state.hwnd, top ? (pinned ? pinned : HWND_TOP) : nullptr,
-            rect.left, rect.top, width, height,
-            SWP_NOACTIVATE | (top ? 0 : SWP_NOZORDER));
+        if(top) {
+            if(!PositionOverlayWindows(state,&rect)) return pending(L"presentation.pending.position[kept,rows]");
+        } else if(!SetWindowPos(state.hwnd,nullptr,rect.left,rect.top,width,height,
+            SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER)) return pending(L"presentation.pending.position[kept,rows]");
     }
     state.nativePresentationPending = false;
     return true;
@@ -6428,19 +6577,23 @@ UINT IconRequestSize(const ViewState& state) {
     });
     return chosen;
 }
-std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& lookup,
+IconKeyContext MakeIconKeyContext(const ViewState& state) {
+    return {IconRequestSize(state),state.gridView,FileThumbnails(state)};
+}
+std::wstring IconKey(const IconKeyContext& context, const Entry& e, std::wstring& lookup,
                      bool& useAttrs, bool associationOnly = false, UINT previewLimit = 0) {
     auto key = IconKey(e, lookup, useAttrs, associationOnly);
+    const bool thumbnail = !e.folder && context.thumbnails;
     if (!associationOnly && ((e.shellIdentity && e.path.starts_with(L"windhawk:pidl:")) ||
-        UsesThumbnails(state,e))) {
+        thumbnail)) {
         // A thumbnail is per item, unlike its immediate shared filetype icon.
         // The same provider lane supplies either result, with identical
         // cancellation, visible priority, upload pacing and cache lifetime.
         key = lookup = e.path;
         useAttrs = false;
     }
-    const bool listThumbnail = !associationOnly && !state.gridView && UsesThumbnails(state,e);
-    UINT size = IconRequestSize(state);
+    const bool listThumbnail = !associationOnly && !context.gridView && thumbnail;
+    UINT size = context.size;
     // The shared Shell image list contains at most a 256px jumbo icon. Larger
     // requests cannot add detail there; per-item image factories stay adaptive.
     if(useAttrs) size=std::min(size,256u);
@@ -6449,6 +6602,10 @@ std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& looku
     // Larger tiers can reuse the identical decorated grid image unchanged.
     if (size > 32 || listThumbnail) key = L"@" + std::to_wstring(size) + L"|" + key;
     return key;
+}
+std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& lookup,
+                     bool& useAttrs, bool associationOnly = false, UINT previewLimit = 0) {
+    return IconKey(MakeIconKeyContext(state),e,lookup,useAttrs,associationOnly,previewLimit);
 }
 
 int VisibleRows(ViewState& state);
@@ -6632,8 +6789,11 @@ ViewInputOwner InputFocusOwner(const ViewState& state) {
     if (!state.visible || !state.inScope || !state.detailsViewActive ||
         !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd)) return ViewInputOwner::None;
     const HWND focus = GetFocus();
-    if (!focus) return ViewInputOwner::None;
+    if (!focus) return state.rename.zoomHidden && state.rename.restoreZoomFocus ?
+        ViewInputOwner::RenameEditor : ViewInputOwner::None;
     if (focus == state.rename.editor) return ViewInputOwner::RenameEditor;
+    if (state.rename.zoomHidden && state.rename.restoreZoomFocus &&
+        (focus == state.hwnd || focus == state.frameHwnd)) return ViewInputOwner::RenameEditor;
     if (focus == state.hwnd) return ViewInputOwner::GpuList;
     if (focus == state.frameHwnd) return ViewInputOwner::Frame;
     if (NativeRenameEditor(state, focus)) return ViewInputOwner::NativeEditor;
@@ -7325,6 +7485,67 @@ std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
     }
     PropVariantClear(&pv);
     return result;
+}
+
+// Detail workers resolve one row per job, normally with a shared parent.
+// Keep that parent's folder and Size column for one directory generation
+// instead of rebinding from the desktop and rescanning every column per row.
+// Owned by a single worker and released inside its apartment.
+struct ShellSizeBinding {
+    unsigned long long token = 0;
+    OwnedPidl parent;
+    ComPtr<IShellFolder2> folder;
+    UINT column = 0;
+    bool hasColumn = false;
+    void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
+};
+
+// Use the folder's formatted column rather than formatting its raw property
+// ourselves. This keeps Shell size/formatting hooks (including Better file
+// sizes) on their normal path, without importing another mod's calculations.
+// Bind in the requesting provider worker's apartment; never use the live view.
+bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
+                         std::wstring& text, ShellSizeBinding& binding,
+                         unsigned long long token) {
+    if (binding.token != token) { binding.Reset(); binding.token = token; }
+    PIDLIST_ABSOLUTE parsed = nullptr;
+    if (!identity) {
+        const HRESULT hr = SHParseDisplayName(path.c_str(), nullptr, &parsed, 0, nullptr);
+        if (FAILED(hr)) { CoTaskMemFree(parsed); return false; }
+        identity = parsed;
+    }
+    OwnedPidl owned(parsed);
+    if (!identity || ILIsEmpty(identity)) return false;
+    PCUITEMID_CHILD child = ILFindLastID(identity);
+    const size_t parentBytes = static_cast<size_t>(
+        reinterpret_cast<const BYTE*>(child) - reinterpret_cast<const BYTE*>(identity));
+    const bool sameParent = binding.parent &&
+        ILGetSize(binding.parent.get()) == parentBytes + sizeof(USHORT) &&
+        memcmp(binding.parent.get(), identity, parentBytes) == 0;
+    if (!sameParent) {
+        // Failures are remembered for this parent too, so a provider without
+        // a Size column is not rescanned for every remaining row.
+        binding.Reset();
+        OwnedPidl parent(ILCloneFull(identity));
+        if (!parent || !ILRemoveLastID(parent.get())) return false;
+        binding.parent = std::move(parent);
+        PCUITEMID_CHILD ignored = nullptr;
+        if (FAILED(SHBindToParent(identity, IID_PPV_ARGS(&binding.folder), &ignored)) || !binding.folder)
+            return false;
+        for (UINT column = 0; column < kMaxShellColumns; ++column) {
+            PROPERTYKEY key{};
+            if (FAILED(binding.folder->MapColumnToSCID(column, &key))) break;
+            if (SameKey(key, PKEY_Size)) { binding.column = column; binding.hasColumn = true; break; }
+        }
+    }
+    if (!binding.folder || !binding.hasColumn) return false;
+    SHELLDETAILS details{};
+    if (FAILED(binding.folder->GetDetailsOf(child, binding.column, &details))) return false;
+    PWSTR formatted = nullptr;
+    const HRESULT hr = StrRetToStrW(&details.str, child, &formatted);
+    if (SUCCEEDED(hr)) text = formatted ? formatted : L"";
+    CoTaskMemFree(formatted);
+    return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
 // Device-independent storage metadata. Shell storage providers expose either
@@ -8104,6 +8325,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     std::shared_ptr<FolderChangeStamp> observedFolder;
     unsigned long long observedToken = 0;
     bool watchNotified = false;
+    ShellSizeBinding sizeBinding; // Declared after the apartment; released before it.
     for (;;) {
         if (watchLane && work.watchGeneration.load(std::memory_order_acquire) != observedToken)
             observedFolder.reset();
@@ -8181,6 +8403,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 break;
             }
         }
+        // An idle detail lane keeps no provider folder alive between demands.
+        if (detailsLane && !haveDetail) sizeBinding.Reset();
         if(statusButtons) {
             const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
                 work.statusButtonGeneration.load(std::memory_order_acquire)==statusButtons->token;};
@@ -8390,6 +8614,19 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
             }
             if (directory.namespaceFolder && !directory.enumerated) {
+                if (directory.captureNativeCatalog && !directory.nativeCatalogChecked) {
+                    {
+                        ExclusiveSrwLock lock(work.directoryLock);
+                        if (!DirectoryJobCurrent(work,directory.token)) continue;
+                        work.nativeCatalogRequest=std::make_shared<DirectoryJob>(std::move(directory));
+                        if (PostMessageW(work.hwnd,kMsgNativeCatalog,0,0)) continue;
+                        // The owner cannot receive the request; enumerate here
+                        // rather than leaving this generation without rows.
+                        directory=std::move(*work.nativeCatalogRequest);
+                        work.nativeCatalogRequest.reset();
+                    }
+                    directory.nativeCatalogChecked=true;
+                }
                 NativeRowsJob job;
                 job.token = directory.token;
                 job.folder.reset(ILCloneFull(directory.namespaceFolder.get()));
@@ -8398,7 +8635,38 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 job.requestedAt = GetTickCount64();
                 const bool filesystem = IsTargetPath(directory.path);
                 job.presentation = std::make_unique<DirectoryJob>(std::move(directory));
-                if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
+                if (job.folder && job.presentation->nativeCatalogAvailable) {
+                    if (const auto expected=job.presentation->verifyIdentities) {
+                        DirectoryResult result;
+                        result.kind=DirectoryResult::NamespaceCheck; result.token=job.token; result.hwnd=work.hwnd;
+                        result.namespaceChanged=job.presentation->nativeChildren.size()!=expected->size();
+                        for (const auto& child:job.presentation->nativeChildren) {
+                            if (!DirectoryJobCurrent(work,job.token)) break;
+                            OwnedPidl absolute(ILCombine(job.folder.get(),child.get()));
+                            if (!absolute || !expected->contains(NamespaceItemKey(absolute.get()))) {
+                                result.namespaceChanged=true; break;
+                            }
+                        }
+                        PublishDirectoryResult(work,std::move(result));
+                        continue;
+                    }
+                    if (!provider && FAILED(BindDirectoryProvider(job.presentation->path,provider,job.folder.get()))) {
+                        std::vector<Entry> empty;
+                        auto result=PrepareDirectoryResult(work,*job.presentation,empty,ERROR_NOT_READY);
+                        PublishDirectoryResult(work,std::move(result));
+                        continue;
+                    }
+                    for (auto& child:job.presentation->nativeChildren) {
+                        NativeRowIdentity identity;
+                        identity.absolute.reset(ILCombine(job.folder.get(),child.get()));
+                        identity.child.reset(ILCloneFull(child.get())); identity.namespaceItem=true;
+                        job.identities.push_back(std::move(identity));
+                    }
+                    const auto resolve=[&](const NativeRowIdentity& identity,Entry& entry) {
+                        return ResolveNativeRowIdentity(identity,entry,provider.Get(),filesystem);
+                    };
+                    ResolveNativeRowsJob(work,job,resolve);
+                } else if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
                 continue;
             }
             if (IsThisPcLocation(directory.path)) {
@@ -8595,16 +8863,21 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     // worker (or intentionally blank on unsupported volumes).
                     // Do not block on provider queries just to rediscover them.
                     ComPtr<IPropertyStore> store;
-                    if (!req.missingKeys.empty())
-                        EntryPropertyStore(req.path, req.shellIdentity.get(),
-                            static_cast<GETPROPERTYSTOREFLAGS>(
-                                GPS_DELAYCREATION | GPS_BESTEFFORT),
-                            store.GetAddressOf());
                     for (const auto& key : req.missingKeys) {
                         if (detail.thisPc && ThisPcSeededColumn(key)) continue;
                         ColumnCell cell; cell.key = key;
                         bool resolved=false;
-                        cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                        if (SameKey(key, PKEY_Size))
+                            resolved = ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text,
+                                sizeBinding, detail.token);
+                        if (!resolved) {
+                            if (!store)
+                                EntryPropertyStore(req.path, req.shellIdentity.get(),
+                                    static_cast<GETPROPERTYSTOREFLAGS>(
+                                        GPS_DELAYCREATION | GPS_BESTEFFORT),
+                                    store.GetAddressOf());
+                            cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                        }
                         if(!resolved) {v.failed=true; continue;}
                         if (SameKey(key, PKEY_DateModified)) v.date = cell.text;
                         else if (SameKey(key, PKEY_Size)) v.size = cell.text;
@@ -8624,7 +8897,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 };
                 if (hasColumn(PKEY_DateModified)) v.date = FormatFileTime(req.modified);
                 if (hasColumn(PKEY_ItemTypeText)) v.type = GetTypeName(typeNames, req.path, req.folder);
-                if (!req.folder && hasColumn(PKEY_Size)) v.size = FormatSize(req.size);
+                if (hasColumn(PKEY_Size) &&
+                    !ReadShellSizeDetail(req.path, nullptr, v.size, sizeBinding, detail.token) && !req.folder)
+                    v.size = FormatSize(req.size);
                 v.columnEpoch = detail.columnEpoch;
                 // Only displayed columns are queried on this tab's property
                 // pool, never Explorer's STA or the compositor draw callback.
@@ -8756,7 +9031,10 @@ bool RequestColumnCatalog(ViewState& state) {
     return true;
 }
 
+void CancelNativeCatalog(ViewState& state);
+
 void ForgetDirectory(ViewState& state) {
+    CancelNativeCatalog(state);
     InvalidateColumnCatalog(state);
     state.zebraExtentAnimating = false;
     auto& work = *state.background;
@@ -8771,6 +9049,7 @@ void ForgetDirectory(ViewState& state) {
         if (state.namespaceIdentities)
             work.retiredEntries.emplace_back(std::exchange(state.namespaceIdentities, {}));
         work.directoryJobs.clear();
+        work.nativeCatalogRequest.reset();
         work.nativeRowsJobs.clear();
         for (auto& job : work.layoutJobs)
             if (!job.enumeratedEntries.empty()) work.retiredEntries.push_back(std::move(job.enumeratedEntries));
@@ -8813,6 +9092,112 @@ bool RetireCachedEntries(ViewState& state, Entries& entries, bool nonblocking = 
     }
     if (EnsureDirectoryWorker(state, true)) SetEvent(state.background->properties.wake);
     return true;
+}
+
+// Owner-STA slices are bounded by elapsed time. GetTickCount64 advances in
+// ~16 ms steps and cannot measure a 1 ms budget, so a slice could run for a
+// whole tick or stop after a single batch. Use the QPC clock instead.
+class OwnerSliceBudget {
+    LONGLONG deadline = 0;
+public:
+    explicit OwnerSliceBudget(const ViewState& state, double milliseconds = 1.) {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        double frequency = state.qpcFrequency;
+        if (frequency <= 0.) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); frequency = double(f.QuadPart); }
+        deadline = now.QuadPart + LONGLONG(frequency * milliseconds / 1000.);
+    }
+    bool Remaining() const { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); return now.QuadPart < deadline; }
+};
+
+void CancelNativeCatalog(ViewState& state) {
+    state.nativeCatalogCapture.Reset(); // Release the live enumerator on its owner STA.
+    if (state.nativeCatalogJob) RetireCachedEntries(state,state.nativeCatalogJob->nativeChildren);
+    state.nativeCatalogJob.reset(); state.nativeCatalogView=nullptr;
+    state.nativeCatalogCount=-1;
+}
+
+// Shell folder enumeration can include identities filtered or replaced by its
+// view. Copy the actual view's PIDLs in bounded owner-STA slices; all provider
+// binding, names, attributes and layout remain on the tab's names lane.
+void AdvanceNativeCatalog(ViewState& state) {
+    auto& work=*state.background;
+    std::shared_ptr<DirectoryJob> request;
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        request=std::move(work.nativeCatalogRequest);
+    }
+    if (request && request->token==state.directoryToken) {
+        CancelNativeCatalog(state);
+        state.nativeCatalogJob=std::move(request);
+        state.nativeCatalogView=state.nativeHwnd;
+    }
+    const auto job=state.nativeCatalogJob;
+    const auto view=state.folderView;
+    const HWND owner=state.hwnd;
+    if (!job) return;
+    const auto current=[&] {
+        return IsWindow(owner) && State(owner)==&state && state.nativeCatalogJob==job &&
+            job->token==state.directoryToken && state.nativeHwnd==state.nativeCatalogView &&
+            state.folderView.Get()==view.Get() && DirectoryJobCurrent(work,job->token);
+    };
+    if (!current()) { CancelNativeCatalog(state); return; }
+    bool complete=false, available=false;
+    if (!state.nativeCatalogCapture) {
+        ComPtr<IEnumIDList> items;
+        int count=-1;
+        const HRESULT hr=view ? view->ItemCount(SVGIO_ALLVIEW,&count) : E_NOINTERFACE;
+        if (!current()) return;
+        const HRESULT enumHr=SUCCEEDED(hr) && count>=0 ?
+            view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items)) : E_FAIL;
+        if (!current()) return;
+        if (SUCCEEDED(hr) && count==0 && enumHr!=E_NOTIMPL && enumHr!=E_NOINTERFACE) {
+            state.nativeCatalogCount=0; complete=available=true;
+        }
+        else if (FAILED(enumHr) || !items) complete=true;
+        else { state.nativeCatalogCount=count; state.nativeCatalogCapture=std::move(items); }
+    }
+    const auto enumerator=state.nativeCatalogCapture;
+    // Every slice copies at least one batch; the rest is bounded by time.
+    const OwnerSliceBudget budget(state);
+    for (bool first=true; !complete && (first || budget.Remaining()); first=false) {
+        PITEMID_CHILD children[16]{}; ULONG fetched=0;
+        const HRESULT hr=enumerator->Next(ARRAYSIZE(children),children,&fetched);
+        const bool valid=current();
+        for (ULONG i=0;i<fetched;++i) {
+            SharedPidl child(children[i],TaskMemDeleter{});
+            if (valid && child) job->nativeChildren.push_back(std::move(child));
+        }
+        if (!valid) return;
+        complete=hr!=S_OK || !fetched;
+        available=SUCCEEDED(hr);
+    }
+    // A rejected continuation would strand this generation with no rows.
+    // Fall back to the worker's own enumeration instead.
+    if (!complete) {
+        if (PostMessageW(owner,kMsgNativeCatalog,0,0)) return;
+        available=false;
+    }
+    if (available) {
+        int count=-1;
+        HRESULT hr=view->ItemCount(SVGIO_ALLVIEW,&count);
+        if (!current()) return;
+        if (SUCCEEDED(hr) && (count!=state.nativeCatalogCount || size_t(count)!=job->nativeChildren.size())) {
+            state.nativeCatalogCapture.Reset();
+            RetireCachedEntries(state,job->nativeChildren);
+            // Model changed during capture; take a fresh snapshot.
+            if (PostMessageW(owner,kMsgNativeCatalog,0,0)) return;
+            hr=E_FAIL;
+        }
+        available=SUCCEEDED(hr);
+    }
+    state.nativeCatalogCapture.Reset(); state.nativeCatalogJob.reset();
+    job->nativeCatalogChecked=true; job->nativeCatalogAvailable=available;
+    if (!available) { state.nativeCatalogCount=-1; RetireCachedEntries(state,job->nativeChildren); }
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        if (DirectoryJobCurrent(work,job->token)) work.directoryJobs.push_back(std::move(*job));
+    }
+    SetEvent(work.directory.wake);
 }
 
 size_t FolderCacheBudget(FolderCache& cache) {
@@ -9289,7 +9674,10 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
                 // cached width; never create DirectWrite layouts for this diff.
                 const auto width = state.widthCache.find(i);
                 if (width != state.widthCache.end() &&
-                    width->second.font == state.fontPx)
+                    state.textFormat && width->second.font == state.textFormat->GetFontSize() &&
+                    width->second.face == state.textFaceSerial &&
+                    width->second.name == capture.entry.name &&
+                    width->second.middleTrim == ViewOptionEnabled(state,g_middleEllipsis))
                     capture.selectedNameWidth = width->second.width;
             }
             snapshot.oldViewport.push_back(std::move(capture));
@@ -9366,6 +9754,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         check.hwnd = state.hwnd; check.token = state.directoryToken;
         check.path = state.folderPath; check.visibility = state.visibility;
         check.namespaceFolder = state.directoryFolderIdentity;
+        check.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
         check.verifyIdentities = state.namespaceIdentities;
         ExclusiveSrwLock lock(state.background->directoryLock, true);
         if (!lock) {
@@ -9393,6 +9782,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // navigation, the new view starts with an empty names-only surface.
     state.directoryPending = true;
     state.directoryRequestedAt = GetTickCount64();
+    CancelNativeCatalog(state);
     state.directoryToken = g_nextToken.fetch_add(1);
     state.namesPreview = false;
     // Build the bounded viewport snapshot without holding the global worker
@@ -9413,6 +9803,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     newJob.token = state.directoryToken;
     newJob.path = state.folderPath;
     newJob.folderIdentity = state.directoryFolderIdentity;
+    newJob.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
     newJob.previousOrderHash=state.displayedOrderHash;
     newJob.previousMetadataHash=state.displayedMetadataHash;
     newJob.sortRevealPath=std::move(state.sortRevealPath);
@@ -11102,16 +11493,16 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     return g;
 }
 
-D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item) {
+D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item,const RowVisual& visual) {
     auto box=item.checkbox;
-    if (!state.gridView || state.pointingDevice!=PointingDevice::Touch) return box;
-    // Windows' 40 epx touch target, clipped to this cell's leading half.
-    // Compact cells can use their height; the trailing half still opens items.
+    if (!state.gridView) return D2D1::RectF(ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state),
+        visual.top,item.icon.left,visual.top+visual.height);
+    // Double the visible box for either input device, within this cell's
+    // leading half. The trailing half remains available to open the item.
     const float width=std::max(0.f,item.cell.right-item.cell.left);
     const float height=std::max(0.f,item.cell.bottom-item.cell.top);
     if (width<=0.f || height<=0.f) return {};
-    const float target=float(Scale96(40,ViewDpi(state)));
-    const float w=std::min(target,width*.5f),h=std::min(target,height);
+    const float w=std::min((box.right-box.left)*2.f,width*.5f),h=std::min((box.bottom-box.top)*2.f,height);
     const float left=std::clamp((box.left+box.right-w)*.5f,item.cell.left,item.cell.left+width*.5f-w);
     const float top=std::clamp((box.top+box.bottom-h)*.5f,item.cell.top,item.cell.bottom-h);
     return D2D1::RectF(left,top,left+w,top+h);
@@ -12663,9 +13054,11 @@ const std::wstring* ColumnCellText(const Entry& entry,
 
 // Headers and body cells share their text origin during column edits and
 // horizontal scrolling. Mode transitions retain the header's Details bounds.
+// Layout against the full column; the surrounding paint clip owns viewport
+// occlusion. Scrolling must not change trimming or cached glyph widths.
 // Name retains its icon/indent alignment.
 D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
-                           float listStart, float listEnd, int dpi) {
+                           float listStart, int dpi) {
     const auto& column = PresentedColumn(state,columnIndex);
     const auto [start, end] = ColumnBounds(state, columnIndex, header);
     const float from = listStart + start - state.horizontalScroll;
@@ -12679,7 +13072,7 @@ D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
     const float headerOffset = header ? ColumnHeaderOffset(state,dpi) : 0.f;
     return D2D1::RectF(from + leading,
         headerOffset,
-        (state.modeComposition.painting && state.modeComposition.widths ? to : std::min(to, listEnd)) - trailing,
+        to - trailing,
         header ? headerOffset + Scale96(kHeader96,dpi) : state.rowPx);
 }
 
@@ -12910,7 +13303,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
 
         // Match the existing Paint() caption geometry (including the sort
         // chevron), not an invented width or a second fitting algorithm.
-        const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, listEnd, dpi);
+        const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, dpi);
         const float captionStart = caption.left;
         const float captionEnd = caption.right;
         if (!column.title.empty()) {
@@ -12921,7 +13314,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
                 return true;
         }
 
-        const auto content = ColumnTextBounds(state, columnIndex, false, listStart, listEnd, dpi);
+        const auto content = ColumnTextBounds(state, columnIndex, false, listStart, dpi);
         const float driveLabel=name && state.thisPcGpu ? SharedInlineDriveLabelWidth(state) : 0.f;
         for (size_t j = 0; j < sample.count; ++j) {
             const int row = sample.At(j);
@@ -13913,8 +14306,8 @@ void ProfileGpuMemory(ViewState& state, const wchar_t* reason, bool force=false,
 bool InactiveGraphics(const ViewState& state) {
     if(state.presentationOnly) return !state.presentationActive || !state.visible || !state.inScope || !state.detailsViewActive;
     return !state.visible || !state.inScope || !state.detailsViewActive || PresentationMinimized(state) ||
-        !TabOwnsActiveView(state) || (!PresentationVisible(state) &&
-            !state.nativePresentationPending && !state.initialModePending);
+        (!state.preparingTab && (!TabOwnsActiveView(state) || (!PresentationVisible(state) &&
+            !state.nativePresentationPending && !state.initialModePending)));
 }
 void QueueInactiveGraphicsRelease(ViewState& state) {
     if(state.presenter && !state.presentationOnly) {
@@ -15617,21 +16010,31 @@ void DrawZebraBand(ViewState& state, float top,
 float SelectedFilenameWidth(ViewState& state, int index, float available) {
     if (index < 0 || index >= state.total || available <= 0.f ||
         !state.textFormat || !g_writeFactory) return 0.f;
+    const std::wstring& name = ModelEntry(state,index).name;
+    const float font = state.textFormat->GetFontSize();
+    const float layoutWidth = roundf(available);
+    const bool middleTrim = ViewOptionEnabled(state,g_middleEllipsis);
+    // Renderer row indices survive directory publications and sparse rename
+    // previews. Validate content and font, independently of owner-side clears.
     const auto it = state.widthCache.find(index);
     if (it != state.widthCache.end() &&
-        fabsf(available - it->second.available) < .5f &&
-        it->second.font == state.fontPx) return it->second.width;
-    const std::wstring& name = ModelEntry(state,index).name;
+        layoutWidth == it->second.available && it->second.font == font &&
+        it->second.face == state.textFaceSerial && it->second.name == name &&
+        it->second.middleTrim == middleTrim) return std::min(it->second.width, available);
     float width = 0.f;
-    if (auto layout = ResolveTextLayout(state, name, available,
+    if (auto layout = ResolveTextLayout(state, name, layoutWidth,
             std::max(1.f, state.rowPx),false,false,nullptr,false,true)) {
         DWRITE_TEXT_METRICS metrics{};
-        if (SUCCEEDED(layout->GetMetrics(&metrics)))
-            width = std::clamp(metrics.width, 0.f, available);
-    }
+        if (FAILED(layout->GetMetrics(&metrics))) return 0.f;
+        width = std::clamp(metrics.width, 0.f, layoutWidth);
+    } else return 0.f;
     if (state.widthCache.size() >= 256) state.widthCache.clear();
-    state.widthCache[index] = {available, width, state.fontPx};
-    return width;
+    state.widthCache[index] = {layoutWidth, width, font, name, state.textFaceSerial, middleTrim};
+    return std::min(width, available);
+}
+
+float FilenameSelectionPadding(const ViewState& state) {
+    return 2.f * std::max(96, ViewDpi(state)) / 96.f;
 }
 
 // All normal and moving selection backgrounds use the SAME bounds and fill.
@@ -15696,8 +16099,8 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         SelectionShape result;
         // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
         const float origin = state.rtlLayout ? state.paintWidth-
-            roundf(state.paintWidth-text.right)-(text.right-text.left) : roundf(text.left);
-        const float padding = 2.f * std::max(96,state.textFormatDpi) / 96.f;
+            roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
+        const float padding = FilenameSelectionPadding(state);
         for (unsigned i=0;i<cached.filenameSelection.count;++i) {
             auto rc=cached.filenameSelection.lines[i];
             rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
@@ -17373,7 +17776,7 @@ void Paint(ViewState& state) {
                 const bool sorted = state.sort.explicitOrder &&
                     SameKey(col.key, state.sort.key);
                 const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
-                const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, listEnd, dpi);
+                const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, dpi);
                 const int checked = HeaderSelectionCheckboxState(state);
                 if (checked>=0 && ClassifySort(col.key)==SortKind::Name) {
                     const auto box = HeaderSelectionCheckbox(state);
@@ -17389,10 +17792,9 @@ void Paint(ViewState& state) {
                 if (caption.right > caption.left)
                     Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
                          headerColor, true, fade, sorted);
-                const float visibleEnd = compositionFrame.Widths() ? to : std::min(to, listEnd);
                 if (compositionFrame.Widths()) compositionFrame.Column(columnIndex,true);
-                if (sorted && visibleEnd - std::max(0.f, from) >= arrowRoom)
-                    DrawHeaderSortChevron(state, visibleEnd,
+                if (sorted && to - from >= arrowRoom)
+                    DrawHeaderSortChevron(state, to,
                         state.sort.direction == SORT_DESCENDING, headerColor, fade);
                 if (compositionFrame.Widths() || to <= listEnd)
                     Fill(state, to - .5f, headerOffset, to + .5f, headerBottom, headerColor,
@@ -17414,12 +17816,12 @@ void Paint(ViewState& state) {
                          static_cast<float>(Scale96(5, ViewDpi(state))));
                     const bool sorted = state.sort.explicitOrder &&
                         SameKey(col.key, state.sort.key);
-                    const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, listEnd, dpi);
+                    const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, dpi);
                     if (caption.right > caption.left)
                         Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
                              headerColor, true, 1.f, sorted);
-                    if (sorted && clipRight - clipLeft >= arrowRoom)
-                        DrawHeaderSortChevron(state, clipRight,
+                    if (sorted && right - left >= arrowRoom)
+                        DrawHeaderSortChevron(state, right,
                             state.sort.direction == SORT_DESCENDING, headerColor, 1.f);
                 }
             }
@@ -17883,7 +18285,7 @@ void Paint(ViewState& state) {
                 const auto& col = PresentedColumn(state,columnIndex);
                 if (col.opacity <= 0.f) continue;
                 if (ClassifySort(col.key) == SortKind::Name) continue;
-                const auto cell = ColumnTextBounds(state, columnIndex, false, listStart, listEnd, dpi);
+                const auto cell = ColumnTextBounds(state, columnIndex, false, listStart, dpi);
                 const float left = cell.left, right = cell.right;
                 if (right <= left || (!compositionFrame.Widths() && (right <= 0.f || left >= listEnd))) continue;
                 const std::wstring* text = ColumnCellText(e, col.key,
@@ -18347,6 +18749,7 @@ void EnsureVisible(ViewState& state, int index) {
 struct PidlSelection {
     std::vector<PITEMID_CHILD> owned;
     std::vector<PCUITEMID_CHILD> children;
+    std::vector<int> rejected;
     // Borrowed from owned: no second potentially blocking Shell parse just
     // to mark the same selected item as focused.
     PCUITEMID_CHILD focused = nullptr;
@@ -18358,6 +18761,44 @@ void BorrowPreparedSelection(PidlSelection& pidls, const PreparedNativeSelection
     for (const auto& child : prepared.children) pidls.children.push_back(child.get());
     if (prepared.focused >= 0 && static_cast<size_t>(prepared.focused) < pidls.children.size())
         pidls.focused = pidls.children[static_cast<size_t>(prepared.focused)];
+}
+
+void RememberVerifiedSelection(ViewState& state) {
+    state.verifiedSelectionFlags=state.selectedFlags;
+    state.verifiedSelectionRow=state.selected; state.verifiedSelectionAnchor=state.anchor;
+    state.verifiedSelectionToken=state.token; state.verifiedSelectionDirectory=state.directoryToken;
+    state.verifiedSelectionOrder=state.displayedOrderHash;
+}
+
+void RestoreVerifiedSelection(ViewState& state) {
+    const bool retained=state.verifiedSelectionToken==state.token && (state.verifiedSelectionDirectory==state.directoryToken ||
+        (state.verifiedSelectionOrder && state.verifiedSelectionOrder==state.displayedOrderHash)) &&
+        state.verifiedSelectionFlags.size()==state.selectedFlags.size();
+    if (retained) {
+        state.selectedFlags=state.verifiedSelectionFlags;
+        state.selected=state.verifiedSelectionRow; state.anchor=state.verifiedSelectionAnchor;
+    } else { state.selectedFlags.Fill(0); state.selected=state.anchor=-1; }
+    state.nativeSelectionUnsafe=!retained;
+    QueueNativeSelectionHint(state);
+    Redraw(state);
+}
+
+bool NativeSelectionTarget(IFolderView2* view, PCUITEMID_CHILD child) {
+    if (!child) return false;
+    DWORD flags=0;
+    const HRESULT hr=view->GetSelectionState(child,&flags);
+    return SUCCEEDED(hr) || hr==E_NOTIMPL || hr==E_NOINTERFACE;
+}
+
+void RejectSelectionRows(ViewState& state, const std::vector<int>& rejected) {
+    for (int row:rejected) if (row>=0 && size_t(row)<state.selectedFlags.size())
+        state.selectedFlags[size_t(row)]=0;
+    const auto selected=[&](int row) {return row>=0 && size_t(row)<state.selectedFlags.size() && state.selectedFlags[size_t(row)];};
+    if (!selected(state.selected)) {
+        state.selected=-1;
+        for (size_t i=0;i<state.selectedFlags.size();++i) if (state.selectedFlags[i]) { state.selected=int(i); break; }
+    }
+    if (!selected(state.anchor)) state.anchor=state.selected;
 }
 
 bool VerifyNativeSelection(ViewState& state, const PidlSelection& expected);
@@ -18507,12 +18948,9 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
             for (const Entry& entry : job->entries) {
                 if (!current()) break;
                 PITEMID_CHILD child = nullptr;
-                job->result = EntryChildPidl(folder.Get(), nullptr, entry, &child);
+                const HRESULT hr = EntryChildPidl(folder.Get(), nullptr, entry, &child);
                 OwnedPidl owned(child);
-                if (FAILED(job->result) || !owned) {
-                    if (SUCCEEDED(job->result)) job->result = E_FAIL;
-                    break;
-                }
+                if (FAILED(hr)) owned.reset(); // Reject this identity, retaining the rest of the group.
                 job->children.push_back(std::move(owned));
             }
             }
@@ -18528,7 +18966,7 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
 }
 
 bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& selection) {
-    if (state.token != selection.viewToken || state.nativeHwnd != selection.native ||
+    if (state.token != selection.viewToken || state.directoryToken != selection.directoryToken || state.nativeHwnd != selection.native ||
         static_cast<size_t>(std::count_if(state.selectedFlags.begin(), state.selectedFlags.end(),
             [](unsigned char flag) { return flag != 0; })) != selection.entries.size()) return false;
     for (const Entry& entry : selection.entries) {
@@ -18539,19 +18977,67 @@ bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& 
     return true;
 }
 
+bool ValidatePreparedSelection(ViewState& state, const std::shared_ptr<PreparedNativeSelection>& job) {
+    const auto view=state.folderView;
+    const HWND owner=state.hwnd;
+    const auto current=[&] {
+        return IsWindow(owner) && State(owner)==&state && state.pendingNativeSelection==job->generation &&
+            state.token==job->viewToken && state.directoryToken==job->directoryToken &&
+            state.nativeHwnd==job->native && state.folderView.Get()==view.Get();
+    };
+    if (!current() || !view) return false;
+    const OwnerSliceBudget budget(state);
+    for (bool first=true; job->validationCursor<job->children.size() && (first || budget.Remaining()); first=false) {
+        auto& child=job->children[job->validationCursor++];
+        const bool valid=NativeSelectionTarget(view.Get(),child.get());
+        if (!current()) return false;
+        if (!valid) child.reset();
+    }
+    if (job->validationCursor<job->children.size()) {
+        ExclusiveSrwLock lock(state.background->selectionLock);
+        state.background->selectionResult=job;
+        state.background->selectionNotificationQueued=PostMessageW(owner,kMsgPreparedSelection,0,0)!=FALSE;
+        return false;
+    }
+    std::vector<int> rejected;
+    size_t accepted=0; int focused=-1;
+    for (size_t i=0;i<job->children.size();++i) {
+        if (!job->children[i]) { rejected.push_back(GpuRowForNativePath(state,job->entries[i].path)); continue; }
+        if (int(i)==job->focused) focused=int(accepted);
+        if (accepted!=i) { job->entries[accepted]=std::move(job->entries[i]); job->children[accepted]=std::move(job->children[i]); }
+        ++accepted;
+    }
+    job->entries.resize(accepted); job->children.resize(accepted);
+    job->focused=focused>=0 ? focused : accepted ? 0 : -1;
+    if (!rejected.empty()) {
+        if (!accepted) RestoreVerifiedSelection(state);
+        RejectSelectionRows(state,rejected);
+        if (!accepted && !state.nativeSelectionUnsafe) RememberVerifiedSelection(state);
+    }
+    return true;
+}
+
 bool CollectSelectedPidls(ViewState& state, PidlSelection& pidls) {
     if (!state.folder || !state.folderView) return false;
+    const auto view=state.folderView;
+    const auto token=state.token, directory=state.directoryToken;
+    const HWND owner=state.hwnd;
     for (int i = 0; i < state.total; ++i) {
         if (i >= static_cast<int>(state.selectedFlags.size()) ||
             !state.selectedFlags[static_cast<size_t>(i)]) continue;
         if (static_cast<size_t>(i) >= state.entries.size()) return false;
         PITEMID_CHILD child = nullptr;
-        if (SUCCEEDED(EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child)) && child) {
+        const HRESULT hr=EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
+        OwnedPidl owned(child);
+        const bool valid=SUCCEEDED(hr) && child && NativeSelectionTarget(view.Get(),child);
+        if (State(owner)!=&state || state.token!=token || state.directoryToken!=directory || state.folderView.Get()!=view.Get()) return false;
+        if (valid) {
             pidls.owned.push_back(child);
             pidls.children.push_back(child);
+            owned.release();
             if (i == state.selected) pidls.focused = child;
         } else {
-            return false; // don't silently operate on only some files
+            pidls.rejected.push_back(i);
         }
     }
     return true;
@@ -18847,6 +19333,7 @@ void ApplyImportedNativeSelection(ViewState& state,
                     RevealNativeSelection(state, state.selected);
                 if (preserveViewport) state.nativeSelectionViewportOwned=true;
                 state.nativeSelectionImportPreserveViewport=false;
+                RememberVerifiedSelection(state);
                 return;
             }
         }
@@ -18874,6 +19361,7 @@ void ApplyImportedNativeSelection(ViewState& state,
         ClearPostDeletionCaret(state);
         state.selectedFlags.assign(state.entries.size(), 1);
         state.selected = state.anchor = state.selected>=0 && state.selected<state.total ? state.selected : state.total ? 0 : -1;
+        RememberVerifiedSelection(state);
         AnimateVisibleSelection(state, previousVisible);
         Redraw(state);
         return;
@@ -18925,6 +19413,7 @@ void ApplyImportedNativeSelection(ViewState& state,
     if (!preserveViewport) RevealNativeSelection(state, state.selected);
     // The native view already owns these selections: never echo them back
     // with SelectAndPositionItems during import.
+    RememberVerifiedSelection(state);
     Redraw(state);
 }
 
@@ -18963,6 +19452,11 @@ bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool comm
     }
     if (state.thisPcGpu && !ShellRowsInteractive(state)) return false;
     if (!state.folderView) return false;
+    if (eventDriven && state.nativeCatalogCount>=0 && !state.directoryPending) {
+        int count=-1;
+        if (SUCCEEDED(state.folderView->ItemCount(SVGIO_ALLVIEW,&count)) && count!=state.nativeCatalogCount)
+            QueueDirectoryRefresh(state,false,true);
+    }
     TabTraceSlowScope trace(L"native selection snapshot", state.hwnd);
     if (state.thisPcGpu && state.total > 0) {
         int nativeTotal = 0;
@@ -19253,6 +19747,7 @@ void MaybeRecoverNativeSelection(ViewState& state) {
     state.nativeSelectionObservedCount=0; state.nativeSelectionObservedPaths.clear();
     state.nativeSelectionAwaitingRefresh=state.nativeSelectionUnsafe=false;
     state.nativeSelectionRecoveryPending=state.nativeSelectionDirty=false;
+    RememberVerifiedSelection(state);
     PipelineEvent(*state.background,{.operation=L"selection.recovery.cleared",.a=state.token});
     Redraw(state);
 }
@@ -19311,9 +19806,8 @@ bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool rev
         job->entries.push_back(std::move(entry));
     }
     if (!StartTabWorker(state.background, work.selection, SelectionWorkerProc, THREAD_PRIORITY_NORMAL)) return false;
-    // Clear the old native selection before any asynchronous work: commands
-    // must never operate on items from the preceding click while preparing.
-    if (!ClearNativeSelection(state)) return false;
+    // Commands are gated by pendingNativeSelection. Keep the verified native
+    // set intact until the new identities have been prepared and validated.
     state.pendingNativeSelection = job->generation;
     work.selectionGeneration.store(job->generation, std::memory_order_release);
     {
@@ -19425,6 +19919,10 @@ bool CapturedSelectionStillCurrent(ViewState& state, const PreparedNativeSelecti
 }
 
 bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelection> prepared) {
+    WindowCallbackGuard callback;
+    const HWND owner=state.hwnd;
+    const auto view=state.folderView;
+    const auto token=state.token, directory=state.directoryToken;
     TraceSelectionIdentity(state, L"native.sync.before");
     // A fresh explicit selection supersedes an older queued recovery. Failed
     // commits still use the normal verified import/recovery path.
@@ -19457,13 +19955,13 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
             i < state.entries.size())
             selectedPaths.push_back(state.entries[i].path);
     }
-    if (desired <= kMaxDirectNativeSelectionItems) CancelNativeSelectionPreparation(state);
+    if (desired <= kMaxDirectNativeSelectionItems && !prepared) CancelNativeSelectionPreparation(state);
     state.nativeSelectionImportPending = state.nativeSelectionAllPending = false;
     state.nativeSelectionAllCount = -1;
     state.nativeSelectionAwaitingRefresh = false;
     state.nativeSelectionPaths.clear(); state.nativeFocusedPath.clear();
     if (desired == 0) {
-        if (ClearNativeSelection(state)) return true;
+        if (ClearNativeSelection(state)) { RememberVerifiedSelection(state); return true; }
         ReconcileFailedNativeSelection(state);
         return false;
     }
@@ -19484,11 +19982,24 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
         prepared->children.size() == desired && GpuSelectionMatches(state, *prepared);
     if (havePrepared) BorrowPreparedSelection(pidls, *prepared);
     if ((prepared && !havePrepared) || (!prepared && !CollectSelectedPidls(state, pidls))) {
+        if (State(owner)!=&state || state.token!=token || state.directoryToken!=directory || state.folderView.Get()!=view.Get()) return false;
         Wh_Log(L"[GPU selection] PIDL parsing failed: wanted=%zu rows=%d elapsed=%llu ms",
             desired, state.total,
             static_cast<unsigned long long>(GetTickCount64() - started));
-        ReconcileFailedNativeSelection(state);
+        RestoreVerifiedSelection(state); // No native transaction has been attempted.
         return false;
+    }
+    if (!pidls.rejected.empty()) {
+        RejectSelectionRows(state,pidls.rejected);
+        if (pidls.children.empty()) {
+            RestoreVerifiedSelection(state); RejectSelectionRows(state,pidls.rejected);
+            if (!state.nativeSelectionUnsafe) RememberVerifiedSelection(state);
+            return true;
+        }
+        desired=pidls.children.size();
+        selectedPaths.clear();
+        for (size_t i=0;i<state.entries.size();++i) if (state.selectedFlags[i]) selectedPaths.push_back(state.entries[i].path);
+        if (!pidls.focused) pidls.focused=pidls.children.front();
     }
     // A single selected item can also own the native caret atomically. The
     // separate focus transaction is needed only for multi-selection, whose
@@ -19557,6 +20068,7 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
     }
     if (verified) {
         state.nativeSelectionUnsafe=false;
+        RememberVerifiedSelection(state);
         state.confirmedNativeSelection = std::move(prepared);
         state.nativeSelectionViewportOwned = true;
         if (selectedPaths.size() > 1)
@@ -20103,14 +20615,20 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
     if (FAILED(native->GetWindow(&window)) || window!=target)
         return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     if (key.newTab) {
-        // opennewtab is a registered Shell activation verb. A view's legacy
-        // IContextMenu need not expose it. Use the verified native selection's
-        // PIDL and the current browser's service site, without reparsing paths.
-        const auto folderView=state.folderView;
-        const auto selection=state.selectedFlags;
-        ComPtr<IServiceProvider> site;
-        if ((!state.shellBrowser || FAILED(state.shellBrowser.As(&site))) && FAILED(native->QueryInterface(IID_PPV_ARGS(&site))))
-            return E_NOINTERFACE;
+        auto* live=State(owner);
+        if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken || live->nativeHwnd!=target ||
+            !live->visible || live->optimisticStartedAt || !TabOwnsActiveView(*live) ||
+            g_unloading.load(std::memory_order_acquire)) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        const auto selection=live->selectedFlags;
+        const HWND tab=live->activeTabHost;
+        const auto browser=live->shellBrowser;
+        const auto folderView=live->folderView;
+        HWND browserWindow=nullptr;
+        if (tab==frame || !IsWindow(tab) || GetAncestor(tab,GA_ROOT)!=frame ||
+            !browser || FAILED(browser->GetWindow(&browserWindow)) || browserWindow!=tab)
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        // Reuse the native selection prepared by the tab's existing PIDL lane,
+        // including provider folders. No context-menu extensions are loaded.
         ComPtr<IShellItemArray> items;
         ComPtr<IShellItem> item;
         DWORD count=0;
@@ -20121,23 +20639,24 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
         PIDLIST_ABSOLUTE raw=nullptr;
         if (FAILED(hr=SHGetIDListFromObject(item.Get(),&raw))) return hr;
         OwnedPidl identity(raw);
-        auto* live=State(owner);
-        if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
-            live->nativeHwnd!=target || live->folderView.Get()!=folderView.Get() ||
-            !live->selectedFlags.SharesStorage(selection) || !live->visible || live->optimisticStartedAt ||
-            !g_middleClickNewTab.load(std::memory_order_relaxed) || !TabOwnsActiveView(*live) ||
-            g_unloading.load(std::memory_order_acquire)) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-        SHELLEXECUTEINFOW invoke{sizeof(invoke)};
-        invoke.fMask=SEE_MASK_IDLIST | SEE_MASK_FLAG_HINST_IS_SITE | SEE_MASK_FLAG_NO_UI;
-        invoke.hwnd=frame;
-        invoke.lpVerb=L"opennewtab";
-        invoke.lpIDList=identity.get();
-        invoke.hInstApp=reinterpret_cast<HINSTANCE>(site.Get());
-        invoke.nShow=SW_SHOWNORMAL;
-        PipelineScope invocation(live->background,L"folder.newTab.invoke",viewToken,0);
-        const BOOL opened=ShellExecuteExW(&invoke);
-        hr=opened ? S_OK : HRESULT_FROM_WIN32(GetLastError());
-        Wh_Log(L"[GPU gestures] folder new-tab activation hwnd=%p hr=0x%08X",owner,static_cast<unsigned>(hr));
+        live=State(owner);
+        if (!identity || !live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
+            live->nativeHwnd!=target || live->activeTabHost!=tab || live->shellBrowser.Get()!=browser.Get() ||
+            live->folderView.Get()!=folderView.Get() || !live->selectedFlags.SharesStorage(selection) ||
+            !live->visible || live->optimisticStartedAt || !TabOwnsActiveView(*live) ||
+            !g_middleClickNewTab.load(std::memory_order_relaxed) || g_unloading.load(std::memory_order_acquire))
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        // Tracing native Open in new tab shows BrowseObject(0x411), followed
+        // asynchronously by AddTab/AddTabAtIndex on the owning frame. Match
+        // that request on its real tab browser; Explorer queues tab creation.
+        // The 0x400 disposition is also used by Explorer Column View:
+        // https://github.com/ramensoftware/windhawk-mods/blob/main/mods/explorer-column-view.wh.cpp
+        constexpr UINT kNativeNewTabBrowse=0x00000400;
+        constexpr UINT flags=SBSP_ABSOLUTE | SBSP_SAMEBROWSER | SBSP_OPENMODE | kNativeNewTabBrowse;
+        PipelineScope invocation(live->background,L"folder.newTab.browse",viewToken,0);
+        hr=browser->BrowseObject(identity.get(),flags);
+        Wh_Log(L"[GPU gestures] folder new-tab browse hwnd=%p tab=%p flags=0x%08X hr=0x%08X",
+            owner,tab,flags,static_cast<unsigned>(hr));
         return hr;
     }
     ComPtr<IContextMenu> command;
@@ -20431,6 +20950,28 @@ ViewState* State(HWND hwnd);
 
 void FinishRename(ViewState& state, bool commit);
 
+// Keep this on the existing bounded asynchronous trace lane. In particular,
+// observing a drag must not invalidate, reformat, or acquire a drawing DC.
+void TraceRenameEvent(ViewState& state, UINT message, WPARAM parameter, unsigned phase) {
+    if ((!g_uiTransitionLogging.load(std::memory_order_relaxed) &&
+         !g_pipelineTracing.load(std::memory_order_relaxed)) || !state.rename.editor) return;
+    const HWND edit = state.rename.editor;
+    DWORD first=0,last=0;
+    SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&first),reinterpret_cast<LPARAM>(&last));
+    const LRESULT origin=SendMessageW(edit,EM_POSFROMCHAR,0,0);
+    PipelineEvent(*state.background,{.operation=L"ui.rename.message[phase,depth,focus,capture]",
+        .a=message,.b=parameter,.v={double(phase),double(state.rename.nativeDispatchDepth),
+            GetFocus()==edit ? 1. : 0.,GetCapture()==edit ? 1. : 0.}},true);
+    PipelineEvent(*state.background,{.operation=L"ui.rename.selection[x,y,firstVisible,lines]",
+        .a=first,.b=last,.v={double(static_cast<short>(LOWORD(origin))),double(static_cast<short>(HIWORD(origin))),
+            double(SendMessageW(edit,EM_GETFIRSTVISIBLELINE,0,0)),double(SendMessageW(edit,EM_GETLINECOUNT,0,0))}},true);
+    RECT rect{}; GetWindowRect(edit,&rect);
+    PipelineEvent(*state.background,{.operation=L"ui.rename.window[left,top,right,bottom]",
+        .a=static_cast<unsigned long long>(GetWindowLongPtrW(edit,GWL_STYLE)),
+        .b=reinterpret_cast<UINT_PTR>(GetWindow(edit,GW_HWNDPREV)),
+        .v={double(rect.left),double(rect.top),double(rect.right),double(rect.bottom)}},true);
+}
+
 LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                      UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
@@ -20439,6 +20980,7 @@ LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         reinterpret_cast<HWND>(lp) == reinterpret_cast<HWND>(id)) {
         ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
         if (state && state->rename.editor == reinterpret_cast<HWND>(lp) && state->rename.background) {
+            TraceRenameEvent(*state,msg,0,2);
             const HDC dc = reinterpret_cast<HDC>(wp);
             SetTextColor(dc, state->nativeEditForeground);
             SetBkColor(dc, state->nativeEditBackground);
@@ -20448,8 +20990,15 @@ LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (msg == WM_COMMAND && HIWORD(wp) == EN_CHANGE &&
         reinterpret_cast<HWND>(lp) == reinterpret_cast<HWND>(id)) {
         ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
-        if (state && state->rename.editor == reinterpret_cast<HWND>(lp))
-            RepositionRenameEdit(*state);
+        if (state && state->rename.editor == reinterpret_cast<HWND>(lp)) {
+            TraceRenameEvent(*state,msg,HIWORD(wp),2);
+            state->rename.layoutValid = false;
+            state->rename.textLayoutDirty = true;
+            if (!state->rename.nativeDispatchDepth) {
+                state->rename.textLayoutDirty = false;
+                RepositionRenameEdit(*state);
+            }
+        }
     }
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameParentSubclass, id);
     return DefSubclassProc(hwnd, msg, wp, lp);
@@ -20471,10 +21020,45 @@ RECT RenameViewport(ViewState& state, bool frameCoordinates = true) {
     return viewport;
 }
 
+ItemGeometry RenameItemGeometry(ViewState& state, int index) {
+    return LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
+        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+}
+
+SIZE RenameTextPadding(const ViewState& state) {
+    const int dpi = ViewDpi(state);
+    const LONG selection = ViewOptionEnabled(state, g_filenameOnly) ?
+        static_cast<LONG>(std::ceil(FilenameSelectionPadding(state))) : 0;
+    return {std::max<LONG>(selection, GetSystemMetricsForDpi(SM_CXBORDER, dpi)),
+        std::max<LONG>(selection, GetSystemMetricsForDpi(SM_CYBORDER, dpi))};
+}
+
 RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true) {
     const int dpi = ViewDpi(state);
-    const auto geometry = LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
-        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+    const auto geometry = RenameItemGeometry(state, index);
+    if (geometry.wrapped) {
+        // Enclose the label and its filename-only selection padding. Insetting
+        // this band exposed the old selection above the frame-child EDIT.
+        const RECT viewport = RenameViewport(state, false);
+        RECT client{}; ViewClientRect(state, &client);
+        const auto& text = geometry.text;
+        const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? client.right - text.right : text.left));
+        const LONG top = static_cast<LONG>(std::lround(text.top));
+        const auto padding = RenameTextPadding(state);
+        const LONG borderX = padding.cx, borderY = padding.cy;
+        RECT rc{left - borderX, top - borderY,
+            left + static_cast<LONG>(std::ceil(text.right - text.left)) + borderX,
+            top + static_cast<LONG>(std::ceil(text.bottom - text.top)) + borderY};
+        rc.left = std::max(rc.left, static_cast<LONG>(std::floor(state.rtlLayout ? client.right - geometry.cell.right : geometry.cell.left)));
+        rc.right = std::min(rc.right, static_cast<LONG>(std::ceil(state.rtlLayout ? client.right - geometry.cell.left : geometry.cell.right)));
+        rc.top = std::max(rc.top, static_cast<LONG>(std::floor(geometry.cell.top)));
+        rc.bottom = std::min(rc.bottom, static_cast<LONG>(std::ceil(geometry.cell.bottom)));
+        rc.right = rc.left + std::max(1L, std::min(rc.right - rc.left, viewport.right - viewport.left));
+        rc.bottom = rc.top + std::max(1L, std::min(rc.bottom - rc.top, viewport.bottom - viewport.top));
+        if (frameCoordinates)
+            MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&rc), 2);
+        return rc;
+    }
     const float nameStart = geometry.text.left;
     // Use the whole Name column even when its current origin is offscreen.
     // Measuring against the clipped draw extent could collapse the EDIT to 1px.
@@ -20501,7 +21085,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
         }
     }
     const int limit = std::max(1, static_cast<int>(maxWidth));
-    const int width = geometry.wrapped ? limit : std::clamp(static_cast<int>(std::ceil(measured)) + Scale96(28, dpi),
+    const int width = std::clamp(static_cast<int>(std::ceil(measured)) + Scale96(28, dpi),
         std::min(Scale96(85, dpi), limit), limit);
     RECT client{}; ViewClientRect(state, &client);
     const int x = state.rtlLayout ?
@@ -20552,6 +21136,10 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.folder.clear();
     r.tab = r.native = nullptr;
     r.finishing = false;
+    r.textLayoutDirty = false;
+    r.requestedTextRectValid = false;
+    r.layoutValid = false;
+    r.zoomHidden = r.zoomRetargeting = r.restoreZoomFocus = false;
     r.creationSticky = false;
     r.refocusQueued = false;
     r.startedAt = 0;
@@ -20638,19 +21226,115 @@ int RenameLineHeight(HWND editor) {
     return height;
 }
 
-void CenterWrappedRenameText(HWND editor) {
+void AlignWrappedRenameText(ViewState& state) {
+    const HWND editor = state.rename.editor;
     if (!(GetWindowLongPtrW(editor, GWL_STYLE) & ES_MULTILINE)) return;
-    RECT client{}, format{};
+    RECT client{};
     GetClientRect(editor, &client);
-    SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
-    const int line = RenameLineHeight(editor);
-    const int lines = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
-    const LONG top = std::max(0L, (client.bottom - line * lines) / 2);
-    if (format.top == top) return;
-    format.top = top;
-    format.bottom = client.bottom;
-    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&format));
-    InvalidateRect(editor, nullptr, FALSE);
+    const auto padding = RenameTextPadding(state);
+    const LONG x = std::min(std::max(0L, padding.cx - GetSystemMetricsForDpi(SM_CXBORDER, ViewDpi(state))),
+        std::max(0L, (client.right - 1) / 2));
+    const LONG y = std::min(std::max(0L, padding.cy - GetSystemMetricsForDpi(SM_CYBORDER, ViewDpi(state))),
+        std::max(0L, (client.bottom - 1) / 2));
+    // Padding belongs to this independent editor, so growing or moving it
+    // above a bottom-edge label never leaves an empty band above its text.
+    RECT aligned{x, y, std::max(x + 1, client.right - x), std::max(y + 1, client.bottom - y)};
+    // EDIT normalizes formatting heights to its own line metrics (and can
+    // retain a minimum height in tiny viewports). Comparing EM_GETRECT with
+    // the request repeatedly reformats/invalidates an otherwise settled field.
+    auto& rename=state.rename;
+    if (!rename.requestedTextRectValid || !EqualRect(&rename.requestedTextRect, &aligned)) {
+        SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
+        rename.requestedTextRect=aligned;
+        rename.requestedTextRectValid=true;
+        InvalidateRect(editor, nullptr, FALSE);
+    }
+    const int first = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+    if (first > 0 && SendMessageW(editor, EM_GETLINECOUNT, 0, 0) * RenameLineHeight(editor) <= aligned.bottom - aligned.top)
+        SendMessageW(editor, EM_LINESCROLL, 0, -first);
+}
+
+BYTE RenameFontQuality() {
+    const auto mode = g_textAntialiasing.load(std::memory_order_relaxed);
+    if (mode == TextAntialiasing::Aliased) return NONANTIALIASED_QUALITY;
+    if (mode == TextAntialiasing::Smooth) return ANTIALIASED_QUALITY;
+    BOOL smoothing = TRUE;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0)) return DEFAULT_QUALITY;
+    if (!smoothing) return NONANTIALIASED_QUALITY;
+    UINT type = 0;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE, 0, &type, 0)) return DEFAULT_QUALITY;
+    return type == FE_FONTSMOOTHINGCLEARTYPE ? CLEARTYPE_QUALITY : ANTIALIASED_QUALITY;
+}
+
+LOGFONTW RenameFontDescription(ViewState& state) {
+    LOGFONTW font = NativeHeaderFont(state);
+    const ResolvedManualFont chosen = ResolveManualFont(ConfiguredFontFamily());
+    if (!chosen.family.empty()) {
+        const auto& face = chosen.gdiFamily.empty() ? chosen.family : chosen.gdiFamily;
+        const size_t count = std::min(face.size(), static_cast<size_t>(LF_FACESIZE - 1));
+        std::copy_n(face.c_str(), count, font.lfFaceName); font.lfFaceName[count] = L'\0';
+    }
+    font.lfHeight = -static_cast<LONG>(std::lround(state.fontPx));
+    font.lfWeight = chosen.exactFace ? static_cast<LONG>(chosen.weight) : FW_NORMAL;
+    if (chosen.exactFace) font.lfItalic = chosen.style != DWRITE_FONT_STYLE_NORMAL;
+    font.lfQuality = RenameFontQuality();
+    return font;
+}
+
+void RefreshRenameFont(ViewState& state) {
+    auto& r = state.rename;
+    LOGFONTW font{};
+    if (!r.font || !GetObjectW(r.font, sizeof(font), &font)) return;
+    const unsigned revision = g_textRenderingRevision.load(std::memory_order_relaxed);
+    const LONG height = -static_cast<LONG>(std::lround(state.fontPx));
+    if (r.fontRenderingRevision != revision) font = RenameFontDescription(state);
+    else if (font.lfHeight == height) return;
+    font.lfHeight = height;
+    const HFONT replacement = CreateFontIndirectW(&font);
+    if (!replacement) return;
+    const HFONT previous = std::exchange(r.font, replacement);
+    r.fontRenderingRevision = revision;
+    SendMessageW(r.editor, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), TRUE);
+    DeleteObject(previous); // The native EDIT has selected its replacement.
+}
+
+void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) {
+    const HWND edit = state.rename.editor;
+    if (!(GetWindowLongPtrW(edit, GWL_STYLE) & ES_MULTILINE)) return;
+    auto& rename=state.rename;
+    const auto padding = RenameTextPadding(state);
+    const SIZE preferred{rect.right-rect.left,rect.bottom-rect.top};
+    const SIZE available{viewport.right-viewport.left,viewport.bottom-viewport.top};
+    const auto same=[](SIZE a,SIZE b) {return a.cx==b.cx && a.cy==b.cy;};
+    if (rename.layoutValid && same(preferred,rename.layoutPreferred) &&
+        same(available,rename.layoutAvailable) && same(padding,rename.layoutPadding)) {
+        if (rename.layoutSize.cx!=preferred.cx) rect.left=viewport.left;
+        rect.right=rect.left+rename.layoutSize.cx;
+        rect.bottom=rect.top+rename.layoutSize.cy;
+        return;
+    }
+    const auto measure = [&](LONG width) {
+        RECT current{}; GetWindowRect(edit, &current);
+        if (current.right - current.left != width)
+            SetWindowPos(edit, nullptr, 0, 0, width, current.bottom - current.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        AlignWrappedRenameText(state);
+        return static_cast<LONG>(SendMessageW(edit, EM_GETLINECOUNT, 0, 0)) *
+            std::max(1, RenameLineHeight(edit)) + padding.cy * 2;
+    };
+    LONG height = std::max(rect.bottom - rect.top, measure(rect.right - rect.left));
+    if (height > viewport.bottom - viewport.top && rect.right - rect.left < viewport.right - viewport.left) {
+        // At a window edge, use the available width before resorting to the
+        // native editor's scrolling. No filename line-count or row-height cap.
+        rect.left = viewport.left; rect.right = viewport.right;
+        height = std::max(rect.bottom - rect.top, measure(rect.right - rect.left));
+    }
+    rect.bottom = rect.top + std::max(1L, std::min(height, viewport.bottom - viewport.top));
+    // Text/font changes invalidate this measurement. Geometry/padding are
+    // keyed above: moving a settled field must not shrink it to measure its
+    // old narrow width and immediately expand it again on every owner update.
+    rename.layoutPreferred=preferred; rename.layoutAvailable=available; rename.layoutPadding=padding;
+    rename.layoutSize={rect.right-rect.left,rect.bottom-rect.top}; rename.layoutValid=true;
 }
 
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
@@ -20661,24 +21345,24 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // Its session stays alive until this procedure's final native NCDESTROY.
     const HWND overlay=state ? state->hwnd : nullptr;
     const bool current = state && state->rename.editor == hwnd;
+    const bool trace = current && (msg==WM_PAINT || msg==WM_ERASEBKGND || msg==WM_NCPAINT ||
+        msg==WM_SETFOCUS || msg==WM_KILLFOCUS || msg==WM_CAPTURECHANGED ||
+        msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP || (msg==WM_MOUSEMOVE && GetCapture()==hwnd) ||
+        msg==WM_WINDOWPOSCHANGING || msg==WM_WINDOWPOSCHANGED || msg==WM_SETFONT ||
+        msg==WM_SETTEXT || msg==WM_TIMER || msg==EM_SETSEL || msg==EM_SCROLLCARET || msg==EM_SETRECTNP);
+    const WPARAM traceParameter=(msg==WM_WINDOWPOSCHANGING || msg==WM_WINDOWPOSCHANGED) && lp ?
+        reinterpret_cast<const WINDOWPOS*>(lp)->flags : wp;
+    if (trace) TraceRenameEvent(*state,msg,traceParameter,0);
     // Own the border outside the EDIT's client area: native multiline borders
-    // inset every EM_SETRECT again. Single-line EDITs ignore EM_SETRECT, so
-    // center their client band using the selected HFONT's actual line metrics.
+    // inset every EM_SETRECT again.
     if (msg == WM_NCCALCSIZE && current) {
         const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
         auto& client = wp ? reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] :
             *reinterpret_cast<RECT*>(lp);
-        const auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
         const int dpi = DpiOf(hwnd);
         const LONG borderX = std::min<LONG>(GetSystemMetricsForDpi(SM_CXBORDER, dpi), (client.right-client.left)/2);
         const LONG borderY = std::min<LONG>(GetSystemMetricsForDpi(SM_CYBORDER, dpi), (client.bottom-client.top)/2);
         InflateRect(&client, -borderX, -borderY);
-        const int line = (style & ES_MULTILINE) ? 0 : RenameLineHeight(hwnd);
-        if (line > 0) {
-            const LONG padding = std::max(0L, (client.bottom - client.top - line) / 2);
-            client.top += padding;
-            client.bottom -= padding;
-        }
         return result;
     }
     if (msg == WM_NCPAINT && current && state->rename.background) {
@@ -20696,12 +21380,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         }
         return 0;
     }
-    // Notifications cover text mutations; paint also follows font/geometry
-    // changes without enumerating each editor mutation message here.
-    if (msg == WM_PAINT && current && !state->rename.finishing) {
-        RepositionRenameEdit(*state);
-        if (state->rename.editor != hwnd || !IsWindow(hwnd)) return 0;
-    }
+    // Painting/drag selection must never resize or reformat the native EDIT.
+    // EN_CHANGE, font, viewport and animation events own those operations.
     if (msg == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE)) {
         if (current && !state->rename.finishing)
             PostMessageW(overlay, kMsgRenameDecision, wp == VK_RETURN ? 1 : 0,
@@ -20709,7 +21389,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         return 0;
     }
     if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;
-    if (msg == WM_KILLFOCUS && current && !state->rename.finishing) {
+    if (msg == WM_KILLFOCUS && current && !state->rename.finishing &&
+        !(state->rename.zoomHidden && state->rename.positioning)) {
         if (state->rename.creationSticky) {
             // Shell's hidden native editor can transiently steal focus after
             // New Folder. Don't cancel the user's GPU editing session for it.
@@ -20735,12 +21416,26 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // Always call the genuine EDIT window procedure through WM_NCDESTROY.
     // The session (and its font) are released only AFTER it has completed.
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameEditProc, id);
+    if (current && (msg==WM_SIZE || msg==WM_SETFONT || msg==EM_SETRECT || msg==EM_SETRECTNP))
+        state->rename.requestedTextRectValid=false;
+    if (current && (msg==WM_SETFONT || msg==WM_SETTEXT)) state->rename.layoutValid=false;
+    if (current) ++state->rename.nativeDispatchDepth;
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+    if (current) --state->rename.nativeDispatchDepth;
+    if (trace && state->rename.editor==hwnd) TraceRenameEvent(*state,msg,traceParameter,1);
     if (current && msg == WM_SETFONT) {
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) CenterWrappedRenameText(hwnd);
+    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) AlignWrappedRenameText(*state);
+    if (state && state->rename.editor == hwnd && !state->rename.nativeDispatchDepth && !state->rename.finishing &&
+        (msg == WM_SETFONT || msg == WM_SETTEXT || state->rename.textLayoutDirty)) {
+        // EN_CHANGE is synchronous inside the native editor's mutation. Let
+        // it finish its own word-wrap/scroll bookkeeping before resizing.
+        // Multiline WM_SETTEXT does not send EN_CHANGE at all.
+        state->rename.textLayoutDirty = false;
+        RepositionRenameEdit(*state);
+    }
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
@@ -20785,9 +21480,13 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     const std::wstring name = state.entries[static_cast<size_t>(index)].name;
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
-    const DWORD style = WS_CHILD | WS_CLIPSIBLINGS |
-        (state.gridView && state.cachedNativeMode != FVM_SMALLICON ? ES_MULTILINE | ES_AUTOVSCROLL : ES_AUTOHSCROLL) |
-        (state.rtlLayout ? ES_RIGHT : ES_LEFT);
+    const bool wrapped = RenameItemGeometry(state, index).wrapped;
+    // The single-line EDIT normalizes reversed selections to the trailing
+    // caret even though EM_SETSEL documents an active ending parameter.
+    // Use the same native wrapping/expansion path in every view; it honors the
+    // leading caret and keeps long names accessible in narrow columns and RTL.
+    const DWORD style = WS_CHILD | WS_CLIPSIBLINGS | ES_MULTILINE | ES_AUTOVSCROLL |
+        (wrapped ? ES_CENTER : state.rtlLayout ? ES_RIGHT : ES_LEFT);
     HWND edit = CreateWindowExW(state.rtlLayout ? WS_EX_RTLREADING : 0,
         L"EDIT", name.c_str(), style, rc.left, rc.top,
         rc.right - rc.left, rc.bottom - rc.top, state.frameHwnd, nullptr,
@@ -20812,6 +21511,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     r.tab = state.activeTabHost;
     r.native = state.nativeHwnd;
     r.frameRect = rc;
+    EnsurePipelineTrace(state);
     RefreshRenamePalette(state);
     // Creation, input and overlay retirement run on this EDIT's owner thread.
     if (!SetWindowSubclass(edit, RenameEditProc,
@@ -20820,39 +21520,30 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
         Wh_Log(L"[GPU rename] EDIT subclass failed");
         return;
     }
-    LOGFONTW editFont = NativeHeaderFont(state);
-    const ResolvedManualFont chosen = ResolveManualFont(ConfiguredFontFamily());
-    if (!chosen.family.empty()) {
-        const std::wstring& face = chosen.gdiFamily.empty() ?
-            chosen.family : chosen.gdiFamily;
-        const size_t count = std::min(face.size(),
-                                     static_cast<size_t>(LF_FACESIZE - 1));
-        std::copy_n(face.c_str(), count, editFont.lfFaceName);
-        editFont.lfFaceName[count] = L'\0';
-    }
-    editFont.lfHeight = -static_cast<LONG>(std::lround(state.fontPx));
-    editFont.lfWeight = chosen.exactFace ?
-        static_cast<LONG>(chosen.weight) : FW_NORMAL;
-    if (chosen.exactFace)
-        editFont.lfItalic = chosen.style != DWRITE_FONT_STYLE_NORMAL;
+    LOGFONTW editFont = RenameFontDescription(state);
     r.font = CreateFontIndirectW(&editFont);
-    SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(r.font ? r.font :
-        static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
+    r.fontRenderingRevision = g_textRenderingRevision.load(std::memory_order_relaxed);
+    {
+        ScopedFlag initializing(r.positioning);
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(r.font ? r.font :
+            static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
+    }
     int end = static_cast<int>(name.size());
     if (!state.entries[static_cast<size_t>(index)].folder) {
         const size_t dot = name.find_last_of(L'.');
         if (dot != std::wstring::npos && dot > 0)
             end = static_cast<int>(dot);
     }
-    SendMessageW(edit, EM_SETSEL, 0, end);
+    // Keep the full basename selected, with its active end at character zero.
+    // Focusing a narrow single-line EDIT otherwise scrolls to the suffix.
+    SendMessageW(edit, EM_SETSEL, end, 0);
     RepositionRenameEdit(state);
     if (r.editor != edit || !IsWindowVisible(edit)) return;
-    // Two FRAME siblings: keep GPU list immediately below the editor, not
-    // above it. DWM will composite EDIT text/caret on top of the DComp list.
+    // Keep the editor and chrome above the GPU sibling in the shared order.
     PositionOverlayOverNative(state);
-    SetWindowPos(edit, HWND_TOP, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    EnsureOverlayStacking(state);
     SetFocus(edit);
+    SendMessageW(edit, EM_SCROLLCARET, 0, 0);
     if (GetFocus() != edit && !createdItem) {
         CancelRename(state);
         return;
@@ -20882,7 +21573,7 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
     // subsequently focuses its duplicate. Cancel only the duplicate session.
     if (state.rename.editor) {
         SendMessageW(editor, WM_KEYDOWN, VK_ESCAPE, 0);
-        if (current()) { RepositionRenameEdit(state); SetFocus(state.rename.editor); }
+        if (current()) { RepositionRenameEdit(state); if (!state.rename.zoomHidden) SetFocus(state.rename.editor); }
         return current() && state.rename.editor;
     }
     const auto view = state.folderView;
@@ -20923,7 +21614,8 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
     BeginRename(state, row, true);
     if (!state.rename.editor) return false;
     SetWindowTextW(state.rename.editor, text.c_str());
-    SendMessageW(state.rename.editor, EM_SETSEL, first, last);
+    SendMessageW(state.rename.editor, EM_SETSEL, first == 0 ? last : first, first == 0 ? first : last);
+    SendMessageW(state.rename.editor, EM_SCROLLCARET, 0, 0);
     ClearInteractiveCreation(state);
     if (g_perf.load(std::memory_order_relaxed))
         Wh_Log(L"[GPU rename] NATIVE_EDIT_HANDOFF native-edit=%p gpu-edit=%p row=%d path=%s",
@@ -20993,6 +21685,24 @@ void RepositionRenameEdit(ViewState& state) {
     if (!state.rename.editor || state.rename.positioning) return;
     ScopedFlag positioning(state.rename.positioning);
     if (!RenameSessionValid(state)) { CancelRename(state); return; }
+    auto& rename = state.rename;
+    const bool zooming = state.zoomAnimating || rename.zoomRetargeting ||
+        (state.touchpadPinching && (state.manipulationFrameActive || (state.touch.active && !state.swipeReleased)));
+    if (zooming) {
+        if (!rename.zoomHidden) {
+            rename.zoomHidden = true;
+            rename.restoreZoomFocus = GetFocus() == rename.editor;
+            SetPresentationVisibility(rename.editor, false);
+            Redraw(state);
+        }
+        return; // No native sizing/font/painting work during compositor zoom.
+    }
+    if (rename.zoomHidden && g_unloading.load(std::memory_order_acquire)) return;
+    const HWND focus = GetFocus();
+    if (rename.zoomHidden && rename.restoreZoomFocus && focus && focus != rename.editor &&
+        focus != state.hwnd && focus != state.frameHwnd) { CancelRename(state); return; }
+    RefreshRenameFont(state);
+    if (!RenameSessionValid(state)) { CancelRename(state); return; }
     if (!state.rename.parentSubclassInstalled) {
         state.rename.notificationHost = state.frameHwnd;
         state.rename.parentSubclassInstalled = SetWindowSubclass(state.rename.notificationHost,
@@ -21008,6 +21718,8 @@ void RepositionRenameEdit(ViewState& state) {
         return;
     }
     RECT local = RenameEditorRect(state, state.rename.index, false);
+    // Reveal the original Name-column anchor before an expanded editor can
+    // borrow the whole viewport width and replace that offscreen rectangle.
     const LONG dx = local.left < overlayArea.left ? local.left - overlayArea.left :
         std::max(0L, local.right - overlayArea.right);
     if (dx && ColumnsPresented(state)) {
@@ -21015,12 +21727,14 @@ void RepositionRenameEdit(ViewState& state) {
         overlayArea = RenameViewport(state, false);
         local = RenameEditorRect(state, state.rename.index, false);
     }
+    FitWrappedRenameEditor(state, local, overlayArea);
     const LONG dy = local.top < overlayArea.top ? local.top - overlayArea.top :
         std::max(0L, local.bottom - overlayArea.bottom);
     if (dy) {
         SetScrollImmediate(state, state.scrollNow + dy);
         overlayArea = RenameViewport(state, false);
         local = RenameEditorRect(state, state.rename.index, false);
+        FitWrappedRenameEditor(state, local, overlayArea);
     }
     // If an icon/indent alone exceeds a tiny viewport, keep the EDIT usable
     // inside that viewport after exhausting the real scroll range.
@@ -21028,15 +21742,21 @@ void RepositionRenameEdit(ViewState& state) {
     OffsetRect(&local, std::clamp(local.left, overlayArea.left, std::max(overlayArea.left, overlayArea.right-width)) - local.left,
         std::clamp(local.top, overlayArea.top, std::max(overlayArea.top, overlayArea.bottom-height)) - local.top);
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
-    CenterWrappedRenameText(state.rename.editor);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
-    if (EqualRect(&local, &state.rename.frameRect) && IsWindowVisible(state.rename.editor) &&
-        GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) return;
-    if (SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
-        local.right - local.left, local.bottom - local.top,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS | SWP_FRAMECHANGED))
+    if (PositionOverlayWindows(state,nullptr,&local))
         state.rename.frameRect = local;
+    else {
+        state.nativePresentationPending=true;
+        RegisterViewAnimation(state);
+        return; // Keep zoom suspension/focus intent until placement succeeds.
+    }
+    AlignWrappedRenameText(state);
+    if (std::exchange(rename.zoomHidden, false)) {
+        if (std::exchange(rename.restoreZoomFocus, false) && ExplorerFrameHasForeground(state.frameHwnd))
+            SetFocus(rename.editor);
+        Redraw(state);
+    }
 }
 
 void FinishRename(ViewState& state, bool commit) {
@@ -21275,7 +21995,8 @@ void Open(ViewState& state, int index, bool newTab = false) {
         auto* live=State(owner);
         if (!live || live->token!=token || live->lifetimeToken!=lifetime) return;
         const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
-        if (FAILED(hr)) Wh_Log(L"[GPU selection] default command failed hr=0x%08X",static_cast<unsigned>(hr));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] %s command failed hr=0x%08X",
+            newTab ? L"new-tab" : L"default",static_cast<unsigned>(hr));
         return;
     }
 
@@ -21729,7 +22450,7 @@ void UpdateDirectory(ViewState& state) {
     }
 }
 
-void ScanShellWindow(HWND explorerFrame);
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr);
 
 ViewState* State(HWND hwnd) {
     // A process-wide foreground/WinEvent can name another Explorer UI thread.
@@ -22162,6 +22883,22 @@ bool AdvanceRowHeight(ViewState& state, bool finish) {
 // limits as wheel input without losing sub-pixel changes. Grid has no visual
 // upper limit; only the integer preference's representable range bounds it.
 int RowFromPoint(ViewState& state, int y, int x);
+class RenameZoomUpdate {
+    ViewState& state;
+    bool previous;
+    UINT_PTR epoch;
+public:
+    explicit RenameZoomUpdate(ViewState& owner) : state(owner), previous(std::exchange(owner.rename.zoomRetargeting, true)), epoch(owner.rename.epoch) {
+        RepositionRenameEdit(state);
+    }
+    ~RenameZoomUpdate() {
+        // Completion is the gesture state/compositor acknowledgement, never
+        // an extra quiet-period timer on the native editor.
+        if (state.rename.epoch == epoch) state.rename.zoomRetargeting = previous;
+        RepositionRenameEdit(state);
+    }
+};
+
 double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact = nullptr) {
     const int current = state.rowHeight96[state.gridView] ?
         state.rowHeight96[state.gridView] : g_row96.load();
@@ -22169,6 +22906,11 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
     const double bounded96 = std::clamp(requested96, 24.,
         state.gridView ? static_cast<double>(std::numeric_limits<int>::max()) : 96.);
     const int height96 = static_cast<int>(std::llround(bounded96));
+    if (!contact && height96 == current) {
+        ScheduleZoomAutoRefit(state, false);
+        return bounded96;
+    }
+    RenameZoomUpdate renameZoom(state);
     if (contact) {
         // Direct touch follows each physical scale sample. Preserve the item
         // and fractional row under the midpoint through grid/group reflow;
@@ -22200,10 +22942,6 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         QueueVisibleDataFrame(state);
         ScheduleZoomAutoRefit(state, true);
         Redraw(state);
-        return bounded96;
-    }
-    if (height96 == current) {
-        ScheduleZoomAutoRefit(state, false);
         return bounded96;
     }
     state.preciseRowHeight96[state.gridView] = 0.;
@@ -22416,7 +23154,7 @@ void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
             UnregisterAnimationWhenIdle(state);
         }
     }
-
+    RepositionRenameEdit(state);
 }
 
 void ApplyManipulationPan(ViewState& state, float physicalX, float dy) {
@@ -22517,6 +23255,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
             state.preciseRowHeight96[state.gridView] > 0. ? state.preciseRowHeight96[state.gridView] :
             state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
     }
+    RepositionRenameEdit(state);
     if (!logDelta) return;
     state.lastManipulationActivity = GetTickCount64();
     state.touchpadPinchHeight96 = ApplyRowHeight(state,
@@ -22558,8 +23297,9 @@ int SelectionCheckboxAt(ViewState& state, POINT point) {
             contains(HeaderSelectionCheckbox(state)) ? -2 : -1;
     const int row=RowFromPoint(state,point.y,point.x);
     if (row<0) return -1;
-    const auto item=LayoutItem(state,LayoutRowVisual(state,row,1.f));
-    return contains(SelectionCheckboxHitRect(state,item)) ? row : -1;
+    const auto visual=LayoutRowVisual(state,row,1.f);
+    const auto item=LayoutItem(state,visual);
+    return contains(SelectionCheckboxHitRect(state,item,visual)) ? row : -1;
 }
 
 // A Shell drag that originated in this overlay must not be handed back to
@@ -23571,6 +24311,7 @@ UINT g_bootstrapAttachMessage = 0;
 HANDLE g_bootstrapStopEvent = nullptr;
 HANDLE g_bootstrapThread = nullptr;
 struct BootstrapPendingFrame {
+    HWND frame = nullptr;
     HWND eventSource = nullptr;
     ULONGLONG started = 0;
     unsigned attempt = 0;
@@ -23593,17 +24334,21 @@ struct BootstrapObserverState {
 thread_local BootstrapObserverState* t_bootstrapPending = nullptr;
 
 void CheckOverlaySize(HWND frame);
-void HandleColdAttach(HWND frame) {
+HWND OverlayForTab(HWND tabHost);
+void HandleColdAttach(HWND frame, HWND requestedTab = nullptr) {
+    const HWND key=requestedTab ? requestedTab : frame;
+    const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
     if (!g_unloading.load(std::memory_order_acquire) && IsExplorerFrame(frame) &&
         BelongsToThisProcess(frame) &&
-        GetWindowThreadProcessId(frame, nullptr) == GetCurrentThreadId() && !IsIconic(frame) && !OverlayUnder(frame)) {
+        GetWindowThreadProcessId(frame, nullptr) == GetCurrentThreadId() && !IsIconic(frame) &&
+        IsWindow(target) && (target==frame || GetAncestor(target,GA_ROOT)==frame) && !OverlayForTab(target)) {
         if (g_perf.load(std::memory_order_relaxed))
-            Wh_Log(L"[GPU startup] COLD_WAKE frame=%p iconic=%d thread=%lu",
-                frame, IsIconic(frame), GetCurrentThreadId());
-        ScanShellWindow(frame);
-        CheckOverlaySize(frame);
+            Wh_Log(L"[GPU startup] COLD_WAKE frame=%p tab=%p background=%d thread=%lu",
+                frame,target,target!=ActiveExplorerTab(frame),GetCurrentThreadId());
+        ScanShellWindow(frame,requestedTab ? target : nullptr);
+        if(target==ActiveExplorerTab(frame)) CheckOverlaySize(frame);
     }
-    RemovePropW(frame, kBootstrapQueuedProperty);
+    RemovePropW(key, kBootstrapQueuedProperty);
 }
 
 // Explorer may consume a registered message before DispatchMessageW. Claim
@@ -23615,27 +24360,32 @@ LRESULT CALLBACK ColdAttachGetMessageHook(int code, WPARAM removal, LPARAM data)
         if (g_bootstrapAttachMessage && msg.message == g_bootstrapAttachMessage &&
             IsExplorerFrame(msg.hwnd) && BelongsToThisProcess(msg.hwnd)) {
             const HWND frame = msg.hwnd;
+            const HWND target=reinterpret_cast<HWND>(msg.wParam);
             msg.message = WM_NULL;
             msg.wParam = msg.lParam = 0;
-            HandleColdAttach(frame);
+            HandleColdAttach(frame,target);
         }
     }
     return CallNextHookEx(nullptr, code, removal, data);
 }
 
-void PostColdAttach(HWND frame) {
+void PostColdAttach(HWND frame, HWND requestedTab = nullptr) {
     // The observer is the only writer setting this property; the owner STA
     // clears it after handling the queued scan, including failure paths.
-    if (GetPropW(frame, kBootstrapQueuedProperty)) return;
-    if (!SetPropW(frame, kBootstrapQueuedProperty, reinterpret_cast<HANDLE>(1))) return;
-    if (!PostMessageW(frame, g_bootstrapAttachMessage, 0, 0))
-        RemovePropW(frame, kBootstrapQueuedProperty);
+    const HWND key=requestedTab ? requestedTab : frame;
+    if (GetPropW(key, kBootstrapQueuedProperty)) return;
+    if (!SetPropW(key, kBootstrapQueuedProperty, reinterpret_cast<HANDLE>(1))) return;
+    if (!PostMessageW(frame, g_bootstrapAttachMessage, reinterpret_cast<WPARAM>(requestedTab), 0))
+        RemovePropW(key, kBootstrapQueuedProperty);
 }
 
-bool QueueColdAttach(HWND frame, HWND source) {
+bool QueueColdAttach(HWND frame, HWND source, HWND requestedTab = nullptr) {
+    const HWND key=requestedTab ? requestedTab : frame;
+    const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
     if (!t_bootstrapPending || !g_bootstrapAttachMessage ||
         !IsExplorerFrame(frame) || !BelongsToThisProcess(frame) ||
-        WatchRegisteredOverlay(ActiveExplorerTab(frame))) return false;
+        !IsWindow(target) || (target!=frame && GetAncestor(target,GA_ROOT)!=frame) ||
+        WatchRegisteredOverlay(target)) return false;
     const DWORD thread = GetWindowThreadProcessId(frame, nullptr);
     auto& threads = t_bootstrapPending->threads;
     auto foundThread = threads.find(thread);
@@ -23659,15 +24409,15 @@ bool QueueColdAttach(HWND frame, HWND source) {
         threads.emplace(thread, std::move(subscription));
     }
     auto& pending = t_bootstrapPending->pending;
-    RemovePropW(frame,kColdAttachResolvedProperty);
-    const auto found = pending.find(frame);
+    RemovePropW(key,kColdAttachResolvedProperty);
+    const auto found = pending.find(key);
     // Multiple CREATE/SHOW notifications are normal during one layout.
     // Don't rearm a retry chain for the same view, and don't force extra
     // work on another frame's already-present GPU surface.
     if (found != pending.end() &&
         (found->second.eventSource == source ||
          (GetTickCount64() == found->second.started))) return true;
-    pending[frame] = {source, GetTickCount64(), 0};
+    pending[key] = {frame, source, GetTickCount64(), 0};
     return true;
 }
 
@@ -23699,6 +24449,13 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
             _wcsicmp(parentClass, L"SHELLDLL_DefView") != 0) return;
     }
     const HWND frame = frameEvent ? changed : GetAncestor(changed, GA_ROOT);
+    // New Shell tabs need their own startup request even while another tab
+    // already has a renderer. CREATE is sufficient; retries retain this tab's
+    // identity until its browser/view is ready, without waiting for input.
+    if (tabEvent) {
+        if(QueueColdAttach(frame,changed,changed)) PostColdAttach(frame,changed);
+        return;
+    }
     if (HWND overlay = WatchRegisteredOverlay(ActiveExplorerTab(frame))) {
         if (viewEvent || contentEvent)
             PostMessageW(overlay, kMsgNativeRowsHint, 0, reinterpret_cast<LPARAM>(changed));
@@ -23709,7 +24466,12 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
 }
 
 BOOL CALLBACK BootstrapExistingFrame(HWND frame, LPARAM) {
-    if (IsWindowVisible(frame)) QueueColdAttach(frame, frame);
+    if (IsWindowVisible(frame)) {
+        const HWND first=FindWindowExW(frame,nullptr,L"ShellTabWindowClass",nullptr);
+        if(!first) QueueColdAttach(frame,frame);
+        for(HWND tab=first;tab;tab=FindWindowExW(frame,tab,L"ShellTabWindowClass",nullptr))
+            QueueColdAttach(frame,tab,tab);
+    }
     return TRUE;
 }
 
@@ -23736,11 +24498,12 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
         const ULONGLONG now = GetTickCount64();
         DWORD waitMs = INFINITE;
         for (auto it = pending.begin(); it != pending.end();) {
-            const HWND frame = it->first;
+            const HWND key = it->first;
             auto& task = it->second;
-            if (!IsWindow(frame) || !IsWindowVisible(frame) ||
-                WatchRegisteredOverlay(ActiveExplorerTab(frame)) ||
-                GetPropW(frame,kColdAttachResolvedProperty)) {
+            const HWND frame=task.frame;
+            const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
+            if (!IsWindow(key) || !IsWindow(frame) || !IsWindowVisible(frame) ||
+                WatchRegisteredOverlay(target) || GetPropW(key,kColdAttachResolvedProperty)) {
                 it = pending.erase(it);
                 continue;
             }
@@ -23748,7 +24511,7 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
             if (now >= due) {
                 // The native Shell view can still be initializing. Explorer's
                 // own STA receives and performs every Shell discovery scan.
-                PostColdAttach(frame);
+                PostColdAttach(frame,key==frame ? nullptr : key);
                 task.nextAttemptAt=now+retryIntervals[std::min<size_t>(task.attempt,ARRAYSIZE(retryIntervals)-1)];
                 task.attempt=std::min<unsigned>(task.attempt+1,ARRAYSIZE(retryIntervals)-1);
             }
@@ -23771,7 +24534,12 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
     }
     t_bootstrapPending = nullptr;
     EnumWindows(+[](HWND frame,LPARAM)->BOOL {
-        if (BelongsToThisProcess(frame)) RemovePropW(frame,kColdAttachResolvedProperty);
+        if (BelongsToThisProcess(frame)) {
+            RemovePropW(frame,kColdAttachResolvedProperty);
+            EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
+                RemovePropW(child,kColdAttachResolvedProperty); return TRUE;
+            },0);
+        }
         return TRUE;
     },0);
     if (hook) UnhookWinEvent(hook);
@@ -23806,8 +24574,12 @@ void StopColdAttachObserver() {
         g_bootstrapStopEvent = nullptr;
     }
     EnumWindows([](HWND frame, LPARAM) -> BOOL {
-        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame))
+        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
             RemovePropW(frame, kBootstrapQueuedProperty);
+            EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
+                RemovePropW(child,kBootstrapQueuedProperty); return TRUE;
+            },0);
+        }
         return TRUE;
     }, 0);
 }
@@ -24363,7 +25135,9 @@ bool UpdateCapturedPointer(ViewState& state, std::optional<POINT> delivered = {}
     const bool frameTick = !delivered.has_value();
     const bool captured = GetCapture() == state.hwnd;
     const bool touch = state.touch.active && (state.touch.control || state.touch.gesture == TouchGesture::Marquee);
-    const bool held = touch ? state.touch.down : (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    // GetAsyncKeyState reports physical buttons; honor swapped primary buttons.
+    const bool held = touch ? state.touch.down :
+        (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0;
     POINT point = delivered.value_or(POINT{});
     if (frameTick && (!captured || !held || !state.visible || !state.detailsViewActive))
         return true; // A delivered UP/capture change owns completion/commit.
@@ -24553,7 +25327,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
         state.presentationFont=NativeHeaderFont(state); state.presentationDpi=model->dpi;
     }
     model->font=state.presentationFont;
-    model->renameEditor=state.rename.editor; model->renameIndex=state.rename.index;
+    model->renameEditor=state.rename.zoomHidden ? nullptr : state.rename.editor; model->renameIndex=state.rename.index;
     model->observerId=state.presentObserverId; model->observerQpc=state.presentObserverQpc;
     model->observerCommitQpc=state.observerCommitQpc;
     model->documentHeight=DocumentHeight(state); model->clipboard=state.clipboardPaths;
@@ -24600,41 +25374,74 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     // Keep packet work bounded even for a giant Home/End jump. Names between
     // the endpoints remain available to the lane through the immutable base.
     constexpr size_t maxRows=4096;
-    for(int i:rows) if(i>=0 && i<state.total && model->items.size()<maxRows) {
+    // A row still holding the same complete value and key inputs is shared
+    // with the previous model. Comparison reads in place; only entering or
+    // changed rows allocate a copy and image keys on Explorer's owner thread.
+    const auto iconContext=MakeIconKeyContext(state);
+    const bool renamePreview=state.renamePreviewToken==state.token && !state.renamePreviewPath.empty();
+    auto items=std::make_shared<PresentationItems>();
+    std::unordered_map<int,PresentationRowCache> captured;
+    captured.reserve(std::min(rows.size(),maxRows));
+    items->rows.reserve(std::min(rows.size(),maxRows));
+    for(int i:rows) if(i>=0 && i<state.total && items->rows.size()<maxRows) {
+        const Entry& source=state.entries[size_t(i)];
         const int group=ModelGroup(state,i);
         const auto mapped=groups.find(group);
-        model->items.emplace(i,PresentationItem{i,mapped==groups.end() ? -1 : mapped->second,
-            ModelSelected(state,i),state.entries[size_t(i)]});
-        if (state.renamePreviewToken == state.token && !state.renamePreviewPath.empty() &&
-            model->items.at(i).entry.path == state.renamePreviewPath)
-            model->items.at(i).entry.name = state.renamePreviewName;
+        auto& row=captured[i];
+        bool reused=false;
+        if(renamePreview && source.path==state.renamePreviewPath) {
+            auto preview=std::make_shared<Entry>(source);
+            preview->name=state.renamePreviewName;
+            row.entry=std::move(preview);
+        } else if(const auto found=state.presentationRows.find(i);found!=state.presentationRows.end() &&
+            found->second.entry && *found->second.entry==source) {
+            row=std::move(found->second); reused=true;
+        } else row.entry=std::make_shared<const Entry>(source);
+        if(!reused || !(row.icons==iconContext)) {
+            for(size_t fallback=0;fallback<row.iconKeys.size();++fallback) {
+                std::wstring path; bool attrs=false;
+                row.iconKeys[fallback]=IconKey(iconContext,*row.entry,path,attrs,fallback!=0);
+            }
+            row.icons=iconContext;
+        }
+        items->rows.push_back({i,mapped==groups.end() ? -1 : mapped->second,ModelSelected(state,i),row.entry});
     }
+    // Departing rows are usually still owned by an earlier model. Free them
+    // on the tab lane when this cache was their last owner.
+    std::vector<std::shared_ptr<const Entry>> departed;
+    for(auto& [index,row]:state.presentationRows)
+        if(row.entry && row.entry.use_count()==1) departed.push_back(std::move(row.entry));
+    state.presentationRows.swap(captured);
+    RetireCachedEntries(state,departed);
+    model->items=items;
     // Membership only: ordered comparisons repeatedly walk long shared PIDL
-    // prefixes for every nearby row on Explorer's owner thread.
-    std::unordered_set<std::wstring> keys;
-    const auto image=[&](std::wstring key) -> const std::wstring& {
-        const auto [stored,inserted]=keys.insert(std::move(key));
-        if(inserted) {
-            const IconRecord* icon=nullptr;
-            if(*stored==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
-            else if(const auto found=state.icons.find(*stored);found!=state.icons.end()) icon=&found->second;
-            if(icon && icon->pixels.Ready()) model->images.push_back({*stored,icon->pixels,icon->requestedSize,icon->association});
-        }
-        return *stored;
+    // prefixes for every nearby row on Explorer's owner thread. Views refer to
+    // the row cache or to keys owned below for the rest of this capture.
+    std::unordered_set<std::wstring_view> keys;
+    std::deque<std::wstring> owned;
+    const auto image=[&](const std::wstring& key) {
+        if(!keys.insert(key).second) return;
+        const IconRecord* icon=nullptr;
+        if(key==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
+        else if(const auto found=state.icons.find(key);found!=state.icons.end()) icon=&found->second;
+        if(icon && icon->pixels.Ready()) model->images.push_back({key,icon->pixels,icon->requestedSize,icon->association});
     };
-    const auto icons=[&](const Entry& entry) {
-        for(bool fallback:{false,true}) {
-            std::wstring path; bool attrs=false;
-            auto key=IconKey(state,entry,path,attrs,fallback);
-            if(keys.contains(key)) continue;
-            const auto& captured=image(std::move(key));
+    const auto icons=[&](const Entry& entry,const std::array<std::wstring,2>* cached) {
+        for(size_t fallback=0;fallback<2;++fallback) {
+            const std::wstring* key=cached ? &(*cached)[fallback] : nullptr;
+            if(!key) {
+                std::wstring path; bool attrs=false;
+                key=&owned.emplace_back(IconKey(iconContext,entry,path,attrs,fallback!=0));
+            }
+            if(keys.contains(*key)) continue;
+            image(*key);
             std::wstring fallbackKey;
-            if(FindIconRecord(state,captured,true,false,&fallbackKey,true)) image(std::move(fallbackKey));
+            if(FindIconRecord(state,*key,true,false,&fallbackKey,true)) image(owned.emplace_back(std::move(fallbackKey)));
         }
     };
-    for(const auto& [index,item]:model->items) icons(item.entry);
-    for(const auto& ghost:model->disappearingRows) icons(ghost.entry);
-    image(kDefaultFolderIconKey);
+    for(const auto& item:items->rows) icons(*item.entry,&state.presentationRows.at(item.index).iconKeys);
+    for(const auto& ghost:model->disappearingRows) icons(ghost.entry,nullptr);
+    image(owned.emplace_back(kDefaultFolderIconKey));
     return model;
 }
 
@@ -24888,7 +25695,7 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->groupIntents=state.presentationGroupIntents;
     receipt->groups=state.groupAnimating; receipt->groupFrame=state.groupFrameQpc;
     receipt->glyphBytes=GlyphCacheBytes(state); receipt->imageBytes=state.iconCacheBytes;
-    receipt->overrides=state.presentationItems.size(); receipt->modelRows=state.presentationEntries ? state.presentationEntries->size() : 0;
+    receipt->overrides=state.presentationItems ? state.presentationItems->rows.size() : 0; receipt->modelRows=state.presentationEntries ? state.presentationEntries->size() : 0;
     if(lane->diagnostics.load(std::memory_order_relaxed)) for(int i:VisibleItemRows(state,0.f)) {
         const auto& entry=ModelEntry(state,i);
         receipt->samples.push_back({i,SelectionPathHash(entry.path),SelectionPathHash(entry.name),ModelSelected(state,i),
@@ -25182,10 +25989,12 @@ void ConsumePresentation(ViewState& state) {
         if (live!=&state || live->lifetimeToken!=lifetime || live->token!=token) return;
     }
     if(receipt->failed) {
+        const bool preparing=state.preparingTab;
+        state.preparingTab=false;
         state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();
         state.graphicsFailure=receipt->failure; state.graphicsFailureStage=receipt->failureStage;
         state.graphicsReady=false; state.graphicsSuspended=true;
-        if(!InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
+        if(preparing || !InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
         return;
     }
     if(receipt->ready) {
@@ -25236,7 +26045,13 @@ void ConsumePresentation(ViewState& state) {
         state.iconPx=receipt->iconSize; state.headerPx=receipt->headerHeight;
         state.itemWidth=receipt->itemWidth; state.itemsPerRow=receipt->itemsPerRow;
         state.scrollNow=state.scrollTarget=receipt->scroll; geometry=true;
-        if(state.textFormat && state.textFormat->GetFontSize()!=state.fontPx) MakeTextFormats(state,true);
+        if(state.textFormat && state.textFormat->GetFontSize()!=state.fontPx) {
+            const auto style = state.presentationStyleRevision;
+            MakeTextFormats(state,true);
+            // A cold/invalidated owner format can resolve its face here.
+            // Publish that new style before requiring it on the next receipt.
+            if (style != state.presentationStyleRevision) Redraw(state);
+        }
         if(!state.zoomAnimating && state.zoomLayoutTransition) StopRowTransition(state);
     }
     if(state.presentationGroupIntents==receipt->groupIntents && receipt->groupFrame.QuadPart)
@@ -25255,6 +26070,7 @@ void ConsumePresentation(ViewState& state) {
         // Only accepted content from the current view/directory can release
         // it. A loading frame or a departing-directory receipt cannot.
         if(!state.firstContentSubmittedAt) state.firstContentSubmittedAt=GetTickCount64();
+        state.preparingTab=false;
         if(state.deferColumnProviders) {
             state.deferColumnProviders=false; state.lastColumnsProbe=0;
             PipelineEvent(*state.background,{.operation=L"columns.providers.ready[step,dirty,rows,first]",
@@ -26556,6 +27372,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ++g_textRenderingRevision;
                 StopKeyboardSelectionAnimation(*s);
                 if (s->target || s->presenter) MakeTextFormats(*s);
+                RepositionRenameEdit(*s);
             }
             if (changes & kStyleInput) {
                 s->checkboxHeaderActionPending=false; s->checkboxHeaderActionSelection.clear();
@@ -26588,6 +27405,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->selectedFlags.assign(s->entries.size(), 1);
                 s->selected = s->selected>=0 && s->selected<s->total ? s->selected : s->total ? 0 : -1;
                 s->anchor = s->selected;
+                RememberVerifiedSelection(*s);
                 s->keyboardCaretVisible = false;
                 StopKeyboardSelectionAnimation(*s);
                 ClearPostDeletionCaret(*s);
@@ -26665,6 +27483,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 TryStartCreatedItemRename(*s);
         }
         return 0;
+    case kMsgNativeCatalog:
+        if (s) AdvanceNativeCatalog(*s);
+        return 0;
     case kMsgPreparedSelection:
         if (s) {
             if (s->nativeSelectionCaptureJob) { AdvanceNativeSelectionCapture(*s); return 0; }
@@ -26740,7 +27561,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             } else if (!GpuSelectionMatches(*s, *prepared)) {
                 CancelNativeSelectionPreparation(*s);
                 return 0;
-            } else committed=SyncNativeSelection(*s, prepared);
+            } else {
+                if (FAILED(prepared->result)) {
+                    CancelNativeSelectionPreparation(*s);
+                    RestoreVerifiedSelection(*s);
+                    return 0;
+                }
+                if (SUCCEEDED(prepared->result)) {
+                    if (!ValidatePreparedSelection(*s,prepared)) return 0;
+                    if (prepared->entries.empty()) {
+                        CancelNativeSelectionPreparation(*s);
+                        Redraw(*s);
+                        return 0;
+                    }
+                }
+                committed=SyncNativeSelection(*s, prepared);
+            }
             if (!IsWindow(hwnd) || State(hwnd) != s) return 0;
             if (s->pendingNativeSelection != prepared->generation) return 0;
             s->pendingNativeSelection = 0;
@@ -26766,8 +27602,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         live->token != viewToken || live->nativeHwnd != target ||
                         !GpuSelectionMatches(*live, *prepared)) break;
                     const HRESULT hr = InvokeNativeFileKey(*live,native.Get(),key);
-                    if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred native command failed hr=0x%08X",
-                        static_cast<unsigned>(hr));
+                    if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred %s command failed hr=0x%08X",
+                        key.newTab ? L"new-tab" : L"native",static_cast<unsigned>(hr));
                 }
                 ViewState* live = IsWindow(hwnd) ? State(hwnd) : nullptr;
                 if (menu && live && live->token == viewToken && live->nativeHwnd == target &&
@@ -26789,12 +27625,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case kMsgThisPcRows:
-        if (s && s->thisPcGpu && s->visible && TabOwnsActiveView(*s)) {
+        if (s && s->thisPcGpu && s->visible && (TabOwnsActiveView(*s) || s->preparingTab)) {
             if (s->nativeRowsNeedCapture && !s->nativeRowsPending) RequestNativeRows(*s);
             if (s->thisPcRowsDirty && !s->nativeRowsPending) {
                 if (s->loaded && s->nativeRowsComplete) QueueVisibleDataFrame(*s);
                 else RefreshThisPcRows(*s);
             }
+            if(s->preparingTab && s->presenter) SubmitPresentation(*s);
         }
         if (s) s->nativeRowsMessageQueued = false;
         return 0;
@@ -26922,6 +27759,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case kMsgTabActivated:
+        if(s) s->tabSurfaceWakeQueued=false;
         // Existing tabs have independent, already-presented surfaces. No
         // synchronous Shell COM or directory scan is permitted on activation.
         // wParam=2 is an HWND-only wake from the low-priority observer or a
@@ -26947,7 +27785,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     static_cast<unsigned long long>(GetTickCount64()),
                     s->frameHwnd, s->activeTabHost, hwnd,
                     IsWindowVisible(hwnd) != FALSE,
-                    GetWindow(s->frameHwnd, GW_CHILD) == hwnd);
+                    !OverlayStackingNeeded(*s));
             // Only unresolved/new views get a native Shell scan. A known
             // cached tab is reactivated using its own HWND/State exclusively.
             if (wParam != 2 && (wParam == 1 || !OverlayUnder(s->frameHwnd))) {
@@ -27117,7 +27955,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // changes. Restore keyboard input without dismissing or recreating
             // the field. Never steal focus from another Explorer/application.
             AdoptNativeRenameEditor(*s, GetFocus());
-            if (s->rename.editor && s->rename.creationSticky &&
+            if (s->rename.editor && !s->rename.zoomHidden && s->rename.creationSticky &&
                 GetFocus() != s->rename.editor &&
                 ExplorerFrameHasForeground(s->frameHwnd) &&
                 !(GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
@@ -27324,7 +28162,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->lastFolderNativePresentAfter=0;
                 if (!s->lastFolderNativePending.empty()) PostMessageW(hwnd,kMsgLastFolderSelection,0,0);
             }
-            if (s->initialModePending && s->visible && TabOwnsActiveView(*s)) PrepareInitialOverlay(*s);
+            if (s->initialModePending && s->visible && (TabOwnsActiveView(*s) || s->preparingTab)) PrepareInitialOverlay(*s);
             if (s->nativePresentationPending && s->visible && TabOwnsActiveView(*s)) ApplyNativePresentation(*s);
             if (s->thisPcGpu && s->nativeRowsNeedCapture && !s->nativeRowsPending &&
                 s->visible && TabOwnsActiveView(*s)) QueueNativeRows(*s, false);
@@ -28069,7 +28907,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             AdoptNativeRenameEditor(*s, reinterpret_cast<HWND>(wParam));
         return 0;
     case kMsgCreationRefocus:
-        if (s && s->rename.editor && s->rename.creationSticky &&
+        if (s && s->rename.editor && !s->rename.zoomHidden && s->rename.creationSticky &&
             s->rename.epoch == static_cast<UINT_PTR>(lParam)) {
             s->rename.refocusQueued = false;
             const ULONGLONG now = GetTickCount64();
@@ -28234,6 +29072,17 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const bool background = OnScrollbar(*s, x, y) || OnHorizontalBar(*s, x, y) ||
                 !InsideListX(*s, x);
             const int row = background ? -1 : RowFromPoint(*s, y, x);
+            // A previous WinUI menu can still own its InputSiteWindow when
+            // the next mouse request arrives. Return focus before Select()
+            // publishes the new selection and enters reentrant Shell calls,
+            // just as a left press does. Otherwise that first model hides
+            // selection feedback until the new popup takes ownership.
+            if (background || y >= (s->columnsView ? ColumnHeaderHeight(*s) : s->headerPx)) {
+                const auto lifetime = s->lifetimeToken, token = s->token;
+                ReturnListInputFocus(*s, GetFocus());
+                if (State(hwnd) != s || s->lifetimeToken != lifetime || s->token != token)
+                    return 0;
+            }
             if (!background && s->columnsView && y < ColumnHeaderHeight(*s))
                 ExplorerColumnMenu(*s, screen);
             else if (row >= 0) ContextMenu(*s, row, screen);
@@ -28468,6 +29317,12 @@ void DisposeOverlayState(ViewState* s) {
     ForgetDirectory(*s);
     ClearFolderSnapshots(*s);
     RetireCachedEntries(*s, s->presentationEntries);
+    {
+        std::vector<std::shared_ptr<const Entry>> rows;
+        for (auto& [index,row] : s->presentationRows) if (row.entry) rows.push_back(std::move(row.entry));
+        s->presentationRows.clear();
+        RetireCachedEntries(*s, rows);
+    }
     RetireCachedEntries(*s, s->entries);
     RetireCachedEntries(*s, s->retiredIconPixels);
     {
@@ -28675,6 +29530,7 @@ void PresentCachedTabSurface(ViewState& state) {
     // Present cached pixels first. The owner message then uses exactly the
     // F5/menu path; duplicate activation hints cannot restart provider work.
     QueueResumeRefresh(state);
+    QueueFeatureInitialization(state);
     if (trace)
         Wh_Log(L"[GPU tabs] PRESENT tick=%llu tab=%p gpu=%p native=%p was-visible=%d now-visible=%d loaded=%d rows=%d position=%llu ms show=%llu ms top=%llu ms total=%llu ms folder=%s",
             static_cast<unsigned long long>(started), state.activeTabHost, state.hwnd,
@@ -28810,6 +29666,18 @@ void SuppressAppearingNativeSurface(HWND changed, DWORD event) {
     if (!view) return;
     const HWND frame=GetAncestor(view,GA_ROOT);
     if (!IsExplorerFrame(frame)) return;
+    // A new background view is a frame sibling on modern Explorer. USER can
+    // place it above the current frame-owned GPU surface before discovery.
+    // Repair the current tab's HWND order synchronously; never borrow its
+    // suppression ownership for the new tab or query Shell from this callback.
+    if(auto* current=State(OverlayUnder(frame)); current && current->nativeHwnd!=view &&
+        current->visible && current->inScope && current->detailsViewActive && PresentationVisible(*current)) {
+        const HWND before=GetWindow(current->hwnd,GW_HWNDPREV);
+        EnsureOverlayStacking(*current);
+        if(before!=GetWindow(current->hwnd,GW_HWNDPREV))
+            PipelineEvent(*current->background,{.operation=L"tab.creation.preserve.surface",.a=event,
+                .b=reinterpret_cast<UINT_PTR>(view)});
+    }
     HWND overlay=OverlayForNative(view,frame);
     if (!overlay) overlay=OverlayUnder(frame);
     auto* owner=overlay ? State(overlay) : nullptr;
@@ -28849,6 +29717,21 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
     ReleaseSRWLockShared(&g_shellHookLock);
     if(!owns) return;
+    // USER reports a child z-order change on its parent. Explorer can select
+    // an already-visible tab this way, without a tab-host SHOW event.
+    if(event==EVENT_OBJECT_REORDER && !childId &&
+        (objectId==OBJID_WINDOW || objectId==OBJID_CLIENT)) {
+        wchar_t cls[64]{};
+        const bool tabHost=GetClassNameW(changed,cls,ARRAYSIZE(cls)) && !_wcsicmp(cls,L"ShellTabWindowClass");
+        if(changed==frame || tabHost) {
+            if(auto* selected=State(OverlayUnder(frame)); selected && selected->visible && selected->inScope && selected->detailsViewActive) {
+                if(PresentationVisible(*selected)) EnsureOverlayStacking(*selected);
+                else if(!selected->tabSurfaceWakeQueued)
+                    selected->tabSurfaceWakeQueued=PostMessageW(selected->hwnd,kMsgTabActivated,2,
+                        static_cast<LPARAM>(GetTickCount64()))!=FALSE;
+            }
+        }
+    }
     if(!GetPropW(changed,kViewToggleOwnerProperty) &&
         (event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_HIDE || event==EVENT_OBJECT_DESTROY ||
          (event==EVENT_OBJECT_LOCATIONCHANGE && objectId==OBJID_WINDOW))) {
@@ -28949,10 +29832,10 @@ void CALLBACK ShellViewEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed
                 if (event == EVENT_OBJECT_REORDER) {
                     const HWND selected = ActiveExplorerTab(frame);
                     if (HWND owner = OverlayForTab(selected)) {
-                        if (!IsWindowVisible(owner) ||
-                            GetWindow(frame, GW_CHILD) != owner)
-                            PostMessageW(owner, kMsgTabActivated, 2,
-                                static_cast<LPARAM>(GetTickCount64()));
+                        if(auto* state=State(owner); state && !state->tabSurfaceWakeQueued &&
+                            (!IsWindowVisible(owner) || OverlayStackingNeeded(*state)))
+                            state->tabSurfaceWakeQueued=PostMessageW(owner,kMsgTabActivated,2,
+                                static_cast<LPARAM>(GetTickCount64()))!=FALSE;
                     }
                 } else if (event == EVENT_OBJECT_SHOW) {
                     SynchronizeTabSurfaces(frame, true);
@@ -30298,7 +31181,7 @@ void RetryShellSubscriptions(ViewState& state, ULONGLONG now) {
 }
 
 void PrepareInitialOverlay(ViewState& state) {
-    if (!state.folderView || !state.visible || !TabOwnsActiveView(state) ||
+    if (!state.folderView || !state.visible || (!TabOwnsActiveView(state) && !state.preparingTab) ||
         state.overlayInitializing) return;
     GraphicsContinuation continuation(state);
     ScopedFlag initializing(state.overlayInitializing);
@@ -30317,8 +31200,17 @@ void PrepareInitialOverlay(ViewState& state) {
     state.initialModePending = false;
     ApplyViewLayout(state,{mode,state.nativeIconSize},false);
     if (!state.detailsViewActive) {
+        state.preparingTab=false;
         RestoreNativeContent(state);
         UnregisterAnimationWhenIdle(state);
+        return;
+    }
+    // Use the dedicated native content host even while preparing a hidden
+    // surface. A zero-sized/unfinished host is not a whole-frame viewport.
+    // Its real layout notifications and existing frame lane retry startup.
+    if(state.preparingTab && !PositionOverlayOverNative(state,false)) {
+        state.initialModePending=true;
+        RegisterViewAnimation(state);
         return;
     }
     state.visibility = ReadShellVisibilityPolicy();
@@ -30355,7 +31247,7 @@ void PrepareInitialOverlay(ViewState& state) {
 
 void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ComPtr<IShellFolder>& folder, ComPtr<IShellBrowser>& shellBrowser,
-                const std::wstring& path) {
+                const std::wstring& path, bool prepareTab = false) {
     if (g_unloading.load(std::memory_order_acquire) || !native || !IsWindow(native) ||
         !IsSupportedLocation(path) ||
         !BelongsToThisProcess(native)) return;
@@ -30365,8 +31257,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     if (!IsExplorerFrame(frame)) return;
     const HWND tabHost = BrowserTabHost(shellBrowser.Get(), native, frame);
     if (g_unloading.load(std::memory_order_acquire)) return;
-    if (!tabHost || tabHost != ActiveExplorerTab(frame) ||
-        !NativeViewAvailable(native)) return;
+    if (!tabHost || (!prepareTab && tabHost != ActiveExplorerTab(frame)) ||
+        !NativeViewAvailable(native,prepareTab ? tabHost : nullptr)) return;
     HWND overlay = OverlayForTab(tabHost);
     if (overlay && GetWindowThreadProcessId(overlay, nullptr) !=
                        GetCurrentThreadId()) return;
@@ -30628,6 +31520,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     s->nativeHwnd = native;
     s->frameHwnd = frame;
     s->activeTabHost = tabHost;
+    s->preparingTab = prepareTab && tabHost != ActiveExplorerTab(frame);
     s->folderView = view;
     s->shellBrowser = shellBrowser;
     s->folder = folder;
@@ -30668,7 +31561,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     SetTimer(overlay, kTimerId, 250, nullptr);
 }
 
-void ScanShellWindow(HWND explorerFrame) {
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
     if (g_unloading.load() || !IsWindow(explorerFrame) ||
         GetPropW(explorerFrame, kShellScanProperty)) return;
     struct ScanGuard {
@@ -30676,11 +31569,14 @@ void ScanShellWindow(HWND explorerFrame) {
         ~ScanGuard() { if (IsWindow(frame)) RemovePropW(frame, kShellScanProperty); }
     } guard{explorerFrame};
     if (!SetPropW(explorerFrame, kShellScanProperty, reinterpret_cast<HANDLE>(1))) return;
-    SynchronizeTabSurfaces(explorerFrame);
+    const HWND targetTab=requestedTab ? requestedTab : ActiveExplorerTab(explorerFrame);
+    if (!IsWindow(targetTab) || (targetTab!=explorerFrame && GetAncestor(targetTab,GA_ROOT)!=explorerFrame)) return;
+    const bool preparing=requestedTab && targetTab!=ActiveExplorerTab(explorerFrame);
+    if (!preparing) SynchronizeTabSurfaces(explorerFrame);
     // The DispatchMessage hook, WinEvent and short navigation timer all run
     // on this STA. Never let them independently scan during one layout burst.
     // A genuinely NEW SHELLDLL_DefView resets this gate when first observed.
-    if (HWND overlay = OverlayUnder(explorerFrame)) {
+    if (HWND overlay = OverlayForTab(targetTab)) {
         if (ViewState* state = State(overlay)) {
             const ULONGLONG now = GetTickCount64();
             if (state->lastShellScanAt && now == state->lastShellScanAt)
@@ -30712,15 +31608,14 @@ void ScanShellWindow(HWND explorerFrame) {
             previous = now;
         }
     } stage(explorerFrame);
-    // A selected tab's browser can supply its own current view cheaply.
-    // Never consult an inactive tab's Shell browser for this frame; on tab
-    // activation without a matching overlay, use normal Shell discovery.
-    if (HWND overlay = OverlayUnder(explorerFrame)) {
+    // Use only the requested tab's browser. Ordinary discovery targets the
+    // selected tab; a cold request may explicitly prepare a background tab.
+    if (HWND overlay = OverlayForTab(targetTab)) {
         if (ViewState* s = State(overlay); s && s->shellBrowser) {
             ComPtr<IShellView> active;
             HWND native = nullptr;
             const bool matchingTab = BrowserTabHost(s->shellBrowser.Get(),
-                native, explorerFrame) == ActiveExplorerTab(explorerFrame);
+                native, explorerFrame) == targetTab;
             if (g_unloading.load(std::memory_order_acquire)) return;
             stage.Mark(L"cached browser resolve tab host");
             const HRESULT activeResult = matchingTab ?
@@ -30833,8 +31728,8 @@ void ScanShellWindow(HWND explorerFrame) {
         }
         stage.Mark(L"QueryService");
         // ShellWindows exposes one entry per Explorer tab but each entry's
-        // IWebBrowser2::HWND is the same frame. Reject inactive tab browsers
-        // *before* expensive view/property COM work.
+        // IWebBrowser2::HWND is the same frame. Reject other tab browsers
+        // before view/property COM work, including explicit cold preparation.
         HWND browserTab = nullptr;
         const HRESULT hostResult = shellBrowser->GetWindow(&browserTab);
         stage.Mark(L"IShellBrowser GetWindow");
@@ -30843,7 +31738,7 @@ void ScanShellWindow(HWND explorerFrame) {
         const bool qualifiedTab = browserTab &&
             GetClassNameW(browserTab, browserClass, ARRAYSIZE(browserClass)) &&
             _wcsicmp(browserClass, L"ShellTabWindowClass") == 0;
-        if (qualifiedTab && browserTab != ActiveExplorerTab(explorerFrame))
+        if (qualifiedTab && browserTab != targetTab)
             continue;
         ComPtr<IShellView> shellView;
         const HRESULT activeResult = shellBrowser->QueryActiveShellView(shellView.GetAddressOf());
@@ -30853,23 +31748,23 @@ void ScanShellWindow(HWND explorerFrame) {
         const HRESULT nativeResult = shellView->GetWindow(&native);
         stage.Mark(L"discovered IShellView GetWindow");
         if (FAILED(nativeResult) || !native ||
-            GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native) ||
+            GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native,preparing ? targetTab : nullptr) ||
             BrowserTabHost(shellBrowser.Get(), native, explorerFrame) !=
-                ActiveExplorerTab(explorerFrame))
+                targetTab)
             continue;
         ComPtr<IFolderView2> view;
         const HRESULT viewResult=shellView.As(&view);
         if (FAILED(viewResult) || !view) {
             if (viewResult!=E_NOINTERFACE) break; // Still unresolved, not proof of unsupported content.
-            SetPropW(explorerFrame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
-            if (HWND overlay = OverlayUnder(explorerFrame))
+            SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     DeactivateOutsideScope(*state);
             break;
         }
         ComPtr<IShellFolder> folder;
         std::wstring path;
-        if (HWND overlay=OverlayUnder(explorerFrame))
+        if (HWND overlay=OverlayForTab(targetTab))
             if (auto state=State(overlay); state && state->pendingShellView &&
                 IsWindow(state->pendingShellView) && native!=state->pendingShellView) continue;
         const bool pathResolved = GetFolderPath(view.Get(),path,folder);
@@ -30879,15 +31774,15 @@ void ScanShellWindow(HWND explorerFrame) {
             break;
         }
         if (!IsSupportedLocation(path))
-            SetPropW(explorerFrame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
         if (IsSupportedLocation(path)) {
-            AttachView(native,view,folder,shellBrowser,path);
+            AttachView(native,view,folder,shellBrowser,path,preparing);
             stage.Mark(L"AttachView discovered tab");
-            if (HWND overlay = OverlayUnder(explorerFrame))
+            if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     BindShellAutomation(*state, disp.Get());
             stage.Mark(L"AttachShellAutomationEvents/SelectionChanged");
-        } else if (HWND overlay = OverlayUnder(explorerFrame)) {
+        } else if (HWND overlay = OverlayForTab(targetTab)) {
             if (ViewState* state = State(overlay))
                 DeactivateOutsideScope(*state);
         }
@@ -31401,7 +32296,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     if (msg && g_bootstrapAttachMessage &&
         msg->message == g_bootstrapAttachMessage &&
         IsExplorerFrame(msg->hwnd)) {
-        HandleColdAttach(msg->hwnd);
+        HandleColdAttach(msg->hwnd,reinterpret_cast<HWND>(msg->wParam));
         return 0; // Do not forward the private registered message to Shell.
     }
     // Reuse the existing per-frame scan state for diagnostic input timestamps:
@@ -32202,13 +33097,14 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
         }
         RECT previous{}; GetWindowRect(state->viewToggle, &previous);
         MapWindowPoints(HWND_DESKTOP, frame, reinterpret_cast<POINT*>(&previous), 2);
-        if (!IsWindowVisible(state->viewToggle) || GetWindow(frame, GW_CHILD) != state->viewToggle ||
-            previous.left != x || previous.top != y || previous.right - previous.left != width ||
-            previous.bottom - previous.top != height)
+        const RECT placement{x,y,x+width,y+height};
+        const bool repaint=!IsWindowVisible(state->viewToggle) || !EqualRect(&previous,&placement);
+        if (repaint || OverlayStackingNeeded(*state))
         {
-            SetWindowPos(state->viewToggle, HWND_TOP, x, y, width, height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-            InvalidateRect(state->viewToggle, nullptr, FALSE);
+            if(!PositionOverlayWindows(*state,nullptr,nullptr,&placement)) {
+                RetryStatusButtonGeometry(*state); continue;
+            }
+            if(repaint) InvalidateRect(state->viewToggle, nullptr, FALSE);
             if(g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU status] layout source=%s root=%p neighbor=%p x=%d y=%d w=%d h=%d gap=%d pending=%d",
                     fromNative ? (state->viewToggleGeometry.accessible ? L"accessibility" : L"HWND") : L"fallback",
