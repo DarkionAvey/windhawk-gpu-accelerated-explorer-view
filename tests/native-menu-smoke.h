@@ -26,14 +26,25 @@ std::vector<Item> Read(HMENU menu, bool& valid) {
     return result;
 }
 inline thread_local struct Popup* observing = nullptr;
+LRESULT CALLBACK MouseContext(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_CONTEXTMENU) return OverlayProc(hwnd, msg, wp, lp);
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
 struct Popup {
     unsigned opened = 0;
     bool expired = false, dismissed = false, valid = true;
     RECT bounds{};
     std::vector<Item> items;
     HWND native, frame;
+    ViewState* feedbackState = nullptr;
+    bool listFeedbackBeforeMenu = false;
     UINT_PTR timer = 0;
     static LRESULT CALLBACK Owner(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+        if (message == WM_CONTEXTMENU && observing && hwnd == observing->native && observing->feedbackState) {
+            auto& state = *observing->feedbackState;
+            observing->listFeedbackBeforeMenu = OverlayHasInputFocus(state) &&
+                CapturePresentationModel(state)->selectionFeedback;
+        }
         // WM_ENTERIDLE comes from Windows' actual menu loop, after a popup is
         // visible. A call or success HRESULT alone is never counted as a menu.
         if (message == WM_ENTERIDLE && wp == MSGF_MENU && observing && lp) {
@@ -439,6 +450,39 @@ void Child(const std::wstring& fixture) {
             {
                 Popup popup(state.nativeHwnd, host.frame);
                 if (target < 0) BackgroundContextMenu(state, point);
+                else if (target < 2) {
+                    // Windows generates WM_CONTEXTMENU from its default
+                    // right-release handler. Start with another selected row
+                    // and a separate input owner, as after a delegated menu.
+                    const int row = target == 0 ? fileRow : folderRow;
+                    Select(state, target == 0 ? folderRow : fileRow);
+                    HWND input = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE,
+                        0, 0, 1, 1, host.frame, nullptr, GetModuleHandleW(nullptr), nullptr);
+                    Check(input != nullptr, "right-click previous input owner");
+                    // A non-input desktop has no foreground window. Substitute
+                    // focus/foreground ownership while keeping the real Shell
+                    // menu and Windows-generated context request.
+                    FocusFixture::Session focus(host.frame, input);
+                    if (target == 1) FocusFixture::rejected = state.nativeHwnd;
+                    SetFocus(input);
+                    Check(GetFocus() == input && !OverlayHasInputFocus(state), "right-click focus precondition");
+                    StopRowTransition(state);
+                    SetScrollImmediate(state, RevealScrollTarget(state, row, state.scrollNow));
+                    const auto item = LayoutItem(state, LayoutRowVisual(state, row, 1.f));
+                    const POINT client{LogicalX(state, LONG((item.text.left + item.text.right) * .5f)),
+                        LONG((item.text.top + item.text.bottom) * .5f)};
+                    Check(SetWindowSubclass(state.hwnd, MouseContext, 316, 0), "right-click default menu receiver");
+                    popup.feedbackState = &state;
+                    DefWindowProcW(state.hwnd, WM_RBUTTONUP, 0, MAKELPARAM(client.x, client.y));
+                    RemoveWindowSubclass(state.hwnd, MouseContext, 316);
+                    DestroyWindow(input);
+                    if (state.selected != row || !popup.listFeedbackBeforeMenu)
+                        std::cout << "RIGHT MENU mode=" << mode << " row=" << row << " selected=" << state.selected
+                            << " opened=" << popup.opened << " feedback=" << popup.listFeedbackBeforeMenu
+                            << " focus=" << GetFocus() << " native=" << state.nativeHwnd << std::endl;
+                    Check(state.selected == row && popup.listFeedbackBeforeMenu,
+                        "right-only selection published hidden feedback before native popup ownership");
+                }
                 else ContextMenu(state, target == 0 ? fileRow : folderRow, point);
                 std::cout << "ACTUAL MENU mode=" << mode << " target=" << target << " opened=" << popup.opened
                     << " expired=" << popup.expired << " items=" << popup.items.size() << std::endl;

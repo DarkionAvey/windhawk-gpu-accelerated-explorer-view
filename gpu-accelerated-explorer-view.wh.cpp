@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.315
+// @version         0.9.316
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -28588,6 +28588,17 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const bool background = OnScrollbar(*s, x, y) || OnHorizontalBar(*s, x, y) ||
                 !InsideListX(*s, x);
             const int row = background ? -1 : RowFromPoint(*s, y, x);
+            // A previous WinUI menu can still own its InputSiteWindow when
+            // the next mouse request arrives. Return focus before Select()
+            // publishes the new selection and enters reentrant Shell calls,
+            // just as a left press does. Otherwise that first model hides
+            // selection feedback until the new popup takes ownership.
+            if (background || y >= (s->columnsView ? ColumnHeaderHeight(*s) : s->headerPx)) {
+                const auto lifetime = s->lifetimeToken, token = s->token;
+                ReturnListInputFocus(*s, GetFocus());
+                if (State(hwnd) != s || s->lifetimeToken != lifetime || s->token != token)
+                    return 0;
+            }
             if (!background && s->columnsView && y < ColumnHeaderHeight(*s))
                 ExplorerColumnMenu(*s, screen);
             else if (row >= 0) ContextMenu(*s, row, screen);

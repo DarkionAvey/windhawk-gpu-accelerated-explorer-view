@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.316
+
+- Prevent selection-background flicker when right-clicking an unselected item
+  to open its context menu.
+
 ## 0.9.315
 
 - Reject unavailable selection targets without clearing the other selected items.

@@ -1287,7 +1287,13 @@ static void TestBackgroundTabStartup(const std::wstring& fixture) {
     Check(current && Eventually([&] {pump();return current->loaded && current->firstContentSubmittedAt;}),"initial tab content");
     watched=current;
     for(bool hostVisible:{false,true}) {
-        Check(Eventually([&] {pump();return current->loaded && !current->directoryPending && !current->tabResumeRefreshQueued;}),
+        // Names can finish before the filesystem watch is installed. Watch
+        // delivery intentionally starts a gap-closing scan; that scan belongs
+        // to startup, not to the background tab created below. Require its
+        // completed snapshot before capturing the generation we must preserve.
+        Check(Eventually([&] {pump();return current->loaded && current->directoryWatch &&
+            current->validatedFolderStamp == current->directoryWatch->stamp &&
+            !current->directoryPending && !current->tabResumeRefreshQueued;}),
             "current tab did not finish its prior activation refresh");
         const auto token=current->token, generation=current->directoryToken;
         HWND tab=makeTab(false);
