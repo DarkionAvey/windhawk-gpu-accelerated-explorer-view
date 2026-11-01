@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.333
+
+- Keep two-finger swipes on their chosen action until release or cancellation.
+- Start held-item touch drags at Windows' drag threshold through the same Shell
+  drag-and-drop path used by mouse and touchpad.
+- Refresh drag previews with smooth edges, theme-aware tiles, uncropped images,
+  equally wide, centered emoji operation symbols without backplates, and subtle
+  animations. Show cached artwork immediately and sharpen it using the tab's
+  existing background image workers.
+
 ## 0.9.332
 
 - Make group headers share the list's hover background and smooth movement,

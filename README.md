@@ -27,6 +27,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - Two finger horizontal swipes will start Back or Forward gestures (disabled by default). 
 - Pinch to resize, tap to select, and double-tap to open. 
 - For context menu: press and hold, or tap with two fingers. 
+- To drag files: press and hold an item, then move your finger. Lift to drop.
 - The scrollbars remain large and easy to drag (even if they appear small, their trigger area remains comfortably large)
 
 ## Report bugs

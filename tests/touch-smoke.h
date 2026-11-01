@@ -601,6 +601,12 @@ void PinchAcquisition(Device& input,const std::wstring& fixture) {
                 }
                 input.Next(); input.Send(view,{input.Packet(view,input.primary,first,move),input.Packet(view,input.primary+1,second,move)});
             }
+            if(start==Start::AfterPan) {
+                Check(view.touch.gesture==TouchGesture::Horizontal && !view.touchpadPinching && view.rowPx==beforeRow,
+                    "committed two-finger pan/history switched to pinch after opposing finger movement");
+                input.Next(); input.Send(view,{input.Packet(view,input.primary,first,up),input.Packet(view,input.primary+1,second,up)});
+                ++trials; continue;
+            }
             if(view.touch.gesture!=TouchGesture::Pinch)
                 std::cerr<<"PINCH ACQUIRE dpi="<<dpi<<" rtl="<<rtl<<" history="<<history<<" axis="<<axis
                     <<" direction="<<direction<<" start="<<int(start)<<" gesture="<<int(view.touch.gesture)
@@ -623,7 +629,7 @@ void PinchAcquisition(Device& input,const std::wstring& fixture) {
         StopTouchpad(view); SetWindowLongPtrW(view.hwnd,GWLP_USERDATA,0);
     }
     g_touchpadSwipeNavigation=historySetting;
-    std::cout<<"PASS: "<<trials<<" native unequal/drifting pinches, late second fingers and same-pair pan-to-pinch transitions; inward/outward, three axes, 96/144/192 DPI, LTR/RTL and history policies\n";
+    std::cout<<"PASS: "<<trials<<" native unequal/drifting pinches, late second fingers and locked same-pair pans; inward/outward, three axes, 96/144/192 DPI, LTR/RTL and history policies\n";
 }
 
 void ScrollbarInteractions(Device& input,const std::wstring& fixture) {
@@ -1343,7 +1349,7 @@ static void TestTouchInput(const std::wstring& fixture) {
     WaitForPreparedSelection(state);
     const auto expectedDraggedPath=state.entries[size_t(state.touch.row)].path;
     const float beforeDrag=state.scrollNow;
-    POINT moved=point; moved.y-=80;
+    POINT moved=point; moved.y-=GetSystemMetricsForDpi(SM_CYDRAG,ViewDpi(state));
     input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,move)});
     Check(state.touch.dragPending && state.scrollNow==beforeDrag && TouchFixture::drags==0,
         "held movement scrolled or entered OLE inside the recognizer callback");

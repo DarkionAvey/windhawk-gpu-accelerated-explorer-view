@@ -545,6 +545,9 @@ static void TestLayoutWatchAndCache(const std::wstring& directory) {
     state.grouping.key = PKEY_FileName;
     QueueDirectoryRefresh(state);
     auto result = WaitForComplete(*state.background, state.directoryToken);
+    if(result.error!=ERROR_SUCCESS || result.entries.size()!=512)
+        std::cerr<<"LAYOUT SNAPSHOT error="<<result.error<<" entries="<<result.entries.size()
+            <<" token="<<state.directoryToken<<" result-token="<<result.token<<"\n";
     Check(result.error == ERROR_SUCCESS && result.entries.size() == 512, "real layout snapshot");
     Check(std::is_sorted(result.entries.begin(), result.entries.end(), [](const Entry& a, const Entry& b) {
         return CompareEntryNames(a, b) < 0;
@@ -1901,6 +1904,7 @@ static void TestPreviewInput() {
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"
+#include "drag-preview-smoke.h"
 #include "additional-gestures-smoke.h"
 #include "checkbox-smoke.h"
 #include "rename-appearance-smoke.h"
@@ -1924,6 +1928,9 @@ static const RegressionSuite kRegressionSuites[] = {
     }},
     {L"touch", false, [](const std::wstring& fixture) {
         TestTouchInput(fixture);
+    }},
+    {L"drag-preview", false, [](const std::wstring& fixture) {
+        TestDragPreview(fixture);
     }},
     {L"gestures", false, [](const std::wstring& fixture) {
         TestAdditionalGestures(fixture);
@@ -2038,9 +2045,14 @@ int wmain(int argc,wchar_t** argv) {
         }
         wchar_t temporary[MAX_PATH]{};
         Check(GetTempPathW(MAX_PATH, temporary) != 0, "temp directory");
+        GUID fixtureId{}; wchar_t fixtureName[40]{};
+        Check(SUCCEEDED(CoCreateGuid(&fixtureId)) && StringFromGUID2(fixtureId,fixtureName,ARRAYSIZE(fixtureName)),
+            "unique private fixture identity");
+        // Failed runs retain diagnostics. A recycled PID must never reuse their
+        // files and accidentally test a different directory than this run made.
         const auto fixture = std::filesystem::path(temporary) /
-            (L"gpu-overlay-regression-" + std::to_wstring(GetCurrentProcessId()));
-        std::filesystem::create_directories(fixture);
+            (L"gpu-overlay-regression-" + std::to_wstring(GetCurrentProcessId())+L"-"+fixtureName);
+        Check(std::filesystem::create_directory(fixture),"fresh private fixture directory");
         for (int i = 0; i < 512; ++i) {
             HANDLE file = CreateFileW((fixture / (L"file" + std::to_wstring(i) + L".txt")).c_str(),
                 GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
