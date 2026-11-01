@@ -91,6 +91,66 @@ static void TestStickyGroupHeaders(HWND frame) {
         g_marqueeAlpha=marqueeAlpha; g_selectionRgb=marqueeColor;
         UpdatePointerHover(state,{x,y},false);
         Check(state.hotSection==0 && state.hovered==-1,"sticky hover targeted an underlying file");
+        {
+            const auto filenameOnly=g_filenameOnly.load();
+            const bool animate=g_animateHover.exchange(true), zebra=g_zebra.exchange(false);
+            const auto selection=state.selectedFlags;
+            state.selectedFlags.assign(state.total,0);
+            state.activeTabHost=state.frameHwnd;
+            const auto sample=[&](const std::vector<BYTE>& band,float logicalX) {
+                const int a=int(rtl ? 640-ListEndX(state) : ListStartX(state))+1;
+                const int b=int(rtl ? 640-ListStartX(state) : ListEndX(state))-1;
+                const int physicalX=int(rtl ? 640-logicalX : logicalX);
+                return int(band[(size_t(int(heading*.5f))*(b-a)+physicalX-a)*4+3]);
+            };
+            const float trailing=ListEndX(state)-Scale96(24,ViewDpi(state));
+            const auto text=GroupHeadingTextRect(state,pinned.top,pinned.height,ListEndX(state));
+            for(bool labelOnly : {false,true}) {
+                g_filenameOnly=labelOnly ? ViewOption::AlwaysOn : ViewOption::AlwaysOff;
+                ClearPointerHover(state,false);
+                UpdatePointerHover(state,{x,y},false);
+                const auto band=paintBand();
+                Check(std::abs(sample(band,text.left-Scale96(3,ViewDpi(state)))-
+                    255*g_hoverAlpha.load()/100)<=2,
+                    "group hover did not use the item highlight opacity/padding");
+                Check(labelOnly ? sample(band,trailing)<=2 :
+                    std::abs(sample(band,trailing)-255*g_hoverAlpha.load()/100)<=2,
+                    "group hover ignored filename-only or full-row highlight bounds");
+                const POINT item{x,LONG(state.headerPx+heading+state.rowPx*.5f)};
+                UpdatePointerHover(state,item,false);
+                Check(state.hovered>=0 && state.hotSection<0,"group hover item endpoint missing");
+                const auto start=CurrentHoverVisual(state);
+                AnimationClockFixture::Freeze clock;
+                UpdatePointerHover(state,{x,y},true);
+                Check(state.hoverAnimationActive && state.hotSection==0 && state.hovered<0 &&
+                    fabsf(state.hoverFromRow-start.row)<.001f &&
+                    fabsf(state.hoverFromLeft-start.left)<.001f &&
+                    fabsf(state.hoverFromRight-start.right)<.001f &&
+                    fabsf(state.hoverFromHeight-start.height)<.001f,
+                    "item-to-header hover restarted at a disconnected rectangle");
+                Check(sample(paintBand(),trailing)<=2,"group hover appeared instantly at its destination");
+                AnimationClockFixture::instant.QuadPart+=LONGLONG(
+                    state.qpcFrequency*kHoverAnimationDurationMs*.5/1000.);
+                const auto midway=CurrentHoverVisual(state);
+                Check(midway.row>std::min(start.row,state.hoverToRow) &&
+                    midway.row<std::max(start.row,state.hoverToRow),"group hover had no intermediate position");
+                UpdatePointerHover(state,item,true);
+                const auto retargeted=CurrentHoverVisual(state);
+                Check(fabsf(retargeted.row-midway.row)<.001f &&
+                    fabsf(retargeted.left-midway.left)<.001f &&
+                    fabsf(retargeted.right-midway.right)<.001f &&
+                    fabsf(retargeted.height-midway.height)<.001f,
+                    "header-to-item retarget jumped in flight");
+                UpdatePointerHover(state,{x,y},false);
+                ClearPointerHover(state,true);
+                Check(state.hoverAnimationActive && state.hoverToStrength==0.f,
+                    "leaving a group header did not fade the shared hover");
+            }
+            ClearPointerHover(state,false);
+            state.selectedFlags=selection;
+            state.activeTabHost=activeTabHost;
+            g_filenameOnly=filenameOnly; g_animateHover=animate; g_zebra=zebra;
+        }
         const auto captured=CaptureVisibleGroupHeaders(state);
         Check(std::any_of(captured.begin(),captured.end(),[](const auto& h) { return h.key==L"0"; }),
             "offscreen natural header was lost from the sticky transition capture");
@@ -199,5 +259,5 @@ static void TestStickyGroupHeaders(HWND frame) {
         UnregisterAnimationWindow(state.hwnd); Stop(state.background);
         DropTarget(state); DestroyWindow(state.hwnd);
     }
-    std::cout<<"PASS: sticky group headings push/handoff and own hover/click pixels in LTR/RTL Details/List/grid; first-item stripes per section, blank headers/spacers, body masking, real empty separators, collapse, capture and reveal\n";
+    std::cout<<"PASS: sticky group headings share item hover opacity, filename-only bounds and continuous retarget/fade in LTR/RTL Details/List/grid; push/handoff, section stripes, body masking, collapse, capture and reveal\n";
 }

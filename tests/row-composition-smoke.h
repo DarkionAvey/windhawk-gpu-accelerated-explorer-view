@@ -157,6 +157,31 @@ static void TestRowComposition(HWND frame) {
             for(const auto& item:s.modeComposition.items)
                 Check(item.cell.bottom-item.cell.top+1.f>=std::max(item.from.height,item.to.height),
                     "retargeted growing ghost can sample a neighboring atlas cell");
+            if(grouped) {
+                AnimationClockFixture::Freeze clock;
+                AnimationClockFixture::instant=s.rowTransitionStartedQpc;
+                const auto filenameOnly=g_filenameOnly.exchange(ViewOption::AlwaysOff);
+                const auto viewport=ContentViewport(s);
+                SetScrollImmediate(s,std::max(0.f,s.sections[1].documentTop-
+                    (viewport.bottom-viewport.top)*.5f));
+                const auto heading=LayoutGroupHeader(s,1,CurrentRowProgress(s));
+                UpdatePointerHover(s,{LogicalX(s,int(ListStartX(s)+40)),
+                    LONG(heading.top+heading.height*.5f)},false);
+                Check(s.hotSection==1,"moving natural heading did not own pointer hover");
+                Paint(s);
+                const auto& slices=s.modeComposition.headings;
+                const auto slice=std::find_if(slices.begin(),slices.end(),
+                    [](const auto& item) {return item.key==1;});
+                Check(slice!=slices.end(),"hovered heading has no atlas slice");
+                const auto pixels=read(s.modeComposition.groups.bitmap.Get());
+                const float logicalX=ListEndX(s)-Scale96(24,ViewDpi(s));
+                const UINT x=UINT(slice->cell.left+(rtl ? s.paintWidth-logicalX : logicalX)-slice->sourceLeft);
+                const UINT y=UINT(slice->cell.top+(slice->cell.bottom-slice->cell.top)*.5f);
+                const UINT width=s.modeComposition.groups.bitmap->GetPixelSize().width;
+                Check(std::abs(int(pixels[(size_t(y)*width+x)*4+3])-255*g_hoverAlpha.load()/100)<=2,
+                    "group hover used animated screen bounds inside its compositor source");
+                ClearPointerHover(s,false); g_filenameOnly=filenameOnly;
+            }
             Sleep(kUiTransitionDurationMs+30);
             Check(s.rowTransitionActive && LayoutTransitionProgress(s,true,s.rowTransitionStartedQpc)==1.f,
                 "blocked owner could not leave a committed animation to finish independently");

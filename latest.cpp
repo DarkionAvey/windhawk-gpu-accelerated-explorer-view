@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.331
+// @version         0.9.332
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -3118,6 +3118,7 @@ struct ViewState {
     // Cached horizontal bounds avoid text measurements on animation frames.
     bool hoverAnimationActive = false;
     float hoverFromRow = 0.f, hoverToRow = 0.f;
+    float hoverFromHeight = 1.f, hoverToHeight = 1.f;
     float hoverFromLeft = 0.f, hoverFromRight = 0.f;
     float hoverToLeft = 0.f, hoverToRight = 0.f;
     float hoverFromStrength = 0.f, hoverToStrength = 0.f;
@@ -3681,6 +3682,7 @@ struct SwipeFeedbackSnapshot {
     X(keyboardSelectionRowTangent) X(keyboardSelectionLeftTangent) X(keyboardSelectionRightTangent) \
     X(keyboardSelectionTo) X(keyboardSelectionStartedQpc) X(hoverAnimationActive) X(hoverFromRow) X(hoverToRow) \
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
+    X(hoverFromHeight) X(hoverToHeight) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
     X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
@@ -16495,7 +16497,32 @@ struct HoverVisual {
     float row = 0.f;
     float left = 0.f, right = 0.f;
     float strength = 0.f;
+    float height = 1.f; // Document rows, including the shorter grid section headings.
 };
+
+D2D1_RECT_F GroupHeadingTextRect(ViewState& state, float top, float height, float listEnd) {
+    const int dpi = ViewDpi(state);
+    return D2D1::RectF(ListStartX(state) + Scale96(14, dpi) + Scale96(18, dpi),
+        top, listEnd - Scale96(8, dpi), top + height);
+}
+
+D2D1_RECT_F GroupHoverRect(ViewState& state, int section, const RowVisual& visual) {
+    auto rc = RowHighlightRect(state, visual.top, visual.height);
+    if (ViewOptionEnabled(state,g_filenameOnly)) {
+        const auto text = GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state));
+        const float available = std::max(0.f, text.right-text.left);
+        float width = 0.f;
+        if (auto* layout = ResolveTextLayout(state,state.sections[size_t(section)].title,
+                available,visual.height)) {
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(layout->GetMetrics(&metrics))) width = std::clamp(metrics.width,0.f,available);
+        }
+        const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
+        rc.left = std::max(ListStartX(state),text.left-pad);
+        rc.right = std::min(ListEndX(state),text.left+width+pad);
+    }
+    return rc;
+}
 
 D2D1_RECT_F PointerHoverRect(ViewState& state, int index) {
     const float listEnd = ListEndX(state);
@@ -16505,16 +16532,30 @@ D2D1_RECT_F PointerHoverRect(ViewState& state, int index) {
         std::min(nameEnd - 8.f, listEnd - 8.f), listEnd);
 }
 
+HoverVisual PointerHoverVisual(ViewState& state, int index, int section) {
+    const float row = std::max(1.f,state.rowPx);
+    if (section >= 0 && size_t(section) < state.sections.size()) {
+        // Atlas sources use destination geometry; DWM applies their motion.
+        // Hit testing and input retargets continue to use the displayed bounds.
+        const float progress = state.modeComposition.rows && state.modeComposition.painting ?
+            1.f : CurrentRowProgress(state);
+        const auto visual = LayoutGroupHeader(state,size_t(section),progress);
+        const auto rc = GroupHoverRect(state,section,visual);
+        return {(visual.top-state.headerPx+state.scrollNow)/row,
+            rc.left,rc.right,visual.opacity,visual.height/row};
+    }
+    if (!DisplayedRow(state,index)) return {};
+    const auto rc = PointerHoverRect(state,index);
+    return {DocumentRowTop(state,index)/row,rc.left,rc.right,1.f};
+}
+
 HoverVisual CurrentHoverVisual(ViewState& state) {
     // Resting, moving and drag-target hover share the same paint pass. A
     // keyboard selection must never consume the pointer's background.
     if (!state.hoverAnimationActive || state.shellDropHotRow >= 0) {
         const int index = state.shellDropHotRow >= 0 ?
             state.shellDropHotRow : state.hovered;
-        if (!DisplayedRow(state, index)) return {};
-        const auto rc = PointerHoverRect(state, index);
-        return {DocumentRowTop(state, index) / std::max(1.f, state.rowPx),
-                rc.left, rc.right, 1.f};
+        return PointerHoverVisual(state,index,state.shellDropHotRow >= 0 ? -1 : state.hotSection);
     }
     const float progress = EaseOutCubic(UiTransitionProgress(state,
         state.hoverStartedQpc, kHoverAnimationDurationMs));
@@ -16524,49 +16565,40 @@ HoverVisual CurrentHoverVisual(ViewState& state) {
     return {lerp(state.hoverFromRow, state.hoverToRow),
             lerp(state.hoverFromLeft, state.hoverToLeft),
             lerp(state.hoverFromRight, state.hoverToRight),
-            lerp(state.hoverFromStrength, state.hoverToStrength)};
+            lerp(state.hoverFromStrength, state.hoverToStrength),
+            lerp(state.hoverFromHeight, state.hoverToHeight)};
 }
 
 // Hover movement caches its endpoint rectangles. Rapid movement retargets
 // from the in-flight visual position, not the previous logical row.
-void BeginHoverTransition(ViewState& state, int nextRow, bool animate) {
+void BeginHoverTransition(ViewState& state, int nextRow, bool animate, int nextSection = -1) {
     if (!animate || !g_animateHover.load(std::memory_order_relaxed) ||
         !state.visible || !state.detailsViewActive || state.emptyNative ||
         state.rowTransitionActive || state.marqueePossible) {
         StopHoverAnimation(state);
         return;
     }
-    const bool moving = state.hoverAnimationActive;
-    const int previousRow = state.hovered;
+    HoverVisual from = CurrentHoverVisual(state);
+    HoverVisual to = PointerHoverVisual(state,nextRow,nextSection);
     if (nextRow >= 0) state.hoverLabelRow = nextRow;
-    else if (previousRow >= 0) state.hoverLabelRow = previousRow;
-    if (!moving && previousRow < 0 && nextRow < 0) return;
-    HoverVisual from{};
-    if (moving) {
-        from = CurrentHoverVisual(state);
-    } else if (previousRow >= 0 && previousRow < state.total) {
-        const D2D1_RECT_F rc = PointerHoverRect(state, previousRow);
-        from = {DocumentRowTop(state, previousRow) / std::max(1.f, state.rowPx),
-                rc.left, rc.right, 1.f};
-    } else if (nextRow >= 0 && nextRow < state.total) {
-        const D2D1_RECT_F rc = PointerHoverRect(state, nextRow);
-        from = {DocumentRowTop(state, nextRow) / std::max(1.f, state.rowPx),
-                rc.left, rc.right, 0.f};
-    } else return;
-    const D2D1_RECT_F target = nextRow >= 0 && nextRow < state.total ?
-        PointerHoverRect(state, nextRow) :
-        D2D1::RectF(from.left, 0.f, from.right, 0.f);
+    else if (nextSection >= 0 || state.hotSection >= 0) state.hoverLabelRow = -1;
+    else if (state.hovered >= 0) state.hoverLabelRow = state.hovered;
+    if (from.strength <= 0.f && to.strength <= 0.f) return;
+    if (from.strength <= 0.f) { from = to; from.strength = 0.f; }
+    if (to.strength <= 0.f) { to = from; to.strength = 0.f; }
     state.hoverFromRow = from.row;
-    state.hoverToRow = nextRow >= 0 ?
-        DocumentRowTop(state, nextRow) / std::max(1.f, state.rowPx) : from.row;
+    state.hoverToRow = to.row;
+    state.hoverFromHeight = from.height;
+    state.hoverToHeight = to.height;
     state.hoverFromLeft = from.left;
     state.hoverFromRight = from.right;
-    state.hoverToLeft = target.left;
-    state.hoverToRight = target.right;
+    state.hoverToLeft = to.left;
+    state.hoverToRight = to.right;
     state.hoverFromStrength = from.strength;
-    state.hoverToStrength = nextRow >= 0 ? 1.f : 0.f;
+    state.hoverToStrength = to.strength;
     if (fabsf(state.hoverFromRow - state.hoverToRow) < .001f &&
         fabsf(state.hoverFromStrength - state.hoverToStrength) < .001f &&
+        fabsf(state.hoverFromHeight - state.hoverToHeight) < .001f &&
         fabsf(state.hoverFromLeft - state.hoverToLeft) < .5f &&
         fabsf(state.hoverFromRight - state.hoverToRight) < .5f) {
         StopHoverAnimation(state);
@@ -16727,8 +16759,9 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         StrokeLine(state,D2D1::Point2F(centerX, centerY+unit*.5f),
             D2D1::Point2F(centerX+unit, centerY-unit*.5f), state.brush.Get(), thickness);
     }
-    Text(state, title, ListStartX(state) + leading + Scale96(18, dpi), top,
-        listEnd - Scale96(8, dpi), top + height, headerColor, false, .9f * opacity);
+    const auto text = GroupHeadingTextRect(state,top,height,listEnd);
+    Text(state, title, text.left, text.top, text.right, text.bottom,
+        headerColor, false, .9f * opacity);
 }
 
 bool MatchesTypeSearchPrefix(const std::wstring& name,
@@ -18383,36 +18416,42 @@ void Paint(ViewState& state) {
             FillSelectionRect(state,focus,.78f,&shape,true);
         }
     }
+    D2D1_RECT_F hoverRect{};
+    SelectionShape hoverShape;
+    float hoverOpacity = 0.f;
     if (hover.strength > 0.f && hover.right > hover.left) {
         const float y = header + hover.row * row - state.scrollNow;
         // The content clip and Fill's RTL mapping are identical to every
         // other highlight; no extra Shell queries or text layout here.
-        D2D1_RECT_F hoverRect = RowHighlightRect(state, y, row);
+        hoverRect = RowHighlightRect(state, y, row * hover.height);
         float opacity = hover.strength;
         int index = state.shellDropHotRow >= 0 ?
             state.shellDropHotRow : state.hovered;
-        if (!state.hoverAnimationActive || state.shellDropHotRow >= 0) {
+        const bool sectionHover = state.shellDropHotRow < 0 && state.hotSection >= 0;
+        if ((!state.hoverAnimationActive || state.shellDropHotRow >= 0) && !sectionHover) {
             const RowVisual v = LayoutRowVisual(state, index, layoutProgress);
             hoverRect = RowHighlightRect(state, v.top, v.height);
             opacity *= v.opacity;
             if (state.rename.editor && index == state.rename.index)
                 opacity = 0.f;
         }
-        SelectionShape shape;
-        if (state.gridView && ViewOptionEnabled(state,g_filenameOnly)) {
+        if (!sectionHover && state.gridView && ViewOptionEnabled(state,g_filenameOnly)) {
             if (index<0 && state.hoverAnimationActive) index=state.hoverLabelRow;
             if (index>=0 && index<state.total) {
                 const auto v=LayoutRowVisual(state,index,layoutProgress);
                 hoverRect=SelectionRect(state,index,state.hoverAnimationActive ? y : v.top,
-                    state.hoverAnimationActive ? row : v.height,xName,nameRight,listEnd,
-                    v.left,v.width,&shape);
-            } else opacity=0.f;
+                    state.hoverAnimationActive ? row * hover.height : v.height,xName,nameRight,listEnd,
+                    v.left,v.width,&hoverShape);
+            }
         }
         hoverRect.left = hover.left;
         hoverRect.right = hover.right;
-        RowSourceScope source(state,index,0);
-        FillSelectionRect(state, hoverRect,
-            HoverOverlayOpacity(state, hover, visibleItems) * opacity,&shape);
+        hoverOpacity = opacity;
+        if (!compositionFrame.Rows() || !sectionHover) {
+            RowSourceScope source(state,index,0);
+            FillSelectionRect(state, hoverRect,
+                HoverOverlayOpacity(state, hover, visibleItems) * opacity,&hoverShape);
+        }
     }
     // The decorative passes above may cross the edge margins in square mode,
     // but item content (including outgoing row ghosts and group headings) never
@@ -18625,7 +18664,7 @@ void Paint(ViewState& state) {
     state.target->PopAxisAlignedClip(); // row item content
     state.target->PopAxisAlignedClip(); // selection/hover backgrounds
     struct HeadingPaint {
-        const std::wstring* title; bool collapsed, hot; RowVisual visual; int key=0;
+        const std::wstring* title; bool collapsed; RowVisual visual; int key=0;
     };
     std::vector<HeadingPaint> headings;
     // Outgoing headings stay behind current headings. Reserve every displayed
@@ -18635,7 +18674,7 @@ void Paint(ViewState& state) {
         const float height=GroupHeadingHeight(state)*opacity;
         const float top=old.oldTop-(state.scrollNow-state.rowTransitionOldScroll);
         if (height>.01f && top<contentBottom && top+height>header)
-            headings.push_back({&old.title,old.collapsed,false,{top,height,opacity}});
+            headings.push_back({&old.title,old.collapsed,{top,height,opacity},-int(&old-state.disappearingHeaders.data())-1});
     }
     if (!state.sections.empty()) {
         const float pad=state.rowPx*kRowTransitionOverscan;
@@ -18646,8 +18685,7 @@ void Paint(ViewState& state) {
             if (section.documentTop>to) break;
             const auto visual=LayoutGroupHeader(state,i,headerProgress);
             if (visual.top+visual.height>header && visual.top<contentBottom)
-                headings.push_back({&section.title,section.collapsed,
-                    state.inputFocusIndicators && state.hotSection==static_cast<int>(i),visual});
+                headings.push_back({&section.title,section.collapsed,visual,int(i)});
         }
     }
     if(compositionFrame.Rows()) {
@@ -18655,11 +18693,10 @@ void Paint(ViewState& state) {
         for(const auto& item:state.modeComposition.headings) {
             if(item.key>=0) {
                 const auto& section=state.sections[size_t(item.key)];
-                headings.push_back({&section.title,section.collapsed,
-                    state.inputFocusIndicators && state.hotSection==item.key,item.source,item.key});
+                headings.push_back({&section.title,section.collapsed,item.source,item.key});
             } else {
                 const auto& old=state.disappearingHeaders[size_t(-item.key-1)];
-                headings.push_back({&old.title,old.collapsed,false,item.source,item.key});
+                headings.push_back({&old.title,old.collapsed,item.source,item.key});
             }
         }
     }
@@ -18669,13 +18706,23 @@ void Paint(ViewState& state) {
     if (compositionFrame.active && !compositionFrame.Rows() && state.modeComposition.groups.bitmap)
         state.target->SetTarget(state.modeComposition.groups.bitmap.Get());
     state.target->PushAxisAlignedClip(state.rtlLayout ?
+        D2D1::RectF(w-rowBgEnd,header,w-rowBgStart,contentBottom) :
+        D2D1::RectF(rowBgStart,header,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
+    // ClearBodyBand reserves transparent space above items for sticky headings.
+    // Restore only the shared hover's intersection with each reserved band,
+    // below its text, so crossing a heading never swaps to a separate fill.
+    for (const auto& heading:headings) if (hoverOpacity > 0.f) {
+        RowSourceScope source(state,heading.key,0,true);
+        state.target->PushAxisAlignedClip(D2D1::RectF(0.f,heading.visual.top,w,
+            heading.visual.top+heading.visual.height),D2D1_ANTIALIAS_MODE_ALIASED);
+        FillSelectionRect(state,hoverRect,g_hoverAlpha.load(std::memory_order_relaxed)/100.f *
+            hoverOpacity,&hoverShape);
+        state.target->PopAxisAlignedClip();
+    }
+    state.target->PopAxisAlignedClip(); // group hover background margins
+    state.target->PushAxisAlignedClip(state.rtlLayout ?
         D2D1::RectF(w-listEnd,header,w-listStart,contentBottom) :
         D2D1::RectF(listStart,header,listEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
-    for (const auto& heading:headings) if (heading.hot) {
-        RowSourceScope source(state,heading.key,0,true);
-        Fill(state,0.f,heading.visual.top,listEnd,heading.visual.top+heading.visual.height,
-            ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),.10f*heading.visual.opacity);
-    }
     for (const auto& heading:headings) {
         RowSourceScope source(state,heading.key,2,true);
         PaintGroupHeading(state,*heading.title,heading.collapsed,heading.visual.top,
@@ -24276,19 +24323,17 @@ void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
     const bool horizontal = inside && !vertical && OnHorizontalBar(state, pos.x, pos.y);
     const int sectionHot = inside && !vertical && !horizontal ?
         GroupHeaderAtPoint(state, pos.x, pos.y) : -1;
-    if (state.hotSection != sectionHot) {
-        state.hotSection = sectionHot;
-        Redraw(state);
-    }
     const int row = inside && !vertical && !horizontal &&
         InsideListX(state, pos.x) ? RowFromPoint(state, pos.y, pos.x) : -1;
     // Content moves under a stationary mouse during scrolling: hit testing
     // stays exact, but a second hover animation would visually lag behind it.
     if (!animate) StopHoverAnimation(state);
-    if (row != state.hovered || vertical != state.verticalScrollbarHot ||
+    if (row != state.hovered || sectionHot != state.hotSection || vertical != state.verticalScrollbarHot ||
         horizontal != state.horizontalScrollbarHot) {
-        if (row != state.hovered) BeginHoverTransition(state, row, animate);
+        if (row != state.hovered || sectionHot != state.hotSection)
+            BeginHoverTransition(state, row, animate, sectionHot);
         state.hovered = row;
+        state.hotSection = sectionHot;
         state.verticalScrollbarHot = vertical;
         state.horizontalScrollbarHot = horizontal;
         Redraw(state);
@@ -24299,7 +24344,7 @@ void ClearPointerHover(ViewState& state, bool animate) {
     if (state.hovered < 0 && state.hotSection < 0 &&
         !state.verticalScrollbarHot && !state.horizontalScrollbarHot &&
         !state.hoverAnimationActive) return;
-    if (state.hovered >= 0) BeginHoverTransition(state, -1, animate);
+    if (state.hovered >= 0 || state.hotSection >= 0) BeginHoverTransition(state, -1, animate);
     else if (!animate) StopHoverAnimation(state);
     state.hovered = -1;
     state.hotSection = -1;

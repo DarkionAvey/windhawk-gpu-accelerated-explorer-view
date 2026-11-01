@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.332
+
+- Make group headers share the list's hover background and smooth movement,
+  including text-sized highlights with "Highlight filename only" enabled.
+
 ## 0.9.331
 
 - Speed up build validation by running independent regression groups and compiler
