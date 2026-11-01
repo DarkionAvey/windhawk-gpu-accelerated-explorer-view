@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.330
+
+- Keep item selections when collapsing or expanding sections, including selected
+  items inside collapsed sections and selections still being synchronized with Explorer.
+
 ## 0.9.329
 
 - Fix brief flashes of the list while resizing: Explorer's own window layout

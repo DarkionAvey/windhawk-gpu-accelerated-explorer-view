@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.329
+// @version         0.9.330
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -4323,21 +4323,9 @@ void ToggleGroupSection(ViewState& state, int index) {
     // Carry offscreen collapsed sections as immutable intent too. A viewport
     // packet alone cannot reconstruct the document's complete geometry.
     PublishGroupIntents(state);
-    // Hidden items must not stay selected in native Shell: QuickLook and
-    // keyboard navigation continue operating on the same visible identities.
-    if (group.collapsed) {
-        bool changed = false;
-        for (int i=group.first; i<group.end; ++i) {
-            if (i < static_cast<int>(state.selectedFlags.size()) &&
-                state.selectedFlags[static_cast<size_t>(i)]) {
-                state.selectedFlags[static_cast<size_t>(i)] = 0;
-                changed = true;
-            }
-        }
-        if (state.selected >= group.first && state.selected < group.end)
-            state.selected = state.anchor = -1;
-        if (changed && !state.optimisticStartedAt) SyncNativeSelection(state);
-    }
+    // Collapse changes visibility only. Keep selection, caret and range anchor
+    // in both views while the user browses sections; navigation independently
+    // skips hidden rows through DisplayedRow/NextDisplayedRow.
     state.hovered = -1;
     state.hotSection = -1;
     RegisterViewAnimation(state);
@@ -27466,7 +27454,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
          OnScrollbar(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)) ||
          OnHorizontalBar(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)));
     if (scrollbarButton && msg==WM_LBUTTONDBLCLK) msg=WM_LBUTTONDOWN;
+    const int pressedGroup = s && (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK)
+        ? GroupHeaderAtPoint(*s,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)) : -1;
     if (s && !s->lastFolderNativePending.empty() &&
+        pressedGroup < 0 &&
         (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN ||
          msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL ||
          (msg==WM_KEYDOWN && wParam!=VK_CONTROL && wParam!=VK_SHIFT &&
@@ -28891,17 +28882,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_LBUTTONDOWN:
-        if (s && s->pendingNativeSelection) CancelNativeSelectionPreparation(*s);
+        if (s && s->pendingNativeSelection && pressedGroup < 0)
+            CancelNativeSelectionPreparation(*s);
         if (s && s->optimisticStartedAt && !scrollbarButton) {
             ResetMouseClickSequence(*s);
             return 0;
         }
         if (s) {
             // Group headers are GPU-only hit targets, not Shell items.
-            const int group = GroupHeaderAtPoint(*s,
-                GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-            if (group >= 0) {
-                PressGroupHeader(*s, group);
+            if (pressedGroup >= 0) {
+                PressGroupHeader(*s, pressedGroup);
                 return 0;
             }
             // Pointer hit testing uses the authoritative new row indexes.
@@ -29395,7 +29385,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_LBUTTONDBLCLK:
-        if (s && s->rowTransitionActive) {
+        if (s && s->rowTransitionActive && pressedGroup < 0) {
             StopRowTransition(*s);
             Redraw(*s);
         }
@@ -29408,9 +29398,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const int y = GET_Y_LPARAM(lParam);
             // This event is the second press on a stationary group header.
             // Treat it like another click, not a file-open double-click.
-            const int group = GroupHeaderAtPoint(*s, x, y);
-            if (group >= 0) {
-                PressGroupHeader(*s, group);
+            if (pressedGroup >= 0) {
+                PressGroupHeader(*s, pressedGroup);
                 return 0;
             }
             // A divider double-click is the same explicit animated refit as

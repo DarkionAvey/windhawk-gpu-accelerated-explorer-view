@@ -207,6 +207,41 @@ static void TestSelectionGestures(ViewState& state, SelectionFolderView& native)
         std::fill(state.rowGroup.begin()+section.first,state.rowGroup.begin()+section.end,group);
     }
     LayoutGroupSections(state);
+    // Exercise the shared mouse/touch header action directly, without injected
+    // input or changing desktop focus. Include the selected item's own section,
+    // unrelated sections, rapid reversals and a completely collapsed view.
+    Select(state,2); SelectWithModifiers(state,12,true,false);
+    const auto sectionSelection=state.selectedFlags;
+    const auto sectionCommits=native.commits;
+    const OwnedPidl sectionFocused(ILClone(native.focused.get()));
+    for(int group : {0,0,1,1,2,0,1,0,2,1}) {
+        PressGroupHeader(state,group);
+        Check(state.selectedFlags==sectionSelection && state.selected==12 && state.anchor==12 &&
+            native.commits==sectionCommits && native.selected.size()==2 &&
+            ILIsEqual(native.focused.get(),sectionFocused.get()),
+            "section toggle changed GPU/native selection, caret or range anchor");
+        Check(CaptureNativeSelection(state,true) && state.selectedFlags==sectionSelection,
+            "native selection echo lost items in a collapsed section");
+    }
+    state.selectedFlags.assign(state.total,1);
+    Check(SyncNativeSelection(state) && state.pendingNativeSelection,
+        "section toggle pending-selection setup");
+    const auto pendingSelection=state.pendingNativeSelection;
+    PressGroupHeader(state,2);
+    Check(state.pendingNativeSelection==pendingSelection,
+        "section toggle canceled pending native selection");
+    WaitForPreparedSelection(state);
+    Check(native.selected.size()==size_t(state.total) && state.selected==12 && state.anchor==12 &&
+        std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==state.total,
+        "pending native selection lost collapsed items");
+    // Leave the middle section collapsed, as in the navigation checks below.
+    for(int group=0;group<3;++group) {
+        auto& section=state.sections[group];
+        section.collapsed=group==1; section.fraction=group==1 ? 0.f : 1.f;
+        section.started={};
+    }
+    state.groupAnimating=false; LayoutGroupSections(state);
+    std::cout << "PASS: section toggles preserve GPU/native selection, caret and anchor through collapse, rapid reversal and native echoes\n";
     Select(state,12); SelectWithModifiers(state,10,false,true);
     NavigateKeyboardSelection(state,VK_UP,false,false); expectSingle(3);
     state.sections[0].collapsed=true; state.sections[0].fraction=0; LayoutGroupSections(state);
