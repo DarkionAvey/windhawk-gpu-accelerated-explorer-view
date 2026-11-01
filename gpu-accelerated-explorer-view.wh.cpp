@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.325
+// @version         0.9.326
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -488,6 +488,7 @@ constexpr int kHeader96 = 38;
 // One transition duration for keyboard selection, vertical/horizontal scroll
 // easing, and transient feedback. All animations share the DWM-paced frames.
 constexpr ULONGLONG kUiTransitionDurationMs = 180;
+constexpr UINT kPresentationBuffers = 2; // Flip-sequential buffers retain older frames.
 // Independent hover animation duration (milliseconds). Change this constant
 // and recompile to experiment without altering selection/scroll animations.
 constexpr ULONGLONG kHoverAnimationDurationMs = 80;
@@ -3089,6 +3090,13 @@ struct ViewState {
     double clipboardIconElapsedMs = 0.; // One clock/size sample per paint; identities stagger individual icons.
     bool clipboardIconsVisible = false;
     D2D1_RECT_F clipboardIconViewport{}; // Logical content clip; excludes offscreen animation work.
+    // Wiggle-only frames redraw just these backbuffer pixels: every rotation
+    // and shadow of each wiggling icon, recorded by the paint that drew it.
+    // Flip buffers keep older frames, so both must hold the static scene.
+    std::vector<RECT> clipboardDamage;
+    bool clipboardDamageValid = true;
+    bool clipboardWiggleOnly = false; // Set by the lane: nothing else changed.
+    unsigned clipboardStaticBuffers = 0;
     bool clipboardListenerInstalled = false;
     // Stock views own the selection while the overlay is not in Details mode.
     // Import their PIDL-backed selection once when Details resumes; if names
@@ -4237,13 +4245,14 @@ bool LayoutAnimationActive(const ViewState& state, bool includeDirectInput = fal
             state.columnDragArmed || state.dragDivider >= 0 || state.shellDragRunning || state.mousePressActive));
 }
 
-bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, bool includeForeground = true) {
+bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, bool includeForeground = true,
+                         bool includeClipboard = true) {
     return LayoutAnimationActive(state) || state.zebraExtentAnimating || state.selectionFadeActive ||
         (state.columnPresentationPending && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.itemOpacityAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
-        (state.clipboardIconsVisible && !state.clipboardPaths.empty() && state.visible &&
+        (includeClipboard && state.clipboardIconsVisible && !state.clipboardPaths.empty() && state.visible &&
             state.inScope && state.detailsViewActive && PresentationVisible(state) && !PresentationMinimized(state)) ||
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
@@ -14453,6 +14462,7 @@ void DropTarget(ViewState& state) {
     state.presentedSwapChain.Reset();
     state.presentPending = false;
     state.rejectedPresentQpc = {};
+    state.clipboardStaticBuffers = 0; state.clipboardDamage.clear();
     state.graphicsReady = false;
     state.composition.Reset();
     state.compositionSurfacePoolUsed=false;
@@ -14481,7 +14491,7 @@ HRESULT CreatePresentationBuffers(ViewState& state,UINT width,UINT height) {
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width=width; desc.Height=height; desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count=1; desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount=2; desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.BufferCount=kPresentationBuffers; desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     desc.Scaling=DXGI_SCALING_STRETCH; desc.AlphaMode=DXGI_ALPHA_MODE_PREMULTIPLIED;
     desc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     ComPtr<IDXGISwapChain1> next;
@@ -14503,6 +14513,7 @@ HRESULT CreatePresentationBuffers(ViewState& state,UINT width,UINT height) {
     if(state.frameLatencyWaitable) CloseHandle(state.frameLatencyWaitable);
     state.frameLatencyWaitable=ready;
     state.presentPending=false; state.rejectedPresentQpc={};
+    state.clipboardStaticBuffers=0; // New buffers hold no scene yet.
     return S_OK;
 }
 
@@ -15438,15 +15449,19 @@ void ReceiveIcons(ViewState& state, bool requestMore) {
 
 // One draw path for both per-item icons and the shared Shell folder icon.
 // Bitmap creation remains lazy and is only attempted once per D2D target.
+// Keep small icons legible without swinging large thumbnails by the same
+// angle (roughly 8 to 1.2 degrees). Also bounds each icon's damaged pixels.
+float ClipboardIconWiggleAmplitude(float size96) {
+    return std::clamp(192.f / std::max(1.f, size96), 1.2f, 8.f);
+}
 float ClipboardIconWiggleAngle(float size96, double elapsedMs, size_t seed = 0) {
-    // Two existing UI intervals per cycle. Keep small icons legible without
-    // swinging large thumbnails by the same angle (roughly 8 to 1.2 degrees).
+    // Two existing UI intervals per cycle.
     constexpr double periodMs = 2. * kUiTransitionDurationMs;
     // Identity supplies a stable pseudorandom 0..120 ms start delay. Preserve
     // that phase through reordering, scrolling and icon resolution changes.
     const double delayMs = static_cast<double>(seed % 121);
     if (elapsedMs <= delayMs) return 0.f;
-    const float amplitude = std::clamp(192.f / std::max(1.f, size96), 1.2f, 8.f);
+    const float amplitude = ClipboardIconWiggleAmplitude(size96);
     return amplitude * static_cast<float>(sin(fmod(elapsedMs-delayMs,periodMs) *
         (6.283185307179586 / periodMs)));
 }
@@ -15463,7 +15478,7 @@ D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
 }
 
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
-                    float opacity = 1.f, float angle = 0.f) {
+                    float opacity = 1.f, float angle = 0.f, D2D1_RECT_F* drawn = nullptr) {
     if(!VisibleOpacity(opacity)) return true;
     if (!icon.bitmap) return false;
     if (state.iconDemandStartedAt && (!state.iconFirstDrawLogged ||
@@ -15489,6 +15504,7 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     const float iconX = state.rtlLayout ? state.paintWidth - x - width : x;
     const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(iconX,y,iconX+width,y+height));
     if(rect.right<=rect.left || rect.bottom<=rect.top) return true;
+    if (drawn) *drawn = rect;
     D2D1_MATRIX_3X2_F previous{};
     if (angle != 0.f) {
         state.target->GetTransform(&previous);
@@ -15543,6 +15559,30 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     return true;
 }
 
+// Every backbuffer pixel this icon can cover at any wiggle angle, including the
+// thumbnail shadow. Unknown transforms make the whole paint ineligible.
+void RecordClipboardDamage(ViewState& state, const D2D1_RECT_F& icon) {
+    D2D1_MATRIX_3X2_F m{}; state.target->GetTransform(&m);
+    float dpiX=96.f,dpiY=96.f; state.target->GetDpi(&dpiX,&dpiY);
+    if (fabsf(m._12)>.00001f || fabsf(m._21)>.00001f || !state.backbuffer) {
+        state.clipboardDamageValid=false; return;
+    }
+    const float scale = std::max(96,state.textFormatDpi)/96.f;
+    const float shadow = 3.f*scale, drop = 2.f*scale, aa = 1.f;
+    const float radians = ClipboardIconWiggleAmplitude(state.clipboardIconSize96)*3.14159265f/180.f;
+    const float c = cosf(radians), s = sinf(radians);
+    const float hw = (icon.right-icon.left)*.5f+shadow, hh = (icon.bottom-icon.top)*.5f+shadow+drop;
+    const float cx = (icon.left+icon.right)*.5f, cy = (icon.top+icon.bottom)*.5f+drop*.5f;
+    const float rx = hw*c+hh*s+aa, ry = hh*c+hw*s+aa;
+    const float sx=m._11*dpiX/96.f, sy=m._22*dpiY/96.f, tx=m._31*dpiX/96.f, ty=m._32*dpiY/96.f;
+    const float l=std::min((cx-rx)*sx,(cx+rx)*sx)+tx, r=std::max((cx-rx)*sx,(cx+rx)*sx)+tx;
+    const float t=std::min((cy-ry)*sy,(cy+ry)*sy)+ty, b=std::max((cy-ry)*sy,(cy+ry)*sy)+ty;
+    const auto size = state.backbuffer->GetPixelSize();
+    RECT damage{static_cast<LONG>(std::max(0.f,floorf(l))),static_cast<LONG>(std::max(0.f,floorf(t))),
+        static_cast<LONG>(std::min(float(size.width),ceilf(r))),static_cast<LONG>(std::min(float(size.height),ceilf(b)))};
+    if (damage.right>damage.left && damage.bottom>damage.top) state.clipboardDamage.push_back(damage);
+}
+
 void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
                     float opacity = 1.f) {
     if(!VisibleOpacity(opacity)) return;
@@ -15550,7 +15590,9 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     const float angle = pending ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
         state.clipboardIconElapsedMs,SelectionPathHash(e.path)) : 0.f;
     const auto draw = [&](IconRecord& icon, bool association) {
-        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle);
+        D2D1_RECT_F drawn{};
+        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr);
+        if (ready && pending && drawn.right>drawn.left && drawn.bottom>drawn.top) RecordClipboardDamage(state,drawn);
         if (ready) icon.painted=state.graphicsPaintSerial;
         if (state.uiTraceDrawItem)
             PipelineEvent(*state.background,{.operation=L"ui.icon.draw[opacity,requested,pixels,fallback]",
@@ -17651,10 +17693,27 @@ void Paint(ViewState& state) {
     // The presentation lane coalesces input while DXGI owns the previous
     // frame. Probe before uploading, rasterizing text or drawing large tiles.
     // DComp planes and their ready-frame handoff do not use that DXGI slot.
+    bool iconsUploaded = false;
     if (state.presentationOnly) {
         if (!compositionFrame.active && !state.modeRootAttached && !PresentationFrameReady(state)) return;
-        UploadVisibleIcons(state);
+        iconsUploaded = UploadVisibleIcons(state);
     }
+    // A Copy/Cut wiggle frame with an otherwise unchanged scene reruns this
+    // ordinary renderer under one aligned clip around the previous paint's
+    // icon damage, and presents only that rect. Pixels inside it match a
+    // full paint; pixels outside are the same static scene in every buffer.
+    std::vector<RECT> clipboardDamage;
+    clipboardDamage.swap(state.clipboardDamage);
+    const bool clipboardDamageValid = std::exchange(state.clipboardDamageValid, true);
+    RECT clipboardBounds{};
+    for (const auto& damage : clipboardDamage) {
+        if (IsRectEmpty(&clipboardBounds)) clipboardBounds = damage;
+        else UnionRect(&clipboardBounds, &clipboardBounds, &damage);
+    }
+    const bool clipboardPartial = state.clipboardWiggleOnly && !iconsUploaded && !compositionFrame.active &&
+        !state.modeRootAttached && clipboardDamageValid && !IsRectEmpty(&clipboardBounds) &&
+        state.clipboardStaticBuffers >= kPresentationBuffers && state.presentedSwapChain == state.swapChain;
+    if (compositionFrame.active) state.clipboardStaticBuffers = 0;
     ++state.graphicsPaintSerial;
     state.presentationContentAccepted=false;
     if (state.itemOpacityToken != state.token) ResetItemContentOpacity(state);
@@ -17724,6 +17783,10 @@ void Paint(ViewState& state) {
     state.target->BeginDraw();
     state.target->SetTransform(D2D1::Matrix3x2F::Identity());
     ConfigureTextTarget(state,state.target.Get());
+    // Outermost clip: Clear and every later pass stay inside the damage.
+    if (clipboardPartial)
+        state.target->PushAxisAlignedClip(D2D1::RectF(float(clipboardBounds.left),float(clipboardBounds.top),
+            float(clipboardBounds.right),float(clipboardBounds.bottom)),D2D1_ANTIALIAS_MODE_ALIASED);
     if (compositionFrame.active && !compositionFrame.Rows()) {
         for (auto* plane : {&state.modeComposition.names,&state.modeComposition.metadata,&state.modeComposition.groups,&state.modeComposition.chrome}) {
             if (!plane->bitmap) continue;
@@ -18428,6 +18491,7 @@ void Paint(ViewState& state) {
     // names-only preview and native-themed background are sufficient during
     // the short asynchronous enumeration window.
     frameStage.Next(FrameStage::Flush);
+    if (clipboardPartial) state.target->PopAxisAlignedClip();
     HRESULT hr = state.target->EndDraw();
     if(compositionFrame.Rows()) {
         const HRESULT itemHr=state.modeComposition.itemTarget->EndDraw();
@@ -18477,6 +18541,10 @@ void Paint(ViewState& state) {
                     compositionFrame.Rows() ? L"rows" : state.modeComposition.widths ? L"fit" : L"mode");
                 state.modeComposition.published=true;
             }
+        } else if (clipboardPartial) {
+            // The dirty rect is exactly the clipped region that was redrawn.
+            DXGI_PRESENT_PARAMETERS parameters{1,&clipboardBounds,nullptr,nullptr};
+            present=state.swapChain->Present1(0,DXGI_PRESENT_DO_NOT_WAIT,&parameters);
         } else {
             present=state.swapChain->Present(0,DXGI_PRESENT_DO_NOT_WAIT);
             if(SUCCEEDED(present) && state.presentedSwapChain!=state.swapChain) {
@@ -18495,6 +18563,18 @@ void Paint(ViewState& state) {
         state.presentPending = present == DXGI_ERROR_WAS_STILL_DRAWING;
         if (state.presentPending) QueryPerformanceCounter(&state.rejectedPresentQpc);
         else state.rejectedPresentQpc = {};
+        // Count buffers holding this static scene outside the icon damage. A
+        // partial frame keeps the count only while its icons stayed inside.
+        const bool damageContained = std::all_of(state.clipboardDamage.begin(),state.clipboardDamage.end(),
+            [&](const RECT& damage) {
+                RECT inside{}; return IntersectRect(&inside,&damage,&clipboardBounds) && EqualRect(&inside,&damage);
+            });
+        if (compositionFrame.active || state.presentPending || FAILED(present) ||
+            (clipboardPartial && (!damageContained || !state.clipboardDamageValid)))
+            state.clipboardStaticBuffers = 0;
+        else if (!clipboardPartial)
+            state.clipboardStaticBuffers = state.clipboardWiggleOnly && !iconsUploaded ?
+                std::min(kPresentationBuffers, state.clipboardStaticBuffers + 1) : 1;
         if (state.uiTracePaint)
             PipelineEvent(*state.background,{.operation=L"ui.submit[scene,accepted,header,rootAttached]",
                 .a=static_cast<unsigned>(present),.b=state.token,
@@ -25886,16 +25966,21 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         }
         if(!state.presentationActive) {PulsePresentation(lane,false); continue;}
         BeginFrameProfile(state);
+        // Sampled before advancing: an animation finishing on this frame
+        // still needs one full paint of its settled scene.
+        const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
+        state.clipboardWiggleOnly=!model && !validated && !foregroundChanged && !handoff && state.graphicsReady &&
+            state.clipboardIconsVisible && !NeedsAnimationPaint(state,true,true,false);
         AdvanceAnimationFrame(state,false);
         const auto previousPaint=state.graphicsPaintSerial;
         const auto previousForeground=state.swipeCompositionSerial;
-        const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
         const bool repaint=model || !state.graphicsReady || NeedsAnimationPaint(state,true,false) || handoff;
         if(repaint) Paint(state);
         else if(!RenderSwipeFeedback(state) && state.d3d) {
             const HRESULT device=state.d3d->GetDeviceRemovedReason();
             if(FAILED(device)) {state.graphicsFailure=device; state.graphicsFailureStage=6; DropTarget(state);}
         }
+        state.clipboardWiggleOnly=false; // Other paths (standby, resume) always paint fully.
         EndFrameProfile(state);
         TrimPresentationImages(state);
         if(repaint && state.target) {ScheduleVisibleIconUploads(state);}

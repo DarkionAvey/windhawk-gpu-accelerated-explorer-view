@@ -305,6 +305,72 @@ static void TestIconUploadBatches() {
         "full Paint failed to sample Copy motion or retain the animation");
     Check(ItemContentOpacity(state,state.entries[0])==1 && !state.itemOpacityAnimating,
         "full Paint dimmed copied content");
+    {
+        // Wiggle-only frames rerun Paint under the previous paint's recorded
+        // icon damage. Every angle must stay inside it; outside, older pixels
+        // survive (including Clear); inside, the static scene is unchanged.
+        const auto size=state.backbuffer->GetPixelSize();
+        ComPtr<ID2D1Bitmap1> frame;
+        auto readable=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+        Check(SUCCEEDED(state.target->CreateBitmap(size,nullptr,0,&readable,&frame)),"wiggle damage readback");
+        const auto read=[&] {
+            Check(SUCCEEDED(frame->CopyFromBitmap(nullptr,state.backbuffer.Get(),nullptr)),"wiggle damage copy");
+            D2D1_MAPPED_RECT mapped{}; Check(SUCCEEDED(frame->Map(D2D1_MAP_OPTIONS_READ,&mapped)),"wiggle damage map");
+            std::vector<UINT32> pixels(size_t(size.width)*size.height);
+            for(UINT y=0;y<size.height;++y) memcpy(pixels.data()+size_t(y)*size.width,mapped.bits+y*mapped.pitch,size.width*4);
+            frame->Unmap(); return pixels;
+        };
+        const auto paintAt=[&](double ms) {
+            LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+            state.clipboardIconsStartedQpc.QuadPart=now.QuadPart-static_cast<LONGLONG>(state.qpcFrequency*ms/1000.);
+            paintClipboard();
+        };
+        const auto inside=[&](const std::vector<RECT>& rects,UINT x,UINT y) {
+            const POINT point{LONG(x),LONG(y)};
+            return std::any_of(rects.begin(),rects.end(),[&](const RECT& r) {return PtInRect(&r,point)!=FALSE;});
+        };
+        paintAt(0.); const auto neutral=read(); const auto damage=state.clipboardDamage;
+        Check(!damage.empty() && state.clipboardDamageValid,"Copy paint recorded no icon damage");
+        const double period=2.*kUiTransitionDurationMs;
+        bool moved=false;
+        for(int phase=0;phase<24;++phase) {
+            paintAt(itemDelay+period*phase/24.); const auto angled=read();
+            for(UINT y=0;y<size.height;++y) for(UINT x=0;x<size.width;++x) {
+                const size_t at=size_t(y)*size.width+x;
+                if(angled[at]==neutral[at]) continue;
+                moved=true;
+                Check(inside(damage,x,y),"wiggling icon pixels escaped the recorded damage");
+            }
+        }
+        Check(moved,"wiggle damage test sampled no motion");
+        paintAt(itemDelay+period*.25); const auto settled=read(); const auto recorded=state.clipboardDamage;
+        RECT bounds{};
+        for(const auto& r:recorded) { if(IsRectEmpty(&bounds)) bounds=r; else UnionRect(&bounds,&bounds,&r); }
+        constexpr UINT32 marker=0xFFFF00FFu;
+        state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(1.f,0.f,1.f,1.f));
+        Check(SUCCEEDED(state.target->EndDraw()),"wiggle damage marker");
+        auto swap=std::move(state.swapChain); auto shown=std::move(state.presentedSwapChain);
+        state.clipboardWiggleOnly=true; state.clipboardStaticBuffers=kPresentationBuffers;
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        state.clipboardIconsStartedQpc.QuadPart=now.QuadPart-static_cast<LONGLONG>(state.qpcFrequency*(itemDelay+period*.75)/1000.);
+        Paint(state);
+        state.clipboardWiggleOnly=false; state.swapChain=std::move(swap); state.presentedSwapChain=std::move(shown);
+        const auto partial=read();
+        const std::vector<RECT> region{bounds};
+        bool touchedOutside=false,sceneChanged=false;
+        for(UINT y=0;y<size.height;++y) for(UINT x=0;x<size.width;++x) {
+            const size_t at=size_t(y)*size.width+x;
+            if(!inside(region,x,y)) touchedOutside|=partial[at]!=marker;
+            else if(!inside(recorded,x,y)) sceneChanged|=partial[at]!=settled[at];
+        }
+        Check(!touchedOutside,"wiggle-only paint drew outside its damage");
+        Check(!sceneChanged,"wiggle-only paint changed static pixels inside its damage");
+        Check(std::equal(state.clipboardDamage.begin(),state.clipboardDamage.end(),
+            recorded.begin(),recorded.end(),[](const RECT& a,const RECT& b) {return EqualRect(&a,&b)!=FALSE;}),
+            "wiggle-only paint recorded different icon damage");
+        paintClipboard(); // Restore a complete frame for the following checks.
+    }
     AcquireSRWLockShared(&g_frameLock);
     const bool clipboardRegistered=std::any_of(g_activeFrames.begin(),g_activeFrames.end(),
         [&](const auto& f) { return f.hwnd==state.hwnd; });

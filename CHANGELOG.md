@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.326
+
+- While copied or cut items wiggle in an otherwise still view, redraw and
+  present only the area around those icons instead of the whole list,
+  reducing GPU and desktop composition work.
+
 ## 0.9.325
 
 - Reduce Explorer UI-thread work during scrolling and animations: each frame
