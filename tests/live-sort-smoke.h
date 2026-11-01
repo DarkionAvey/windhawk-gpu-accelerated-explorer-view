@@ -31,6 +31,38 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     Check(SetWindowSubclass(state.hwnd,LiveSortNotifications,1,0),"live Shell notification receiver");
     UpdateRefreshRate(state); UpdateMetrics(state); UpdateColumns(state);
+    // Keep a renderer alive across real directory publications and renames,
+    // as the presentation lane does. Owner-side cache clearing cannot repair
+    // widths retained by this separate state.
+    ViewState rendered;
+    rendered.hwnd=state.hwnd;
+    rendered.frameHwnd=frame;
+    Check(MakeTextFormats(rendered),"filename width format");
+    const auto lane=std::make_shared<PresentationLane>();
+    const auto checkWidths=[&] {
+        // Enumeration omits the immutable render copy when no live presenter
+        // is attached. Supply that copy from the actual private-folder result.
+        state.presentationEntries=std::make_shared<const std::vector<Entry>>(state.entries);
+        state.presentationModelFolder=state.folderPath;
+        state.presentationOrderHash=state.displayedOrderHash;
+        state.presentationModelGrouping=state.displayedGrouping;
+        const auto model=CapturePresentationModel(state);
+        Check(ApplyPresentationModel(rendered,*model,lane),"filename width model publication");
+        Check(rendered.total>0,"filename width directory was empty");
+        for(int i=0;i<rendered.total;++i) {
+            const auto& name=ModelEntry(rendered,i).name;
+            Check(!name.empty() && name==state.entries[i].name,"filename width model lost the published name");
+            for(float available:{420.f,90.f,420.f}) {
+                ComPtr<IDWriteTextLayout> reference;
+                Check(SUCCEEDED(g_writeFactory->CreateTextLayout(name.c_str(),UINT32(name.size()),
+                    rendered.textFormat.Get(),available,roundf(rendered.rowPx),&reference)),"filename width reference");
+                DWRITE_TEXT_METRICS metrics{};
+                Check(SUCCEEDED(reference->GetMetrics(&metrics)),"filename width reference metrics");
+                Check(fabsf(SelectedFilenameWidth(rendered,i,available)-std::min(metrics.width,available))<.1f,
+                    "presentation retained another filename's width after a real sort/rename");
+            }
+        }
+    };
     const auto settle=[&] {
         Check(Eventually([&] { ReceiveDirectoryResults(state); return state.loaded && !state.directoryPending; }),
             "live sort directory publication");
@@ -40,6 +72,7 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
         state.sort.explicitOrder=state.sortInitialized=true;
         state.sort.direction=SORT_DESCENDING; state.sort.placement=FolderPlacement::Mixed;
         QueueDirectoryRefresh(state,true,true); settle(); StopRowTransition(state);
+        checkWidths();
     };
     const auto hint=[&](const std::wstring& path,bool changed) {
         const auto token=state.directoryToken;
@@ -119,6 +152,7 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
             "rename did not use the shared active sort/comparator");
         if(after!=before) Check(state.rowTransitionActive,"rename resort was not animated");
         StopRowTransition(state);
+        checkWidths();
     }
     // A raw Win32 watcher has no item path. The layout worker's previous
     // accepted sort snapshot still finds an offscreen, unselected edit.
@@ -209,6 +243,17 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     shell.path=L"windhawk:pidl:private-fixture"; shell.name=L"second"; shell.sortText=L"Z";
     Check(EntryPrecedes(filesystem,shell,mixed) && !EntryPrecedes(shell,filesystem,mixed),
         "shared comparator changed its key semantics between the two identities");
+    const auto family=ConfiguredFontFamily();
+    for(const auto* requested:{L"Consolas",L"Arial"}) {
+        if(ResolveManualFont(requested).family.empty()) continue;
+        AcquireSRWLockExclusive(&g_fontFamilyLock); g_fontFamily=requested; ReleaseSRWLockExclusive(&g_fontFamilyLock);
+        Check(MakeTextFormats(rendered),"same-size filename font change");
+        checkWidths();
+        state.rtlLayout=true; checkWidths();
+        state.rtlLayout=false; checkWidths();
+    }
+    AcquireSRWLockExclusive(&g_fontFamilyLock); g_fontFamily=family; ReleaseSRWLockExclusive(&g_fontFamilyLock);
+    Stop(rendered.background);
     UnregisterAnimationWindow(state.hwnd); Stop(state.background);
     RemoveWindowSubclass(state.hwnd,LiveSortNotifications,1);
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0); DestroyWindow(state.hwnd);
@@ -246,5 +291,5 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     Check(volumes.rowTransitionActive && volumes.rowTransitionStartedQpc.QuadPart==origin,
         "stable-rank capacity enrichment interrupted the preceding sort animation");
     UnregisterAnimationWindow(volumes.hwnd); Stop(volumes.background); DestroyWindow(volumes.hwnd);
-    std::cout<<"PASS: live date/size/created/accessed/Shell-property edits, explicit and natural-order renames, real Shell notifications, animated ranks/scroll follow, unchanged/overflow observations and preserved selection\n";
+    std::cout<<"PASS: live date/size/created/accessed/Shell-property edits, explicit and natural-order renames, real Shell notifications, animated ranks/scroll follow, unchanged/overflow observations, preserved selection and retained renderer filename widths across sort/rename/font/direction changes\n";
 }

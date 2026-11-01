@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.322
+
+- Fix stale filename-only highlight widths after folder, sort, rename and font
+  changes, keeping selection and hover animation bounds matched to the label.
+
 ## 0.9.321
 
 - Read Size column text through the Shell on the existing background workers,

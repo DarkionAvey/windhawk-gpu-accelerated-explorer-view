@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.321
+// @version         0.9.322
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -3125,7 +3125,12 @@ struct ViewState {
     std::deque<DeferredSelectionKey> deferredSelectionKeys;
     std::vector<std::wstring> nativeSelectionPaths;
     std::wstring nativeFocusedPath;
-    struct WidthEntry {float available=0.f, width=0.f, font=0.f;};
+    struct WidthEntry {
+        float available=0.f, width=0.f, font=0.f;
+        std::wstring name;
+        unsigned long long face=0;
+        bool middleTrim=false;
+    };
     std::unordered_map<int, WidthEntry> widthCache;
     TextLayoutCache textLayouts[4]; // Body, header, sorted header, wrapped icon labels.
     struct {
@@ -9566,7 +9571,10 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
                 // cached width; never create DirectWrite layouts for this diff.
                 const auto width = state.widthCache.find(i);
                 if (width != state.widthCache.end() &&
-                    width->second.font == state.fontPx)
+                    state.textFormat && width->second.font == state.textFormat->GetFontSize() &&
+                    width->second.face == state.textFaceSerial &&
+                    width->second.name == capture.entry.name &&
+                    width->second.middleTrim == ViewOptionEnabled(state,g_middleEllipsis))
                     capture.selectedNameWidth = width->second.width;
             }
             snapshot.oldViewport.push_back(std::move(capture));
@@ -15897,21 +15905,27 @@ void DrawZebraBand(ViewState& state, float top,
 float SelectedFilenameWidth(ViewState& state, int index, float available) {
     if (index < 0 || index >= state.total || available <= 0.f ||
         !state.textFormat || !g_writeFactory) return 0.f;
+    const std::wstring& name = ModelEntry(state,index).name;
+    const float font = state.textFormat->GetFontSize();
+    const float layoutWidth = roundf(available);
+    const bool middleTrim = ViewOptionEnabled(state,g_middleEllipsis);
+    // Renderer row indices survive directory publications and sparse rename
+    // previews. Validate content and font, independently of owner-side clears.
     const auto it = state.widthCache.find(index);
     if (it != state.widthCache.end() &&
-        fabsf(available - it->second.available) < .5f &&
-        it->second.font == state.fontPx) return it->second.width;
-    const std::wstring& name = ModelEntry(state,index).name;
+        layoutWidth == it->second.available && it->second.font == font &&
+        it->second.face == state.textFaceSerial && it->second.name == name &&
+        it->second.middleTrim == middleTrim) return std::min(it->second.width, available);
     float width = 0.f;
-    if (auto layout = ResolveTextLayout(state, name, available,
+    if (auto layout = ResolveTextLayout(state, name, layoutWidth,
             std::max(1.f, state.rowPx),false,false,nullptr,false,true)) {
         DWRITE_TEXT_METRICS metrics{};
-        if (SUCCEEDED(layout->GetMetrics(&metrics)))
-            width = std::clamp(metrics.width, 0.f, available);
-    }
+        if (FAILED(layout->GetMetrics(&metrics))) return 0.f;
+        width = std::clamp(metrics.width, 0.f, layoutWidth);
+    } else return 0.f;
     if (state.widthCache.size() >= 256) state.widthCache.clear();
-    state.widthCache[index] = {available, width, state.fontPx};
-    return width;
+    state.widthCache[index] = {layoutWidth, width, font, name, state.textFaceSerial, middleTrim};
+    return std::min(width, available);
 }
 
 float FilenameSelectionPadding(const ViewState& state) {
