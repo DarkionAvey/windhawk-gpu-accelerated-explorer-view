@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+& (Join-Path $PSScriptRoot 'parallel-runner-regression.ps1')
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
 function Assert([bool]$Condition, [string]$Message) {
     if (!$Condition) { throw "Repository regression: $Message" }

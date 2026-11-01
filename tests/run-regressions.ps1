@@ -2,10 +2,14 @@ param(
     [string]$WindhawkDirectory,
     [string]$SourceFile = 'latest.cpp',
     [string[]]$TestArguments = @(),
-    [string]$MinifiedSourceFile
+    [string]$MinifiedSourceFile,
+    [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
+    [switch]$KeepArtifacts
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
+. (Join-Path $PSScriptRoot 'parallel-runner.ps1')
+$totalClock = [Diagnostics.Stopwatch]::StartNew()
 $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
 $compilerDirectory = Join-Path $WindhawkDirectory 'Compiler'
 $compiler = Join-Path $compilerDirectory 'bin\clang++.exe'
@@ -50,9 +54,8 @@ if (-not $hostLibrary) { throw 'Installed Windhawk x64 host import library not f
 Write-Output "Windhawk host library: $hostLibrary"
 $modFlags = $flags | Where-Object { $_ -notin @('-DWH_EDITING', '-static', '-municode') }
 $modFlags += '-fstack-usage'
-& $compiler @modFlags '-shared' (Join-Path $testDirectory 'mod-build.cpp') '-o' $modDll $hostLibrary @libraries
-if ($LASTEXITCODE -ne 0) { throw "Windhawk host DLL build failed: $LASTEXITCODE" }
-Write-Output "PASS: linked $SourceFile against installed Windhawk host API"
+$compileTasks = @([pscustomobject]@{Name='compile-mod'; FilePath=$compiler; Exclusive=$false
+    Arguments=@($modFlags)+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$modDll,$hostLibrary)+$libraries})
 if ($MinifiedSourceFile) {
     if (![IO.Path]::IsPathRooted($MinifiedSourceFile)) {
         $MinifiedSourceFile = Join-Path (Split-Path -Parent $testDirectory) $MinifiedSourceFile
@@ -65,10 +68,32 @@ if ($MinifiedSourceFile) {
         [Text.UTF8Encoding]::new($false))
     $minifiedFlags = @($modFlags | ForEach-Object { if ($_ -eq $configuration) { $minifiedConfiguration } else { $_ } })
     $minifiedDll = Join-Path $outputDirectory 'minified-mod-build.dll'
-    & $compiler @minifiedFlags '-shared' (Join-Path $testDirectory 'mod-build.cpp') '-o' $minifiedDll $hostLibrary @libraries
-    if ($LASTEXITCODE -ne 0) { throw "Minified Windhawk host DLL build failed: $LASTEXITCODE" }
+    $compileTasks += [pscustomobject]@{Name='compile-minified'; FilePath=$compiler; Exclusive=$false
+        Arguments=@($minifiedFlags)+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$minifiedDll,$hostLibrary)+$libraries}
+}
+if ($TestArguments -contains '--unload' -or !$TestArguments.Count) {
+    $unloadDll = Join-Path $outputDirectory 'unload-mod.dll'
+    $unloadExe = Join-Path $outputDirectory 'unload-regression.exe'
+    $unloadFlags = $flags | Where-Object { $_ -notin @('-static', '-municode') }
+    $compileTasks += [pscustomobject]@{Name='compile-unload-mod'; FilePath=$compiler; Exclusive=$false
+        Arguments=@($unloadFlags)+@('-shared',(Join-Path $testDirectory 'unload-mod.cpp'),'-o',$unloadDll)+$libraries}
+    $compileTasks += [pscustomobject]@{Name='compile-unload-host'; FilePath=$compiler; Exclusive=$false
+        Arguments=@('-std=c++23','-target','x86_64-w64-mingw32','-O2','-municode',
+            (Join-Path $testDirectory 'unload-regression.cpp'),'-o',$unloadExe,'-lole32')}
+    # Windhawk's import libraries name the private runtimes .whl. The isolated
+    # Windows loader needs matching files, without injecting Windhawk's loader.
+    Copy-Item -LiteralPath (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin\libc++.dll') -Destination (Join-Path $outputDirectory 'libc++.whl')
+    Copy-Item -LiteralPath (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin\libunwind.dll') -Destination (Join-Path $outputDirectory 'libunwind.whl')
+}
+if ($TestArguments -notcontains '--unload') {
+    $compileTasks += [pscustomobject]@{Name='compile-pipeline'; FilePath=$compiler; Exclusive=$false
+        Arguments=@($flags)+@((Join-Path $testDirectory 'background-regression.cpp'),'-o',$executable)+$libraries}
+}
+# The large translation units are memory intensive; cap concurrent compilers
+# at two while allowing the separately isolated test suites to use -Jobs.
+Invoke-RegressionTasks -Tasks $compileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile
+if ($MinifiedSourceFile) {
     & (Join-Path $testDirectory 'minification-regression.ps1') -Compiler $compiler -OutputDirectory $outputDirectory
-    Write-Output 'PASS: linked minified source against installed Windhawk host API'
 }
 $stackReports = @(Get-ChildItem -LiteralPath $outputDirectory -Filter '*.su' -File)
 if (!$stackReports.Count) { throw 'Mod compiler did not produce stack-usage diagnostics' }
@@ -85,40 +110,40 @@ $oversized = @($callbackStacks | Where-Object Bytes -gt 8192)
 if ($oversized.Count) { $oversized | Format-Table -AutoSize; throw 'Message/COM callback exceeds the 8 KiB stack budget' }
 Write-Output ('PASS: compiled message/COM callback stack frames stay within 8 KiB (maximum ' +
     ($callbackStacks | Measure-Object Bytes -Maximum).Maximum + ' bytes)')
-if ($TestArguments -contains '--unload' -or !$TestArguments.Count) {
-    $unloadDll = Join-Path $outputDirectory 'unload-mod.dll'
-    $unloadExe = Join-Path $outputDirectory 'unload-regression.exe'
-    $unloadFlags = $flags | Where-Object { $_ -notin @('-static', '-municode') }
-    & $compiler @unloadFlags '-shared' (Join-Path $testDirectory 'unload-mod.cpp') '-o' $unloadDll @libraries
-    if ($LASTEXITCODE -ne 0) { throw "Unload fixture DLL build failed: $LASTEXITCODE" }
-    & $compiler '-std=c++23' '-target' 'x86_64-w64-mingw32' '-O2' '-municode' (Join-Path $testDirectory 'unload-regression.cpp') '-o' $unloadExe '-lole32'
-    if ($LASTEXITCODE -ne 0) { throw "Unload fixture host build failed: $LASTEXITCODE" }
-    # Windhawk's import libraries name the private runtimes .whl. The isolated
-    # Windows loader needs matching files, without injecting Windhawk's loader.
-    Copy-Item -LiteralPath (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin\libc++.dll') -Destination (Join-Path $outputDirectory 'libc++.whl')
-    Copy-Item -LiteralPath (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin\libunwind.dll') -Destination (Join-Path $outputDirectory 'libunwind.whl')
-}
-if ($TestArguments -notcontains '--unload') {
-& $compiler @flags (Join-Path $testDirectory 'background-regression.cpp') '-o' $executable @libraries
-if ($LASTEXITCODE -ne 0) { throw "Regression build failed: $LASTEXITCODE" }
-}
 $previousPath = $env:PATH
+$testsPassed = $false
 try {
     $env:PATH = (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin') + ';' +
         (Join-Path $compilerDirectory 'bin') + ';' + $previousPath
-    if ($unloadExe) {
-        & $unloadExe $unloadDll
-        if ($LASTEXITCODE -ne 0) { throw "Unload regressions failed: $LASTEXITCODE (binaries retained at $outputDirectory)" }
-    }
+    $testTasks = @()
+    if ($unloadExe) { $testTasks += [pscustomobject]@{
+        Name='unload'; FilePath=$unloadExe; Arguments=@($unloadDll); Exclusive=$false} }
     if ($TestArguments -notcontains '--unload') {
-        & $executable @TestArguments
-        if ($LASTEXITCODE -ne 0) { throw "Regression tests failed: $LASTEXITCODE (binary retained at $executable)" }
+        if ($TestArguments.Count -or $Jobs -eq 1) {
+            $testTasks += [pscustomobject]@{Name='pipeline'; FilePath=$executable
+                Arguments=$TestArguments; Exclusive=$false}
+        } else {
+            $manifest = @(& $executable --list-suites)
+            if ($LASTEXITCODE -ne 0 -or !$manifest.Count) { throw 'Cannot read full-suite manifest' }
+            foreach ($line in $manifest) {
+                if ($line -notmatch '^([a-z0-9-]+)\t(shared|exclusive)$') { throw "Invalid suite manifest: $line" }
+                $testTasks += [pscustomobject]@{Name=$Matches[1]; FilePath=$executable
+                    Arguments=@('--suite',$Matches[1]); Exclusive=($Matches[2] -eq 'exclusive')}
+            }
+            # Run shared suites first so an exclusive measurement does not
+            # leave other slots idle while earlier children finish.
+            $testTasks = @($testTasks | Where-Object { !$_.Exclusive }) +
+                @($testTasks | Where-Object Exclusive)
+        }
     }
+    Invoke-RegressionTasks -Tasks $testTasks -OutputDirectory $outputDirectory -Jobs $Jobs -Phase regression
     $testsPassed = $true
+    Write-Output ('PASS: complete regression gate in {0:N2}s (compile and execution)' -f $totalClock.Elapsed.TotalSeconds)
+    if ($KeepArtifacts) { Write-Output "Artifacts retained at $outputDirectory" }
 } finally {
     $env:PATH = $previousPath
     # Delete only this script's known generated binary; no recursive deletion.
-    if ($testsPassed) {
+    if ($testsPassed -and !$KeepArtifacts) {
         if (Test-Path -LiteralPath $executable) { Remove-Item -LiteralPath $executable -Force }
         if (Test-Path -LiteralPath $modDll) { Remove-Item -LiteralPath $modDll -Force }
         if ($minifiedDll) { Remove-Item -LiteralPath $minifiedDll, $minifiedConfiguration -Force }
@@ -129,6 +154,12 @@ try {
         if ($unloadExe) {
             Remove-Item -LiteralPath (Join-Path $outputDirectory 'libc++.whl'),(Join-Path $outputDirectory 'libunwind.whl') -Force
         }
+        foreach ($task in @($compileTasks)+@($testTasks)) {
+            Remove-Item -LiteralPath (Join-Path $outputDirectory ($task.Name+'.stdout.log')),
+                (Join-Path $outputDirectory ($task.Name+'.stderr.log')) -Force
+        }
+        Remove-Item -LiteralPath (Join-Path $outputDirectory 'compile-results.csv'),
+            (Join-Path $outputDirectory 'regression-results.csv') -Force
         Remove-Item -LiteralPath $outputDirectory
     }
 }

@@ -242,6 +242,13 @@ void Palette(ViewState& state) {
     Check(SetWindowSubclass(state.frameHwnd,ObserveColors,1,reinterpret_cast<DWORD_PTR>(&colors)),"rename paint observer");
     RedrawWindow(colors.editor,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_FRAME);
     RemoveWindowSubclass(state.frameHwnd,ObserveColors,1);
+    if(!colors.calls || colors.text!=state.nativeEditForeground || colors.background!=state.nativeEditBackground ||
+        colors.brush!=state.nativeEditBackground)
+        std::cout<<"RENAME PALETTE calls="<<colors.calls<<" text="<<colors.text<<"/"<<state.nativeEditForeground
+            <<" background="<<colors.background<<"/"<<state.nativeEditBackground<<" brush="<<colors.brush
+            <<" editor-visible="<<IsWindowVisible(colors.editor)<<" hidden="<<state.rename.zoomHidden
+            <<" dpi="<<StyleFixture::dpi<<" rtl="<<state.rtlLayout<<" grid="<<state.gridView
+            <<" high-contrast="<<StyleFixture::highContrast<<std::endl;
     Check(colors.calls && colors.text==state.nativeEditForeground &&
         colors.background==state.nativeEditBackground && colors.brush==state.nativeEditBackground,
         "native EDIT paint did not use the cached theme background/text/brush");

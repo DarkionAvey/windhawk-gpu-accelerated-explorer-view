@@ -215,6 +215,17 @@ static void TestGraphicsResourceLifecycle() {
         if(adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&info))) peak=std::max(peak,info.CurrentUsage);
         if(!i) {
             ShowWindow(state->hwnd,SW_HIDE);
+            if(!state->graphicsReleaseQueued) {
+                std::cout<<"GPU HIDE queued="<<state->graphicsReleaseQueued<<" standby="<<state->graphicsStandby
+                    <<" pending="<<state->graphicsStandbyPending<<" presenter="<<bool(state->presenter)
+                    <<" ops="<<state->graphicsOperations<<" initializing="<<state->graphicsInitializing
+                    <<" painting="<<state->textRasterPainting<<" inactive="<<InactiveGraphics(*state)
+                    <<" visible="<<IsWindowVisible(state->hwnd)<<std::endl;
+                for(const auto& event:memoryFixtureEvents) if(event.hwnd==state->hwnd)
+                    std::cout<<"GPU HIDE EVENT message="<<event.message<<" flags="<<event.flags
+                        <<" before="<<event.before<<" after="<<event.after<<" queued="<<event.queued
+                        <<" visible="<<event.visible<<" operations="<<event.operations<<std::endl;
+            }
             Check(state->graphicsReleaseQueued,"hide did not queue graphics retirement");
             ShowWindow(state->hwnd,SW_SHOWNOACTIVATE);
             drain(state->hwnd);

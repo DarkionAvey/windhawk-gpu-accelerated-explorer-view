@@ -47,6 +47,26 @@ run retains the working source and temporary binaries, and leaves latest.cpp
 unchanged, without pruning archives. Update CHANGELOG.md with the results after
 testing.
 
+## Parallel execution
+
+Full runs use up to four test processes by default (bounded by the logical CPU
+count), and up to two concurrent compiler processes. Each suite owns its mod
+globals, COM apartments, workers and PID-specific temporary fixtures. The C++
+suite manifest drives both the parallel gate and the original combined serial
+run, so neither mode drops tests. Preprocessing benchmarks, native/GPU resource
+checks, and the UI/presentation groups with native column/EDIT paint assertions
+run alone, after the parallel groups finish. These native probes can also fail
+intermittently in isolated runs; failures retain diagnostics and still fail the
+release gate. No assertion is relaxed or automatically retried.
+
+Use `build.bat -Jobs 1` or `tests/run-regressions.ps1 -SourceFile <source> -Jobs 1`
+for serial compilation and the combined pipeline suite. `-Jobs N` changes the
+test-process limit; focused `-TestArguments` still run only the requested probe.
+The runner prints phase and task durations and reports all failed groups after
+draining started processes. Failure preserves binaries, per-task stdout/stderr
+logs, and compile/regression timing CSVs in the printed artifact directory.
+`-KeepArtifacts` on either command retains these after success too.
+
 ## Toolchain discovery
 
 Use `-WindhawkDirectory "path\to\Windhawk"` for either script, or set

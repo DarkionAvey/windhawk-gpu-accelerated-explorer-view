@@ -1907,7 +1907,119 @@ static void TestPreviewInput() {
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
 
+// One manifest owns full-suite coverage in both serial and parallel runs.
+// Keep related workflows together; each child gets a private PID fixture and
+// performs the same callback/COM/worker shutdown checks as the serial run.
+struct RegressionSuite {
+    const wchar_t* name;
+    bool exclusive;
+    void (*run)(const std::wstring&);
+};
+static const RegressionSuite kRegressionSuites[] = {
+    {L"foundation", false, [](const std::wstring&) {
+        TestLlmReport(); TestRenderQuality(); TestToggleRepaint();
+        TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
+        TestStatusButtonLayout();
+        TestUserOptions();
+    }},
+    {L"touch", false, [](const std::wstring& fixture) {
+        TestTouchInput(fixture);
+    }},
+    {L"gestures", false, [](const std::wstring& fixture) {
+        TestAdditionalGestures(fixture);
+    }},
+    // Native column/EDIT probes observe USER painting and asynchronous Shell
+    // acknowledgements. Keep them exclusive; assertions still fail normally.
+    {L"ui-input", true, [](const std::wstring& fixture) {
+        TestSelectionCheckboxes(fixture);
+        TestResolvedStyles();
+        TestStyleEvents(fixture);
+        TestPeriodicCapacityRefresh();
+        TestTabResumeRefresh(fixture); TestWindowResumeRefresh(); TestUnchangedRefreshPresentation();
+        TestClippingPreflight();
+        TestResizeAutoRefit();
+        TestColumnMinimumWidths();
+        TestOfficeLockFiltering(fixture);
+        TestNamespaceItemMutations(fixture);
+        TestNativeSuppression();
+        TestExplorerColumnBridge(fixture);
+    }},
+    {L"workers", false, [](const std::wstring& fixture) {
+        TestPublicationAndEpochs();
+        TestWorkerApartment();
+        TestWorkerStartupIsolation();
+        TestThirtyIndependentTabs(fixture);
+        TestColdColumnCatalog(fixture);
+        TestDeferredColumnCapture(fixture);
+        TestSnapshotSelectionRestoration(fixture);
+        ProfileExecutableIcons();
+        TestIconQueueIsolation();
+        TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
+        TestFrameBudgets();
+        TestLargeTileBackpressure(); TestLargeTileSampling();
+        TestDenseGridDrawing();
+        TestIconAlphaQuality(fixture);
+        TestNativeIconSizing(fixture);
+        TestPipelineTrace();
+        TestPropertyPoolIsolation(fixture);
+        TestDriveSpaceRefresh();
+        TestPreviewAndLayout(fixture);
+    }},
+    {L"preprocessing", true, [](const std::wstring& fixture) {
+        TestPreprocessingBenchmarks(fixture);
+    }},
+    {L"shell", false, [](const std::wstring& fixture) {
+        TestLayoutWatchAndCache(fixture);
+        TestFilesystemMutationDelivery(fixture);
+        TestShellProviderContents(fixture);
+        TestProviderSelection(fixture);
+        TestInitialSorting(fixture);
+        TestNativeMenuInteraction();
+        TestSelectionUiWork(fixture);
+        TestProviderNavigation(fixture);
+        TestPasteFocus(fixture);
+        TestBurstRowContinuity(fixture);
+        TestSortDetails(fixture);
+        TestShellSizeDetails(fixture);
+    }},
+    {L"graphics", true, [](const std::wstring& fixture) {
+        TestRealNativeViewport(fixture);
+        TestNativeSuppression();
+        TestNativeUiaBatch();
+        TestRealNativeUiaPressure(fixture);
+        TestGraphicsIsolation(fixture);
+        TestGraphicsResourceLifecycle();
+    }},
+    {L"presentation", true, [](const std::wstring& fixture) {
+        TestPresentationOwners();
+        TestTimingReadiness(fixture);
+        TestMirroredWindowCoordinates(fixture);
+        TestRenameSizing();
+        TestRenameAppearance(fixture);
+        TestRenameHandoff(fixture);
+        TestEditorSelectionOwnership(fixture);
+        TestRenameReorderReadiness(fixture);
+        TestUnexpectedInputs(fixture);
+    }},
+    {L"navigation-selection", false, [](const std::wstring& fixture) {
+        TestEscapeClipboard();
+        TestPreviewInput();
+        TestNativeStartupPipeline(fixture);
+        TestColdAttachWake();
+        TestBackgroundTabStartup(fixture);
+        TestAttachedLifecycle(fixture);
+        TestTypeSearchPrefix();
+        TestUiFeedbackAudit(fixture);
+        TestMarqueeSelection(fixture);
+    }},
+};
+
 int wmain(int argc,wchar_t** argv) {
+    if(argc==2 && wcscmp(argv[1],L"--list-suites")==0) {
+        for (const auto& suite : kRegressionSuites)
+            std::wcout << suite.name << L'\t' << (suite.exclusive ? L"exclusive" : L"shared") << L'\n';
+        return 0;
+    }
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
         return TraceLiveSelection(argc>2 ? std::clamp(_wtoi(argv[2]),1,180) : 90);
     WorkerComApartment mainApartment; // Keep the test process's main STA alive through worker shutdown.
@@ -1937,7 +2049,15 @@ int wmain(int argc,wchar_t** argv) {
             CloseHandle(file);
         }
         const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--shell-size")==0) {
+        if (argc>1 && wcscmp(argv[1],L"--suite")==0) {
+            Check(argc==3,"--suite needs one manifest name");
+            bool found=false;
+            for (const auto& suite : kRegressionSuites) if (!wcscmp(argv[2],suite.name)) {
+                TestNativeSuppression(); // Register the private native-control prerequisites in each child.
+                suite.run(fixture.wstring()); found=true; break;
+            }
+            Check(found,"unknown regression suite");
+        } else if (argc>1 && wcscmp(argv[1],L"--shell-size")==0) {
             TestShellSizeDetails(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--icon-sizing")==0) {
             TestNativeIconSizing(fixture.wstring());
@@ -2103,80 +2223,8 @@ int wmain(int argc,wchar_t** argv) {
             TestAttachedLifecycle(fixture.wstring());
             TestUiFeedbackAudit(fixture.wstring());
         } else {
-        TestLlmReport(); TestRenderQuality(); TestToggleRepaint();
-        TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
-        TestStatusButtonLayout();
-        TestUserOptions();
-        TestTouchInput(fixture.wstring());
-        TestAdditionalGestures(fixture.wstring());
-        TestSelectionCheckboxes(fixture.wstring());
-        TestResolvedStyles();
-        TestStyleEvents(fixture.wstring());
-        TestPeriodicCapacityRefresh();
-        TestTabResumeRefresh(fixture.wstring()); TestWindowResumeRefresh(); TestUnchangedRefreshPresentation();
-        TestClippingPreflight();
-        TestResizeAutoRefit();
-        TestColumnMinimumWidths();
-        TestOfficeLockFiltering(fixture.wstring());
-        TestNamespaceItemMutations(fixture.wstring());
-        TestNativeSuppression();
-        TestExplorerColumnBridge(fixture.wstring());
-        TestPublicationAndEpochs();
-        TestWorkerApartment();
-        TestWorkerStartupIsolation();
-        TestThirtyIndependentTabs(fixture.wstring());
-        TestColdColumnCatalog(fixture.wstring());
-        TestDeferredColumnCapture(fixture.wstring());
-        TestSnapshotSelectionRestoration(fixture.wstring());
-        ProfileExecutableIcons();
-        TestIconQueueIsolation();
-        TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
-        TestFrameBudgets();
-        TestLargeTileBackpressure(); TestLargeTileSampling();
-        TestDenseGridDrawing();
-        TestIconAlphaQuality(fixture.wstring());
-        TestNativeIconSizing(fixture.wstring());
-        TestPipelineTrace();
-        TestPropertyPoolIsolation(fixture.wstring());
-        TestDriveSpaceRefresh();
-        TestPreviewAndLayout(fixture.wstring());
-        TestPreprocessingBenchmarks(fixture.wstring());
-        TestLayoutWatchAndCache(fixture.wstring());
-        TestFilesystemMutationDelivery(fixture.wstring());
-        TestShellProviderContents(fixture.wstring());
-        TestProviderSelection(fixture.wstring());
-        TestInitialSorting(fixture.wstring());
-        TestNativeMenuInteraction();
-        TestSelectionUiWork(fixture.wstring());
-        TestProviderNavigation(fixture.wstring());
-        TestPasteFocus(fixture.wstring());
-        TestBurstRowContinuity(fixture.wstring());
-        TestSortDetails(fixture.wstring());
-        TestShellSizeDetails(fixture.wstring());
-        TestRealNativeViewport(fixture.wstring());
-        TestNativeSuppression();
-        TestNativeUiaBatch();
-        TestRealNativeUiaPressure(fixture.wstring());
-        TestGraphicsIsolation(fixture.wstring());
-        TestGraphicsResourceLifecycle();
-        TestPresentationOwners();
-        TestTimingReadiness(fixture.wstring());
-        TestMirroredWindowCoordinates(fixture.wstring());
-        TestRenameSizing();
-        TestRenameAppearance(fixture.wstring());
-        TestRenameHandoff(fixture.wstring());
-        TestEditorSelectionOwnership(fixture.wstring());
-        TestRenameReorderReadiness(fixture.wstring());
-        TestUnexpectedInputs(fixture.wstring());
-        TestEscapeClipboard();
-        TestPreviewInput();
-        TestNativeStartupPipeline(fixture.wstring());
-        TestColdAttachWake();
-        TestBackgroundTabStartup(fixture.wstring());
-        TestAttachedLifecycle(fixture.wstring());
-        TestTypeSearchPrefix();
-        TestUiFeedbackAudit(fixture.wstring());
-        TestMarqueeSelection(fixture.wstring());
+            Check(argc==1, "unknown test argument");
+            for (const auto& suite : kRegressionSuites) suite.run(fixture.wstring());
         }
         Check(g_windowCallbacks.load() == 0, "window callbacks were not drained");
         Check(g_shellViewHooks.empty(), "frame lifecycle/creation hooks outlived their overlays");

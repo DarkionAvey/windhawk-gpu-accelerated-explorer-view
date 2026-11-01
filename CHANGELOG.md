@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.331
+
+- Speed up build validation by running independent regression groups and compiler
+  jobs in parallel, with separate processes and logs for each group.
+
 ## 0.9.330
 
 - Keep item selections when collapsing or expanding sections, including selected
