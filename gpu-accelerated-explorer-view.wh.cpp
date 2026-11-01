@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.334
+// @version         0.9.335
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1029,7 +1029,9 @@ struct TextLayoutCache {
     struct Layout {
         ComPtr<IDWriteTextLayout> text;
         float width = 0.f, height = 0.f;
-        std::list<std::wstring>::iterator recent;
+        std::list<const std::wstring*>::iterator recent;
+        unsigned long long used = 0;    // Tab-wide recency, comparable across the four caches.
+        unsigned long long painted = 0; // Paint serial that last drew it; 0 for measurement only.
         float naturalWidth = -1.f; // Intrinsic measurement survives viewport geometry changes.
         std::vector<Raster> rasters;
         size_t rasterBytes = 0;
@@ -1041,7 +1043,9 @@ struct TextLayoutCache {
     };
     ComPtr<IDWriteTextFormat> format;
     DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING;
-    std::list<std::wstring> recent;
+    // LRU order refers to the map's own keys (stable node storage); erasing a
+    // layout always unlinks its node first, so no entry outlives its key.
+    std::list<const std::wstring*> recent;
     std::unordered_map<std::wstring, Layout> layouts;
     size_t rasterBytes = 0;
     unsigned long long generation = 0;
@@ -1167,9 +1171,9 @@ struct RowDetailsCache {
     struct Record {
         Entry value;
         size_t bytes = 0;
-        std::list<std::wstring>::iterator recent;
+        std::list<const std::wstring*>::iterator recent;
     };
-    std::list<std::wstring> recent;
+    std::list<const std::wstring*> recent; // The map's own keys; Erase unlinks first.
     std::map<std::wstring, Record, CaseInsensitiveFolderLess> entries;
     size_t usedBytes = 0;
     bool empty() const { return entries.empty(); }
@@ -1295,7 +1299,7 @@ struct IconRecord {
     UINT requestedSize = 32;
     bool sourceLimited = false;
     bool presentationListed=false;
-    std::list<std::wstring>::iterator presentationRecent;
+    std::list<const std::wstring*>::iterator presentationRecent;
     IconRecord() = default;
     IconRecord(const IconRecord&) = delete;
     IconRecord& operator=(const IconRecord&) = delete;
@@ -2729,7 +2733,7 @@ struct ViewState {
     std::unordered_map<int,PresentationRowCache> presentationRows; // Owner capture reuse only.
     std::unordered_map<std::wstring,int> presentationGroups;
     std::vector<int> presentationSectionIndices;
-    std::list<std::wstring> presentationIconRecent;
+    std::list<const std::wstring*> presentationIconRecent; // icons' own keys; every erase unlinks first.
     bool presentationCachePending=false;
     size_t presentationImageWorkingBytes=0;
     std::shared_ptr<const std::vector<Entry>> presentationEntries;
@@ -3655,6 +3659,7 @@ struct ViewState {
     TextAntialiasing textAntialiasing = TextAntialiasing::System;
     D2D1_TEXT_ANTIALIAS_MODE textAntialiasMode = D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
     unsigned long long textRasterTick = 0;
+    unsigned long long textLayoutTick = 0; // Shaped-layout recency across this tab's text caches.
     LONGLONG textRasterBuildTicks = 0;
     bool textRasterPainting = false, textRasterPending = false, textRasterUnavailable = false;
     ComPtr<ID2D1Bitmap1> backbuffer;
@@ -9455,12 +9460,12 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     saved.size = entry.size;
     saved.cells = entry.cells;
     const size_t bytes = sizeof(RowDetailsCache::Record) + 8*sizeof(void*) +
-        2*entry.path.size()*sizeof(wchar_t) + EntryPayloadBytes(saved);
+        entry.path.size()*sizeof(wchar_t) + EntryPayloadBytes(saved);
     const size_t budget = FolderCacheBudget(state.folderCache);
     if (bytes > budget) return;
     if (it == cache.entries.end()) {
-        cache.recent.push_front(entry.path);
         it = cache.entries.try_emplace(entry.path).first;
+        cache.recent.push_front(&it->first);
         it->second.recent = cache.recent.begin();
     } else {
         cache.usedBytes -= it->second.bytes;
@@ -9469,7 +9474,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     it->second.value = std::move(saved);
     it->second.bytes = bytes;
     cache.usedBytes += bytes;
-    while (cache.usedBytes > budget) cache.Erase(cache.recent.back());
+    while (cache.usedBytes > budget) cache.Erase(*cache.recent.back());
 }
 
 size_t EstimateSnapshotBytes(const CachedFolderSnapshot& snapshot) {
@@ -12997,6 +13002,43 @@ constexpr size_t kGlyphCacheBudget = 64*1024*1024; // All four caches plus pendi
 // A8 page edge: 1 MiB per page keeps small folders cheap while a page still
 // holds hundreds of typical cells; the texture limit can only lower it.
 constexpr UINT32 kGlyphAtlasSide = 1024;
+// A shaped IDWriteTextLayout holds about 19-21 KiB of private memory almost
+// independently of length (measured with 4096 layouts of 16-120 characters,
+// Windows 11 26100). Bound the tab's four caches together by that real cost.
+constexpr size_t kShapedLayoutCharge = 20*1024;
+constexpr size_t kShapedLayoutBudget = 32*1024*1024;
+constexpr size_t kShapedLayoutLimit = kShapedLayoutBudget/kShapedLayoutCharge;
+
+// Retire least recently used shaped values across all caches until there is
+// room for one more. Values on the current or last presented frame are never
+// evicted: a screen with more text than the budget exceeds it, never thrashes.
+void TrimShapedLayouts(ViewState& state) {
+    size_t count = 0;
+    for (const auto& cache : state.textLayouts) count += cache.layouts.size();
+    const auto onScreen = [&](const TextLayoutCache::Layout& layout) {
+        return layout.painted && layout.painted >= state.lastAcceptedPaint;
+    };
+    while (count >= kShapedLayoutLimit) {
+        // Each cache's oldest evictable value; presented ones are skipped, so
+        // this walk is bounded by the text on screen.
+        TextLayoutCache* cache = nullptr;
+        std::unordered_map<std::wstring, TextLayoutCache::Layout>::iterator victim;
+        for (auto& candidate : state.textLayouts)
+            for (auto node = candidate.recent.rbegin(); node != candidate.recent.rend(); ++node) {
+                const auto found = candidate.layouts.find(**node);
+                if (onScreen(found->second)) continue;
+                if (!cache || found->second.used < victim->second.used) { cache = &candidate; victim = found; }
+                break;
+            }
+        if (!cache) return;
+        cache->rasterBytes -= victim->second.rasterBytes;
+        cache->recent.erase(victim->second.recent);
+        RetireTextLayout(state, std::move(victim->second));
+        cache->layouts.erase(victim);
+        --count;
+    }
+}
+
 size_t GlyphCacheBytes(const ViewState& state) {
     size_t bytes=state.retiredRasterBytes;
     for (const auto& cache : state.textLayouts) bytes+=cache.rasterBytes;
@@ -13084,16 +13126,11 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
             }
         }
         if (it == cache.layouts.end()) {
-            if (cache.layouts.size() >= 4096) {
-                auto victim=cache.layouts.find(cache.recent.back());
-                cache.rasterBytes -= victim->second.rasterBytes;
-                RetireTextLayout(state,std::move(victim->second));
-                cache.layouts.erase(victim);
-                cache.recent.pop_back();
-            }
-            cache.recent.push_front(text);
+            TrimShapedLayouts(state);
+            cache.recent.push_front(nullptr);
             it = cache.layouts.emplace(text, TextLayoutCache::Layout{
                 std::move(layout), width, height, cache.recent.begin()}).first;
+            cache.recent.front() = &it->first;
         } else {
             auto& old = it->second;
             const bool displayed = old.displayed;
@@ -13112,6 +13149,7 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     }
     cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
     auto& layout = it->second;
+    layout.used = ++state.textLayoutTick;
     // Reuse shaped glyphs and intrinsic measurements for fitting. A repeated
     // measurement doesn't disturb the current drawing bounds.
     if (naturalWidth && layout.naturalWidth >= 0.f) {
@@ -15096,11 +15134,12 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     // Reuse the shaping cache's LRU and accounting. There is no second cache
     // index, worker, cross-tab lock or all-directory sweep on a rendered frame.
     if (GlyphCacheBytes(state) + bytes > budget && cache.layouts.size() > 1) {
-        auto victim = cache.layouts.find(cache.recent.back());
+        auto victim = cache.layouts.find(*cache.recent.back());
         if (victim->second.rasterBytes) {
             cache.rasterBytes -= victim->second.rasterBytes;
+            cache.recent.pop_back();
             RetireTextLayout(state,std::move(victim->second));
-            cache.layouts.erase(victim); cache.recent.pop_back();
+            cache.layouts.erase(victim);
         }
     }
     if (GlyphCacheBytes(state) + bytes > budget) {
@@ -15128,7 +15167,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
             // Every page is full. Retire this cache's least recent masks not
             // drawn in this frame; their cells return after paced cleanup.
             for (auto it = cache.recent.rbegin(); it != cache.recent.rend(); ++it) {
-                const auto victim = cache.layouts.find(*it);
+                const auto victim = cache.layouts.find(**it);
                 if (victim == cache.layouts.end() || &victim->second == &shaped || !victim->second.rasterBytes ||
                     std::any_of(victim->second.rasters.begin(),victim->second.rasters.end(),
                         [&](const auto& old) { return old.painted == state.graphicsPaintSerial; })) continue;
@@ -15249,6 +15288,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         }
     }
     if (auto layout = ResolveTextLayout(state, text, r-l, b-t, header, sortedHeader, nullptr, wrapped,filename)) {
+        cache.layouts.at(text).painted = state.graphicsPaintSerial; // On screen: never trimmed this frame.
         BOOL currentUnderline = FALSE;
         if (SUCCEEDED(layout->GetUnderline(0,&currentUnderline)) && bool(currentUnderline) != underline)
             layout->SetUnderline(underline,{0,static_cast<UINT32>(text.size())});
@@ -15564,6 +15604,9 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
         state.iconCacheBytes -= victim->second.cacheBytes;
         RetireIconPixels(state,victim->second.pixels);
         RetireIconPixels(state,victim->second.bitmapPixels);
+        // The lane's LRU refers to this key; unlink it before the key goes.
+        if (victim->second.presentationListed)
+            state.presentationIconRecent.erase(victim->second.presentationRecent);
         state.icons.erase(victim->first);
         QueryPerformanceCounter(&now);
         if (state.iconCacheBytes + bytes > budget &&
@@ -26289,11 +26332,12 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     }
     state.presentationImageWorkingBytes=0;
     for(const auto& image:model.images) {
-        auto& icon=image.key==kDefaultFolderIconKey ? state.defaultFolderIcon : state.icons[image.key];
+        auto* slot=image.key==kDefaultFolderIconKey ? nullptr : &*state.icons.try_emplace(image.key).first;
+        auto& icon=slot ? slot->second : state.defaultFolderIcon;
         icon.used=++state.iconTick; icon.visibleGeneration=model.sequence;
-        if(image.key!=kDefaultFolderIconKey) {
+        if(slot) {
             if(!icon.presentationListed) {
-                state.presentationIconRecent.push_front(image.key);
+                state.presentationIconRecent.push_front(&slot->first);
                 icon.presentationRecent=state.presentationIconRecent.begin(); icon.presentationListed=true;
             } else state.presentationIconRecent.splice(state.presentationIconRecent.begin(),state.presentationIconRecent,icon.presentationRecent);
         }
@@ -26412,7 +26456,7 @@ void TrimPresentationImages(ViewState& state) {
     const size_t limit=std::min<size_t>(64,state.presentationIconRecent.size());
     while(state.iconCacheBytes>budget && attempts++<limit && !state.presentationIconRecent.empty()) {
         const auto oldest=std::prev(state.presentationIconRecent.end());
-        const auto found=state.icons.find(*oldest);
+        const auto found=state.icons.find(**oldest);
         if(found==state.icons.end()) {state.presentationIconRecent.erase(oldest); continue;}
         if(found->second.visibleGeneration==state.presentationSequence || found->second.painted>=state.lastAcceptedPaint) {
             state.presentationIconRecent.splice(state.presentationIconRecent.begin(),state.presentationIconRecent,oldest); continue;

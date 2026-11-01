@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.335
+
+- Limit memory held by measured text to a per-tab budget instead of thousands
+  of entries per cache, which could reach tens of megabytes in large folders.
+  Text on screen is never discarded to meet the budget.
+- Text, icon and row-detail caches no longer store a second copy of every key.
+
 ## 0.9.334
 
 - Visiting an empty folder no longer discards the cached text layouts of

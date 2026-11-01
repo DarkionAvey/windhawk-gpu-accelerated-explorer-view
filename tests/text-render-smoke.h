@@ -249,6 +249,8 @@ static void TestTextRaster(State& state) {
     };
     Check(retained(firstMask),"raster variant eviction released its GPU mask inside text drawing");
     const auto lruMask=state.textLayouts[0].layouts.at(retiring).rasters.front().Identity();
+    // A newer presented frame no longer shows the value; only then may churn evict it.
+    if constexpr (requires { state.textLayoutTick; }) state.lastAcceptedPaint=++state.graphicsPaintSerial;
     for(int i=0;i<4096;++i)
         ResolveTextLayout(state,L"audit shaped value "+std::to_wstring(i),90,100);
     Check(!state.textLayouts[0].layouts.contains(retiring) && retained(lruMask),
@@ -396,6 +398,39 @@ static void TestTextRaster(State& state) {
         state.entries=std::move(entries); state.total=total; state.selectedFlags=selection;
         state.loaded=loaded; state.namesPreview=preview;
         Paint(state);
+    }
+    if constexpr (requires { state.textLayoutTick; }) {
+        // Shaped layouts share one tab budget by their measured cost. Values on
+        // the presented frame survive churn, recency spans all four caches and
+        // each LRU node refers to its cache's own live key.
+        const auto total=[&] { size_t n=0; for(const auto& c:state.textLayouts) n+=c.layouts.size(); return n; };
+        const auto serial=++state.graphicsPaintSerial; state.lastAcceptedPaint=serial;
+        const std::wstring older=L"Older header value from another cache";
+        ResolveTextLayout(state,older,200.f,28.f,true);
+        std::vector<std::wstring> onScreen;
+        for(int i=0;i<64;++i) {
+            onScreen.push_back(L"Presented value "+std::to_wstring(i));
+            ResolveTextLayout(state,onScreen.back(),200.f,28.f);
+            state.textLayouts[0].layouts.at(onScreen.back()).painted=serial; // As Text() marks drawn values.
+        }
+        for(size_t i=0;i<kShapedLayoutLimit+256;++i)
+            ResolveTextLayout(state,L"Churned measurement "+std::to_wstring(i),200.f,28.f);
+        Check(total()<=kShapedLayoutLimit,"shaped layouts exceeded their tab memory budget");
+        Check(std::all_of(onScreen.begin(),onScreen.end(),[&](const auto& text) {
+            return state.textLayouts[0].layouts.contains(text); }),"layout budget evicted text on the presented frame");
+        Check(!state.textLayouts[1].layouts.contains(older),"layout budget kept an older value from another cache");
+        bool linked=true;
+        for(const auto& cache:state.textLayouts) {
+            size_t nodes=0;
+            for(const auto* key:cache.recent) {
+                ++nodes;
+                const auto found=cache.layouts.find(*key);
+                linked=linked && found!=cache.layouts.end() && &found->first==key;
+            }
+            linked=linked && nodes==cache.layouts.size();
+        }
+        Check(linked,"text LRU lost, duplicated or dangled its map keys");
+        while(!state.retiredTextLayouts.empty()) DrainRetiredGraphics(state);
     }
     std::cout<<"PASS: shared text raster pixels, trimming/wrapping/RTL, opacity, native resized/fresh layout equivalence, geometry variants, intrinsic reuse during auto-fit, metadata continuity across font changes, cold budget and paced glyph retirement\n";
 }
