@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.335
+// @version         0.9.336
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -268,6 +268,7 @@ namespace {
 struct ShellPathStorage { wchar_t value[32768]{}; };
 
 constexpr wchar_t kOverlayClass[] = L"" WH_MOD_ID L"-overlay";
+constexpr wchar_t kItemTipClass[] = L"" WH_MOD_ID L"-itemtip";
 HINSTANCE OverlayModuleInstance() {
     HMODULE module=nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -435,6 +436,8 @@ bool RegisterFrameHookReleaseMessage() {
 constexpr UINT kMsgNativeRenameEditor = WM_APP + 74;
 constexpr UINT kMsgStyleChanged = WM_APP + 75;
 constexpr UINT kMsgTabResumeRefresh = WM_APP + 76;
+// Hovered-item tooltip metadata resolved on the tab's Columns lane.
+constexpr UINT kMsgItemTipReady = WM_APP + 78;
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
@@ -1084,11 +1087,13 @@ struct ShellClickPolicy {
     bool singleClick = false;
     bool underlineHot = false, underlineCold = false;
     bool checkSelect = false;
+    bool itemTips = true; // Folder Options: "Show pop-up description for folder and desktop items".
 };
 ShellClickPolicy ReadShellClickPolicy() {
     SHELLSTATE settings{}; settings.fDoubleClickInWebView = -1;
-    SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW | SSF_AUTOCHECKSELECT,FALSE);
+    SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW | SSF_AUTOCHECKSELECT | SSF_SHOWINFOTIP,FALSE);
     ShellClickPolicy policy;
+    policy.itemTips = settings.fShowInfoTip != 0;
     policy.checkSelect = settings.fAutoCheckSelect != 0;
     policy.singleClick = !settings.fDoubleClickInWebView;
     if (!policy.singleClick) return policy;
@@ -1736,6 +1741,19 @@ struct ColumnCatalogJob {
     ColumnChoices known; // Only value snapshots; never an apartment-owned IColumnManager.
 };
 
+// Latest-wins hover metadata the row snapshot lacks: a type name not yet
+// formatted for this view, or a namespace item's size/dates. Plain values only.
+struct ItemTipJob {
+    unsigned long long token = 0;
+    SharedPidl identity;
+    std::wstring path;
+    bool folder = false, namespaceItem = false;
+    std::wstring type;
+    ULONGLONG size = 0;
+    bool sizeKnown = false;
+    FILETIME created{}, modified{};
+};
+
 struct StatusButtonQuery {
     HWND frame=nullptr;
     RECT client{},band{}; // Physical frame-client pixels; stable across window translation.
@@ -2187,6 +2205,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<NativeRowsJob> nativeRowsJobs;
     std::deque<ColumnCatalogJob> columnCatalogJobs;
     std::optional<StatusButtonSnapshot> statusButtonJob,statusButtonResult;
+    std::optional<ItemTipJob> itemTipJob, itemTipResult;
+    std::atomic<unsigned long long> itemTipGeneration{0};
     std::deque<DirectoryWatchJob> watchJobs;
     std::deque<DirectoryResult> directoryResults;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
@@ -2223,6 +2243,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
         selectionGeneration.store(0, std::memory_order_release);
         columnCatalogGeneration.store(0, std::memory_order_release);
         statusButtonGeneration.store(0, std::memory_order_release);
+        itemTipGeneration.store(0, std::memory_order_release);
         for (const Worker* worker : Workers())
             if (worker->wake) SetEvent(worker->wake);
         // Best effort for a blocked synchronous filesystem enumeration. Shell
@@ -2712,7 +2733,47 @@ struct PresentationRowCache {
     IconKeyContext icons;
     std::array<std::wstring,2> iconKeys; // Exact image, then association fallback.
 };
+// Hovered-item tooltip: one popup per tab, painted with that tab's DirectWrite
+// face and palette through standard Win32, Direct2D and DWM calls only.
+struct ItemTipRow { std::wstring label, value; };
+struct ItemTip {
+    HWND hwnd = nullptr;
+    std::wstring item;       // Displayed or pending item identity.
+    std::wstring suppressed; // Dismissed by input until another item is hovered.
+    unsigned long long token = 0; // Pending Columns-lane request; 0 when none.
+    POINT anchor{};          // Screen point of the hover that requested it.
+    std::wstring name;
+    std::vector<ItemTipRow> rows;
+    COLORREF background = CLR_INVALID, foreground = CLR_INVALID, label = CLR_INVALID, border = CLR_INVALID;
+    // Presentation resources, owner thread only.
+    ComPtr<ID2D1Factory> factory;
+    ComPtr<ID2D1DCRenderTarget> target;
+    ComPtr<IDWriteTextFormat> nameFormat, labelFormat, valueFormat;
+    unsigned long long formatSerial = 0;
+    bool formatRtl = false;
+    ComPtr<IDWriteTextLayout> nameLayout;
+    std::vector<std::pair<ComPtr<IDWriteTextLayout>, ComPtr<IDWriteTextLayout>>> rowLayouts;
+    std::vector<float> rowTops;
+    float padX = 0.f, padY = 0.f, nameHeight = 0.f, labelX = 0.f, valueX = 0.f;
+    SIZE size{};
+    void Release() {
+        if (IsWindow(hwnd) && GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId() &&
+            GetWindowLongPtrW(hwnd, GWLP_USERDATA) == reinterpret_cast<LONG_PTR>(this)) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(hwnd);
+        }
+        hwnd = nullptr;
+        target.Reset(); factory.Reset();
+        nameFormat.Reset(); labelFormat.Reset(); valueFormat.Reset();
+        nameLayout.Reset(); rowLayouts.clear(); rowTops.clear();
+        item.clear(); suppressed.clear(); name.clear(); rows.clear();
+        token = 0; formatSerial = 0;
+    }
+    ~ItemTip() { Release(); }
+};
+
 struct ViewState {
+    ItemTip itemTip;
     // The bridge state is owner-STA-only. A presentation instance contains
     // sparse immutable model rows and owns its graphics exclusively on a lane.
     bool presentationOnly=false;
@@ -3696,6 +3757,9 @@ struct ViewState {
     ULONGLONG namesPreviewLatencyMs = 0;
     ULONGLONG namesFullLatencyMs = 0;
 };
+// Every hover transition re-evaluates the item tooltip; input can dismiss it.
+void ItemTipHoverMoved(ViewState& state, int row);
+void HideItemTip(ViewState& state, bool suppress = false);
 
 // Plain visual data only: no Shell interfaces, HWND ownership, GPU resources,
 // providers or mutable directory/selection arrays cross this boundary.
@@ -4377,6 +4441,7 @@ void ToggleGroupSection(ViewState& state, int index) {
     // Collapse changes visibility only. Keep selection, caret and range anchor
     // in both views while the user browses sections; navigation independently
     // skips hidden rows through DisplayedRow/NextDisplayedRow.
+    ItemTipHoverMoved(state, -1);
     state.hovered = -1;
     state.hotSection = -1;
     RegisterViewAnimation(state);
@@ -4783,6 +4848,7 @@ void ResetMouseGestureForNavigation(ViewState& state) {
     AdvanceRowHeight(state, true);
     StopSelectionFade(state);
     StopHoverAnimation(state);
+    ItemTipHoverMoved(state, -1);
     state.hovered = -1;
     for (auto& motion : state.scrollbarMotion) motion = {};
     StopRowTransition(state);
@@ -5930,6 +5996,23 @@ void RefreshRenamePalette(ViewState& state) {
 // OpenThemeData uses native Windows theme resources; no registry color guesses.
 // This is still not a guarantee of reproducing modifications made solely to
 // Explorer's private DirectUI painting code.
+COLORREF BlendColor(COLORREF from, COLORREF to, int percent) {
+    return RGB((GetRValue(from) * (100 - percent) + GetRValue(to) * percent) / 100,
+        (GetGValue(from) * (100 - percent) + GetGValue(to) * percent) / 100,
+        (GetBValue(from) * (100 - percent) + GetBValue(to) * percent) / 100);
+}
+bool DarkerThan(COLORREF a, COLORREF b) {
+    return 2 * GetRValue(a) + 5 * GetGValue(a) + GetBValue(a) <
+        2 * GetRValue(b) + 5 * GetGValue(b) + GetBValue(b);
+}
+// UISettings supplies page black/white. Status chrome and the item tooltip
+// derive one raised surface from that palette, without a fixed dark/light
+// RGB table. High contrast keeps its exact system colors elsewhere.
+COLORREF RaisedSurface(COLORREF background, COLORREF foreground) {
+    return BlendColor(background, foreground, DarkerThan(background, foreground) ? 12 : 4);
+}
+void RefreshItemTipPalette(ViewState& state, bool highContrast);
+
 bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     // Resolve WinRT only at attachment/theme/settings changes. Maintenance
     // probes reuse this tab's copied values, without activating a COM provider.
@@ -6006,6 +6089,7 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     state.nativeEditForeground = highContrast ? systemText :
         ReadableForeground(state.nativeEditBackground, {text, state.nativeAppForeground, systemText});
     RefreshRenamePalette(state);
+    RefreshItemTipPalette(state, highContrast);
     if (state.viewTogglePaletteDirty) {
         state.viewTogglePaletteDirty = false;
         COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
@@ -6016,15 +6100,7 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
             if (ValidRgb(state.nativeAppBackground)) {
                 background = state.nativeAppBackground;
                 foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
-                // UISettings supplies page black/white. Derive the
-                // status-chrome surface from that palette, without a fixed
-                // dark/light RGB table. High contrast keeps its exact colors.
-                const int bgLight = 2 * GetRValue(background) + 5 * GetGValue(background) + GetBValue(background);
-                const int fgLight = 2 * GetRValue(foreground) + 5 * GetGValue(foreground) + GetBValue(foreground);
-                const int amount = bgLight < fgLight ? 12 : 4;
-                background = RGB((GetRValue(background) * (100 - amount) + GetRValue(foreground) * amount) / 100,
-                    (GetGValue(background) * (100 - amount) + GetGValue(foreground) * amount) / 100,
-                    (GetBValue(background) * (100 - amount) + GetBValue(foreground) * amount) / 100);
+                background = RaisedSurface(background, foreground);
             }
         }
         if (!ValidRgb(background)) background = RGB(255,255,255);
@@ -8536,6 +8612,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         DirectoryWatchJob watch;
         ColumnCatalogJob catalog;
         std::optional<StatusButtonSnapshot> statusButtons;
+        std::optional<ItemTipJob> itemTip;
         bool haveCatalog = false;
         bool haveDirectory = false, haveDetail = false, haveWatch = false;
         TabBackground::RetiredPayload retired;
@@ -8549,6 +8626,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 directory = std::move(work.layoutJobs.back());
                 work.layoutJobs.pop_back();
                 haveDirectory = true;
+            } else if (columnsLane && work.itemTipJob) {
+                itemTip=std::exchange(work.itemTipJob,{}); // Hover feedback precedes chrome probes.
             } else if (columnsLane && work.statusButtonJob) {
                 statusButtons=std::move(work.statusButtonJob); work.statusButtonJob.reset();
             } else if (columnsLane && !work.columnCatalogJobs.empty()) {
@@ -8585,6 +8664,32 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         }
         // An idle detail lane keeps no provider folder alive between demands.
         if (detailsLane && !haveDetail) sizeBinding.Reset();
+        if(itemTip) {
+            const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
+                work.itemTipGeneration.load(std::memory_order_acquire)==itemTip->token;};
+            if(current() && itemTip->namespaceItem) {
+                ComPtr<IPropertyStore> store;
+                if(SUCCEEDED(EntryPropertyStore(itemTip->path,itemTip->identity.get(),GPS_DEFAULT,store.GetAddressOf())) && store) {
+                    itemTip->type=FormatShellDetail(store.Get(),PKEY_ItemTypeText);
+                    for(const PROPERTYKEY& key:{PKEY_Size,PKEY_DateCreated,PKEY_DateModified}) {
+                        PROPVARIANT value{}; PropVariantInit(&value);
+                        if(SUCCEEDED(store->GetValue(key,&value))) {
+                            if(SameKey(key,PKEY_Size) && value.vt==VT_UI8) {
+                                itemTip->size=value.uhVal.QuadPart; itemTip->sizeKnown=true;
+                            } else if(value.vt==VT_FILETIME)
+                                (SameKey(key,PKEY_DateCreated) ? itemTip->created : itemTip->modified)=value.filetime;
+                        }
+                        PropVariantClear(&value);
+                    }
+                }
+            } else if(current()) itemTip->type=GetTypeName(typeNames,itemTip->path,itemTip->folder);
+            if(current()) {
+                {ExclusiveSrwLock lock(work.directoryLock);
+                    if(current()) work.itemTipResult=std::move(itemTip);}
+                PostMessageW(work.hwnd,kMsgItemTipReady,WPARAM(work.notificationLifetime),0);
+            }
+            continue;
+        }
         if(statusButtons) {
             const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
                 work.statusButtonGeneration.load(std::memory_order_acquire)==statusButtons->token;};
@@ -11047,6 +11152,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     }
     state.anchor = -1;
     StopHoverAnimation(state);
+    ItemTipHoverMoved(state, -1);
     state.hovered = -1;
     const bool viewportUnmoved =
         fabsf(state.scrollNow - viewportCapturedScrollPx) < .5f;
@@ -24613,9 +24719,11 @@ void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
         state.horizontalScrollbarHot = horizontal;
         Redraw(state);
     }
+    ItemTipHoverMoved(state, row);
 }
 
 void ClearPointerHover(ViewState& state, bool animate) {
+    ItemTipHoverMoved(state, -1);
     if (state.hovered < 0 && state.hotSection < 0 &&
         !state.verticalScrollbarHot && !state.horizontalScrollbarHot &&
         !state.hoverAnimationActive) return;
@@ -24626,6 +24734,333 @@ void ClearPointerHover(ViewState& state, bool animate) {
     state.verticalScrollbarHot = false;
     state.horizontalScrollbarHot = false;
     Redraw(state);
+}
+
+// ---- Hovered-item tooltip ---------------------------------------------------
+// A resting mouse/pen pointer (WM_MOUSEHOVER, the system hover time) shows the
+// item's full name, size, type and dates. Names, sizes and filesystem dates
+// come from the row snapshot; only missing type text or a namespace item's
+// properties are resolved on the tab's Columns lane, never on this thread.
+bool ItemTipEligible(const ViewState& state, int row) {
+    return row >= 0 && static_cast<size_t>(row) < state.entries.size() && state.clickPolicy.itemTips &&
+        state.visible && state.inScope && state.pointerInside && state.pointingDevice != PointingDevice::Touch &&
+        !state.pointerHoverSuppressed && !state.optimisticStartedAt && !state.rename.editor &&
+        !state.shellDragRunning && !state.mousePressActive && !state.marqueeActive && !PointerDragActive(state) &&
+        GetCapture() != state.hwnd && TabOwnsActiveView(state);
+}
+
+void HideItemTip(ViewState& state, bool suppress) {
+    auto& tip = state.itemTip;
+    // A press/wheel/key dismisses the item until the pointer reaches another.
+    if (suppress && !tip.item.empty()) tip.suppressed = tip.item;
+    if (tip.token) state.background->itemTipGeneration.store(0, std::memory_order_release);
+    tip.token = 0;
+    tip.item.clear();
+    if (IsWindow(tip.hwnd) && IsWindowVisible(tip.hwnd))
+        SetWindowPos(tip.hwnd, nullptr, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOACTIVATE |
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+void ItemTipHoverMoved(ViewState& state, int row) {
+    auto& tip = state.itemTip;
+    const std::wstring* item = row >= 0 && static_cast<size_t>(row) < state.entries.size() ?
+        &state.entries[static_cast<size_t>(row)].path : nullptr;
+    if (!tip.item.empty() && (!item || *item != tip.item)) HideItemTip(state);
+    if (!tip.suppressed.empty() && (!item || *item != tip.suppressed)) tip.suppressed.clear();
+}
+
+std::wstring RelativeAge(const FILETIME& then, const FILETIME& now) {
+    const ULONGLONG from = (ULONGLONG(then.dwHighDateTime) << 32) | then.dwLowDateTime;
+    const ULONGLONG to = (ULONGLONG(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    if (!from) return {};
+    // Timestamps from a slightly fast clock (another machine, a share) are
+    // "just now"; anything further in the future gets no age at all.
+    if (to < from) return from - to < 600000000ull ? L"just now" : L"";
+    const ULONGLONG minutes = (to - from) / 600000000ull;
+    const auto ago = [](ULONGLONG count, const wchar_t* unit) {
+        return std::to_wstring(count) + L" " + unit + (count == 1 ? L"" : L"s") + L" ago";
+    };
+    if (minutes < 1) return L"just now";
+    if (minutes < 60) return ago(minutes, L"minute");
+    const ULONGLONG hours = minutes / 60, days = hours / 24;
+    if (hours < 24) return ago(hours, L"hour");
+    if (days < 7) return ago(days, L"day");
+    if (days < 30) return ago(days / 7, L"week");
+    if (days < 365) return ago(std::clamp<ULONGLONG>(days / 30, 1, 11), L"month");
+    return ago(days / 365, L"year");
+}
+
+std::vector<ItemTipRow> ItemTipRows(const ItemTipJob& facts, const FILETIME& now) {
+    std::vector<ItemTipRow> rows;
+    if (facts.sizeKnown) rows.push_back({L"Size", FormatSize(facts.size)});
+    if (!facts.type.empty()) rows.push_back({L"Type", facts.type});
+    for (const auto& [label, time] : {std::pair{L"Created", facts.created}, std::pair{L"Modified", facts.modified}}) {
+        std::wstring value = FormatFileTime(time);
+        if (value.empty()) continue;
+        if (const auto age = RelativeAge(time, now); !age.empty()) value += L" \x00B7 " + age; // Middle dot
+        rows.push_back({label, std::move(value)});
+    }
+    return rows;
+}
+
+void RefreshItemTipPalette(ViewState& state, bool highContrast) {
+    auto& tip = state.itemTip;
+    COLORREF background = GetSysColor(COLOR_INFOBK), foreground = GetSysColor(COLOR_INFOTEXT);
+    COLORREF label = foreground, border = foreground;
+    if (!highContrast && ValidRgb(state.nativeAppBackground)) {
+        background = RaisedSurface(state.nativeAppBackground,
+            ValidRgb(state.nativeAppForeground) ? state.nativeAppForeground : state.nativeTextColor);
+        foreground = ReadableForeground(background, {state.nativeAppForeground, state.nativeTextColor, foreground});
+        label = BlendColor(foreground, background, 35);   // Secondary text, as in Fluent tooltips.
+        border = BlendColor(background, foreground, 16);
+    }
+    if (background == tip.background && foreground == tip.foreground && label == tip.label && border == tip.border) return;
+    tip.background = background; tip.foreground = foreground; tip.label = label; tip.border = border;
+    if (IsWindow(tip.hwnd)) {
+        const COLORREF frame = tip.border;
+        DwmSetWindowAttribute(tip.hwnd, DWMWA_BORDER_COLOR, &frame, sizeof(frame));
+        InvalidateRect(tip.hwnd, nullptr, FALSE);
+    }
+}
+
+LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+bool EnsureItemTipWindow(ViewState& state) {
+    auto& tip = state.itemTip;
+    if (IsWindow(tip.hwnd)) return true;
+    tip.hwnd = nullptr; tip.target.Reset();
+    // Owned by the frame: above it, hidden with it, never activated or hit.
+    const HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, kItemTipClass, L"",
+        WS_POPUP, 0, 0, 1, 1, state.frameHwnd, nullptr, OverlayModuleInstance(), nullptr);
+    if (!hwnd) return false;
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&tip));
+    tip.hwnd = hwnd;
+    // Windows 11 draws native tooltip corners and border; older systems keep
+    // square corners and the painted border below.
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
+    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    const COLORREF frame = tip.border;
+    DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &frame, sizeof(frame));
+    return true;
+}
+
+bool LayoutItemTip(ViewState& state, const RECT& work) {
+    auto& tip = state.itemTip;
+    if (!g_writeFactory || (!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat) return false;
+    const int dpi = DpiOf(state.hwnd);
+    // The header face follows the font option and Explorer's UI font; its
+    // size is already in this view's physical pixels.
+    if (!tip.nameFormat || tip.formatSerial != state.textFaceSerial || tip.formatRtl != state.rtlLayout) {
+        const auto& source = state.headerFormat;
+        std::wstring family(source->GetFontFamilyNameLength() + 1, L'\0');
+        std::wstring locale(source->GetLocaleNameLength() + 1, L'\0');
+        ComPtr<IDWriteFontCollection> collection;
+        if (FAILED(source->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
+            FAILED(source->GetLocaleName(locale.data(), UINT32(locale.size()))) ||
+            FAILED(source->GetFontCollection(&collection))) return false;
+        ComPtr<IDWriteTextFormat> formats[3];
+        const DWRITE_FONT_WEIGHT weights[3]{DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_WEIGHT_NORMAL};
+        for (int i = 0; i < 3; ++i) {
+            if (FAILED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(), weights[i],
+                    source->GetFontStyle(), source->GetFontStretch(), source->GetFontSize(), locale.c_str(),
+                    &formats[i]))) return false;
+            formats[i]->SetReadingDirection(state.rtlLayout ?
+                DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+            formats[i]->SetWordWrapping(i == 0 ? DWRITE_WORD_WRAPPING_EMERGENCY_BREAK : DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        tip.nameFormat = formats[0]; tip.labelFormat = formats[1]; tip.valueFormat = formats[2];
+        tip.formatSerial = state.textFaceSerial; tip.formatRtl = state.rtlLayout;
+    }
+    tip.padX = float(Scale96(10, dpi)); tip.padY = float(Scale96(7, dpi));
+    const float columnGap = float(Scale96(16, dpi)), nameGap = float(Scale96(5, dpi));
+    const float available = std::max(1.f, float(work.right - work.left) - 2.f * tip.padX);
+    const auto layout = [&](const std::wstring& text, IDWriteTextFormat* format, float width,
+                            ComPtr<IDWriteTextLayout>& out, DWRITE_TEXT_METRICS& metrics) {
+        return SUCCEEDED(g_writeFactory->CreateTextLayout(text.c_str(), UINT32(text.size()), format,
+            width, 1e6f, &out)) && SUCCEEDED(out->GetMetrics(&metrics));
+    };
+    // Tab-stop alignment: one label column sized by its widest label, so
+    // every value starts on the same edge.
+    tip.rowLayouts.clear(); tip.rowTops.clear();
+    float labelWidth = 0.f, valueWidth = 0.f;
+    std::vector<float> heights;
+    for (const auto& row : tip.rows) {
+        ComPtr<IDWriteTextLayout> label, value;
+        DWRITE_TEXT_METRICS labelMetrics{}, valueMetrics{};
+        if (!layout(row.label, tip.labelFormat.Get(), available, label, labelMetrics) ||
+            !layout(row.value, tip.valueFormat.Get(), available, value, valueMetrics)) return false;
+        labelWidth = std::max(labelWidth, labelMetrics.widthIncludingTrailingWhitespace);
+        valueWidth = std::max(valueWidth, valueMetrics.widthIncludingTrailingWhitespace);
+        heights.push_back(std::max(labelMetrics.height, valueMetrics.height));
+        tip.rowLayouts.emplace_back(std::move(label), std::move(value));
+    }
+    labelWidth = std::ceil(labelWidth);
+    const float tableWidth = tip.rows.empty() ? 0.f : std::min(available, labelWidth + columnGap + std::ceil(valueWidth));
+    // Long names wrap within the details' width, or a third of the monitor.
+    const float nameLimit = std::min(available, std::max(tableWidth, float(work.right - work.left) / 3.f));
+    DWRITE_TEXT_METRICS nameMetrics{};
+    if (!layout(tip.name, tip.nameFormat.Get(), nameLimit, tip.nameLayout, nameMetrics)) return false;
+    const float content = std::ceil(std::max(tableWidth, nameMetrics.widthIncludingTrailingWhitespace));
+    tip.nameLayout->SetMaxWidth(content);
+    tip.nameHeight = nameMetrics.height;
+    float y = tip.padY + nameMetrics.height + (tip.rows.empty() ? 0.f : nameGap);
+    const float valueBox = std::max(1.f, content - labelWidth - columnGap);
+    for (size_t i = 0; i < tip.rowLayouts.size(); ++i) {
+        tip.rowLayouts[i].first->SetMaxWidth(std::max(1.f, labelWidth));
+        tip.rowLayouts[i].second->SetMaxWidth(valueBox);
+        tip.rowTops.push_back(y);
+        y += heights[i];
+    }
+    // Leading alignment inside each column box mirrors with the reading order.
+    tip.labelX = state.rtlLayout ? tip.padX + content - labelWidth : tip.padX;
+    tip.valueX = state.rtlLayout ? tip.padX : tip.padX + labelWidth + columnGap;
+    tip.size = SIZE{LONG(std::ceil(content + 2.f * tip.padX)), LONG(std::ceil(y + tip.padY))};
+    return true;
+}
+
+// Below the cursor image (its real hotspot and height), flipped above it at
+// the monitor's working-area edge, mirrored for right-to-left Explorer.
+POINT ItemTipPosition(const ViewState& state, POINT anchor, SIZE size, const RECT& work) {
+    int below = GetSystemMetricsForDpi(SM_CYCURSOR, UINT(DpiOf(state.hwnd))), hotspot = 0;
+    CURSORINFO cursor{sizeof(cursor)};
+    ICONINFO info{};
+    if (GetCursorInfo(&cursor) && cursor.hCursor && GetIconInfo(cursor.hCursor, &info)) {
+        BITMAP bitmap{};
+        if (GetObjectW(info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bitmap), &bitmap))
+            below = info.hbmColor ? bitmap.bmHeight : bitmap.bmHeight / 2;
+        hotspot = int(info.yHotspot);
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+    }
+    POINT at{state.rtlLayout ? anchor.x - size.cx : anchor.x, anchor.y - hotspot + below};
+    if (at.y + size.cy > work.bottom) at.y = anchor.y - hotspot - size.cy;
+    at.x = std::clamp<LONG>(at.x, work.left, std::max(work.left, work.right - size.cx));
+    at.y = std::clamp<LONG>(at.y, work.top, std::max(work.top, work.bottom - size.cy));
+    return at;
+}
+
+void PresentItemTip(ViewState& state, const ItemTipJob& facts) {
+    auto& tip = state.itemTip;
+    tip.token = 0;
+    FILETIME now{};
+    GetSystemTimePreciseAsFileTime(&now); // File times are finer than the tick clock.
+    tip.rows = ItemTipRows(facts, now);
+    if (!ValidRgb(tip.background) || !ValidRgb(tip.foreground)) RefreshNativePalette(state);
+    MONITORINFO monitor{sizeof(monitor)};
+    if (!GetMonitorInfoW(MonitorFromPoint(tip.anchor, MONITOR_DEFAULTTONEAREST), &monitor) ||
+        !EnsureItemTipWindow(state) || !LayoutItemTip(state, monitor.rcWork)) { HideItemTip(state); return; }
+    const POINT at = ItemTipPosition(state, tip.anchor, tip.size, monitor.rcWork);
+    InvalidateRect(tip.hwnd, nullptr, FALSE);
+    SetWindowPos(tip.hwnd, HWND_TOPMOST, at.x, at.y, tip.size.cx, tip.size.cy,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+}
+
+void ShowItemTip(ViewState& state, POINT client) {
+    const int row = state.hovered;
+    if (!ItemTipEligible(state, row)) return;
+    auto& tip = state.itemTip;
+    const Entry& entry = state.entries[static_cast<size_t>(row)];
+    if (entry.path.empty() || entry.path == tip.suppressed || entry.path == tip.item) return;
+    HideItemTip(state);
+    tip.item = entry.path;
+    tip.name = entry.name;
+    tip.anchor = client;
+    ClientToScreen(state.hwnd, &tip.anchor);
+    ItemTipJob facts;
+    facts.path = entry.path;
+    facts.identity = entry.shellIdentity;
+    facts.folder = entry.folder;
+    facts.namespaceItem = entry.shellIdentity && entry.path.starts_with(L"windhawk:pidl:");
+    facts.type = entry.type;
+    if (!facts.namespaceItem) {
+        facts.created = entry.created;
+        facts.modified = entry.lastWrite;
+        facts.size = entry.byteSize;
+        facts.sizeKnown = !entry.folder && !state.thisPcGpu;
+    }
+    if (!facts.namespaceItem && !facts.type.empty()) { PresentItemTip(state, facts); return; }
+    auto& work = *state.background;
+    if (!work.hwnd) work.hwnd = state.hwnd;
+    const HWND hwnd = state.hwnd;
+    if (!StartTabWorker(state.background, work.columns, DirectoryWorkerProc, THREAD_PRIORITY_BELOW_NORMAL) ||
+        State(hwnd) != &state) { PresentItemTip(state, facts); return; }
+    facts.token = tip.token = g_nextToken.fetch_add(1);
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        work.itemTipGeneration.store(facts.token, std::memory_order_release);
+        work.itemTipJob = std::move(facts);
+    }
+    SetEvent(work.columns.wake);
+}
+
+void ConsumeItemTip(ViewState& state) {
+    auto& work = *state.background;
+    std::optional<ItemTipJob> result;
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        result = std::exchange(work.itemTipResult, {});
+    }
+    auto& tip = state.itemTip;
+    if (!result || !tip.token || result->token != tip.token) return;
+    // The pointer may have rested elsewhere, pressed or left meanwhile.
+    if (!ItemTipEligible(state, state.hovered) ||
+        state.entries[static_cast<size_t>(state.hovered)].path != tip.item) { HideItemTip(state); return; }
+    PresentItemTip(state, *result);
+}
+
+void PaintItemTip(ItemTip& tip, HWND hwnd) {
+    PAINTSTRUCT paint{};
+    const HDC dc = BeginPaint(hwnd, &paint);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    if (!tip.factory) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, tip.factory.GetAddressOf());
+    if (!tip.target && tip.factory) {
+        const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        tip.factory->CreateDCRenderTarget(&properties, tip.target.GetAddressOf());
+    }
+    const auto color = [](COLORREF value) {
+        return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f);
+    };
+    if (dc && tip.target && tip.nameLayout && SUCCEEDED(tip.target->BindDC(dc, &client))) {
+        tip.target->BeginDraw();
+        tip.target->Clear(color(tip.background));
+        ComPtr<ID2D1SolidColorBrush> text, label;
+        tip.target->CreateSolidColorBrush(color(tip.foreground), &text);
+        tip.target->CreateSolidColorBrush(color(tip.label), &label);
+        // Windows 11 DWM supplies the rounded border; earlier systems need one.
+        DWM_WINDOW_CORNER_PREFERENCE corners{};
+        if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners)))) {
+            ComPtr<ID2D1SolidColorBrush> border;
+            if (SUCCEEDED(tip.target->CreateSolidColorBrush(color(tip.border), &border)))
+                tip.target->DrawRectangle(D2D1::RectF(.5f, .5f, client.right - .5f, client.bottom - .5f), border.Get());
+        }
+        if (text && label) {
+            tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.padY), tip.nameLayout.Get(), text.Get());
+            for (size_t i = 0; i < tip.rowLayouts.size() && i < tip.rowTops.size(); ++i) {
+                tip.target->DrawTextLayout(D2D1::Point2F(tip.labelX, tip.rowTops[i]), tip.rowLayouts[i].first.Get(), label.Get());
+                tip.target->DrawTextLayout(D2D1::Point2F(tip.valueX, tip.rowTops[i]), tip.rowLayouts[i].second.Get(), text.Get());
+            }
+        }
+        if (tip.target->EndDraw() == D2DERR_RECREATE_TARGET) tip.target.Reset();
+    }
+    EndPaint(hwnd, &paint);
+}
+
+LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WindowCallbackGuard callback;
+    auto* tip = reinterpret_cast<ItemTip*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_PAINT:
+        if (tip) { PaintItemTip(*tip, hwnd); return 0; }
+        break;
+    case WM_ERASEBKGND: return 1;
+    case WM_NCHITTEST: return HTTRANSPARENT; // The pointer passes to the view beneath.
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_DPICHANGED: return 0; // Placement and size are computed per show.
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 void ReleasePointerCapture(ViewState& state, POINT pos) {
@@ -25390,6 +25825,10 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         RefreshViewToggleForFrame(hwnd, true, msg != WM_WINDOWPOSCHANGED);
     if (msg == WM_ACTIVATE || msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
         for (HWND overlay : FrameOverlays(hwnd)) QueueInputFocusUpdate(overlay);
+    // A topmost item tooltip must not float over the app that took activation.
+    if (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE)
+        for (HWND overlay : FrameOverlays(hwnd))
+            if (auto* state = State(overlay)) HideItemTip(*state);
     if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE)
         if (auto* state = State(OverlayUnder(hwnd)); state && state->visible && state->inScope)
             QueueResumeRefresh(*state, true);
@@ -27730,6 +28169,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    if (s && !s->itemTip.item.empty()) {
+        // Pressing, wheeling or typing dismisses the hovered item's tooltip
+        // until another item is hovered; hiding this view just hides it.
+        if ((msg >= WM_LBUTTONDOWN && msg <= WM_MOUSELAST && msg != WM_LBUTTONUP && msg != WM_RBUTTONUP &&
+             msg != WM_MBUTTONUP && msg != WM_XBUTTONUP) || msg == WM_POINTERDOWN || msg == WM_KEYDOWN ||
+            msg == WM_SYSKEYDOWN || msg == WM_CANCELMODE || msg == WM_CONTEXTMENU) HideItemTip(*s, true);
+        else if ((msg == WM_SHOWWINDOW && !wParam) || msg == WM_DESTROY || (msg == WM_WINDOWPOSCHANGED &&
+                 (reinterpret_cast<const WINDOWPOS*>(lParam)->flags & SWP_HIDEWINDOW))) HideItemTip(*s);
+    }
     if(s && s->presenter && msg!=WM_NCDESTROY) {
         if(msg!=kMsgPresentationReady || wParam==WPARAM(s->lifetimeToken)) ConsumePresentation(*s);
         if(msg==kMsgPresentationReady) return 0;
@@ -28110,6 +28558,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->styleChangeQueued=false;
             const unsigned changes=std::exchange(s->pendingStyleChanges,0u);
             if (!changes) return 0;
+            HideItemTip(*s); // Its face, palette or Folder Options policy may change.
             if (changes & kStyleColors) {
                 RefreshThemeColor();
                 s->viewTogglePaletteDirty=true;
@@ -29344,9 +29793,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // The wiggle has already docked. Hold capture solely to swallow UP;
         // ignore all further drag movements until that button is released.
         if (s && s->columnWiggleAwaitRelease) return 0;
-        if (s && !PointerHoverSuppressed(*s) && (!s->mouseTracking || s->clickPolicy.singleClick)) {
-            TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE | (s->clickPolicy.singleClick ? TME_HOVER : 0u),hwnd,HOVER_DEFAULT};
-            if (TrackMouseEvent(&tme)) s->mouseTracking = true;
+        // Hover re-arms on every move, so WM_MOUSEHOVER means the pointer
+        // rested for the system hover time (single-click select, item tips).
+        if (s && !PointerHoverSuppressed(*s)) {
+            const bool hover = s->clickPolicy.singleClick || s->clickPolicy.itemTips;
+            if (!s->mouseTracking || hover) {
+                TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE | (hover ? TME_HOVER : 0u),hwnd,HOVER_DEFAULT};
+                if (TrackMouseEvent(&tme)) s->mouseTracking = true;
+            }
         }
         if (s && s->shellDragRow >= 0 && s->mousePressActive &&
             (wParam & MK_LBUTTON)) {
@@ -29378,6 +29832,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (row >= 0 && row == s->hovered &&
                 SelectionCheckboxAt(*s,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)})==-1)
                 SelectWithModifiers(*s,row,(wParam & MK_CONTROL)!=0,(wParam & MK_SHIFT)!=0);
+        }
+        if (s && State(hwnd)==s && !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))) {
+            const POINT at{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+            const int row = InsideListX(*s,at.x) ? RowFromPoint(*s,at.y,at.x) : -1;
+            if (row >= 0 && row == s->hovered && SelectionCheckboxAt(*s,at)==-1) ShowItemTip(*s,at);
         }
         return 0;
     case WM_MOUSELEAVE:
@@ -29980,6 +30439,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && s->inScope && TabOwnsActiveView(*s))
             SetActive(hwnd, !s->visible);
         return 0;
+    case kMsgItemTipReady:
+        if (s && wParam==WPARAM(s->lifetimeToken)) ConsumeItemTip(*s);
+        return 0;
     case kMsgViewToggleLayout:
         if (s && (!wParam || wParam==WPARAM(s->lifetimeToken))) {
             s->viewToggleLayoutQueued = false;
@@ -30000,6 +30462,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // the old state. Outer calls retain its resources until they leave.
             SetWindowLongPtrW(hwnd,GWLP_USERDATA,0);
             UnregisterTabOverlay(s->frameHwnd,s->activeTabHost,hwnd);
+            s->itemTip.Release(); // Its procedure lives in this DLL; never outlive the overlay.
             RestoreNativeContent(*s);
             RetireOverlayState(s);
         }
@@ -30012,6 +30475,7 @@ void DisposeOverlayState(ViewState* s) {
     const HWND hwnd=s->hwnd;
     ReleasePresentation(*s,true);
     DropTarget(*s);
+    s->itemTip.Release();
     s->ReleaseViewToggle();
     if (s->clipboardListenerInstalled)
         RemoveClipboardFormatListener(hwnd);
@@ -33870,12 +34334,21 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
 namespace {
 bool g_overlayClassRegistered=false;
 HINSTANCE g_overlayClassInstance=nullptr;
+// The item tooltip is a system-shadowed popup, like comctl32 tooltips.
+bool RegisterItemTipClass(HINSTANCE instance) {
+    WNDCLASSEXW tip{}; tip.cbSize=sizeof(tip);
+    tip.lpfnWndProc=ItemTipProc; tip.hInstance=instance;
+    tip.lpszClassName=kItemTipClass; tip.style=CS_DROPSHADOW;
+    tip.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+    return RegisterClassExW(&tip)!=0;
+}
 bool RegisterOverlayClass() {
     WNDCLASSEXW wc{}; wc.cbSize=sizeof(wc);
     wc.lpfnWndProc=OverlayProc; wc.hInstance=OverlayModuleInstance();
     wc.lpszClassName=kOverlayClass; wc.style=CS_DBLCLKS;
     wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     if (!wc.hInstance || !RegisterClassExW(&wc)) return false;
+    if (!RegisterItemTipClass(wc.hInstance)) { UnregisterClassW(kOverlayClass,wc.hInstance); return false; }
     g_overlayClassInstance=wc.hInstance;
     g_overlayClassRegistered=true;
     return true;
@@ -33883,7 +34356,10 @@ bool RegisterOverlayClass() {
 void ReleaseOverlayClass() {
     if (!g_overlayClassRegistered) return;
     bool reported=false;
-    while (!UnregisterClassW(kOverlayClass,g_overlayClassInstance)) {
+    // Each tab's tooltip dies with its overlay (WM_NCDESTROY), so the same
+    // overlay drain also releases the tooltip class.
+    for (const wchar_t* name : {kOverlayClass, kItemTipClass})
+    while (!UnregisterClassW(name,g_overlayClassInstance)) {
         const DWORD error=GetLastError();
         if (error==ERROR_CLASS_DOES_NOT_EXIST) break;
         if (!reported) {

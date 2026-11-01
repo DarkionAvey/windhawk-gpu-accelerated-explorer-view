@@ -1910,6 +1910,7 @@ static void TestPreviewInput() {
 #include "rename-appearance-smoke.h"
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
+#include "item-tip-smoke.h"
 
 // One manifest owns full-suite coverage in both serial and parallel runs.
 // Keep related workflows together; each child gets a private PID fixture and
@@ -1988,6 +1989,7 @@ static const RegressionSuite kRegressionSuites[] = {
         TestBurstRowContinuity(fixture);
         TestSortDetails(fixture);
         TestShellSizeDetails(fixture);
+        TestItemTips(fixture);
     }},
     {L"graphics", true, [](const std::wstring& fixture) {
         TestRealNativeViewport(fixture);

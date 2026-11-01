@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.336
+
+- Resting the pointer on an item shows a tooltip with its full name, size,
+  type, and created/modified dates (with how long ago), in aligned columns.
+  It uses the view's font and follows dark, light and high contrast themes.
+  Clicking, the mouse wheel or typing hides it until another item is hovered,
+  and Folder Options' "Show pop-up description" setting turns it off.
+
 ## 0.9.335
 
 - Limit memory held by measured text to a per-tab budget instead of thousands
