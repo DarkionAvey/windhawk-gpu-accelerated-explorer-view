@@ -29,6 +29,7 @@
 #undef ProcessPointerFramesInteractionContext
 #undef GetProcAddress
 #undef SHDoDragDrop
+#undef DoDragDrop
 #undef BeginPanningFeedback
 #undef UpdatePanningFeedback
 #undef EndPanningFeedback

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.337
+
+- Show one larger, transparent drag preview instead of both Shell and GPU images.
+- Anchor the artwork to the pointer, keep touch previews above the contact point,
+  and recalculate placement immediately when crossing monitor DPI boundaries.
+- Load available drag thumbnails in the background even when thumbnails are off
+  in Details/List views, keeping the displayed icon until the thumbnail arrives.
+- Stack up to five selected icons, keeping the front icon upright and gently
+  tilting those behind it. Show Windows' localized transaction description
+  beneath the stack using the view's font and theme.
+- Restore rounded operation emoji by avoiding synthesized bold, and smooth
+  their animation sampling.
+- Apply the mod's text antialiasing choice to drag captions and item counts,
+  including Windows subpixel rendering on their opaque backgrounds.
+
 ## 0.9.336
 
 - Resting the pointer on an item shows a tooltip with its full name, size,

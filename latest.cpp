@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.336
+// @version         0.9.337
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1313,16 +1313,32 @@ struct IconRecord {
 };
 // Immutable, bounded foreground packet. PixelBytes shares the existing decoded
 // artwork; dragging neither screenshots rows nor creates another image worker.
-struct DragPreview {
-    HWND window=nullptr;
-    ULONG_PTR token=0;
+constexpr size_t kDragPreviewImages=5;
+struct DragPreviewImage {
     IconPixels pixels;
     std::wstring imageKey;
+    bool folder=false,association=true;
+    float tilt=0.f;
+};
+struct DragPreview : DragPreviewImage {
+    HWND window=nullptr;
+    ULONG_PTR token=0;
+    std::array<DragPreviewImage,kDragPreviewImages-1> behind;
+    size_t imageCount=1;
+    DragPreviewImage& Image(size_t index) {return index ? behind[index-1]:*this;}
+    const DragPreviewImage& Image(size_t index) const {return index ? behind[index-1]:*this;}
+    std::wstring description;
+    ComPtr<IDWriteTextLayout> caption;
+    D2D1_SIZE_F captionSize{};
+    unsigned long long captionFace=0;
+    int captionDpi=0;
+    float captionAvailable=0.f;
+    HMONITOR monitor=nullptr;
     float side=0.f;
     int dpi=96,count=1;
     DWORD effect=DROPEFFECT_NONE;
     COLORREF background=0,foreground=0,accent=0;
-    bool folder=false,rtl=false,animate=true,association=true;
+    bool rtl=false,animate=true;
     std::shared_ptr<std::atomic<bool>> rendered=std::make_shared<std::atomic<bool>>(false);
 };
 struct DragGlyph {
@@ -1331,6 +1347,16 @@ struct DragGlyph {
     COLORREF foreground=CLR_INVALID;
     ComPtr<ID2D1CommandList> image;
     D2D1_RECT_F bounds{};
+};
+// Same policy calculation as list text, with an independent monitor cache so
+// a drag on another display never invalidates the tab's existing glyph masks.
+struct DragTextStyle {
+    ComPtr<IDWriteRenderingParams> textRenderingParams;
+    HMONITOR textRenderingMonitor=nullptr;
+    unsigned long long textRenderingRevision=0,textRenderingSerial=0;
+    TextAntialiasing textAntialiasing=TextAntialiasing::System;
+    D2D1_TEXT_ANTIALIAS_MODE textAntialiasMode=D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
+    D2D1_TEXT_ANTIALIAS_MODE opaqueTextAntialiasMode=D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
 };
 struct IconJob {
     HWND hwnd = nullptr;
@@ -3457,7 +3483,7 @@ struct ViewState {
     bool shellDragToggleOnClick = false;
     bool shellDragRunning = false;
     std::shared_ptr<DragPreview> dragPreview;
-    Entry dragPreviewEntry;
+    std::array<Entry,kDragPreviewImages> dragPreviewEntries;
     UINT dragPreviewSize=0;
     unsigned long long dragPreviewEpoch=0;
     // The overlay is a real OLE target, forwarding to Explorer's folder/item
@@ -3652,9 +3678,10 @@ struct ViewState {
         ComPtr<IDCompositionVisual> visual;
         ComPtr<IDCompositionScaleTransform> scale;
         ComPtr<IDCompositionAnimation> curve;
-        ComPtr<ID2D1Bitmap> artwork;
-        const void* artworkIdentity=nullptr;
+        std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages> artwork;
+        std::array<const void*,kDragPreviewImages> artworkIdentity{};
         DragGlyph glyph;
+        DragTextStyle textStyle;
         std::shared_ptr<const DragPreview> snapshot;
     } dragComposition;
     struct SwipeComposition {
@@ -15027,11 +15054,12 @@ void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBr
     if(rect.rect.right<=rect.rect.left || rect.rect.bottom<=rect.rect.top) return;
     static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawRoundedRectangle(rect,brush,width);
 }
-void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
+template<class Style>
+void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=false) {
     const auto revision=g_textRenderingRevision.load(std::memory_order_relaxed);
     const auto mode=g_textAntialiasing.load(std::memory_order_relaxed);
     const HMONITOR monitor=checkMonitor || !state.textRenderingSerial ?
-        MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST) : state.textRenderingMonitor;
+        MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST) : state.textRenderingMonitor;
     if(state.textRenderingSerial && state.textRenderingRevision==revision &&
         state.textAntialiasing==mode && state.textRenderingMonitor==monitor) return;
     ComPtr<IDWriteRenderingParams> native;
@@ -15059,10 +15087,22 @@ void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
             custom.As(&state.textRenderingParams);
     }
     state.textRenderingMonitor=monitor; state.textRenderingRevision=revision; state.textAntialiasing=mode;
-    state.textRasterUnavailable=false; // A user/monitor change licenses a fresh native rendering attempt.
+    if constexpr(requires {state.textRasterUnavailable;}) state.textRasterUnavailable=false;
+    if constexpr(requires {state.opaqueTextAntialiasMode;}) {
+        state.opaqueTextAntialiasMode=state.textAntialiasMode;
+        UINT type=0;
+        if(state.textAntialiasMode==D2D1_TEXT_ANTIALIAS_MODE_DEFAULT &&
+            SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE,0,&type,0))
+            state.opaqueTextAntialiasMode=type==FE_FONTSMOOTHINGCLEARTYPE ?
+                D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE:D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+    }
     ++state.textRenderingSerial; // Old raster variants retire lazily through the existing LRU.
 }
-void ConfigureTextTarget(ViewState& state,ID2D1RenderTarget* target) {
+void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
+    RefreshTextRenderingForWindow(state,state.hwnd,checkMonitor);
+}
+template<class Style>
+void ConfigureTextTarget(const Style& state,ID2D1RenderTarget* target) {
     target->SetTextRenderingParams(state.textRenderingParams.Get());
     target->SetTextAntialiasMode(state.textAntialiasMode);
 }
@@ -15657,11 +15697,12 @@ bool UploadVisibleIcons(ViewState& state) {
 bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly,
                       const std::unordered_map<std::wstring, unsigned>& wanted,
                       std::vector<IconCache::value_type*>* evictions = nullptr, bool preview = false,
-                      UINT sizeOverride = 0) {
+                      UINT sizeOverride = 0, bool dragThumbnail = false) {
     std::wstring path;
     bool attributes = false;
     auto context=MakeIconKeyContext(state);
     if(sizeOverride) context.size=sizeOverride;
+    if(dragThumbnail) {context.gridView=true; context.thumbnails=true;}
     const std::wstring key = IconKey(context, entry, path, attributes, associationOnly,preview ? 256 : 0);
     auto record = FindIconRecord(state, key);
     if (record && ((!record->needsRefresh && (record->resolved || record->pixels.Ready() || record->bitmap)) ||
@@ -15669,7 +15710,7 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
     // Budget decoded pixels plus a GPU copy instead of forcing every namespace
     // through a 256-item cliff. A 790-item folder of small icons fits cheaply;
     // large thumbnails still respect this tab's existing adaptive RAM budget.
-    const bool thumbnail = !associationOnly && UsesThumbnails(state,entry);
+    const bool thumbnail = !associationOnly && (dragThumbnail ? !entry.folder:UsesThumbnails(state,entry));
     const size_t side = ImageKeySize(key);
     auto* cached=FindIconRecord(state,key,true);
     if(cached && !cached->needsRefresh && (!record || !record->needsRefresh) &&
@@ -15767,9 +15808,10 @@ void RequestVisibleIcons(ViewState& state) {
     std::vector<IconCache::value_type*> evictions; // One eviction scan per viewport, not per requested icon.
     const bool dragging=state.dragPreview && state.dragPreviewEpoch==state.mouseFolderEpoch;
     if(dragging) {
-        const IconKeyContext context{state.dragPreviewSize,state.gridView,FileThumbnails(state)};
+        const IconKeyContext context{state.dragPreviewSize,true,true};
         std::wstring path; bool attrs=false;
-        wanted.try_emplace(IconKey(context,state.dragPreviewEntry,path,attrs),0);
+        for(size_t i=0;i<state.dragPreview->imageCount;++i)
+            wanted.try_emplace(IconKey(context,state.dragPreviewEntries[i],path,attrs),0);
     }
     ++state.iconViewportGeneration;
     for (int row : rows) {
@@ -15822,7 +15864,8 @@ void RequestVisibleIcons(ViewState& state) {
     for (int row : rows)
         if (!RequestEntryIcon(state, state.entries[static_cast<size_t>(row)], false, wanted, &evictions,
             !std::binary_search(visible.begin(),visible.end(),row))) break;
-    if(dragging) RequestEntryIcon(state,state.dragPreviewEntry,false,wanted,&evictions,false,state.dragPreviewSize);
+    if(dragging) for(size_t i=0;i<state.dragPreview->imageCount;++i)
+        if(!RequestEntryIcon(state,state.dragPreviewEntries[i],false,wanted,&evictions,false,state.dragPreviewSize,true)) break;
     if (state.firstContentSubmittedAt) QueueVisibleDetails(state);
     ScheduleVisibleIconUploads(state);
     state.lastIconFirst = static_cast<int>(state.scrollNow / std::max(1.f, state.rowPx));
@@ -17755,10 +17798,86 @@ bool PublishModePlane(ViewState& state, ViewState::ModePlane& plane) {
 float DragPreviewBadgeSize(const DragPreview& preview) {
     return std::max(preview.side*.58f,GetSystemMetricsForDpi(SM_CXICON,preview.dpi)*.9f);
 }
+struct DragPreviewGeometry {
+    D2D1_RECT_F artwork{},operation{},caption{},visible{};
+    D2D1_SIZE_U extent{};
+    float edge=0.f;
+};
+D2D1_RECT_F DragArtworkRect(const IconPixels& pixels,float side,float center,float bottom) {
+    const float w=float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width);
+    const float h=float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height);
+    const float fit=side/std::max({1.f,w,h});
+    const float width=pixels.Ready() ? w*fit:side,height=pixels.Ready() ? h*fit:side;
+    return D2D1::RectF(center-width*.5f,bottom-height,center+width*.5f,bottom);
+}
+float DragStackTilt(const std::wstring& path,size_t index) {
+    return index ? (SelectionPathHash(path)&1 ? -1.f:1.f)*std::min(12.f,3.f*float(index)):0.f;
+}
+D2D1::Matrix3x2F DragStackTransform(const DragPreview& preview,size_t index,D2D1_RECT_F rect) {
+    return D2D1::Matrix3x2F::Rotation(preview.Image(index).tilt,
+        D2D1::Point2F((rect.left+rect.right)*.5f,(rect.top+rect.bottom)*.5f))*
+        D2D1::Matrix3x2F::Translation((preview.rtl ? -1.f:1.f)*preview.side*.035f*index,-preview.side*.045f*index);
+}
+DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
+    const float side=preview.side,badge=DragPreviewBadgeSize(preview),edge=side*.06f,outset=badge*.35f;
+    // Keep the hotspot fixed when a square association icon is replaced by a
+    // non-square thumbnail, even if the pointer is currently stationary.
+    DragPreviewGeometry geometry;
+    const auto square=D2D1::RectF(edge+outset,edge,edge+outset+side,edge+side);
+    geometry.artwork=DragArtworkRect(preview.pixels,side,(square.left+square.right)*.5f,square.bottom);
+    const auto& art=geometry.artwork;
+    const float left=std::max(edge,preview.rtl ? art.left-outset:art.right-badge+outset);
+    const float top=std::max(edge,art.bottom-badge+outset);
+    geometry.operation=D2D1::RectF(left,top,left+badge,top+badge);
+    auto bounds=D2D1::RectF(0,0,2*edge+side+2*outset,2*edge+side+outset);
+    // Bound rotated squares, not their asynchronously changing artwork.
+    for(size_t i=1;i<std::min(preview.imageCount,kDragPreviewImages);++i) {
+        const auto transform=DragStackTransform(preview,i,square);
+        for(auto point:{D2D1::Point2F(square.left,square.top),D2D1::Point2F(square.right,square.top),
+            D2D1::Point2F(square.left,square.bottom),D2D1::Point2F(square.right,square.bottom)}) {
+            point=transform.TransformPoint(point);
+            bounds.left=std::min(bounds.left,point.x-edge); bounds.top=std::min(bounds.top,point.y-edge);
+            bounds.right=std::max(bounds.right,point.x+edge); bounds.bottom=std::max(bounds.bottom,point.y+edge);
+        }
+    }
+    auto visible=bounds;
+    if(preview.captionAvailable>0.f) {
+        // Keep the canvas origin fixed as native target messages change width.
+        // Only visible content participates in screen-edge placement below.
+        const float reserve=std::ceil(preview.captionAvailable)+4*edge,center=(square.left+square.right)*.5f;
+        bounds.left=std::min(bounds.left,center-reserve*.5f);
+        bounds.right=std::max(bounds.right,center+reserve*.5f);
+    }
+    if(preview.caption) {
+        const float width=preview.captionSize.width+2*edge;
+        const float x=(square.left+square.right-width)*.5f;
+        geometry.caption=D2D1::RectF(x,bounds.bottom+edge,x+width,bounds.bottom+3*edge+preview.captionSize.height);
+        bounds.left=std::min(bounds.left,x-edge); bounds.right=std::max(bounds.right,x+width+edge);
+        bounds.bottom=geometry.caption.bottom+edge;
+        visible.left=std::min(visible.left,x-edge); visible.right=std::max(visible.right,x+width+edge);
+        visible.bottom=bounds.bottom;
+    }
+    const auto shift=[&](D2D1_RECT_F& r) {r.left-=bounds.left; r.right-=bounds.left; r.top-=bounds.top; r.bottom-=bounds.top;};
+    geometry.visible=visible;
+    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption); shift(geometry.visible);
+    geometry.extent=D2D1::SizeU(UINT(std::ceil(bounds.right-bounds.left)),UINT(std::ceil(bounds.bottom-bounds.top)));
+    geometry.edge=edge;
+    return geometry;
+}
 D2D1_SIZE_U DragPreviewExtent(const DragPreview& preview) {
-    // Geometry follows the displayed icon and system DPI, including the badge.
-    const auto side=UINT(std::ceil(preview.side*1.48f+DragPreviewBadgeSize(preview)*.3f));
-    return D2D1::SizeU(side,side);
+    return LayoutDragPreview(preview).extent;
+}
+POINT PositionDragPreview(const DragPreview& preview,POINT cursor,const RECT& work,bool touch) {
+    const auto geometry=LayoutDragPreview(preview);
+    // Anchor the artwork, not its transparent canvas or the operation badge.
+    // Touch keeps the entire preview above the promoted contact point.
+    const float anchorX=(geometry.artwork.left+geometry.artwork.right)*.5f;
+    const float anchorY=touch ? float(geometry.extent.height):geometry.artwork.bottom;
+    const LONG x=LONG(std::lround(cursor.x-anchorX)),y=LONG(std::lround(cursor.y-anchorY));
+    const auto& visible=geometry.visible;
+    const LONG left=LONG(std::ceil(work.left-visible.left)),top=LONG(std::ceil(work.top-visible.top));
+    return {std::clamp(x,left,std::max(left,LONG(std::floor(work.right-visible.right)))),
+        std::clamp(y,top,std::max(top,LONG(std::floor(work.bottom-visible.bottom))))};
 }
 
 void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brush,
@@ -17777,7 +17896,10 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
         target->DrawImage(glyph.image.Get()); target->SetTransform(previous); return;
     }
     ComPtr<IDWriteTextFormat> format;
-    if(!g_writeFactory || FAILED(g_writeFactory->CreateTextFormat(family,nullptr,DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    // Segoe UI Emoji has regular color artwork. Asking for semibold invokes
+    // synthetic bolding, which flattens the color artwork's edge (U+1F6AB).
+    const auto weight=normalizeWidth ? DWRITE_FONT_WEIGHT_NORMAL:DWRITE_FONT_WEIGHT_SEMI_BOLD;
+    if(!g_writeFactory || FAILED(g_writeFactory->CreateTextFormat(family,nullptr,weight,
         DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,size,L"",&format))) return;
     format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     ComPtr<IDWriteTextLayout> layout;
@@ -17816,54 +17938,75 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
     target->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     target->SetTransform(previous);
 }
-void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,ID2D1Bitmap* existingArtwork=nullptr,DragGlyph* glyph=nullptr) {
-    const float side=preview.side,pad=side*.18f,tile=side+2*pad,edge=side*.06f;
+void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
+    const std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages>* existingArtwork=nullptr,DragGlyph* glyph=nullptr,
+    const DragTextStyle* textStyle=nullptr) {
+    const float side=preview.side;
+    const auto geometry=LayoutDragPreview(preview);
     ComPtr<ID2D1SolidColorBrush> brush;
     if(FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0,0.f),&brush))) return;
     const auto color=[&](COLORREF value,float alpha=1.f) {
         brush->SetColor(D2D1::ColorF(GetRValue(value)/255.f,GetGValue(value)/255.f,GetBValue(value)/255.f,alpha));
     };
     target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    color(RGB(0,0,0),.14f);
-    target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(edge,edge*2,tile+edge,tile+edge*2),pad,pad),brush.Get());
-    const auto body=D2D1::RoundedRect(D2D1::RectF(edge,edge,tile+edge,tile+edge),pad,pad);
-    color(preview.background,.97f); target->FillRoundedRectangle(body,brush.Get());
-    color(preview.foreground,.16f); target->DrawRoundedRectangle(body,brush.Get(),std::max(1.f,preview.dpi/96.f));
-    const auto& pixels=preview.pixels;
-    ComPtr<ID2D1Bitmap> bitmap=existingArtwork;
-    if(pixels.Ready() && (bitmap || SUCCEEDED(target->CreateBitmap(D2D1::SizeU(pixels.width,pixels.height),
-        pixels.data.data(),pixels.stride,D2D1::BitmapProperties(
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&bitmap)))) {
-        // Thumbnail decoration has a separate atlas band. Never squeeze that
-        // band into the image, stretch its aspect ratio, or crop it to a square.
-        const float w=float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width);
-        const float h=float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height);
-        const float scale=side/std::max(w,h),x=edge+pad+(side-w*scale)*.5f,y=edge+pad+(side-h*scale)*.5f;
-        const auto destination=D2D1::RectF(x,y,x+w*scale,y+h*scale),source=D2D1::RectF(0,0,w,h);
-        target->DrawBitmap(bitmap.Get(),&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
-    } else {
-        // Only used when even the currently displayed association is missing.
-        // A recognizable, antialiased silhouette replaces the old blank box.
-        color(preview.folder ? preview.accent:preview.foreground,.8f);
-        const auto rect=D2D1::RectF(edge+pad+side*.2f,edge+pad+side*.15f,edge+pad+side*.8f,edge+pad+side*.85f);
-        target->FillRoundedRectangle(D2D1::RoundedRect(rect,side*.04f,side*.04f),brush.Get());
-        color(preview.background);
-        for(float y:{.38f,.53f,.68f}) target->DrawLine(D2D1::Point2F(rect.left+side*.12f,edge+pad+side*y),
-            D2D1::Point2F(rect.right-side*.12f,edge+pad+side*y),brush.Get(),side*.04f);
+    if(textStyle) {
+        ConfigureTextTarget(*textStyle,target);
+        // Count/caption text is wholly inside its already painted opaque
+        // background, so System ClearType is safe on this transparent canvas.
+        target->SetTextAntialiasMode(textStyle->opaqueTextAntialiasMode);
     }
-    const float badge=DragPreviewBadgeSize(preview),left=preview.rtl ? edge:tile+edge-badge*.7f,top=tile+edge-badge*.7f;
-    const auto rect=D2D1::RectF(left,top,left+badge,top+badge);
+    D2D1_MATRIX_3X2_F original{}; target->GetTransform(&original);
+    const float center=(geometry.artwork.left+geometry.artwork.right)*.5f,bottom=geometry.artwork.bottom;
+    const auto square=D2D1::RectF(center-side*.5f,bottom-side,center+side*.5f,bottom);
+    for(size_t layer=std::min(preview.imageCount,kDragPreviewImages);layer-->0;) {
+        const auto& image=preview.Image(layer);
+        const auto& pixels=image.pixels;
+        const auto destination=DragArtworkRect(pixels,side,center,bottom);
+        target->SetTransform(DragStackTransform(preview,layer,square)*original);
+        ComPtr<ID2D1Bitmap> bitmap=existingArtwork ? (*existingArtwork)[layer]:nullptr;
+        if(pixels.Ready() && (bitmap || SUCCEEDED(target->CreateBitmap(D2D1::SizeU(pixels.width,pixels.height),
+            pixels.data.data(),pixels.stride,D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&bitmap)))) {
+            // Thumbnail decoration has a separate atlas band. Never squeeze that
+            // band into the image, stretch its aspect ratio, or crop it to a square.
+            const float w=float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width);
+            const float h=float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height);
+            const auto source=D2D1::RectF(0,0,w,h);
+            target->DrawBitmap(bitmap.Get(),&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+        } else {
+            // Only used when even the currently displayed association is missing.
+            // A recognizable, antialiased silhouette replaces the old blank box.
+            color(image.folder ? preview.accent:preview.foreground,.8f);
+            const auto rect=D2D1::RectF(square.left+side*.2f,square.top+side*.15f,square.left+side*.8f,square.top+side*.85f);
+            target->FillRoundedRectangle(D2D1::RoundedRect(rect,side*.04f,side*.04f),brush.Get());
+            color(preview.background);
+            for(float y:{.38f,.53f,.68f}) target->DrawLine(D2D1::Point2F(rect.left+side*.12f,square.top+side*y),
+                D2D1::Point2F(rect.right-side*.12f,square.top+side*y),brush.Get(),side*.04f);
+        }
+    }
+    target->SetTransform(original);
+    const float badge=DragPreviewBadgeSize(preview);
+    const auto rect=geometry.operation;
     const bool blocked=!(preview.effect&(DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK));
     DrawCenteredDragLabel(target,brush.Get(),blocked ? L"\U0001F6AB":preview.effect&DROPEFFECT_LINK ? L"\U0001F517":preview.effect&DROPEFFECT_COPY ? L"\U0001F4CB":
         preview.rtl ? L"\u2B05\uFE0F":L"\u27A1\uFE0F",L"Segoe UI Emoji",badge*.82f,rect,preview.foreground,true,glyph);
     if(preview.count>1) {
         const auto count=preview.count>999 ? L"999+":std::to_wstring(preview.count);
         const float height=side*.38f,width=std::max(height,height*.65f*float(count.size())+height*.4f);
-        const float x=preview.rtl ? tile+edge-width:edge;
-        const auto bounds=D2D1::RectF(x,edge,x+width,edge+height);
+        const float x=std::clamp(preview.rtl ? geometry.artwork.right-width:geometry.artwork.left,
+            geometry.edge,float(geometry.extent.width)-geometry.edge-width);
+        const auto bounds=D2D1::RectF(x,geometry.artwork.top,x+width,geometry.artwork.top+height);
         color(preview.accent); target->FillRoundedRectangle(D2D1::RoundedRect(bounds,height*.5f,height*.5f),brush.Get());
         DrawCenteredDragLabel(target,brush.Get(),count,L"Segoe UI",height*.7f,bounds,ReadableForeground(preview.accent,{preview.foreground}));
+    }
+    if(preview.caption) {
+        const auto rect=geometry.caption;
+        color(preview.background); target->FillRoundedRectangle(D2D1::RoundedRect(rect,geometry.edge,geometry.edge),brush.Get());
+        color(BlendColor(preview.background,preview.foreground,20));
+        target->DrawRoundedRectangle(D2D1::RoundedRect(rect,geometry.edge,geometry.edge),brush.Get(),float(preview.dpi)/96.f);
+        color(preview.foreground);
+        target->DrawTextLayout(D2D1::Point2F(rect.left+geometry.edge,rect.top+geometry.edge),preview.caption.Get(),brush.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     }
 }
 
@@ -17880,26 +18023,40 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     if(layer.window!=preview->window) layer={};
     const bool entering=!layer.visual;
     if(entering && (FAILED(state.composition->CreateTargetForHwnd(preview->window,TRUE,&layer.target)) ||
-        FAILED(CreatePixelAlignedVisual(state.composition.Get(),&layer.visual)) ||
+        // This surface scales during lift/settle, unlike pixel-aligned list
+        // text. Keep DComp's smooth default instead of snapping emoji texels.
+        FAILED(state.composition->CreateVisual(&layer.visual)) ||
         FAILED(layer.target->SetRoot(layer.visual.Get())))) {layer={}; return false;}
     if(!CreateColumnPlane(state,layer.plane,DragPreviewExtent(*preview))) return false;
-    if(layer.artworkIdentity!=preview->pixels.data.Identity()) {
-        layer.artwork.Reset(); layer.artworkIdentity=preview->pixels.data.Identity();
-        if(auto* shown=FindIconRecord(state,preview->imageKey); shown && shown->bitmap &&
-            shown->bitmapPixels.data.Identity()==layer.artworkIdentity) layer.artwork=shown->bitmap;
-        else if(preview->pixels.Ready()) {
-            const auto& pixels=preview->pixels;
+    RefreshTextRenderingForWindow(layer.textStyle,preview->window,true);
+    for(size_t i=0;i<kDragPreviewImages;++i) {
+        const auto& image=preview->Image(i);
+        const auto identity=i<preview->imageCount ? image.pixels.data.Identity():nullptr;
+        if(layer.artworkIdentity[i]==identity) continue;
+        layer.artwork[i].Reset(); layer.artworkIdentity[i]=identity;
+        if(!identity) continue;
+        // Association/folder artwork can be shared by several selected files.
+        for(size_t shared=0;shared<kDragPreviewImages;++shared)
+            if(layer.artworkIdentity[shared]==identity && layer.artwork[shared]) {layer.artwork[i]=layer.artwork[shared]; break;}
+        if(layer.artwork[i]) continue;
+        if(auto* shown=FindIconRecord(state,image.imageKey); shown && shown->bitmap &&
+            shown->bitmapPixels.data.Identity()==identity) layer.artwork[i]=shown->bitmap;
+        else if(image.pixels.Ready()) {
+            const auto& pixels=image.pixels;
             state.target->CreateBitmap(D2D1::SizeU(pixels.width,pixels.height),pixels.data.data(),pixels.stride,
-                D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&layer.artwork);
+                D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&layer.artwork[i]);
         }
     }
     ComPtr<ID2D1Image> previous; state.target->GetTarget(&previous);
+    ComPtr<IDWriteRenderingParams> previousTextParams; state.target->GetTextRenderingParams(&previousTextParams);
+    const auto previousTextMode=state.target->GetTextAntialiasMode();
     D2D1_MATRIX_3X2_F transform{}; state.target->GetTransform(&transform);
     state.target->SetTarget(layer.plane.bitmap.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
     state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
-    DrawDragPreview(state.target.Get(),*preview,layer.artwork.Get(),&layer.glyph);
+    DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle);
     const HRESULT draw=state.target->EndDraw();
     state.target->SetTarget(previous.Get()); state.target->SetTransform(transform);
+    state.target->SetTextRenderingParams(previousTextParams.Get()); state.target->SetTextAntialiasMode(previousTextMode);
     if(FAILED(draw) || !PublishModePlane(state,layer.plane) || FAILED(layer.visual->SetContent(layer.plane.surface.Get()))) return false;
     // The tab's existing device/compositor animates a short lift on entry and
     // a gentle settle on effect/artwork changes. No periodic owner-thread work.
@@ -17907,7 +18064,8 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
         layer.curve=UiCompositionCurve(state,entering ? .88f:.97f,1.f,now);
         if(layer.curve && SUCCEEDED(state.composition->CreateScaleTransform(&layer.scale))) {
-            layer.scale->SetCenterX(preview->side*.7f); layer.scale->SetCenterY(preview->side*.7f);
+            const auto image=LayoutDragPreview(*preview).artwork;
+            layer.scale->SetCenterX((image.left+image.right)*.5f); layer.scale->SetCenterY((image.top+image.bottom)*.5f);
             layer.scale->SetScaleX(layer.curve.Get()); layer.scale->SetScaleY(layer.curve.Get());
             layer.visual->SetTransform(layer.scale.Get());
         }
@@ -24142,6 +24300,16 @@ bool FindGpuDragOrigin(IDataObject* object, GpuDragOrigin& result) {
     return found;
 }
 
+void ClearShellDropDescription(IDataObject* data) {
+    if(!data) return;
+    static const auto format=CLIPFORMAT(RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION));
+    FORMATETC request{format,nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL};
+    STGMEDIUM medium{}; medium.tymed=TYMED_HGLOBAL; medium.hGlobal=GlobalAlloc(GHND,sizeof(DROPDESCRIPTION));
+    if(!medium.hGlobal) return;
+    auto* description=static_cast<DROPDESCRIPTION*>(GlobalLock(medium.hGlobal));
+    if(description) {description->type=DROPIMAGE_INVALID; GlobalUnlock(medium.hGlobal);}
+    if(!description || FAILED(data->SetData(&request,&medium,TRUE))) ReleaseStgMedium(&medium);
+}
 // A real OLE drop target owned by exactly one tab's GPU HWND. Do not
 // manufacture CF_HDROP lists, file operations, or drag effects: the Shell's
 // IDataObject/IDropTarget contracts preserve virtual items, third-party
@@ -24257,6 +24425,8 @@ class ShellDropBridge final : public IDropTarget {
         auto previous = std::move(current_);
         currentRow_ = -2;
         if (previous) previous->DragLeave();
+        if (session != session_ || !CurrentSession()) { *effect = DROPEFFECT_NONE; return S_FALSE; }
+        if(hasDragOrigin_) ClearShellDropDescription(data_.Get());
         if (session != session_ || !CurrentSession()) { *effect = DROPEFFECT_NONE; return S_FALSE; }
         currentRow_ = row;
         // Do not even enter Explorer's native drop target when this is a
@@ -24472,51 +24642,137 @@ void PublishDragPreview(ViewState& state) {
 
 void RefreshDragPreview(ViewState& state) {
     if(!state.dragPreview || state.dragPreviewEpoch!=state.mouseFolderEpoch) return;
-    const IconKeyContext context{state.dragPreviewSize,state.gridView,FileThumbnails(state)};
-    std::wstring path,key; bool attrs=false;
-    auto* record=FindIconRecord(state,IconKey(context,state.dragPreviewEntry,path,attrs),true,false,&key);
-    if((!record || !record->pixels.Ready()) &&
-        (!state.dragPreviewEntry.folder || !IsDriveRoot(state.dragPreviewEntry.path)))
-        record=FindIconRecord(state,IconKey(context,state.dragPreviewEntry,path,attrs,true),true,false,&key);
-    if(!record || !record->pixels.Ready()) return;
-    const auto extent=[](const IconPixels& p) {
-        return std::max(p.thumbnailWidth ? p.thumbnailWidth:p.width,p.thumbnailHeight ? p.thumbnailHeight:p.height);
-    };
-    const auto& pixels=record->pixels;
-    auto& current=state.dragPreview->pixels;
-    const bool association=record->association || record==&state.defaultFolderIcon;
-    const UINT before=extent(current),after=extent(pixels);
-    const bool betterSize=before<state.dragPreviewSize ? after>=before:
-        after>=state.dragPreviewSize && after<=before;
-    if(current.data.Identity()==pixels.data.Identity() ||
-        (current.Ready() && ((!state.dragPreview->association && association) ||
-            (state.dragPreview->association==association && !betterSize)))) return;
-    current=pixels;
-    state.dragPreview->imageKey=std::move(key);
-    state.dragPreview->association=association;
-    PublishDragPreview(state);
+    const IconKeyContext context{state.dragPreviewSize,true,true};
+    bool changed=false;
+    for(size_t i=0;i<state.dragPreview->imageCount;++i) {
+        const auto& entry=state.dragPreviewEntries[i];
+        auto& image=state.dragPreview->Image(i);
+        std::wstring path,key; bool attrs=false;
+        auto* record=FindIconRecord(state,IconKey(context,entry,path,attrs),true,false,&key);
+        if((!record || !record->pixels.Ready()) &&
+            (!entry.folder || !IsDriveRoot(entry.path)))
+            record=FindIconRecord(state,IconKey(context,entry,path,attrs,true),true,false,&key);
+        if(!record || !record->pixels.Ready()) continue;
+        const auto extent=[](const IconPixels& p) {
+            return std::max(p.thumbnailWidth ? p.thumbnailWidth:p.width,p.thumbnailHeight ? p.thumbnailHeight:p.height);
+        };
+        const auto& pixels=record->pixels;
+        auto& current=image.pixels;
+        const bool association=record->association || record==&state.defaultFolderIcon;
+        const bool thumbnail=pixels.thumbnailWidth && pixels.thumbnailHeight;
+        const bool hadThumbnail=current.thumbnailWidth && current.thumbnailHeight;
+        const bool betterArtwork=(!hadThumbnail && thumbnail) || (image.association && !association);
+        const UINT before=extent(current),after=extent(pixels);
+        const bool betterSize=before<state.dragPreviewSize ? after>=before:
+            after>=state.dragPreviewSize && after<=before;
+        if(current.data.Identity()==pixels.data.Identity() ||
+            (current.Ready() && ((hadThumbnail && !thumbnail) || (!image.association && association) ||
+                (!betterArtwork && !betterSize)))) continue;
+        current=pixels;
+        image.imageKey=std::move(key);
+        image.association=association;
+        changed=true;
+    }
+    if(changed) PublishDragPreview(state);
 }
 
 // Only visual feedback differs from the native source. The same Shell selection
 // IDataObject and existing IDropTarget bridge own every file operation/effect.
-class ShellDragFeedback final : public IDropSource {
+// Use the already imported identities and viewport: optional preview artwork
+// never enumerates the directory or asks a provider for names on this STA.
+std::vector<int> DragPreviewRows(const ViewState& state,int front,int count) {
+    std::vector<int> rows{front};
+    const size_t limit=std::min(kDragPreviewImages,size_t(std::max(1,count)));
+    const auto add=[&](int row) {
+        if(rows.size()<limit && row>=0 && size_t(row)<state.entries.size() &&
+            size_t(row)<state.selectedFlags.size() && state.selectedFlags[size_t(row)] &&
+            std::find(rows.begin(),rows.end(),row)==rows.end()) rows.push_back(row);
+    };
+    for(size_t i=0;i<std::min(limit,state.nativeSelectionObservedPaths.size());++i)
+        add(GpuRowForNativePath(state,state.nativeSelectionObservedPaths[i]));
+    for(size_t i=0;i<std::min(limit,state.nativeSelectionPaths.size());++i)
+        add(GpuRowForNativePath(state,state.nativeSelectionPaths[i]));
+    if(rows.size()<limit) for(int row:VisibleItemRows(state,0.f)) {add(row); if(rows.size()==limit) break;}
+    if(count==state.total) for(int row=0;row<std::min<int>(state.total,kDragPreviewImages);++row) add(row);
+    return rows;
+}
+struct ShellDropText {std::wstring text; DWRITE_TEXT_RANGE insert{};};
+ShellDropText ReadShellDropText(IDataObject* data,DWORD effect) {
+    ShellDropText result;
+    if(!data) return result;
+    static const auto format=CLIPFORMAT(RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION));
+    FORMATETC request{format,nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL}; STGMEDIUM medium{};
+    // This is the target's small feedback record, never file/provider content.
+    if(FAILED(data->GetData(&request,&medium))) return result;
+    DROPDESCRIPTION description{};
+    if(medium.tymed==TYMED_HGLOBAL && medium.hGlobal && GlobalSize(medium.hGlobal)>=sizeof(description)) {
+        if(const void* memory=GlobalLock(medium.hGlobal)) {memcpy(&description,memory,sizeof(description)); GlobalUnlock(medium.hGlobal);}
+    } else description.type=DROPIMAGE_INVALID;
+    ReleaseStgMedium(&medium);
+    const auto type=description.type;
+    if(type==DROPIMAGE_INVALID || (type==DROPIMAGE_COPY && !(effect&DROPEFFECT_COPY)) ||
+        (type==DROPIMAGE_MOVE && !(effect&DROPEFFECT_MOVE)) || (type==DROPIMAGE_LINK && !(effect&DROPEFFECT_LINK))) return result;
+    const std::wstring message(description.szMessage,wcsnlen(description.szMessage,ARRAYSIZE(description.szMessage)));
+    const std::wstring insert(description.szInsert,wcsnlen(description.szInsert,ARRAYSIZE(description.szInsert)));
+    for(size_t i=0;i<message.size();++i) {
+        if(message[i]==L'%' && i+1<message.size()) {
+            if(message[i+1]==L'1') {
+                result.insert={UINT32(result.text.size()),UINT32(insert.size())}; result.text+=insert; ++i; continue;
+            }
+            if(message[i+1]==L'%') {result.text+=L'%'; ++i; continue;}
+        }
+        result.text+=message[i];
+    }
+    return result;
+}
+bool UpdateDragCaption(ViewState& state,DragPreview& preview,const ShellDropText& text,float available) {
+    if(!state.headerFormat && !text.text.empty() && g_writeFactory) MakeTextFormats(state);
+    if(preview.description==text.text && preview.captionDpi==preview.dpi && preview.captionFace==state.textFaceSerial &&
+        preview.captionAvailable==available) return false;
+    preview.captionDpi=preview.dpi; preview.captionFace=state.textFaceSerial; preview.captionAvailable=available;
+    preview.description=text.text; preview.caption.Reset(); preview.captionSize={};
+    const auto& source=state.headerFormat;
+    if(text.text.empty() || !source || !g_writeFactory) return true;
+    std::wstring family(source->GetFontFamilyNameLength()+1,L'\0'),locale(source->GetLocaleNameLength()+1,L'\0');
+    ComPtr<IDWriteFontCollection> collection; ComPtr<IDWriteTextFormat> format;
+    if(FAILED(source->GetFontFamilyName(family.data(),UINT32(family.size()))) ||
+        FAILED(source->GetLocaleName(locale.data(),UINT32(locale.size()))) || FAILED(source->GetFontCollection(&collection)) ||
+        FAILED(g_writeFactory->CreateTextFormat(family.c_str(),collection.Get(),source->GetFontWeight(),source->GetFontStyle(),
+            source->GetFontStretch(),source->GetFontSize()*float(preview.dpi)/ViewDpi(state),locale.c_str(),&format))) return true;
+    format->SetReadingDirection(preview.rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT:DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
+    if(FAILED(g_writeFactory->CreateTextLayout(text.text.c_str(),UINT32(text.text.size()),format.Get(),std::max(1.f,available),1e6f,&preview.caption))) return true;
+    if(text.insert.length) preview.caption->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD,text.insert);
+    DWRITE_TEXT_METRICS metrics{};
+    if(SUCCEEDED(preview.caption->GetMetrics(&metrics))) {
+        preview.captionSize=D2D1::SizeF(std::ceil(metrics.widthIncludingTrailingWhitespace),std::ceil(metrics.height));
+        preview.caption->SetMaxWidth(std::max(1.f,preview.captionSize.width));
+    }
+    return true;
+}
+class ShellDragFeedback final : public IDropSource, public IDropSourceNotify {
     CallbackObjectLifetime moduleLifetime_;
     std::atomic<ULONG> refs_{1};
     HWND source_,window_=nullptr;
     unsigned long long lifetime_;
     std::shared_ptr<PresentationLane> lane_;
+    ComPtr<IDataObject> data_;
 public:
-    explicit ShellDragFeedback(ViewState& state,int row,int count) :
-        source_(state.hwnd),lifetime_(state.lifetimeToken),lane_(state.presenter) {
+    explicit ShellDragFeedback(ViewState& state,int row,int count,IDataObject* data) :
+        source_(state.hwnd),lifetime_(state.lifetimeToken),lane_(state.presenter),data_(data) {
         if(!lane_ || lane_->stopping.load(std::memory_order_acquire)) return;
         const int dpi=ViewDpi(state),systemIcon=GetSystemMetricsForDpi(SM_CXICON,dpi);
         auto preview=std::make_shared<DragPreview>();
-        preview->side=std::clamp(state.iconPx,float(systemIcon),float(systemIcon*3));
-        preview->dpi=dpi; preview->count=count; preview->folder=state.entries[size_t(row)].folder;
+        preview->side=std::clamp(state.iconPx,float(systemIcon*4),float(systemIcon*8));
+        preview->dpi=dpi; preview->count=count;
         preview->rtl=state.rtlLayout; preview->background=state.nativeEditBackground;
         preview->foreground=state.nativeEditForeground; preview->accent=g_selectionRgb.load(std::memory_order_relaxed);
         BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0); preview->animate=animations!=FALSE;
         preview->token=ULONG_PTR(g_nextToken.fetch_add(1,std::memory_order_relaxed));
+        POINT pointer{}; MONITORINFO monitor{sizeof(monitor)};
+        if(GetCursorPos(&pointer) && GetMonitorInfoW(MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST),&monitor))
+            preview->captionAvailable=float(monitor.rcWork.right-monitor.rcWork.left)/3.f;
+        preview->monitor=MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST);
         const auto size=DragPreviewExtent(*preview);
         // A system-class layered, input-transparent window has no DLL callback,
         // focus/capture, drop target or worker of its own.
@@ -24528,26 +24784,32 @@ public:
             DestroyWindow(window_); window_=nullptr; return;
         }
         preview->window=window_; state.dragPreview=std::move(preview);
-        state.dragPreviewEntry=state.entries[size_t(row)]; state.dragPreviewEpoch=state.mouseFolderEpoch;
+        const auto rows=DragPreviewRows(state,row,count);
+        state.dragPreview->imageCount=rows.size(); state.dragPreviewEpoch=state.mouseFolderEpoch;
         state.dragPreviewSize=32;
         VisitImageTiers([&](UINT size) {state.dragPreviewSize=size; return size<state.dragPreview->side;});
         // Start with exactly the artwork already supplied to the shown row.
-        std::wstring path; bool attrs=false;
-        auto* shown=FindIconRecord(state,IconKey(state,state.dragPreviewEntry,path,attrs),true,false,&state.dragPreview->imageKey);
-        if((!shown || !shown->pixels.Ready()) && (!state.dragPreviewEntry.folder || !IsDriveRoot(state.dragPreviewEntry.path)))
-            shown=FindIconRecord(state,IconKey(state,state.dragPreviewEntry,path,attrs,true),true,false,&state.dragPreview->imageKey);
-        if(shown) {
-            state.dragPreview->pixels=shown->bitmapPixels.Ready() ? shown->bitmapPixels:shown->pixels;
-            state.dragPreview->association=shown->association || shown==&state.defaultFolderIcon;
+        for(size_t i=0;i<rows.size();++i) {
+            const auto& entry=state.entries[size_t(rows[i])]; state.dragPreviewEntries[i]=entry;
+            auto& image=state.dragPreview->Image(i); image.folder=entry.folder;
+            image.tilt=DragStackTilt(entry.path,i);
+            std::wstring path; bool attrs=false;
+            auto* shown=FindIconRecord(state,IconKey(state,entry,path,attrs),true,false,&image.imageKey);
+            if((!shown || !shown->pixels.Ready()) && (!entry.folder || !IsDriveRoot(entry.path)))
+                shown=FindIconRecord(state,IconKey(state,entry,path,attrs,true),true,false,&image.imageKey);
+            if(shown) {
+                image.pixels=shown->bitmapPixels.Ready() ? shown->bitmapPixels:shown->pixels;
+                image.association=shown->association || shown==&state.defaultFolderIcon;
+            }
         }
         PublishDragPreview(state);
         RequestVisibleIcons(state);
         RefreshDragPreview(state);
-        GiveFeedback(DROPEFFECT_NONE);
     }
+    bool HasPreview() const {return window_!=nullptr;}
     ~ShellDragFeedback() {
         if(auto* live=State(source_); live && live->lifetimeToken==lifetime_) {
-            live->dragPreview.reset(); live->dragPreviewEntry={}; live->dragPreviewSize=0;
+            live->dragPreview.reset(); live->dragPreviewEntries={}; live->dragPreviewSize=0;
         }
         if(lane_ && !lane_->stopping.load(std::memory_order_acquire)) {
             std::lock_guard lock(lane_->mutex); lane_->dragPreview=std::shared_ptr<const DragPreview>{}; SetEvent(lane_->wake);
@@ -24558,12 +24820,18 @@ public:
         WindowCallbackGuard callback;
         if(!out) return E_POINTER;
         *out=nullptr;
-        if(iid!=IID_IUnknown && iid!=IID_IDropSource) return E_NOINTERFACE;
-        *out=static_cast<IDropSource*>(this); AddRef(); return S_OK;
+        if(iid==IID_IUnknown || iid==IID_IDropSource) *out=static_cast<IDropSource*>(this);
+        else if(iid==IID_IDropSourceNotify) *out=static_cast<IDropSourceNotify*>(this);
+        else return E_NOINTERFACE;
+        AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override {WindowCallbackGuard callback; return refs_.fetch_add(1)+1;}
     ULONG STDMETHODCALLTYPE Release() override {
         WindowCallbackGuard callback; const auto count=refs_.fetch_sub(1)-1; if(!count) delete this; return count;
+    }
+    HRESULT STDMETHODCALLTYPE DragEnterTarget(HWND) override {WindowCallbackGuard callback; return S_OK;}
+    HRESULT STDMETHODCALLTYPE DragLeaveTarget() override {
+        WindowCallbackGuard callback; ClearShellDropDescription(data_.Get()); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape,DWORD keys) override {
         WindowCallbackGuard callback;
@@ -24581,30 +24849,34 @@ public:
         const auto owned=live->dragPreview;
         auto& preview=*owned;
         effect&=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
+        const auto text=ReadShellDropText(data_.Get(),effect);
+        if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return DRAGDROP_S_USEDEFAULTCURSORS;
         const auto accent=g_selectionRgb.load(std::memory_order_relaxed);
-        if(preview.effect!=effect || preview.background!=live->nativeEditBackground || preview.foreground!=live->nativeEditForeground || preview.accent!=accent) {
-            preview.effect=effect; preview.background=live->nativeEditBackground; preview.foreground=live->nativeEditForeground;
+        const auto background=ValidRgb(live->itemTip.background) ? live->itemTip.background:live->nativeEditBackground;
+        const auto foreground=ValidRgb(live->itemTip.foreground) ? live->itemTip.foreground:live->nativeEditForeground;
+        if(preview.effect!=effect || preview.background!=background || preview.foreground!=foreground || preview.accent!=accent) {
+            preview.effect=effect; preview.background=background; preview.foreground=foreground;
             preview.accent=accent;
             PublishDragPreview(*live);
         }
         POINT cursor{};
         if(GetCursorPos(&cursor)) {
-            const auto size=DragPreviewExtent(preview);
-            const int offset=GetSystemMetricsForDpi(SM_CXCURSOR,preview.dpi)/2;
-            int x=preview.rtl ? cursor.x-int(size.width)-offset:cursor.x+offset;
-            int y=live->touch.dragPromoted ? cursor.y-int(size.height)-offset:cursor.y+offset;
             MONITORINFO monitor{sizeof(monitor)};
-            if(GetMonitorInfoW(MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST),&monitor)) {
-                x=std::clamp(x,int(monitor.rcWork.left),int(std::max(monitor.rcWork.left,monitor.rcWork.right-LONG(size.width))));
-                y=std::clamp(y,int(monitor.rcWork.top),int(std::max(monitor.rcWork.top,monitor.rcWork.bottom-LONG(size.height))));
-            }
-            SetWindowPos(window_,HWND_TOPMOST,x,y,int(size.width),int(size.height),SWP_NOACTIVATE|SWP_SHOWWINDOW);
-            if(State(source_)!=live || live->lifetimeToken!=lifetime_) return DRAGDROP_S_USEDEFAULTCURSORS;
-            const int dpi=DpiOf(window_);
-            if(dpi!=preview.dpi) {
+            if(GetMonitorInfoW(MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST),&monitor)) for(int pass=0;pass<2;++pass) {
+                const auto destination=MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST);
+                if(preview.monitor!=destination) {preview.monitor=destination; PublishDragPreview(*live);}
+                if(UpdateDragCaption(*live,preview,text,float(monitor.rcWork.right-monitor.rcWork.left)/3.f)) PublishDragPreview(*live);
+                const auto size=DragPreviewExtent(preview);
+                const auto position=PositionDragPreview(preview,cursor,monitor.rcWork,live->touch.dragPromoted);
+                SetWindowPos(window_,HWND_TOPMOST,position.x,position.y,int(size.width),int(size.height),SWP_NOACTIVATE|SWP_SHOWWINDOW);
+                if(State(source_)!=live || live->lifetimeToken!=lifetime_) return DRAGDROP_S_USEDEFAULTCURSORS;
+                const int dpi=DpiOf(window_);
+                if(dpi==preview.dpi) break;
                 preview.side*=float(dpi)/preview.dpi; preview.dpi=dpi;
                 VisitImageTiers([&](UINT size) {live->dragPreviewSize=size; return size<preview.side;});
                 PublishDragPreview(*live); RequestVisibleIcons(*live); RefreshDragPreview(*live);
+                // Recalculate the hotspot and bounds immediately at the new
+                // monitor DPI, without waiting for another pointer movement.
             }
         }
         if(!preview.rendered->load(std::memory_order_acquire)) return DRAGDROP_S_USEDEFAULTCURSORS;
@@ -24641,18 +24913,23 @@ void StartNativeShellDrag(ViewState& state, int row) {
     ViewState* const sourceState = &state;
     state.shellDragRunning = true;
     // Keep the origin valid throughout the reentrant OLE modal loop. It is
-    // removed unconditionally when SHDoDragDrop returns, even after navigation.
+    // removed unconditionally when the OLE loop returns, even after navigation.
     RegisterGpuDragOrigin(objects.Get(), state.hwnd, state.folderPath,
         state.entries[static_cast<size_t>(row)].path);
     ComPtr<IDropSource> feedback;
-    feedback.Attach(new ShellDragFeedback(state,row,nativeCount));
+    auto* visuals=new ShellDragFeedback(state,row,nativeCount,objects.Get());
+    feedback.Attach(visuals);
     const ULONGLONG started = GetTickCount64();
     DWORD effect = DROPEFFECT_NONE;
     // Shell owns data formats and all target behavior. Feedback is shared by
     // mouse, touchpad and promoted touch, including external applications.
     NativeFileCommandScope command(&state);
-    const HRESULT hr = SHDoDragDrop(hwnd, objects.Get(), feedback.Get(),
-        DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
+    // SHDoDragDrop manufactures a generic image if no source bitmap exists.
+    // Our source already implements OLE feedback: bypass that image-producing
+    // wrapper while preserving the exact Shell IDataObject and target routing.
+    const DWORD allowed=DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+    const HRESULT hr = visuals->HasPreview() ? DoDragDrop(objects.Get(),feedback.Get(),allowed,&effect) :
+        SHDoDragDrop(hwnd,objects.Get(),feedback.Get(),allowed,&effect);
     feedback.Reset();
     UnregisterGpuDragOrigin(objects.Get(), hwnd);
     // The OLE modal loop can re-enter navigation and even destroy this HWND.
@@ -27074,7 +27351,8 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             if(FAILED(device)) {state.graphicsFailure=device; state.graphicsFailureStage=6; DropTarget(state);}
         }
         state.clipboardWiggleOnly=false; // Other paths (standby, resume) always paint fully.
-        if(activeDragPreview && !state.dragComposition.visual) RenderDragPreview(state,activeDragPreview);
+        if(activeDragPreview && (!state.dragComposition.visual || state.dragComposition.textStyle.textRenderingRevision!=
+            g_textRenderingRevision.load(std::memory_order_relaxed))) RenderDragPreview(state,activeDragPreview);
         EndFrameProfile(state);
         TrimPresentationImages(state);
         if(repaint && state.target) {ScheduleVisibleIconUploads(state);}

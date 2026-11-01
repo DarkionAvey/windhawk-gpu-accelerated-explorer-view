@@ -94,6 +94,9 @@ inline HRESULT WINAPI Drag(HWND hwnd,IDataObject* data,IDropSource* source,DWORD
     ++drags; if(duringDrag) duringDrag();
     *effect=DROPEFFECT_NONE; promoted=false; return DRAGDROP_S_CANCEL;
 }
+inline HRESULT WINAPI OleDrag(IDataObject* data,IDropSource* source,DWORD allowed,DWORD* effect) {
+    return enabled ? Drag(nullptr,data,source,allowed,effect) : ::DoDragDrop(data,source,allowed,effect);
+}
 inline BOOL WINAPI Begin(HWND hwnd) {if(!enabled) return ::BeginPanningFeedback(hwnd); ++begins; return TRUE;}
 inline BOOL WINAPI Update(HWND hwnd,LONG x,LONG y,BOOL inertial) {
     if(!enabled) return ::UpdatePanningFeedback(hwnd,x,y,inertial);
@@ -119,6 +122,7 @@ struct Session {
 #define ProcessPointerFramesInteractionContext TouchFixture::Process
 #define GetProcAddress TouchFixture::Procedure
 #define SHDoDragDrop TouchFixture::Drag
+#define DoDragDrop TouchFixture::OleDrag
 #define BeginPanningFeedback TouchFixture::Begin
 #define UpdatePanningFeedback TouchFixture::Update
 #define EndPanningFeedback TouchFixture::End

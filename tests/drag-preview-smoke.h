@@ -20,18 +20,96 @@ static void TestDragPreview(const std::wstring& fixture) {
         }),"drag preview initial Shell artwork");
         state.dragPreview=std::make_shared<DragPreview>();
         state.dragPreview->pixels=shown; state.dragPreview->side=96;
-        state.dragPreviewEntry=state.entries[0]; state.dragPreviewEpoch=state.mouseFolderEpoch; state.dragPreviewSize=96;
+        state.dragPreviewEntries[0]=state.entries[0]; state.dragPreviewEpoch=state.mouseFolderEpoch; state.dragPreviewSize=96;
         RequestVisibleIcons(state);
         Check(state.dragPreview->pixels.data.Identity()==shown.data.Identity(),"drag request discarded immediate displayed pixels");
         Check(Eventually([&] {ReceiveIcons(state,false); return state.dragPreview->pixels.width>=96;}),
             "existing image workers did not enrich the drag preview");
         const auto sharp=state.dragPreview->pixels;
         state.dragPreview.reset();
+        // A real PNG must enrich a Details drag even when list thumbnails are
+        // disabled. The ordinary view keeps its association icon unchanged.
+        const auto imagePath=std::filesystem::path(fixture+L"-drag-preview.png");
+        struct ImageCleanup {std::filesystem::path path; ~ImageCleanup() {std::error_code e; std::filesystem::remove(path,e);}} cleanup{imagePath};
+        ComPtr<IWICImagingFactory> wic;
+        Check(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&wic))),"drag PNG factory");
+        IconPixels image; image.width=192; image.height=96; image.stride=image.width*4;
+        image.data.assign(size_t(image.stride)*image.height,255);
+        for(UINT y=0;y<image.height;++y) for(UINT x=0;x<image.width;++x) {
+            auto* p=image.data.data()+size_t(y)*image.stride+x*4;
+            p[0]=BYTE(40+x); p[1]=BYTE(60+y); p[2]=BYTE(x<image.width/2 ? 220:70);
+        }
+        IconAlphaFixture::Save(wic.Get(),image,imagePath);
+        const bool listThumbnails=g_listThumbnails.exchange(false);
+        struct RestoreThumbnails {bool value; ~RestoreThumbnails() {g_listThumbnails=value;}} restoreThumbnails{listThumbnails};
+        state.gridView=false; state.cachedNativeMode=FVM_DETAILS;
+        state.entries[0].path=imagePath.wstring(); state.entries[0].name=imagePath.filename().wstring(); state.entries[0].folder=false;
+        IconPixels listed;
+        RequestVisibleIcons(state);
+        Check(Eventually([&] {
+            ReceiveIcons(state,false); std::wstring path; bool attrs=false;
+            auto* record=FindIconRecord(state,IconKey(state,state.entries[0],path,attrs),true);
+            if(record && record->pixels.Ready()) listed=record->pixels;
+            return listed.Ready();
+        }) && !listed.thumbnailWidth,"Details fixture did not retain its ordinary icon");
+        state.dragPreview=std::make_shared<DragPreview>(); state.dragPreview->pixels=listed; state.dragPreview->side=128;
+        state.dragPreviewEntries[0]=state.entries[0]; state.dragPreviewEpoch=state.mouseFolderEpoch; state.dragPreviewSize=128;
+        RequestVisibleIcons(state);
+        Check(state.dragPreview->pixels.data.Identity()==listed.data.Identity(),"thumbnail request discarded immediate shown icon");
+        Check(Eventually([&] {ReceiveIcons(state,false); return state.dragPreview->pixels.thumbnailWidth>0;}),
+            "real PNG thumbnail did not replace the drag icon with list thumbnails disabled");
+        const auto thumbnail=state.dragPreview->pixels;
+        Check(!FileThumbnails(state) && thumbnail.thumbnailWidth==2*thumbnail.thumbnailHeight,
+            "drag thumbnails changed the list setting or lost source proportions");
+        state.dragPreview.reset();
+        // Ask the actual filesystem target for feedback, without dropping or
+        // changing focus/clipboard. No manufactured operation descriptions.
+        ComPtr<IShellItem> sourceItem,destinationItem;
+        Check(SUCCEEDED(SHCreateItemFromParsingName(imagePath.c_str(),nullptr,IID_PPV_ARGS(&sourceItem))) &&
+            SUCCEEDED(SHCreateItemFromParsingName(fixture.c_str(),nullptr,IID_PPV_ARGS(&destinationItem))),"drag text Shell items");
+        ComPtr<IDataObject> data;
+        ComPtr<IDropTarget> destination;
+        Check(SUCCEEDED(sourceItem->BindToHandler(nullptr,BHID_DataObject,IID_PPV_ARGS(&data))) &&
+            SUCCEEDED(destinationItem->BindToHandler(nullptr,BHID_SFUIObject,IID_PPV_ARGS(&destination))),"drag text Shell binding");
+        std::array<ShellDropText,4> shellTexts;
+        for(int operation=1;operation<4;++operation) {
+            DWORD effect=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
+            const DWORD keys=operation==1 ? MK_CONTROL:operation==2 ? MK_SHIFT:MK_CONTROL|MK_SHIFT;
+            const auto enter=destination->DragEnter(data.Get(),keys,POINTL{},&effect);
+            shellTexts[operation]=ReadShellDropText(data.Get(),effect);
+            destination->DragLeave();
+            Check(SUCCEEDED(enter) && effect==DWORD(operation==3 ? DROPEFFECT_LINK:operation) &&
+                !shellTexts[operation].text.empty() && shellTexts[operation].insert.length,
+                "native filesystem target did not provide its localized transaction description");
+            Check(ReadShellDropText(data.Get(),DROPEFFECT_NONE).text.empty(),"blocked effect retained an earlier transaction caption");
+            ClearShellDropDescription(data.Get());
+            Check(ReadShellDropText(data.Get(),effect).text.empty(),"target leave retained an earlier transaction caption");
+        }
+        const auto& shellText=shellTexts[1];
+        if(!state.headerFormat) Check(MakeTextFormats(state),"drag caption fonts");
+        DragPreview captionPreview; captionPreview.side=128; captionPreview.dpi=96;
+        UpdateDragCaption(state,captionPreview,shellText,600.f);
+        Check(captionPreview.caption && captionPreview.captionSize.width>0.f && captionPreview.captionSize.height>0.f &&
+            !UpdateDragCaption(state,captionPreview,shellText,600.f),"drag caption layout was absent or rebuilt unchanged feedback");
+        const auto captionGeometry=LayoutDragPreview(captionPreview);
+        const RECT captionWork{0,0,1920,1080}; const POINT captionCursor{960,540};
+        const auto captionPosition=PositionDragPreview(captionPreview,captionCursor,captionWork,false);
+        for(const auto& text:shellTexts) {
+            UpdateDragCaption(state,captionPreview,text,600.f);
+            const auto geometry=LayoutDragPreview(captionPreview);
+            const auto position=PositionDragPreview(captionPreview,captionCursor,captionWork,false);
+            Check(geometry.artwork.left==captionGeometry.artwork.left && geometry.artwork.top==captionGeometry.artwork.top &&
+                position.x==captionPosition.x && position.y==captionPosition.y,
+                "native description width changes moved the icon canvas or pointer anchor");
+        }
         Check(EnsureTarget(state),"drag preview GPU target");
         {
             // Exercise the real layered-window/DComp contract offscreen. The
             // popup uses the already-created tab device and has no callback.
             auto preview=std::make_shared<DragPreview>(); preview->pixels=sharp;
+            preview->imageCount=kDragPreviewImages;
+            for(size_t i=1;i<kDragPreviewImages;++i) {preview->Image(i).pixels=i&1 ? thumbnail:sharp;
+                preview->Image(i).tilt=DragStackTilt(std::to_wstring(i),i);}
             preview->side=64; preview->background=RGB(32,32,32); preview->foreground=RGB(245,245,245);
             preview->token=ULONG_PTR(g_nextToken.fetch_add(1));
             preview->window=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOREDIRECTIONBITMAP,
@@ -41,9 +119,12 @@ static void TestDragPreview(const std::wstring& fixture) {
             const auto device=state.d3d.Get();
             Check(RenderDragPreview(state,preview) && preview->rendered->load() && state.dragComposition.visual &&
                 state.dragComposition.curve && state.d3d.Get()==device,"drag preview did not reuse tab GPU/compositor animation");
-            const auto artwork=state.dragComposition.artwork.Get(); preview->effect=DROPEFFECT_COPY;
-            Check(artwork && RenderDragPreview(state,preview) && state.dragComposition.artwork.Get()==artwork,
+            const auto artwork=state.dragComposition.artwork[0].Get(); preview->effect=DROPEFFECT_COPY;
+            const auto rear=state.dragComposition.artwork[1].Get();
+            Check(artwork && RenderDragPreview(state,preview) && state.dragComposition.artwork[0].Get()==artwork,
                 "effect feedback uploaded the same artwork again");
+            Check(rear && state.dragComposition.artwork[1].Get()==rear && state.dragComposition.artwork[2].Get()==artwork &&
+                state.dragComposition.artwork[3].Get()==rear,"stack images reuploaded identical shared pixels");
             Check(RenderDragPreview(state,nullptr) && !state.dragComposition.target && !state.dragComposition.plane.bitmap,
                 "drag preview resources survived cancellation");
             ++preview->token;
@@ -54,27 +135,38 @@ static void TestDragPreview(const std::wstring& fixture) {
         ComPtr<ID2D1Bitmap1> surface;
         const auto properties=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
-        Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(720,480),nullptr,0,&properties,&surface)),"drag preview sheet");
+        Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(1440,1200),nullptr,0,&properties,&surface)),"drag preview sheet");
         state.target->SetTarget(surface.Get()); state.target->BeginDraw();
         state.target->Clear(D2D1::ColorF(0,0.f));
+        DragTextStyle sheetStyle; RefreshTextRenderingForWindow(sheetStyle,state.hwnd,true);
         for(int row=0;row<4;++row) for(int column=0;column<4;++column) {
-            DragPreview preview; preview.side=64; preview.dpi=96; preview.pixels=sharp;
+            DragPreview preview; preview.side=128; preview.dpi=96; preview.pixels=row<2 ? sharp:thumbnail;
             preview.background=row&1 ? RGB(32,32,32):RGB(248,248,248);
             preview.foreground=row&1 ? RGB(245,245,245):RGB(24,24,24);
             preview.accent=RGB(0,100,200); preview.rtl=row>=2; preview.count=column==3 ? 1200:column+1;
+            preview.captionAvailable=260.f;
+            preview.imageCount=column==3 ? kDragPreviewImages:size_t(column+1);
+            for(size_t i=1;i<preview.imageCount;++i) {
+                preview.Image(i).pixels=i&1 ? thumbnail:sharp;
+                preview.Image(i).tilt=(i&1 ? -1.f:1.f)*3.f*float(i);
+            }
             preview.effect=column==0 ? DROPEFFECT_NONE:column==1 ? DROPEFFECT_COPY:column==2 ? DROPEFFECT_MOVE:DROPEFFECT_LINK;
-            state.target->SetTransform(D2D1::Matrix3x2F::Translation(float(column*180),float(row*120)));
-            DrawDragPreview(state.target.Get(),preview);
+            if(column) UpdateDragCaption(state,preview,shellTexts[column],260.f);
+            state.target->SetTransform(D2D1::Matrix3x2F::Translation(float(column*360),float(row*300)));
+            DrawDragPreview(state.target.Get(),preview,nullptr,nullptr,&sheetStyle);
         }
         Check(SUCCEEDED(state.target->EndDraw()),"drag preview color emoji/theme draw");
         auto sheet=IconAlphaFixture::Read(state,surface.Get());
         ComPtr<ID2D1SolidColorBrush> glyphBrush;
         Check(SUCCEEDED(state.target->CreateSolidColorBrush(D2D1::ColorF(1,1,1),&glyphBrush)),"drag glyph brush");
+        state.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE); // Compare emoji artwork, independently of opaque text.
+        for(float symbolSize:{48.f,128.f*.58f*.82f,192.f*.58f*.82f,256.f*.58f*.82f})
         for(const auto* emoji:{L"\U0001F6AB",L"\U0001F4CB",L"\u27A1\uFE0F",L"\u2B05\uFE0F",L"\U0001F517"}) {
+            DragGlyph cached;
             state.target->SetTransform(D2D1::Matrix3x2F::Identity());
             state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
-            DrawCenteredDragLabel(state.target.Get(),glyphBrush.Get(),emoji,L"Segoe UI Emoji",48,
-                D2D1::RectF(40,40,104,104),RGB(255,255,255),true);
+            DrawCenteredDragLabel(state.target.Get(),glyphBrush.Get(),emoji,L"Segoe UI Emoji",symbolSize,
+                D2D1::RectF(168,168,232,232),RGB(255,255,255),true,&cached);
             Check(SUCCEEDED(state.target->EndDraw()),"centered operation emoji draw");
             const auto glyph=IconAlphaFixture::Read(state,surface.Get());
             UINT left=glyph.width,top=glyph.height,right=0,bottom=0;
@@ -82,18 +174,110 @@ static void TestDragPreview(const std::wstring& fixture) {
                 if(glyph.data[size_t(y)*glyph.stride+x*4+3]>16) {
                     left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
                 }
-            Check(right>left && bottom>top && std::abs(float(left+right)*.5f-72.f)<=1.f &&
-                std::abs(float(top+bottom)*.5f-72.f)<=1.f,"operation emoji ink is not centered in both axes");
-            if(std::abs(float(right-left)-48.f)>1.f)
+            Check(right>left && bottom>top && std::abs(float(left+right)*.5f-200.f)<=1.f &&
+                std::abs(float(top+bottom)*.5f-200.f)<=1.f,"operation emoji ink is not centered in both axes");
+            // Fractional edge coverage can occupy one extra texel on either
+            // side of the common continuous width; integer cases stay +/-1.
+            const bool commonWidth=right-left>=UINT(std::floor(symbolSize)-1) && right-left<=UINT(std::ceil(symbolSize)+1);
+            if(!commonWidth)
                 std::cerr<<"EMOJI WIDTH utf16="<<unsigned(emoji[0])<<","<<unsigned(emoji[1])
                     <<" bounds="<<left<<","<<top<<","<<right<<","<<bottom<<"\n";
-            Check(std::abs(float(right-left)-48.f)<=1.f,"operation emoji did not use the shared visible width");
+            Check(commonWidth,"operation emoji did not use the shared visible width");
+            // Compare against the font's original regular color artwork.
+            // Semibold synthesizes bold and visibly flattens the 🚫 edge,
+            // including when using Windows' direct text drawing path.
+            ComPtr<IDWriteTextFormat> directFormat; ComPtr<IDWriteTextLayout> direct;
+            Check(SUCCEEDED(g_writeFactory->CreateTextFormat(L"Segoe UI Emoji",nullptr,DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,symbolSize,L"",&directFormat)) &&
+                SUCCEEDED(g_writeFactory->CreateTextLayout(emoji,UINT32(wcslen(emoji)),directFormat.Get(),64,64,&direct)),"native emoji reference");
+            const auto& b=cached.bounds; const float scale=symbolSize/(b.right-b.left);
+            state.target->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale)*D2D1::Matrix3x2F::Translation(
+                200.f-(b.left+b.right)*.5f*scale,200.f-(b.top+b.bottom)*.5f*scale));
+            state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
+            state.target->DrawTextLayout(D2D1::Point2F(),direct.Get(),glyphBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            Check(SUCCEEDED(state.target->EndDraw()),"direct native emoji draw");
+            const auto native=IconAlphaFixture::Read(state,surface.Get());
+            size_t changed=0;
+            for(size_t i=0;i<glyph.data.size();++i) changed+=std::abs(int(glyph.data[i])-int(native.data[i]))>1;
+            Check(emoji[0]!=L'\xD83D' || emoji[1]!=L'\xDEAB' || !changed,
+                "prohibition emoji differed from the unclipped native font rendering");
+        }
+        for(int dpi:{96,144,192}) for(bool rtl:{false,true}) for(size_t count:{size_t(1),kDragPreviewImages}) {
+            DragPreview preview; preview.side=128.f*dpi/96.f; preview.dpi=dpi; preview.rtl=rtl; preview.imageCount=count;
+            preview.pixels.width=preview.pixels.height=32; preview.pixels.stride=128; preview.pixels.data.assign(4096,0);
+            preview.count=int(count);
+            for(size_t i=1;i<count;++i) {preview.Image(i).pixels=i&1 ? sharp:thumbnail; preview.Image(i).tilt=3.f*i*(i&1 ? -1.f:1.f);}
+            const auto extent=DragPreviewExtent(preview);
+            ComPtr<ID2D1Bitmap1> exact;
+            Check(SUCCEEDED(state.target->CreateBitmap(extent,nullptr,0,&properties,&exact)),"exact drag popup surface");
+            const auto render=[&](ID2D1Bitmap1* target) {
+                state.target->SetTarget(target); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
+                state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f)); DrawDragPreview(state.target.Get(),preview);
+                Check(SUCCEEDED(state.target->EndDraw()),"popup boundary render"); return IconAlphaFixture::Read(state,target);
+            };
+            const auto bounded=render(exact.Get()),reference=render(surface.Get());
+            for(UINT y=0;y<reference.height;++y) for(UINT x=0;x<reference.width;++x) {
+                const auto* pixel=reference.data.data()+size_t(y)*reference.stride+x*4;
+                if(x>=extent.width || y>=extent.height) Check(!pixel[3],"drag popup clipped emoji or rotated-stack pixels");
+                else for(UINT channel=0;channel<4;++channel)
+                    Check(std::abs(int(pixel[channel])-int(bounded.data[size_t(y)*bounded.stride+x*4+channel]))<=1,
+                        "emoji texels changed at the actual popup surface boundary");
+            }
+        }
+        {
+            const auto old=g_textAntialiasing.load();
+            struct Restore {TextAntialiasing mode; ~Restore() {g_textAntialiasing=mode; ++g_textRenderingRevision;}} restore{old};
+            DragTextStyle style;
+            DragPreview preview; preview.side=128; preview.dpi=96; preview.count=6;
+            preview.background=RGB(24,24,24); preview.foreground=RGB(240,240,240); preview.accent=RGB(40,40,40);
+            preview.pixels.width=preview.pixels.height=32; preview.pixels.stride=128; preview.pixels.data.assign(4096,0);
+            UpdateDragCaption(state,preview,shellText,260.f);
+            const auto geometry=LayoutDragPreview(preview);
+            const auto listSerial=state.textRenderingSerial;
+            for(auto mode:{TextAntialiasing::System,TextAntialiasing::Smooth,TextAntialiasing::Aliased}) {
+                g_textAntialiasing=mode; ++g_textRenderingRevision;
+                RefreshTextRenderingForWindow(style,state.hwnd,true);
+                state.target->SetTarget(surface.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
+                state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
+                DrawDragPreview(state.target.Get(),preview,nullptr,nullptr,&style);
+                Check(SUCCEEDED(state.target->EndDraw()),"drag text rendering choice");
+                ComPtr<IDWriteRenderingParams> effective; state.target->GetTextRenderingParams(&effective);
+                const auto actualMode=state.target->GetTextAntialiasMode();
+                const bool overridden=effective.Get()!=style.textRenderingParams.Get() || actualMode!=style.opaqueTextAntialiasMode;
+                // The normal text-quality suite recognizes this same native
+                // font customizer. Verify its effective policy and pixels too.
+                if(overridden) Check(GetModuleHandleW(L"MacType64.dll") || GetModuleHandleW(L"MacType64.Core.dll"),
+                    "unexplained drag text policy override");
+                Check(listSerial==state.textRenderingSerial && style.textAntialiasing==mode,
+                    "drag text ignored shared policy or invalidated the tab glyph cache");
+                const auto pixels=IconAlphaFixture::Read(state,surface.Get());
+                const float height=preview.side*.38f;
+                const auto count=D2D1::RectF(geometry.artwork.left+height*.25f,geometry.artwork.top+height*.25f,
+                    geometry.artwork.left+height*.75f,geometry.artwork.top+height*.75f);
+                auto caption=geometry.caption; caption.left+=geometry.edge; caption.top+=geometry.edge;
+                caption.right-=geometry.edge; caption.bottom-=geometry.edge;
+                for(auto area:{count,caption}) {
+                    size_t partial=0,colored=0;
+                    for(UINT y=UINT(std::ceil(area.top));y<UINT(area.bottom);++y) for(UINT x=UINT(std::ceil(area.left));x<UINT(area.right);++x) {
+                        const auto* p=pixels.data.data()+size_t(y)*pixels.stride+x*4;
+                        colored+=p[0]!=p[1] || p[1]!=p[2];
+                        const BYTE background=area.top==count.top ? 40:24;
+                        partial+=p[0]>background && p[0]<240;
+                        Check(p[3]==255,"subpixel drag text left its opaque background");
+                    }
+                    if(actualMode==D2D1_TEXT_ANTIALIAS_MODE_ALIASED) Check(!partial && !colored,"drag caption/count antialiased in aliased mode");
+                    if(actualMode==D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) Check(partial>5 && !colored,"drag caption/count did not use grayscale smoothing");
+                    if(actualMode==D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE &&
+                        effective->GetClearTypeLevel()>0 && effective->GetPixelGeometry()!=DWRITE_PIXEL_GEOMETRY_FLAT)
+                        Check(colored>5,"System drag text lost Windows subpixel rendering");
+                }
+            }
         }
         size_t rounded=0,red=0;
         for(UINT y=0;y<sheet.height;++y) for(UINT x=0;x<sheet.width;++x) {
             const auto* p=sheet.data.data()+y*sheet.stride+x*4;
             rounded+=p[3]>0 && p[3]<200;
-            if(x<180) red+=p[2]>140 && p[2]>p[1]*1.5 && p[2]>p[0]*1.5;
+            if(x<360) red+=p[2]>140 && p[2]>p[1]*1.5 && p[2]>p[0]*1.5;
         }
         Check(rounded>200,"drag preview lost antialiased alpha edges");
         Check(red>100,"large prohibition emoji is absent or monochrome");
@@ -117,16 +301,56 @@ static void TestDragPreview(const std::wstring& fixture) {
             state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f)); DrawDragPreview(state.target.Get(),preview);
             Check(SUCCEEDED(state.target->EndDraw()),"drag preview aspect draw");
             const auto image=IconAlphaFixture::Read(state,surface.Get());
-            const UINT x=UINT(preview.side*.74f),y=UINT(preview.side*.74f);
+            const auto geometry=LayoutDragPreview(preview);
+            const UINT x=UINT((geometry.artwork.left+geometry.artwork.right)*.5f),y=UINT((geometry.artwork.top+geometry.artwork.bottom)*.5f);
             const auto* center=image.data.data()+y*image.stride+x*4;
-            const auto* margin=image.data.data()+UINT(preview.side*.3f)*image.stride+x*4;
-            Check(center[2]>210 && center[0]<10 && margin[2]<50,"thumbnail was cropped, stretched or sampled its atlas badge");
+            const auto* margin=image.data.data()+UINT(geometry.artwork.top-3)*image.stride+x*4;
+            Check(center[2]>210 && center[0]<10 && margin[3]==0,"thumbnail was cropped, sampled its atlas badge or retained a tile background");
             const auto extent=DragPreviewExtent(preview);
             Check(extent.width<=UINT(dpi*2) && DragPreviewBadgeSize(preview)>=GetSystemMetricsForDpi(SM_CXICON,dpi)*.9f,
                 "drag preview/badge did not follow system DPI geometry");
+            const RECT work{-1920,-1080,0,0};
+            const POINT cursor{-960,-540};
+            const auto position=PositionDragPreview(preview,cursor,work,false);
+            Check(std::abs(position.x+(geometry.artwork.left+geometry.artwork.right)*.5f-cursor.x)<=.5f &&
+                std::abs(position.y+geometry.artwork.bottom-cursor.y)<=.5f,
+                "drag artwork hotspot included transparent padding or badge offset");
+            const auto touch=PositionDragPreview(preview,cursor,work,true);
+            Check(touch.y+LONG(extent.height)==cursor.y,"touch preview overlaps the promoted contact point");
+            auto portrait=preview;
+            std::swap(portrait.pixels.thumbnailWidth,portrait.pixels.thumbnailHeight);
+            const auto replacement=PositionDragPreview(portrait,cursor,work,false);
+            Check(position.x==replacement.x && position.y==replacement.y,
+                "background thumbnail aspect changes moved the stationary drag hotspot");
+            for(POINT edge: {POINT{work.left,work.top},POINT{work.right,work.bottom}}) {
+                const auto bounded=PositionDragPreview(preview,edge,work,false);
+                Check(bounded.x>=work.left && bounded.y>=work.top &&
+                    bounded.x+LONG(extent.width)<=work.right && bounded.y+LONG(extent.height)<=work.bottom,
+                    "drag preview escaped the monitor work area");
+            }
         }
         state.target->SetTarget(previous.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
     }
+    {
+        const auto root=std::filesystem::path(fixture+L"-drag-pile");
+        for(int i=0;i<7;++i) std::filesystem::create_directories(root/std::to_wstring(i));
+        struct Cleanup {std::filesystem::path root; ~Cleanup() {std::error_code error;
+            for(int i=0;i<7;++i) std::filesystem::remove(root/std::to_wstring(i),error); std::filesystem::remove(root,error);}} cleanup{root};
+        ProviderSelectionFixture::Browser host; host.Navigate(root.wstring(),7);
+        auto& state=host.state;
+        for(int i=0;i<6;++i) Check(SUCCEEDED(state.folderView->SelectItem(i,SVSI_SELECT|SVSI_NOTAKEFOCUS|
+            (i ? 0:SVSI_DESELECTOTHERS))),"native pile selection");
+        Check(CaptureNativeSelection(state,false) && Eventually([&] {host.Pump();
+            return !state.pendingNativeSelection && state.nativeSelectionObservedPaths.size()==6;}),"native pile identity import");
+        const int front=GpuRowForNativePath(state,state.nativeSelectionObservedPaths.back());
+        const auto rows=DragPreviewRows(state,front,6);
+        Check(rows.size()==kDragPreviewImages && rows.front()==front,"pile failed to cap native selection at five with the grabbed item on top");
+        for(int row:rows) Check(state.selectedFlags[size_t(row)] && std::count(rows.begin(),rows.end(),row)==1,
+            "pile included an unselected or duplicate native identity");
+        for(size_t i=0;i<rows.size();++i) Check(std::abs(DragStackTilt(state.entries[size_t(rows[i])].path,i))==3.f*i &&
+            std::abs(DragStackTilt(state.entries[size_t(rows[i])].path,i))<=12.f,
+            "pile rotated its front item or exceeded the progressive portrait tilt cap");
+    }
     g_writeFactory=fonts;
-    std::cout<<"PASS: immediate shared Shell pixels, real background high-resolution enrichment, antialiased dark/light LTR/RTL previews, color prohibition emoji, bounded count badge and uncropped atlas-aware thumbnails at three DPIs (offscreen components)\n";
+    std::cout<<"PASS: immediate shared Shell pixels; real PNG background thumbnails with Details thumbnails disabled; transparent previews, equal-width operation emoji, texture reuse and uncropped atlas-aware images at three DPIs (offscreen components)\n";
 }
