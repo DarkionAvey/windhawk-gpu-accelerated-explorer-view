@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.320
+// @version         0.9.321
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -35,6 +35,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
+- **Shell Size Text** — The Size column uses Shell formatting and can pick up folder sizes from [Better file sizes in Explorer details](https://windhawk.net/mods/explorer-details-better-file-sizes). Refresh after changing that mod's settings. Size sorting and grouping use the overlay's own rules.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
@@ -7436,6 +7437,39 @@ std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
     return result;
 }
 
+// Use the folder's formatted column rather than formatting its raw property
+// ourselves. This keeps Shell size/formatting hooks (including Better file
+// sizes) on their normal path, without importing another mod's calculations.
+// Bind in the requesting provider worker's apartment; never use the live view.
+bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
+                         std::wstring& text) {
+    PIDLIST_ABSOLUTE parsed = nullptr;
+    if (!identity) {
+        const HRESULT hr = SHParseDisplayName(path.c_str(), nullptr, &parsed, 0, nullptr);
+        if (FAILED(hr)) { CoTaskMemFree(parsed); return false; }
+        identity = parsed;
+    }
+    OwnedPidl owned(parsed);
+    if (!identity || ILIsEmpty(identity)) return false;
+    ComPtr<IShellFolder2> folder;
+    PCUITEMID_CHILD child = nullptr;
+    if (FAILED(SHBindToParent(identity, IID_PPV_ARGS(&folder), &child)) || !folder)
+        return false;
+    for (UINT column = 0; column < kMaxShellColumns; ++column) {
+        PROPERTYKEY key{};
+        if (FAILED(folder->MapColumnToSCID(column, &key))) break;
+        if (!SameKey(key, PKEY_Size)) continue;
+        SHELLDETAILS details{};
+        if (FAILED(folder->GetDetailsOf(child, column, &details))) return false;
+        PWSTR formatted = nullptr;
+        const HRESULT hr = StrRetToStrW(&details.str, child, &formatted);
+        if (SUCCEEDED(hr)) text = formatted ? formatted : L"";
+        CoTaskMemFree(formatted);
+        return SUCCEEDED(hr); // An empty folder size is authoritative too.
+    }
+    return false;
+}
+
 // Device-independent storage metadata. Shell storage providers expose either
 // System.Capacity/System.FreeSpace or System.Devices.Storage* properties.
 // Everything here executes on the tab-owned directory worker. Never invoke
@@ -8743,16 +8777,20 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     // worker (or intentionally blank on unsupported volumes).
                     // Do not block on provider queries just to rediscover them.
                     ComPtr<IPropertyStore> store;
-                    if (!req.missingKeys.empty())
-                        EntryPropertyStore(req.path, req.shellIdentity.get(),
-                            static_cast<GETPROPERTYSTOREFLAGS>(
-                                GPS_DELAYCREATION | GPS_BESTEFFORT),
-                            store.GetAddressOf());
                     for (const auto& key : req.missingKeys) {
                         if (detail.thisPc && ThisPcSeededColumn(key)) continue;
                         ColumnCell cell; cell.key = key;
                         bool resolved=false;
-                        cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                        if (SameKey(key, PKEY_Size))
+                            resolved = ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text);
+                        if (!resolved) {
+                            if (!store)
+                                EntryPropertyStore(req.path, req.shellIdentity.get(),
+                                    static_cast<GETPROPERTYSTOREFLAGS>(
+                                        GPS_DELAYCREATION | GPS_BESTEFFORT),
+                                    store.GetAddressOf());
+                            cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                        }
                         if(!resolved) {v.failed=true; continue;}
                         if (SameKey(key, PKEY_DateModified)) v.date = cell.text;
                         else if (SameKey(key, PKEY_Size)) v.size = cell.text;
@@ -8772,7 +8810,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 };
                 if (hasColumn(PKEY_DateModified)) v.date = FormatFileTime(req.modified);
                 if (hasColumn(PKEY_ItemTypeText)) v.type = GetTypeName(typeNames, req.path, req.folder);
-                if (!req.folder && hasColumn(PKEY_Size)) v.size = FormatSize(req.size);
+                if (hasColumn(PKEY_Size) &&
+                    !ReadShellSizeDetail(req.path, nullptr, v.size) && !req.folder)
+                    v.size = FormatSize(req.size);
                 v.columnEpoch = detail.columnEpoch;
                 // Only displayed columns are queried on this tab's property
                 // pool, never Explorer's STA or the compositor draw callback.

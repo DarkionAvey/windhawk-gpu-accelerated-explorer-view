@@ -1892,6 +1892,7 @@ static void TestPreviewInput() {
 #include "icon-alpha-smoke.h"
 #include "icon-sizing-smoke.h"
 #include "shell-provider-smoke.h"
+#include "shell-size-smoke.h"
 #include "provider-selection-smoke.h"
 #include "initial-sort-smoke.h"
 #include "preprocessing-benchmark.h"
@@ -1936,7 +1937,9 @@ int wmain(int argc,wchar_t** argv) {
             CloseHandle(file);
         }
         const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--icon-sizing")==0) {
+        if (argc>1 && wcscmp(argv[1],L"--shell-size")==0) {
+            TestShellSizeDetails(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--icon-sizing")==0) {
             TestNativeIconSizing(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--icon-alpha")==0) {
             TestIconAlphaQuality(fixture.wstring());
@@ -2149,6 +2152,7 @@ int wmain(int argc,wchar_t** argv) {
         TestPasteFocus(fixture.wstring());
         TestBurstRowContinuity(fixture.wstring());
         TestSortDetails(fixture.wstring());
+        TestShellSizeDetails(fixture.wstring());
         TestRealNativeViewport(fixture.wstring());
         TestNativeSuppression();
         TestNativeUiaBatch();

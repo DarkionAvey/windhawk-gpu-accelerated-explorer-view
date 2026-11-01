@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.321
+
+- Read Size column text through the Shell on the existing background workers,
+  allowing Better file sizes in Explorer details to supply folder sizes and
+  size formatting without duplicating its calculations or Everything support.
+  Size sorting and grouping retain the overlay's existing behavior.
+
 ## 0.9.320
 
 - Keep the file view, rename editor and view button in one stable window order.
