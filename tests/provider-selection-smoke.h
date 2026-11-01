@@ -99,6 +99,7 @@ struct Browser {
         SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
         if (travelLog) { RegisterTabOverlay(frame,frame,state.hwnd); registered=true; }
         Check(SetWindowSubclass(state.hwnd, +[](HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data)->LRESULT {
+            if (message==kMsgNativeCatalog) return OverlayProc(hwnd,message,wp,lp);
             if (message == kMsgShellItemCreated) {
                 ++reinterpret_cast<Browser*>(data)->shellHints;
                 return OverlayProc(hwnd, message, wp, lp);
@@ -117,7 +118,7 @@ struct Browser {
         MSG message{};
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.hwnd == state.hwnd && (message.message == kMsgPreparedSelection ||
-                message.message == kMsgFlushDirectoryChanges)) {
+                message.message == kMsgFlushDirectoryChanges || message.message == kMsgNativeCatalog)) {
                 OverlayProc(state.hwnd, message.message, message.wParam, message.lParam);
             }
             else { TranslateMessage(&message); DispatchMessageW(&message); }
@@ -135,11 +136,15 @@ struct Browser {
         Bind(expected);
     }
     void Bind(int expected) {
+        int actual=-1;
         Check(Eventually([&] {
             Pump(); int count = -1;
-            return sink->navigationComplete && sink->view &&
-                SUCCEEDED(sink->view->ItemCount(SVGIO_ALLVIEW, &count)) && count == expected;
+            const bool ready=sink->navigationComplete && sink->view &&
+                SUCCEEDED(sink->view->ItemCount(SVGIO_ALLVIEW, &count)) && (expected<0 ? count>0 : count == expected);
+            if (ready) actual=count;
+            return ready;
         }, 30000), "provider native model population");
+        if (expected<0) expected=actual;
         state.folderView = sink->view;
         state.columnManager.Reset(); state.folderView.As(&state.columnManager);
         browser.As(&state.shellBrowser);
@@ -160,6 +165,9 @@ struct Browser {
         ResetForNewDirectory(state, location, folder, false, state.activeTabHost);
         state.deferColumnProviders = false; UpdateMetrics(state);
         auto result = WaitForComplete(*state.background, state.directoryToken);
+        if (result.error!=ERROR_SUCCESS || result.entries.size()!=size_t(expected))
+            std::cout<<"PROVIDER MODEL expected="<<expected<<" rows="<<result.entries.size()<<" error="<<result.error
+                <<" catalog="<<state.nativeCatalogCount<<" namespace="<<bool(result.namespaceIdentities)<<std::endl;
         Check(result.error == ERROR_SUCCESS && result.entries.size() == size_t(expected), "provider GPU model population");
         PublishDirectoryResult(*state.background, std::move(result)); ReceiveDirectoryResults(state);
         Check(Eventually([&] {
@@ -169,6 +177,7 @@ struct Browser {
         }, 30000), "provider watch/model did not settle after navigation");
     }
     ~Browser() {
+        CancelNativeCatalog(state);
         CancelNativeSelectionPreparation(state); CloseDirectoryWatch(state);
         UnregisterAnimationWindow(state.hwnd);
         state.validatedFolderStamp.reset();
@@ -180,6 +189,113 @@ struct Browser {
         SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, 0); DestroyWindow(frame);
     }
 };
+}
+
+// Intentional read-only OS integration probe. The browser and selection are
+// private; locate the Shell root through Windows rather than a user path.
+static void TestNativeCatalogSelection() {
+    ProviderSelectionFixture::Browser host;
+    auto& state=host.state;
+    FocusFixture::Session focus(host.frame,state.hwnd);
+    PIDLIST_ABSOLUTE raw=nullptr;
+    Check(SUCCEEDED(SHGetSpecialFolderLocation(nullptr,CSIDL_DESKTOP,&raw)),"native catalog root");
+    OwnedPidl root(raw);
+    host.NavigateIdentity(root.get(),-1);
+    Check(state.nativeCatalogCount==state.total && state.namespaceIdentities,
+        "provider snapshot did not use the native catalog");
+    ComPtr<IEnumIDList> items;
+    Check(SUCCEEDED(state.folderView->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items))),"native catalog enumeration");
+    size_t seen=0, virtualItems=0;
+    for (;;) {
+        PITEMID_CHILD child=nullptr; ULONG fetched=0;
+        if (items->Next(1,&child,&fetched)!=S_OK) break;
+        OwnedPidl owned(child); ++seen;
+        int row=-1;
+        for (size_t i=0;i<state.entries.size();++i)
+            if (state.entries[i].shellChild && ILIsEqual(child,state.entries[i].shellChild.get())) { row=int(i); break; }
+        Check(row>=0,"native catalog item missing from GPU provider snapshot");
+        SFGAOF attributes=SFGAO_FILESYSTEM;
+        PCUITEMID_CHILD one[]={child};
+        if (FAILED(state.folder->GetAttributesOf(1,one,&attributes)) || (attributes&SFGAO_FILESYSTEM)) continue;
+        ++virtualItems;
+        state.selectedFlags.Fill(0); state.selectedFlags[size_t(row)]=1;
+        state.selected=state.anchor=row;
+        Check(SyncNativeSelection(state),"native virtual item rejected by GPU selection");
+        PidlSelection expected; expected.children.push_back(child);
+        Check(VerifyNativeSelection(state,expected),"GPU virtual selection differs from native identity");
+        Check(ClearNativeSelection(state),"native catalog deselection");
+        Check(SUCCEEDED(state.folderView->SelectAndPositionItems(1,one,nullptr,SVSI_SELECT|SVSI_FOCUSED|SVSI_NOTAKEFOCUS)),
+            "external virtual selection");
+        Check(CaptureNativeSelection(state,true),"virtual native selection capture");
+        WaitForPreparedSelection(state);
+        Check(state.selectedFlags[size_t(row)] && !state.nativeSelectionUnsafe && !state.nativeSelectionRecoveryPending,
+            "native virtual selection did not import into GPU checkbox");
+    }
+    Check(seen==state.entries.size(),"GPU snapshot contains items excluded by the native view");
+    std::cout<<"PASS: read-only Shell root catalog equality and bidirectional selection of "<<virtualItems
+        <<" virtual items; private ExplorerBrowser, no name/GUID exceptions\n";
+}
+
+static void TestRejectedProviderSelection(const std::filesystem::path& target) {
+    ProviderSelectionFixture::Browser host;
+    auto& state=host.state;
+    FocusFixture::Session focus(host.frame,state.hwnd);
+    host.Navigate(target.wstring(),99);
+    CloseDirectoryWatch(state); // Hold the last displayed snapshot while the real native model changes.
+    std::vector<int> files;
+    for (size_t i=0;i<state.entries.size() && files.size()<4;++i)
+        if (!state.entries[i].folder) files.push_back(int(i));
+    Check(files.size()==4,"stale private file fixture");
+    const int stale=files[0], first=files[1], second=files[2], extra=files[3];
+    state.selectedFlags.Fill(0); state.selectedFlags[size_t(first)]=state.selectedFlags[size_t(second)]=1;
+    state.selected=state.anchor=second;
+    Check(SyncNativeSelection(state),"prior valid selection");
+    Check(DeleteFileW(state.entries[size_t(stale)].path.c_str()),"remove private stale item");
+    Check(Eventually([&] {
+        host.Pump(); int count=-1;
+        return SUCCEEDED(state.folderView->ItemCount(SVGIO_ALLVIEW,&count)) && count==98;
+    },30000),"native removal of private stale item");
+    state.selectedFlags.Fill(0); state.selectedFlags[size_t(first)]=state.selectedFlags[size_t(second)]=1;
+    state.selected=state.anchor=second;
+    Check(SyncNativeSelection(state),"valid group after native removal settled");
+    const auto verify=[&](size_t count) {
+        int actual=-1; state.folderView->ItemCount(SVGIO_SELECTION,&actual);
+        if (actual!=int(count) || state.nativeSelectionRecoveryPending || state.nativeSelectionUnsafe || state.selectedFlags[size_t(stale)])
+            std::cout<<"REJECT expected="<<count<<" native="<<actual<<" gpu="<<std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)
+                <<" unsafe="<<state.nativeSelectionUnsafe<<" recovery="<<state.nativeSelectionRecoveryPending<<" stale="<<int(state.selectedFlags[size_t(stale)])
+                <<" rows="<<state.total<<" pending="<<state.directoryPending<<std::endl;
+        Check(actual==int(count) && !state.nativeSelectionRecoveryPending && !state.nativeSelectionUnsafe &&
+            !state.selectedFlags[size_t(stale)],"invalid item cleared valid selections or remained checked");
+        int focused=-1; PITEMID_CHILD focusedChild=nullptr, gpuChild=nullptr;
+        Check(SUCCEEDED(state.folderView->GetFocusedItem(&focused)) &&
+            SUCCEEDED(state.folderView->Item(focused,&focusedChild)) &&
+            SUCCEEDED(EntryChildPidl(state,state.entries[size_t(state.selected)],&gpuChild)),"focus after rejecting stale item");
+        OwnedPidl nativeFocus(focusedChild), gpuFocus(gpuChild);
+        Check(ILIsEqual(nativeFocus.get(),gpuFocus.get()),"rejected target left native and GPU caret on different items");
+        for (size_t i=0;i<state.entries.size();++i) if (state.selectedFlags[i]) {
+            OwnedPidl child; PITEMID_CHILD item=nullptr;
+            Check(SUCCEEDED(EntryChildPidl(state,state.entries[i],&item)),"valid private selection identity");
+            child.reset(item); DWORD flags=0;
+            Check(SUCCEEDED(state.folderView->GetSelectionState(item,&flags)) && (flags&SVSI_SELECT),
+                "valid GPU selection missing from native view after rejection");
+        }
+    };
+    // A plain rejected click must also retain the preceding valid group.
+    state.selectedFlags.Fill(0); state.selectedFlags[size_t(stale)]=1;
+    state.selected=state.anchor=stale;
+    Check(SyncNativeSelection(state),"reject stale single target"); verify(2);
+    Check(state.selectedFlags[size_t(first)] && state.selectedFlags[size_t(second)],"plain rejection lost preceding group");
+    state.selectedFlags[size_t(stale)]=state.selectedFlags[size_t(extra)]=1;
+    state.selected=state.anchor=stale;
+    Check(SyncNativeSelection(state),"reject stale additive target"); verify(3);
+    state.selectedFlags.Fill(0);
+    for (size_t i=0;i<70;++i) state.selectedFlags[i]=1;
+    state.selected=state.anchor=stale;
+    Check(SyncNativeSelection(state) && state.pendingNativeSelection,"prepare stale bulk target");
+    int before=-1; state.folderView->ItemCount(SVGIO_SELECTION,&before);
+    Check(before==3,"asynchronous preparation erased the preceding native set");
+    WaitForPreparedSelection(state); verify(69);
+    std::cout<<"PASS: real private-file removal rejects only stale single/additive/bulk targets and preserves prior native selection during preparation\n";
 }
 
 static void TestProviderSelection(const std::wstring& fixture) {
@@ -319,6 +435,8 @@ static void TestProviderSelection(const std::wstring& fixture) {
         std::cout << "PROVIDER SELECTION kind=" << (path == archive ? "archive" : provider ? "delegated filesystem" : "ordinary filesystem")
             << " rows=" << state.total << " modes=Details/List/grid single/multiple/70-item external/echo/menu passed\n";
     }
+    TestNativeCatalogSelection();
+    TestRejectedProviderSelection(target);
     SetFileAttributesW(alias.c_str(), FILE_ATTRIBUTE_NORMAL);
     SetFileAttributesW((alias / L"desktop.ini").c_str(), FILE_ATTRIBUTE_NORMAL);
     Check(std::filesystem::weakly_canonical(root).parent_path() ==

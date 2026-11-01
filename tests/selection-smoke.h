@@ -601,7 +601,13 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
         state.selected = state.anchor = 200;
         SetScrollImmediate(state,MaxScrollPx(state));
         const float atEnd=state.scrollNow;
-        Check(!SyncNativeSelection(state) && !state.pendingNativeSelection && state.visible &&
+        const bool queued=SyncNativeSelection(state);
+        if (large) {
+            Check(queued && state.pendingNativeSelection && native->selected.size()==1,
+                "preparing a bulk selection changed the preceding native selection");
+            WaitForPreparedSelection(state);
+        }
+        Check((large || !queued) && !state.pendingNativeSelection && state.visible &&
               state.nativeSelectionRecoveryPending && state.nativeSelectionUnsafe &&
               state.scrollNow==atEnd && state.scrollTarget==atEnd && native->selected.size()==1,
               "failed native commit imported an unrelated first item or reset End's viewport");

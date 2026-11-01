@@ -172,6 +172,9 @@ static void TestWorkerStartupIsolation() {
 static DirectoryResult WaitForComplete(TabBackground& work, unsigned long long token) {
     DirectoryResult result;
     Check(Eventually([&] {
+        MSG message{};
+        while (PeekMessageW(&message,work.hwnd,kMsgNativeCatalog,kMsgNativeCatalog,PM_REMOVE))
+            OverlayProc(message.hwnd,message.message,message.wParam,message.lParam);
         ExclusiveSrwLock lock(work.directoryLock);
         for (auto it = work.directoryResults.begin(); it != work.directoryResults.end(); ++it) {
             if (it->kind == DirectoryResult::Complete && it->token == token) {

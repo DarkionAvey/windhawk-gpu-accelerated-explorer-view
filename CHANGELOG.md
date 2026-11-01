@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.315
+
+- Reject unavailable selection targets without clearing the other selected items.
+- Use the native view's item identities for provider folders, avoiding entries
+  that the provider enumerates but Explorer excludes or replaces.
+
 ## 0.9.314
 
 - Extend list-item checkbox targets across the full row height and reserved

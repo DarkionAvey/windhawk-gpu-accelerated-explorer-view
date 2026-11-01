@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.314
+// @version         0.9.315
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -423,6 +423,7 @@ constexpr UINT kMsgRetireGraphics = WM_APP + 69;
 constexpr UINT kMsgFilesystemChanged = WM_APP + 70;
 constexpr UINT kMsgFlushDirectoryChanges = WM_APP + 71;
 constexpr UINT kMsgPresentationReady = WM_APP + 72;
+constexpr UINT kMsgNativeCatalog = WM_APP + 73;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -1482,6 +1483,9 @@ struct DirectoryJob {
     std::wstring path;
     bool allowInitialPreview = false; // Cold filesystem loads; provisional names precede layout.
     bool enumerated = false;
+    bool captureNativeCatalog = false, nativeCatalogChecked = false;
+    bool nativeCatalogAvailable = false;
+    std::vector<SharedPidl> nativeChildren;
     std::vector<Entry> enumeratedEntries;
     DWORD enumerationError = ERROR_SUCCESS;
     size_t previewRows = 64; // Captured viewport + overhang, bounded independently of directory size.
@@ -1651,6 +1655,7 @@ struct PreparedNativeSelection {
     OwnedPidl folder;
     std::vector<Entry> entries;
     std::vector<OwnedPidl> children;
+    size_t validationCursor = 0;
     bool imported = false, revealUnchanged = false, preserveViewport = false;
     bool compareObserved = false;
     int expectedCount = 0;
@@ -2023,6 +2028,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     bool registered = false; // Protected by the lifetime regulator's mutex.
     SRWLOCK directoryLock = SRWLOCK_INIT;
     std::deque<DirectoryJob> directoryJobs, layoutJobs, capacityJobs;
+    std::shared_ptr<DirectoryJob> nativeCatalogRequest;
     std::deque<DetailJob> detailJobs;
     std::deque<NativeRowsJob> nativeRowsJobs;
     std::deque<ColumnCatalogJob> columnCatalogJobs;
@@ -2031,7 +2037,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<DirectoryResult> directoryResults;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
         std::shared_ptr<const NamespaceIdentities>, std::shared_ptr<const std::vector<Entry>>,
-        std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates>;
+        std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates,
+        std::vector<SharedPidl>>;
     std::deque<RetiredPayload> retiredEntries;
     bool directoryNotificationQueued = false, detailNotificationQueued = false;
     SRWLOCK iconLock = SRWLOCK_INIT;
@@ -3103,6 +3110,13 @@ struct ViewState {
     ComPtr<IEnumIDList> nativeSelectionCapture;
     std::shared_ptr<PreparedNativeSelection> nativeSelectionCaptureJob;
     std::shared_ptr<PreparedNativeSelection> confirmedNativeSelection;
+    SelectionFlags verifiedSelectionFlags;
+    int verifiedSelectionRow = -1, verifiedSelectionAnchor = -1;
+    unsigned long long verifiedSelectionToken = 0, verifiedSelectionDirectory = 0, verifiedSelectionOrder = 0;
+    ComPtr<IEnumIDList> nativeCatalogCapture;
+    std::shared_ptr<DirectoryJob> nativeCatalogJob;
+    HWND nativeCatalogView = nullptr;
+    int nativeCatalogCount = -1;
     bool pendingSelectionContextMenu = false;
     bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
@@ -8424,6 +8438,14 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
             }
             if (directory.namespaceFolder && !directory.enumerated) {
+                if (directory.captureNativeCatalog && !directory.nativeCatalogChecked) {
+                    ExclusiveSrwLock lock(work.directoryLock);
+                    if (DirectoryJobCurrent(work,directory.token)) {
+                        work.nativeCatalogRequest=std::make_shared<DirectoryJob>(std::move(directory));
+                        PostMessageW(work.hwnd,kMsgNativeCatalog,0,0);
+                    }
+                    continue;
+                }
                 NativeRowsJob job;
                 job.token = directory.token;
                 job.folder.reset(ILCloneFull(directory.namespaceFolder.get()));
@@ -8432,7 +8454,38 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 job.requestedAt = GetTickCount64();
                 const bool filesystem = IsTargetPath(directory.path);
                 job.presentation = std::make_unique<DirectoryJob>(std::move(directory));
-                if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
+                if (job.folder && job.presentation->nativeCatalogAvailable) {
+                    if (const auto expected=job.presentation->verifyIdentities) {
+                        DirectoryResult result;
+                        result.kind=DirectoryResult::NamespaceCheck; result.token=job.token; result.hwnd=work.hwnd;
+                        result.namespaceChanged=job.presentation->nativeChildren.size()!=expected->size();
+                        for (const auto& child:job.presentation->nativeChildren) {
+                            if (!DirectoryJobCurrent(work,job.token)) break;
+                            OwnedPidl absolute(ILCombine(job.folder.get(),child.get()));
+                            if (!absolute || !expected->contains(NamespaceItemKey(absolute.get()))) {
+                                result.namespaceChanged=true; break;
+                            }
+                        }
+                        PublishDirectoryResult(work,std::move(result));
+                        continue;
+                    }
+                    if (!provider && FAILED(BindDirectoryProvider(job.presentation->path,provider,job.folder.get()))) {
+                        std::vector<Entry> empty;
+                        auto result=PrepareDirectoryResult(work,*job.presentation,empty,ERROR_NOT_READY);
+                        PublishDirectoryResult(work,std::move(result));
+                        continue;
+                    }
+                    for (auto& child:job.presentation->nativeChildren) {
+                        NativeRowIdentity identity;
+                        identity.absolute.reset(ILCombine(job.folder.get(),child.get()));
+                        identity.child.reset(ILCloneFull(child.get())); identity.namespaceItem=true;
+                        job.identities.push_back(std::move(identity));
+                    }
+                    const auto resolve=[&](const NativeRowIdentity& identity,Entry& entry) {
+                        return ResolveNativeRowIdentity(identity,entry,provider.Get(),filesystem);
+                    };
+                    ResolveNativeRowsJob(work,job,resolve);
+                } else if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
                 continue;
             }
             if (IsThisPcLocation(directory.path)) {
@@ -8790,7 +8843,10 @@ bool RequestColumnCatalog(ViewState& state) {
     return true;
 }
 
+void CancelNativeCatalog(ViewState& state);
+
 void ForgetDirectory(ViewState& state) {
+    CancelNativeCatalog(state);
     InvalidateColumnCatalog(state);
     state.zebraExtentAnimating = false;
     auto& work = *state.background;
@@ -8805,6 +8861,7 @@ void ForgetDirectory(ViewState& state) {
         if (state.namespaceIdentities)
             work.retiredEntries.emplace_back(std::exchange(state.namespaceIdentities, {}));
         work.directoryJobs.clear();
+        work.nativeCatalogRequest.reset();
         work.nativeRowsJobs.clear();
         for (auto& job : work.layoutJobs)
             if (!job.enumeratedEntries.empty()) work.retiredEntries.push_back(std::move(job.enumeratedEntries));
@@ -8847,6 +8904,91 @@ bool RetireCachedEntries(ViewState& state, Entries& entries, bool nonblocking = 
     }
     if (EnsureDirectoryWorker(state, true)) SetEvent(state.background->properties.wake);
     return true;
+}
+
+void CancelNativeCatalog(ViewState& state) {
+    state.nativeCatalogCapture.Reset(); // Release the live enumerator on its owner STA.
+    if (state.nativeCatalogJob) RetireCachedEntries(state,state.nativeCatalogJob->nativeChildren);
+    state.nativeCatalogJob.reset(); state.nativeCatalogView=nullptr;
+    state.nativeCatalogCount=-1;
+}
+
+// Shell folder enumeration can include identities filtered or replaced by its
+// view. Copy the actual view's PIDLs in bounded owner-STA slices; all provider
+// binding, names, attributes and layout remain on the tab's names lane.
+void AdvanceNativeCatalog(ViewState& state) {
+    auto& work=*state.background;
+    std::shared_ptr<DirectoryJob> request;
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        request=std::move(work.nativeCatalogRequest);
+    }
+    if (request && request->token==state.directoryToken) {
+        CancelNativeCatalog(state);
+        state.nativeCatalogJob=std::move(request);
+        state.nativeCatalogView=state.nativeHwnd;
+    }
+    const auto job=state.nativeCatalogJob;
+    const auto view=state.folderView;
+    const HWND owner=state.hwnd;
+    if (!job) return;
+    const auto current=[&] {
+        return IsWindow(owner) && State(owner)==&state && state.nativeCatalogJob==job &&
+            job->token==state.directoryToken && state.nativeHwnd==state.nativeCatalogView &&
+            state.folderView.Get()==view.Get() && DirectoryJobCurrent(work,job->token);
+    };
+    if (!current()) { CancelNativeCatalog(state); return; }
+    bool complete=false, available=false;
+    if (!state.nativeCatalogCapture) {
+        ComPtr<IEnumIDList> items;
+        int count=-1;
+        const HRESULT hr=view ? view->ItemCount(SVGIO_ALLVIEW,&count) : E_NOINTERFACE;
+        if (!current()) return;
+        const HRESULT enumHr=SUCCEEDED(hr) && count>=0 ?
+            view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items)) : E_FAIL;
+        if (!current()) return;
+        if (SUCCEEDED(hr) && count==0 && enumHr!=E_NOTIMPL && enumHr!=E_NOINTERFACE) {
+            state.nativeCatalogCount=0; complete=available=true;
+        }
+        else if (FAILED(enumHr) || !items) complete=true;
+        else { state.nativeCatalogCount=count; state.nativeCatalogCapture=std::move(items); }
+    }
+    const auto enumerator=state.nativeCatalogCapture;
+    const ULONGLONG started=GetTickCount64();
+    for (unsigned copied=0; !complete && copied<64 && GetTickCount64()-started<1;) {
+        PITEMID_CHILD children[16]{}; ULONG fetched=0;
+        const HRESULT hr=enumerator->Next(ARRAYSIZE(children),children,&fetched);
+        const bool valid=current();
+        for (ULONG i=0;i<fetched;++i) {
+            SharedPidl child(children[i],TaskMemDeleter{});
+            if (valid && child) job->nativeChildren.push_back(std::move(child));
+        }
+        if (!valid) return;
+        copied+=fetched;
+        complete=hr!=S_OK || !fetched;
+        available=SUCCEEDED(hr);
+    }
+    if (!complete) { PostMessageW(owner,kMsgNativeCatalog,0,0); return; }
+    if (available) {
+        int count=-1;
+        const HRESULT hr=view->ItemCount(SVGIO_ALLVIEW,&count);
+        if (!current()) return;
+        if (SUCCEEDED(hr) && (count!=state.nativeCatalogCount || size_t(count)!=job->nativeChildren.size())) {
+            state.nativeCatalogCapture.Reset();
+            RetireCachedEntries(state,job->nativeChildren);
+            PostMessageW(owner,kMsgNativeCatalog,0,0); // Model changed during capture; take a fresh snapshot.
+            return;
+        }
+        available=SUCCEEDED(hr);
+    }
+    state.nativeCatalogCapture.Reset(); state.nativeCatalogJob.reset();
+    job->nativeCatalogChecked=true; job->nativeCatalogAvailable=available;
+    if (!available) { state.nativeCatalogCount=-1; RetireCachedEntries(state,job->nativeChildren); }
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        if (DirectoryJobCurrent(work,job->token)) work.directoryJobs.push_back(std::move(*job));
+    }
+    SetEvent(work.directory.wake);
 }
 
 size_t FolderCacheBudget(FolderCache& cache) {
@@ -9400,6 +9542,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         check.hwnd = state.hwnd; check.token = state.directoryToken;
         check.path = state.folderPath; check.visibility = state.visibility;
         check.namespaceFolder = state.directoryFolderIdentity;
+        check.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
         check.verifyIdentities = state.namespaceIdentities;
         ExclusiveSrwLock lock(state.background->directoryLock, true);
         if (!lock) {
@@ -9427,6 +9570,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // navigation, the new view starts with an empty names-only surface.
     state.directoryPending = true;
     state.directoryRequestedAt = GetTickCount64();
+    CancelNativeCatalog(state);
     state.directoryToken = g_nextToken.fetch_add(1);
     state.namesPreview = false;
     // Build the bounded viewport snapshot without holding the global worker
@@ -9447,6 +9591,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     newJob.token = state.directoryToken;
     newJob.path = state.folderPath;
     newJob.folderIdentity = state.directoryFolderIdentity;
+    newJob.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
     newJob.previousOrderHash=state.displayedOrderHash;
     newJob.previousMetadataHash=state.displayedMetadataHash;
     newJob.sortRevealPath=std::move(state.sortRevealPath);
@@ -18381,6 +18526,7 @@ void EnsureVisible(ViewState& state, int index) {
 struct PidlSelection {
     std::vector<PITEMID_CHILD> owned;
     std::vector<PCUITEMID_CHILD> children;
+    std::vector<int> rejected;
     // Borrowed from owned: no second potentially blocking Shell parse just
     // to mark the same selected item as focused.
     PCUITEMID_CHILD focused = nullptr;
@@ -18392,6 +18538,44 @@ void BorrowPreparedSelection(PidlSelection& pidls, const PreparedNativeSelection
     for (const auto& child : prepared.children) pidls.children.push_back(child.get());
     if (prepared.focused >= 0 && static_cast<size_t>(prepared.focused) < pidls.children.size())
         pidls.focused = pidls.children[static_cast<size_t>(prepared.focused)];
+}
+
+void RememberVerifiedSelection(ViewState& state) {
+    state.verifiedSelectionFlags=state.selectedFlags;
+    state.verifiedSelectionRow=state.selected; state.verifiedSelectionAnchor=state.anchor;
+    state.verifiedSelectionToken=state.token; state.verifiedSelectionDirectory=state.directoryToken;
+    state.verifiedSelectionOrder=state.displayedOrderHash;
+}
+
+void RestoreVerifiedSelection(ViewState& state) {
+    const bool retained=state.verifiedSelectionToken==state.token && (state.verifiedSelectionDirectory==state.directoryToken ||
+        (state.verifiedSelectionOrder && state.verifiedSelectionOrder==state.displayedOrderHash)) &&
+        state.verifiedSelectionFlags.size()==state.selectedFlags.size();
+    if (retained) {
+        state.selectedFlags=state.verifiedSelectionFlags;
+        state.selected=state.verifiedSelectionRow; state.anchor=state.verifiedSelectionAnchor;
+    } else { state.selectedFlags.Fill(0); state.selected=state.anchor=-1; }
+    state.nativeSelectionUnsafe=!retained;
+    QueueNativeSelectionHint(state);
+    Redraw(state);
+}
+
+bool NativeSelectionTarget(IFolderView2* view, PCUITEMID_CHILD child) {
+    if (!child) return false;
+    DWORD flags=0;
+    const HRESULT hr=view->GetSelectionState(child,&flags);
+    return SUCCEEDED(hr) || hr==E_NOTIMPL || hr==E_NOINTERFACE;
+}
+
+void RejectSelectionRows(ViewState& state, const std::vector<int>& rejected) {
+    for (int row:rejected) if (row>=0 && size_t(row)<state.selectedFlags.size())
+        state.selectedFlags[size_t(row)]=0;
+    const auto selected=[&](int row) {return row>=0 && size_t(row)<state.selectedFlags.size() && state.selectedFlags[size_t(row)];};
+    if (!selected(state.selected)) {
+        state.selected=-1;
+        for (size_t i=0;i<state.selectedFlags.size();++i) if (state.selectedFlags[i]) { state.selected=int(i); break; }
+    }
+    if (!selected(state.anchor)) state.anchor=state.selected;
 }
 
 bool VerifyNativeSelection(ViewState& state, const PidlSelection& expected);
@@ -18541,12 +18725,9 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
             for (const Entry& entry : job->entries) {
                 if (!current()) break;
                 PITEMID_CHILD child = nullptr;
-                job->result = EntryChildPidl(folder.Get(), nullptr, entry, &child);
+                const HRESULT hr = EntryChildPidl(folder.Get(), nullptr, entry, &child);
                 OwnedPidl owned(child);
-                if (FAILED(job->result) || !owned) {
-                    if (SUCCEEDED(job->result)) job->result = E_FAIL;
-                    break;
-                }
+                if (FAILED(hr)) owned.reset(); // Reject this identity, retaining the rest of the group.
                 job->children.push_back(std::move(owned));
             }
             }
@@ -18562,7 +18743,7 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
 }
 
 bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& selection) {
-    if (state.token != selection.viewToken || state.nativeHwnd != selection.native ||
+    if (state.token != selection.viewToken || state.directoryToken != selection.directoryToken || state.nativeHwnd != selection.native ||
         static_cast<size_t>(std::count_if(state.selectedFlags.begin(), state.selectedFlags.end(),
             [](unsigned char flag) { return flag != 0; })) != selection.entries.size()) return false;
     for (const Entry& entry : selection.entries) {
@@ -18573,19 +18754,67 @@ bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& 
     return true;
 }
 
+bool ValidatePreparedSelection(ViewState& state, const std::shared_ptr<PreparedNativeSelection>& job) {
+    const auto view=state.folderView;
+    const HWND owner=state.hwnd;
+    const auto current=[&] {
+        return IsWindow(owner) && State(owner)==&state && state.pendingNativeSelection==job->generation &&
+            state.token==job->viewToken && state.directoryToken==job->directoryToken &&
+            state.nativeHwnd==job->native && state.folderView.Get()==view.Get();
+    };
+    if (!current() || !view) return false;
+    const ULONGLONG started=GetTickCount64();
+    for (unsigned copied=0; job->validationCursor<job->children.size() && copied<64 && GetTickCount64()-started<1; ++copied) {
+        auto& child=job->children[job->validationCursor++];
+        const bool valid=NativeSelectionTarget(view.Get(),child.get());
+        if (!current()) return false;
+        if (!valid) child.reset();
+    }
+    if (job->validationCursor<job->children.size()) {
+        ExclusiveSrwLock lock(state.background->selectionLock);
+        state.background->selectionResult=job;
+        state.background->selectionNotificationQueued=PostMessageW(owner,kMsgPreparedSelection,0,0)!=FALSE;
+        return false;
+    }
+    std::vector<int> rejected;
+    size_t accepted=0; int focused=-1;
+    for (size_t i=0;i<job->children.size();++i) {
+        if (!job->children[i]) { rejected.push_back(GpuRowForNativePath(state,job->entries[i].path)); continue; }
+        if (int(i)==job->focused) focused=int(accepted);
+        if (accepted!=i) { job->entries[accepted]=std::move(job->entries[i]); job->children[accepted]=std::move(job->children[i]); }
+        ++accepted;
+    }
+    job->entries.resize(accepted); job->children.resize(accepted);
+    job->focused=focused>=0 ? focused : accepted ? 0 : -1;
+    if (!rejected.empty()) {
+        if (!accepted) RestoreVerifiedSelection(state);
+        RejectSelectionRows(state,rejected);
+        if (!accepted && !state.nativeSelectionUnsafe) RememberVerifiedSelection(state);
+    }
+    return true;
+}
+
 bool CollectSelectedPidls(ViewState& state, PidlSelection& pidls) {
     if (!state.folder || !state.folderView) return false;
+    const auto view=state.folderView;
+    const auto token=state.token, directory=state.directoryToken;
+    const HWND owner=state.hwnd;
     for (int i = 0; i < state.total; ++i) {
         if (i >= static_cast<int>(state.selectedFlags.size()) ||
             !state.selectedFlags[static_cast<size_t>(i)]) continue;
         if (static_cast<size_t>(i) >= state.entries.size()) return false;
         PITEMID_CHILD child = nullptr;
-        if (SUCCEEDED(EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child)) && child) {
+        const HRESULT hr=EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
+        OwnedPidl owned(child);
+        const bool valid=SUCCEEDED(hr) && child && NativeSelectionTarget(view.Get(),child);
+        if (State(owner)!=&state || state.token!=token || state.directoryToken!=directory || state.folderView.Get()!=view.Get()) return false;
+        if (valid) {
             pidls.owned.push_back(child);
             pidls.children.push_back(child);
+            owned.release();
             if (i == state.selected) pidls.focused = child;
         } else {
-            return false; // don't silently operate on only some files
+            pidls.rejected.push_back(i);
         }
     }
     return true;
@@ -18881,6 +19110,7 @@ void ApplyImportedNativeSelection(ViewState& state,
                     RevealNativeSelection(state, state.selected);
                 if (preserveViewport) state.nativeSelectionViewportOwned=true;
                 state.nativeSelectionImportPreserveViewport=false;
+                RememberVerifiedSelection(state);
                 return;
             }
         }
@@ -18908,6 +19138,7 @@ void ApplyImportedNativeSelection(ViewState& state,
         ClearPostDeletionCaret(state);
         state.selectedFlags.assign(state.entries.size(), 1);
         state.selected = state.anchor = state.selected>=0 && state.selected<state.total ? state.selected : state.total ? 0 : -1;
+        RememberVerifiedSelection(state);
         AnimateVisibleSelection(state, previousVisible);
         Redraw(state);
         return;
@@ -18959,6 +19190,7 @@ void ApplyImportedNativeSelection(ViewState& state,
     if (!preserveViewport) RevealNativeSelection(state, state.selected);
     // The native view already owns these selections: never echo them back
     // with SelectAndPositionItems during import.
+    RememberVerifiedSelection(state);
     Redraw(state);
 }
 
@@ -18997,6 +19229,11 @@ bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool comm
     }
     if (state.thisPcGpu && !ShellRowsInteractive(state)) return false;
     if (!state.folderView) return false;
+    if (eventDriven && state.nativeCatalogCount>=0 && !state.directoryPending) {
+        int count=-1;
+        if (SUCCEEDED(state.folderView->ItemCount(SVGIO_ALLVIEW,&count)) && count!=state.nativeCatalogCount)
+            QueueDirectoryRefresh(state,false,true);
+    }
     TabTraceSlowScope trace(L"native selection snapshot", state.hwnd);
     if (state.thisPcGpu && state.total > 0) {
         int nativeTotal = 0;
@@ -19287,6 +19524,7 @@ void MaybeRecoverNativeSelection(ViewState& state) {
     state.nativeSelectionObservedCount=0; state.nativeSelectionObservedPaths.clear();
     state.nativeSelectionAwaitingRefresh=state.nativeSelectionUnsafe=false;
     state.nativeSelectionRecoveryPending=state.nativeSelectionDirty=false;
+    RememberVerifiedSelection(state);
     PipelineEvent(*state.background,{.operation=L"selection.recovery.cleared",.a=state.token});
     Redraw(state);
 }
@@ -19345,9 +19583,8 @@ bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool rev
         job->entries.push_back(std::move(entry));
     }
     if (!StartTabWorker(state.background, work.selection, SelectionWorkerProc, THREAD_PRIORITY_NORMAL)) return false;
-    // Clear the old native selection before any asynchronous work: commands
-    // must never operate on items from the preceding click while preparing.
-    if (!ClearNativeSelection(state)) return false;
+    // Commands are gated by pendingNativeSelection. Keep the verified native
+    // set intact until the new identities have been prepared and validated.
     state.pendingNativeSelection = job->generation;
     work.selectionGeneration.store(job->generation, std::memory_order_release);
     {
@@ -19459,6 +19696,10 @@ bool CapturedSelectionStillCurrent(ViewState& state, const PreparedNativeSelecti
 }
 
 bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelection> prepared) {
+    WindowCallbackGuard callback;
+    const HWND owner=state.hwnd;
+    const auto view=state.folderView;
+    const auto token=state.token, directory=state.directoryToken;
     TraceSelectionIdentity(state, L"native.sync.before");
     // A fresh explicit selection supersedes an older queued recovery. Failed
     // commits still use the normal verified import/recovery path.
@@ -19491,13 +19732,13 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
             i < state.entries.size())
             selectedPaths.push_back(state.entries[i].path);
     }
-    if (desired <= kMaxDirectNativeSelectionItems) CancelNativeSelectionPreparation(state);
+    if (desired <= kMaxDirectNativeSelectionItems && !prepared) CancelNativeSelectionPreparation(state);
     state.nativeSelectionImportPending = state.nativeSelectionAllPending = false;
     state.nativeSelectionAllCount = -1;
     state.nativeSelectionAwaitingRefresh = false;
     state.nativeSelectionPaths.clear(); state.nativeFocusedPath.clear();
     if (desired == 0) {
-        if (ClearNativeSelection(state)) return true;
+        if (ClearNativeSelection(state)) { RememberVerifiedSelection(state); return true; }
         ReconcileFailedNativeSelection(state);
         return false;
     }
@@ -19518,11 +19759,24 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
         prepared->children.size() == desired && GpuSelectionMatches(state, *prepared);
     if (havePrepared) BorrowPreparedSelection(pidls, *prepared);
     if ((prepared && !havePrepared) || (!prepared && !CollectSelectedPidls(state, pidls))) {
+        if (State(owner)!=&state || state.token!=token || state.directoryToken!=directory || state.folderView.Get()!=view.Get()) return false;
         Wh_Log(L"[GPU selection] PIDL parsing failed: wanted=%zu rows=%d elapsed=%llu ms",
             desired, state.total,
             static_cast<unsigned long long>(GetTickCount64() - started));
-        ReconcileFailedNativeSelection(state);
+        RestoreVerifiedSelection(state); // No native transaction has been attempted.
         return false;
+    }
+    if (!pidls.rejected.empty()) {
+        RejectSelectionRows(state,pidls.rejected);
+        if (pidls.children.empty()) {
+            RestoreVerifiedSelection(state); RejectSelectionRows(state,pidls.rejected);
+            if (!state.nativeSelectionUnsafe) RememberVerifiedSelection(state);
+            return true;
+        }
+        desired=pidls.children.size();
+        selectedPaths.clear();
+        for (size_t i=0;i<state.entries.size();++i) if (state.selectedFlags[i]) selectedPaths.push_back(state.entries[i].path);
+        if (!pidls.focused) pidls.focused=pidls.children.front();
     }
     // A single selected item can also own the native caret atomically. The
     // separate focus transaction is needed only for multi-selection, whose
@@ -19591,6 +19845,7 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
     }
     if (verified) {
         state.nativeSelectionUnsafe=false;
+        RememberVerifiedSelection(state);
         state.confirmedNativeSelection = std::move(prepared);
         state.nativeSelectionViewportOwned = true;
         if (selectedPaths.size() > 1)
@@ -26666,6 +26921,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->selectedFlags.assign(s->entries.size(), 1);
                 s->selected = s->selected>=0 && s->selected<s->total ? s->selected : s->total ? 0 : -1;
                 s->anchor = s->selected;
+                RememberVerifiedSelection(*s);
                 s->keyboardCaretVisible = false;
                 StopKeyboardSelectionAnimation(*s);
                 ClearPostDeletionCaret(*s);
@@ -26743,6 +26999,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 TryStartCreatedItemRename(*s);
         }
         return 0;
+    case kMsgNativeCatalog:
+        if (s) AdvanceNativeCatalog(*s);
+        return 0;
     case kMsgPreparedSelection:
         if (s) {
             if (s->nativeSelectionCaptureJob) { AdvanceNativeSelectionCapture(*s); return 0; }
@@ -26818,7 +27077,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             } else if (!GpuSelectionMatches(*s, *prepared)) {
                 CancelNativeSelectionPreparation(*s);
                 return 0;
-            } else committed=SyncNativeSelection(*s, prepared);
+            } else {
+                if (FAILED(prepared->result)) {
+                    CancelNativeSelectionPreparation(*s);
+                    RestoreVerifiedSelection(*s);
+                    return 0;
+                }
+                if (SUCCEEDED(prepared->result)) {
+                    if (!ValidatePreparedSelection(*s,prepared)) return 0;
+                    if (prepared->entries.empty()) {
+                        CancelNativeSelectionPreparation(*s);
+                        Redraw(*s);
+                        return 0;
+                    }
+                }
+                committed=SyncNativeSelection(*s, prepared);
+            }
             if (!IsWindow(hwnd) || State(hwnd) != s) return 0;
             if (s->pendingNativeSelection != prepared->generation) return 0;
             s->pendingNativeSelection = 0;
