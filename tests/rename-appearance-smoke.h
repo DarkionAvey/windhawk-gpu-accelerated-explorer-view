@@ -14,7 +14,8 @@ void Bounds(ViewState& state) {
         actual.right <= viewport.right && actual.top >= viewport.top && actual.bottom <= viewport.bottom,
         "rename EDIT escaped the item viewport");
 }
-void FontCenter(HWND editor) {
+void TextAlignment(ViewState& state) {
+    const HWND editor=state.rename.editor;
     HDC dc = GetDC(editor);
     const auto font = reinterpret_cast<HFONT>(SendMessageW(editor, WM_GETFONT, 0, 0));
     const auto old = SelectObject(dc, font);
@@ -23,9 +24,23 @@ void FontCenter(HWND editor) {
     RECT window{}, client{}; GetWindowRect(editor, &window); GetClientRect(editor, &client);
     if (GetWindowLongPtrW(editor, GWL_STYLE) & ES_MULTILINE) {
         RECT format{}; SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
-        const int lines = int(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
-        Check(std::abs(format.top - std::max(0L, (client.bottom-lines*metrics.tmHeight)/2)) <= 1,
-            "wrapped rename text was not centered using native line count/font metrics");
+        Check((GetWindowLongPtrW(editor,GWL_STYLE)&(ES_CENTER|ES_RIGHT))==ES_CENTER,
+            "grid rename text did not use native centered alignment");
+        MapWindowPoints(editor,state.hwnd,reinterpret_cast<POINT*>(&format),2);
+        const auto geometry=LayoutItem(state,{state.headerPx+DocumentRowTop(state,state.rename.index)-state.scrollNow,
+            DisplayRowHeight(state,state.rename.index),1.f,DocumentRowLeft(state,state.rename.index)});
+        RECT overlay{}; ViewClientRect(state,&overlay);
+        const float left=state.rtlLayout ? overlay.right-geometry.text.right : geometry.text.left;
+        const auto viewport=RenameViewport(state,false);
+        // Tiny resized viewports can clip the text band; check exact label
+        // alignment whenever it fits, and containment in Bounds otherwise.
+        if(left>=viewport.left && left+geometry.text.right-geometry.text.left<=viewport.right &&
+            geometry.text.top>=viewport.top && geometry.text.bottom<=viewport.bottom) {
+            Check(std::abs(format.left-left)<=1.f &&
+                std::abs(format.right-format.left-(geometry.text.right-geometry.text.left))<=1.f &&
+                std::abs(format.top-geometry.text.top)<=1.f,
+                "grid rename formatting did not match the label origin/wrapping width");
+        }
     } else {
         MapWindowPoints(editor, nullptr, reinterpret_cast<POINT*>(&client), 2);
         const LONG available=std::max(0L,window.bottom-window.top-
@@ -67,23 +82,26 @@ void Palette(ViewState& state) {
 static void TestRenameAppearance(const std::wstring& directory) {
     StyleFixture::Session styles;
     const auto factory=g_writeFactory;
+    const auto filenameOnly=g_filenameOnly.exchange(ViewOption::GridOnly);
     if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
         __uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"rename appearance fonts");
-    for(int dpi:{96,192}) for(bool rtl:{false,true}) for(UINT mode:{FVM_DETAILS,FVM_LIST,FVM_ICON}) for(bool grouped:{false,true}) {
-        const bool grid=mode==FVM_ICON, details=mode==FVM_DETAILS;
+    for(int dpi:{96,144,192}) for(bool rtl:{false,true})
+        for(UINT mode:{FVM_DETAILS,FVM_LIST,FVM_SMALLICON,FVM_ICON,FVM_THUMBNAIL}) for(bool grouped:{false,true}) {
+        const bool grid=mode==FVM_ICON || mode==FVM_SMALLICON || mode==FVM_THUMBNAIL, details=mode==FVM_DETAILS;
         StyleFixture::dpi=dpi;
         PresentationFixture::Tab tab(L"rename appearance",80,rtl,grid,grouped,Scale96(330,dpi),Scale96(210,dpi));
         auto& state=tab.state;
-        if(mode==FVM_LIST) ApplyViewLayout(state,{mode,48},false);
+        ApplyViewLayout(state,{mode,mode==FVM_THUMBNAIL ? 192 : 48},false);
         if(rtl) SetWindowLongPtrW(tab.frame,GWL_EXSTYLE,GetWindowLongPtrW(tab.frame,GWL_EXSTYLE)|WS_EX_LAYOUTRTL);
         SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
         Check(SetWindowSubclass(state.hwnd,RenameAppearanceFixture::Resize,1,0),"rename resize delivery");
         FocusFixture::Session focus(tab.frame,state.hwnd);
         const auto path=std::filesystem::path(directory)/(L"rename-appearance-"+std::to_wstring(dpi)+
             std::to_wstring(rtl)+std::to_wstring(mode)+std::to_wstring(grouped));
-        std::filesystem::create_directories(path/L"renaming");
         state.folderPath=path.wstring();
-        auto& entry=state.entries.back(); entry.name=L"renaming"; entry.path=(path/entry.name).wstring();
+        auto& entry=state.entries.back();
+        entry.name=grouped ? L"a longer original filename that wraps across several lines" : L"renaming";
+        entry.path=(path/entry.name).wstring(); std::filesystem::create_directories(entry.path);
         auto* view=new SelectionFolderView;
         ComPtr<IShellItem> item;
         Check(SUCCEEDED(SHCreateItemFromParsingName(path.c_str(),nullptr,IID_PPV_ARGS(&item))) &&
@@ -99,6 +117,7 @@ static void TestRenameAppearance(const std::wstring& directory) {
         }
         RefreshNativePalette(state,true);
         for(bool trailing:{false,true}) {
+            g_filenameOnly=trailing ? ViewOption::AlwaysOff : ViewOption::GridOnly;
             FocusFixture::focus=state.hwnd;
             if(details) SetHorizontalScroll(state,trailing ? state.columnContentWidth : 0.f);
             const float before=state.horizontalScroll;
@@ -109,6 +128,26 @@ static void TestRenameAppearance(const std::wstring& directory) {
             if(details) Check(trailing ? state.horizontalScroll<before : state.horizontalScroll>before,
                 "rename did not reveal the moved Name column from both horizontal edges");
             RenameAppearanceFixture::Bounds(state);
+            RenameAppearanceFixture::TextAlignment(state);
+            if(grid && mode!=FVM_SMALLICON && !trailing) {
+                // The owner can open rename before acquiring any DirectWrite
+                // resources. Only now build them to inspect its old label.
+                Check(MakeTextFormats(state),"grid rename selection measurement");
+                RECT actual{}, overlay{}; GetWindowRect(state.rename.editor,&actual); ViewClientRect(state,&overlay);
+                state.paintWidth=static_cast<float>(overlay.right);
+                const float top=state.headerPx+DocumentRowTop(state,state.selected)-state.scrollNow;
+                const auto selection=SelectionRect(state,state.selected,top,DisplayRowHeight(state,state.selected),
+                    0.f,0.f,ListEndX(state));
+                MapWindowPoints(nullptr,state.hwnd,reinterpret_cast<POINT*>(&actual),2);
+                const float left=state.rtlLayout ? overlay.right-selection.right : selection.left;
+                const float right=state.rtlLayout ? overlay.right-selection.left : selection.right;
+                const bool covered=actual.left<=left && actual.right>=right && actual.top<=selection.top && actual.bottom>=selection.bottom;
+                if(!covered) std::cout<<"RENAME coverage dpi="<<dpi<<" rtl="<<rtl<<" mode="<<mode<<" grouped="<<grouped
+                    <<" edit="<<actual.left<<","<<actual.top<<","<<actual.right<<","<<actual.bottom
+                    <<" selection="<<left<<","<<selection.top<<","<<right<<","<<selection.bottom<<std::endl;
+                Check(covered,
+                    "grid rename exposed the original filename selection outside the EDIT");
+            }
             Check(SelectionFeedbackVisible(state) && !OverlayHasInputFocus(state),
                 "rename lost selection feedback or granted list input");
             const auto model=CapturePresentationModel(state);
@@ -131,7 +170,7 @@ static void TestRenameAppearance(const std::wstring& directory) {
                 SendMessageW(state.rename.editor,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
                 for(const wchar_t* text:{L"短い名前.ext",L"a longer filename that wraps across several lines.ext"}) {
                     SetWindowTextW(state.rename.editor,text); UpdateWindow(state.rename.editor);
-                    RenameAppearanceFixture::Bounds(state); RenameAppearanceFixture::FontCenter(state.rename.editor);
+                    RenameAppearanceFixture::Bounds(state); RenameAppearanceFixture::TextAlignment(state);
                     RECT format{}, after{}; SendMessageW(state.rename.editor,EM_GETRECT,0,reinterpret_cast<LPARAM>(&format));
                     for(int n=0;n<3;++n) RepositionRenameEdit(state);
                     SendMessageW(state.rename.editor,EM_GETRECT,0,reinterpret_cast<LPARAM>(&after));
@@ -153,13 +192,13 @@ static void TestRenameAppearance(const std::wstring& directory) {
             // USER supplies WM_SIZE/WM_MOVE from the actual geometry change.
             SetWindowPos(state.hwnd,nullptr,Scale96(25,dpi),Scale96(15,dpi),Scale96(200,dpi),Scale96(130,dpi),
                 SWP_NOZORDER|SWP_NOACTIVATE);
-            RenameAppearanceFixture::Bounds(state); RenameAppearanceFixture::FontCenter(state.rename.editor);
+            RenameAppearanceFixture::Bounds(state); RenameAppearanceFixture::TextAlignment(state);
             CancelRename(state);
             Check(!state.rename.background && !state.rename.parentSubclassInstalled,"rename theme resources leaked");
             SetWindowPos(state.hwnd,nullptr,0,0,Scale96(330,dpi),Scale96(210,dpi),SWP_NOZORDER|SWP_NOACTIVATE);
         }
         RemoveWindowSubclass(state.hwnd,RenameAppearanceFixture::Resize,1);
     }
-    g_writeFactory=factory;
-    std::cout<<"PASS: native rename dark/light/high-contrast paint colors, actual HFONT centering/wrapping, GPU selection pixels, two-axis reveal and real resize containment in grouped/ungrouped LTR/RTL Details/List/grid at 96/192 DPI\n";
+    g_filenameOnly=filenameOnly; g_writeFactory=factory;
+    std::cout<<"PASS: native rename colors, HFONT metrics, centered grid label origins/wrapping and selection coverage, GPU selection pixels, two-axis reveal and real resize containment in grouped/ungrouped LTR/RTL Details/List/small/large icons at 96/144/192 DPI\n";
 }

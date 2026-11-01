@@ -159,7 +159,12 @@ static void TestMirroredWindowCoordinates(const std::wstring& directory) {
             const auto item=LayoutItem(*state,{state->headerPx+DocumentRowTop(*state,row)-state->scrollNow,
                 DisplayRowHeight(*state,row),1.f,DocumentRowLeft(*state,row)});
             const int leading=at(item.text.left,0).x+overlayBounds.left;
-            Check(std::abs((rtl ? editor.right : editor.left)-leading)<=1 &&
+            RECT text=editor;
+            if(item.wrapped) {
+                SendMessageW(state->rename.editor,EM_GETRECT,0,reinterpret_cast<LPARAM>(&text));
+                MapWindowPoints(state->rename.editor,nullptr,reinterpret_cast<POINT*>(&text),2);
+            }
+            Check(std::abs((rtl ? text.right : text.left)-leading)<=1 &&
                 editor.left>=overlayBounds.left && editor.right<=overlayBounds.right,
                 "RTL rename editor was not anchored to its visible filename");
             CancelRename(*state);

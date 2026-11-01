@@ -369,9 +369,15 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             }
             const auto labelGeometry = LayoutItem(state,{0,state.rowPx,1,DocumentRowLeft(state,1)});
             const RECT rename = RenameEditorRect(state,1);
-            POINT origin{rename.left,rename.top}; MapWindowPoints(frame,state.hwnd,&origin,1);
-            Check(origin.y >= labelGeometry.text.top && rename.right-rename.left <=
-                labelGeometry.text.right-labelGeometry.text.left+1.f,
+            RECT local=rename; MapWindowPoints(frame,state.hwnd,reinterpret_cast<POINT*>(&local),2);
+            const auto physical=[&](D2D1_RECT_F rect) {
+                if(rtl) { const float left=rect.left; rect.left=640.f-rect.right; rect.right=640.f-left; }
+                return rect;
+            };
+            const auto cell=physical(labelGeometry.cell), icon=physical(labelGeometry.icon);
+            Check(local.left>=std::floor(cell.left) && local.right<=std::ceil(cell.right) &&
+                local.top>=std::floor(cell.top) && local.bottom<=std::ceil(cell.bottom) &&
+                (local.left>=icon.right || local.right<=icon.left || local.top>=icon.bottom || local.bottom<=icon.top),
                 "grid rename covered the icon or escaped its label cell");
             std::wstring path; bool attrs = false;
             const auto key = IconKey(state,state.entries[0],path,attrs);

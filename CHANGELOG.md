@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.317
+
+- Center grid rename text on the label and preserve its wrapping position.
+  Cover the original label's selection background so it cannot spill above
+  or beside the rename field.
+
 ## 0.9.316
 
 - Prevent selection-background flicker when right-clicking an unselected item

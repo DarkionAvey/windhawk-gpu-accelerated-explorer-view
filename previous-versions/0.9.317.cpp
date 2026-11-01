@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.302
+// @version         0.9.317
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -22,7 +22,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 
 - Replicates explorer views using hardware accelerated graphics: Details list and icons grid, including thumbnails, sorting and grouping.
 - Animated interactions: grouping, sorting, selecting/cutting/copying files, and many more.
-- Smooth scrolling, touchscreen and touchpad gestures, and inertia scrolling.
+- Smooth scrolling, touchscreen and touchpad gestures.
 - RTL language support.
 - Optional button to switch back to native Explorer view; **Ctrl+Alt+F9** also works when the button is hidden.
 - Prioritizes responsiveness and animations over efficiency.
@@ -33,10 +33,15 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Custom Fonts** — Personalize the appearance with your preferred fonts.
 - **Animated Selection & Hover States** — Smooth visual transitions, including a dedicated selection style for file names only.
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
-- **Touchscreen Input** — Swipe vertically to scroll with any finger count. When the directory fits vertically, one-finger swipes select by marquee. Move horizontally with one finger for marquee selection, or two fingers to scroll columns. With swipe navigation enabled, movement beyond either column edge starts Back or Forward. Pinch to resize, tap to select, and double-tap to open. Hold and release for the Shell menu, or hold and move to drag files. Scrollbars stay small when idle, retain large touch hit areas, and grow smoothly while engaged.
-- **Explorer Click Preferences** — Honors Windows' double-click speed and File Explorer's single-click activation, point-to-select, and icon-title underline settings.
-- **Seamless View Switching** — Overlays the default Explorer views, letting you switch between the modded and native views directly from the Explorer window.
-- **Faster Loading** — Improves load times through caching and by skipping file pre-sorting.
+- **Touch support** — Multi touch support with modern interactions.
+- **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
+
+## Touch gestures
+- Swipe horizontally with one finger to start marquee selection. 
+- Two finger horizontal swipes will start Back or Forward gestures (disabled by default). 
+- Pinch to resize, tap to select, and double-tap to open. 
+- For context menu: press and hold, or tap with two fingers. 
+- The scrollbars remain large and easy to drag (even if they appear small, their trigger area remains comfortably large)
 
 ## Report bugs
 Report bugs in the mod's main repository [Here](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/issues). 
@@ -144,10 +149,23 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $name: Jump by item when dragging the vertical scrollbar
       $description: On = jump by whole items; off = smooth scrolling while dragging the vertical thumb.
   $name: Scrolling and navigation
+- Gestures:
+    - doubleClickUp: true
+      $name: Double-click empty space to go up
+      $description: Double-click below the last item or in either side margin to go up one folder.
+    - middleClickNewTab: true
+      $name: Middle-click folders to open in a new tab
+    - twoFingerContextMenu: true
+      $name: Two-finger tap for context menus
+      $description: On a touchscreen, tap an item or empty space with two fingers to show the same context menu as right-click.
+  $name: Additional mouse and touch gestures
 - Columns:
-    - folderPlacement: foldersBottom
+    - preSort: true
+      $name: Use Explorer sorting when opening folders
+      $description: Show items in Explorer's saved sort order. Disable to show unsorted items sooner until you choose a sort. Sort changes stay synchronized with Explorer.
+    - folderPlacement: explorerDefault
       $name: Folder order when sorting
-      $description: Only applies after you sort a column. Unsorted folders keep their original order.
+      $description: Applies to saved and manually chosen sorts. Unsorted folders keep their original order.
       $options:
         - explorerDefault: Explorer default behavior
         - foldersTop: Folders first
@@ -182,6 +200,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <shdispid.h>
 #include <exdisp.h>
 #include <exdispid.h>
+#include <docobj.h>
 #include <ocidl.h>
 #include <olectl.h>
 #include <oleauto.h>
@@ -404,6 +423,7 @@ constexpr UINT kMsgRetireGraphics = WM_APP + 69;
 constexpr UINT kMsgFilesystemChanged = WM_APP + 70;
 constexpr UINT kMsgFlushDirectoryChanges = WM_APP + 71;
 constexpr UINT kMsgPresentationReady = WM_APP + 72;
+constexpr UINT kMsgNativeCatalog = WM_APP + 73;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -514,6 +534,7 @@ std::atomic<int> g_row96{32};
 std::atomic<int> g_fontPercent{52}; // List/Details; keep the existing settings key.
 std::atomic<int> g_gridFontPercent{42};
 std::atomic<bool> g_autoRefitColumns{true};
+std::atomic<bool> g_preSort{true};
 // The settings callback may run on a different thread from Explorer's view.
 // Text formats take a snapshot only when they are created, never per frame.
 SRWLOCK g_fontFamilyLock = SRWLOCK_INIT;
@@ -532,12 +553,16 @@ std::atomic<bool> g_smooth{true};
 std::atomic<bool> g_showNativeViewToggleButton{true};
 std::atomic<bool> g_touchpadDirectManipulation{true};
 std::atomic<bool> g_touchpadSwipeNavigation{false};
+std::atomic<bool> g_doubleClickUp{true}, g_middleClickNewTab{true}, g_twoFingerContextMenu{true};
 std::atomic<UINT> g_wheelLines{3};
 enum class ViewOption { GridOnly, AlwaysOn, AlwaysOff };
 std::atomic<ViewOption> g_filenameOnly{ViewOption::GridOnly};
 std::atomic<ViewOption> g_middleEllipsis{ViewOption::GridOnly};
 std::atomic<bool> g_listThumbnails{false};
 std::atomic<bool> g_animateHover{true};
+// Internal until exposed as "animated item interactions". Header sorting is
+// deliberate input; native context-menu sorting keeps its layout animation.
+std::atomic<bool> g_animateItemInteractions{false};
 std::atomic<COLORREF> g_selectionRgb{RGB(0, 120, 215)};
 std::atomic<bool> g_dynamicAccent{true};
 // One coherent, event-refreshed COLORREF background/foreground/alpha tuple.
@@ -575,17 +600,15 @@ HMODULE g_uiaModule = nullptr;
 ComPtr<IDWriteFactory> g_writeFactory;
 std::atomic<int> g_instances{0};
 
-// New GPU folders start in filesystem enumeration order, without a chevron.
-// A column-header click explicitly opts that folder into sorting and commits
-// its chosen key/direction to Explorer. This immutable policy goes to the background
-// worker and cache; Shell's late per-folder sort initialization cannot cause
-// a second, unexpected resort of a newly opened folder.
+// The native view supplies each folder's sort. Opting out of pre-sorting keeps
+// enumeration order until a deliberate sort choice; both policies use the same
+// immutable worker/cache descriptor and native command synchronization.
 enum class SortKind { Name, Modified, Type, Size, Created, Accessed, Extension, ShellProperty };
 // Directory grouping is an overlay presentation preference, separate from
 // Explorer's native sort property/direction. Include it in immutable worker jobs
 // and cache identities so a settings change never reuses the wrong row order.
 enum class FolderPlacement { ExplorerDefault, AlwaysTop, AlwaysBottom, Mixed };
-std::atomic<FolderPlacement> g_folderPlacement{FolderPlacement::AlwaysBottom};
+std::atomic<FolderPlacement> g_folderPlacement{FolderPlacement::ExplorerDefault};
 struct ShellGroupSpec {
     PROPERTYKEY key{};
     BOOL ascending = TRUE;
@@ -597,6 +620,8 @@ struct SortSpec {
     SortKind kind = SortKind::Name;
     FolderPlacement placement = FolderPlacement::ExplorerDefault;
     bool explicitOrder = false; // False: preserve filesystem enumeration order.
+    bool userChosen = false; // Distinguish saved defaults from deliberate GPU/native sorting.
+    std::vector<SORTCOLUMN> secondary; // Explorer's additional tie-breaking keys.
 };
 bool SameProperty(const PROPERTYKEY& a, const PROPERTYKEY& b) {
     return a.pid == b.pid && IsEqualGUID(a.fmtid, b.fmtid);
@@ -611,7 +636,10 @@ bool SameSort(const SortSpec& a, const SortSpec& b) {
     // No sorting means no chosen key/direction or folder grouping to compare.
     if (!a.explicitOrder) return true;
     return SameProperty(a.key, b.key) && a.direction == b.direction &&
-           a.placement == b.placement;
+           a.placement == b.placement && a.secondary.size() == b.secondary.size() &&
+           std::equal(a.secondary.begin(),a.secondary.end(),b.secondary.begin(),[](const SORTCOLUMN& x,const SORTCOLUMN& y) {
+               return SameProperty(x.propkey,y.propkey) && x.direction==y.direction;
+           });
 }
 SortKind ClassifySort(const PROPERTYKEY& key) {
     if (SameProperty(key, PKEY_ItemNameDisplay) ||
@@ -667,6 +695,7 @@ struct ScrollbarMotion {
 };
 enum class TouchGesture { Pending, Vertical, Horizontal, Marquee, Pinch };
 enum class PointingDevice { Mouse, Touch, Pen, Touchpad };
+enum class ClickSource { Mouse, Injected, Touch };
 // Unit-mass damped springs in DIPs (scale/alpha are unitless). A common QPC
 // origin makes the immutable owner/render snapshots evaluate the same motion.
 struct SwipeSpring { double value=0., velocity=0., target=0.; float stiffness=450.f, damping=.65f; };
@@ -680,10 +709,11 @@ struct SwipeIndicator {
 };
 
 struct TouchInput {
+    int checkbox = -1; // Initial checkbox identity; manipulation still uses the native recognizer.
     bool active = false, consumed = false, control = false, replaying = false;
     bool panningFeedback = false, holding = false, inertia = false, down = false;
     bool dragPending = false, dragPosted = false, dragPromoted = false, controlDouble = false;
-    bool scrollbarMenuEligible = false;
+    bool scrollbarMenuEligible = false, multiTapDelivered = false;
     unsigned long long epoch = 0;
     unsigned long long generation = 0;
     UINT32 primary = 0;
@@ -750,26 +780,41 @@ using SharedPidl = std::shared_ptr<const ITEMIDLIST>;
 // opaque cache key for canonical selection lookup, including cached revisits.
 using NamespaceIdentities = std::unordered_map<std::wstring, SharedPidl>;
 
-struct Entry {
+struct ExtraSortValue {
+    PROPERTYKEY key{};
+    std::wstring text;
+    double number = 0;
+    unsigned char kind = 0;
+    bool operator==(const ExtraSortValue& other) const {
+        return SameProperty(key,other.key) && text==other.text && number==other.number && kind==other.kind;
+    }
+};
+// Refresh baselines retain only comparison data, without presentation cells,
+// formatted metadata, grouping strings or in-flight enrichment state.
+struct EntrySortKey {
     // Extra sort keys are populated only when the user chooses a Shell sort
     // that isn't already in WIN32_FIND_DATA. No per-row property COM on paint.
     std::wstring sortText;
     double sortNumber = 0;
     unsigned char sortValueKind = 0; // 0 absent, 1 text, 2 numeric
+    std::vector<ExtraSortValue> secondarySortValues;
     FILETIME created{}, accessed{};
     std::wstring path;
-    std::wstring name, date, type, size;
+    std::wstring name;
+    FILETIME lastWrite{};
+    ULONGLONG byteSize = 0;
+    bool folder = false;
+    SharedPidl shellIdentity; // Immutable identity for targeted provider rechecks.
+};
+struct Entry : EntrySortKey {
+    std::wstring date, type, size;
     std::vector<ColumnCell> cells;
     unsigned long long columnEpoch = 0;
     // Shell associations invalidate property text independently of UI columns.
     unsigned long long propertyEpoch = 1;
     // Refresh freshness is independent of the last displayed property values.
     unsigned long long detailsRefreshEpoch = 0;
-    FILETIME lastWrite{};
-    ULONGLONG byteSize = 0;
-    bool folder = false;
     DWORD attributes = 0; // Captured by the names worker; never queried while painting.
-    SharedPidl shellIdentity; // Tab-owned immutable Shell identity; never a native row-number dependency.
     SharedPidl shellChild; // Exact enumerated relative PIDL, including compound children.
     ULONGLONG driveUsed = 0, driveTotal = 0;
     int driveUsedPercent = -1; // Shell may report percentage without total bytes.
@@ -905,11 +950,13 @@ ShellVisibilityPolicy ReadShellVisibilityPolicy() {
 struct ShellClickPolicy {
     bool singleClick = false;
     bool underlineHot = false, underlineCold = false;
+    bool checkSelect = false;
 };
 ShellClickPolicy ReadShellClickPolicy() {
     SHELLSTATE settings{}; settings.fDoubleClickInWebView = -1;
-    SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW,FALSE);
+    SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW | SSF_AUTOCHECKSELECT,FALSE);
     ShellClickPolicy policy;
+    policy.checkSelect = settings.fAutoCheckSelect != 0;
     policy.singleClick = !settings.fDoubleClickInWebView;
     if (!policy.singleClick) return policy;
     DWORD mode = 2, bytes = sizeof(mode);
@@ -962,13 +1009,15 @@ using EntryPathIndex = std::vector<std::pair<size_t, int>>;
 // Sparse local identity changes between worker-built directory snapshots.
 // Updating one row must not rebuild/shift the whole sorted index on the STA.
 using EntryPathUpdates = std::map<size_t, std::set<int>>;
-size_t SelectionPathHash(const std::wstring& path) noexcept {
-    size_t hash = static_cast<size_t>(2166136261u);
+size_t ContinueSelectionPathHash(size_t hash, std::wstring_view path) noexcept {
     for (wchar_t ch : path) {
         hash ^= static_cast<size_t>(towlower(ch));
         hash *= static_cast<size_t>(16777619u);
     }
     return hash;
+}
+size_t SelectionPathHash(const std::wstring& path) noexcept {
+    return ContinueSelectionPathHash(static_cast<size_t>(2166136261u),path);
 }
 
 struct CaseInsensitiveFolderLess {
@@ -1424,7 +1473,7 @@ struct DirectoryJob {
     unsigned long long previousOrderHash = 0, previousMetadataHash = 0;
     bool checkSort = false; // Observe keys without invalidating the displayed snapshot.
     unsigned long long checkOrderHash = 0;
-    std::vector<Entry> sortChecks; // Bounded changed identities; empty means verify overflow order.
+    std::vector<EntrySortKey> sortChecks; // Bounded changed identities; empty means verify overflow order.
     SharedPidl folderIdentity; // Native binding, including filesystem-addressed providers.
     SharedPidl namespaceFolder; // Immutable; rebound only by the names worker.
     std::shared_ptr<const NamespaceIdentities> verifyIdentities;
@@ -1434,6 +1483,9 @@ struct DirectoryJob {
     std::wstring path;
     bool allowInitialPreview = false; // Cold filesystem loads; provisional names precede layout.
     bool enumerated = false;
+    bool captureNativeCatalog = false, nativeCatalogChecked = false;
+    bool nativeCatalogAvailable = false;
+    std::vector<SharedPidl> nativeChildren;
     std::vector<Entry> enumeratedEntries;
     DWORD enumerationError = ERROR_SUCCESS;
     size_t previewRows = 64; // Captured viewport + overhang, bounded independently of directory size.
@@ -1603,6 +1655,7 @@ struct PreparedNativeSelection {
     OwnedPidl folder;
     std::vector<Entry> entries;
     std::vector<OwnedPidl> children;
+    size_t validationCursor = 0;
     bool imported = false, revealUnchanged = false, preserveViewport = false;
     bool compareObserved = false;
     int expectedCount = 0;
@@ -1668,6 +1721,7 @@ struct CallbackObjectLifetime {
 struct TouchRecognizer {
     CallbackObjectLifetime lifetime;
     HINTERACTIONCONTEXT context = nullptr;
+    HINTERACTIONCONTEXT tapContext = nullptr;
     std::array<INTERACTION_CONTEXT_OUTPUT2, 16> output{};
     unsigned outputCount = 0;
     bool overflow = false, stopping = false;
@@ -1679,11 +1733,11 @@ struct TouchRecognizer {
     UINT64 performance = 0;
     DWORD time = 0;
     ~TouchRecognizer() {
-        if (context) {
-            stopping = true;
-            StopInteractionContext(context);
-            RegisterOutputCallbackInteractionContext2(context, nullptr, nullptr);
-            DestroyInteractionContext(context);
+        stopping = true;
+        for (auto handle : {context,tapContext}) if (handle) {
+            StopInteractionContext(handle);
+            RegisterOutputCallbackInteractionContext2(handle, nullptr, nullptr);
+            DestroyInteractionContext(handle);
         }
     }
     static void CALLBACK Output(void* client, const INTERACTION_CONTEXT_OUTPUT2* value) {
@@ -1693,9 +1747,20 @@ struct TouchRecognizer {
         if (self.outputCount < self.output.size()) self.output[self.outputCount++] = *value;
         else self.overflow = true;
     }
+    static void CALLBACK TapOutput(void* client, const INTERACTION_CONTEXT_OUTPUT2* value) {
+        WindowCallbackGuard callback;
+        if (value && value->interactionId==INTERACTION_ID_TAP && value->contactCount==2)
+            Output(client,value);
+    }
+    HRESULT Process(UINT32 count, const POINTER_INFO* frame) {
+        HRESULT hr=ProcessPointerFramesInteractionContext(context,1,count,frame);
+        if (SUCCEEDED(hr)) hr=ProcessPointerFramesInteractionContext(tapContext,1,count,frame);
+        return hr;
+    }
     void Stop() {
         stopping = true;
         if (context) StopInteractionContext(context);
+        if (tapContext) StopInteractionContext(tapContext);
         stopping = false;
         contacts.clear(); outputCount = 0; overflow = false;
     }
@@ -1907,9 +1972,10 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
         PTP_WORK pooled = nullptr;
         std::atomic<bool> scheduled{false};
         std::map<std::wstring, std::wstring> typeNames;
-        // Layout-lane ownership only. Compare watch-only edits without copying
+        // Lane-owned. Compare watch-only edits without copying
         // the entire live list on Explorer's STA or retaining provider objects.
-        std::unordered_map<std::wstring, std::pair<int, Entry>> sortedEntries;
+        std::vector<EntrySortKey> sortedEntries;
+        EntryPathIndex sortedPathIndex; // Hash collisions checked against the retained path.
         std::wstring sortedFolder;
         SortSpec sortedOrder;
         unsigned long long sortedOrderHash = 0, sortedMetadataHash = 0;
@@ -1962,6 +2028,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     bool registered = false; // Protected by the lifetime regulator's mutex.
     SRWLOCK directoryLock = SRWLOCK_INIT;
     std::deque<DirectoryJob> directoryJobs, layoutJobs, capacityJobs;
+    std::shared_ptr<DirectoryJob> nativeCatalogRequest;
     std::deque<DetailJob> detailJobs;
     std::deque<NativeRowsJob> nativeRowsJobs;
     std::deque<ColumnCatalogJob> columnCatalogJobs;
@@ -1970,7 +2037,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<DirectoryResult> directoryResults;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
         std::shared_ptr<const NamespaceIdentities>, std::shared_ptr<const std::vector<Entry>>,
-        std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates>;
+        std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates,
+        std::vector<SharedPidl>>;
     std::deque<RetiredPayload> retiredEntries;
     bool directoryNotificationQueued = false, detailNotificationQueued = false;
     SRWLOCK iconLock = SRWLOCK_INIT;
@@ -2432,6 +2500,7 @@ public:
     SelectionFlags& operator=(const std::vector<unsigned char>& values) {assign(values.begin(),values.end()); return *this;}
     size_t size() const {return store ? store->size : 0;}
     bool empty() const {return !size();}
+    bool SharesStorage(const SelectionFlags& other) const {return store==other.store;}
     unsigned char back() const {return Get(size()-1);}
     unsigned char operator[](size_t i) const {return Get(i);}
     Reference operator[](size_t i) {return {this,i};}
@@ -2758,8 +2827,11 @@ struct ViewState {
     bool groupAnimating = false;
     LARGE_INTEGER groupFrameQpc{}; // Geometry sample shared with the input owner.
     int hotSection = -1;
-    bool sortInitialized = false; // Header sort chosen for this folder.
-    bool trackNativeSort = false; // Follow Shell changes after an explicit sort choice.
+    bool sortInitialized = false; // Native sort captured for this folder.
+    bool trackNativeSort = false; // Follow Shell changes after opting into sorting.
+    bool preSortEnabled = g_preSort.load(std::memory_order_relaxed);
+    bool nativeSortPending = false; // Retry a failed initial settings read on native readiness.
+    std::optional<SortSpec> instantInteractionSort; // One header intent, including replacement refreshes.
     // When navigating from a descendant to an ancestor, reveal the immediate
     // child on the return path. This selection stays stable while a cached
     // folder is revalidated by the worker.
@@ -2904,7 +2976,13 @@ struct ViewState {
     bool mouseTracking = false, pointerInside = true;
     ShellClickPolicy clickPolicy;
     PointingDevice pointingDevice = PointingDevice::Mouse;
+    // Owner-only press identity: -2 is the Name header, -1 is no checkbox press.
+    int checkboxPress = -1;
+    std::wstring checkboxPressItem;
+    unsigned long long checkboxPressEpoch = 0, checkboxPressToken = 0;
     POINT passiveMousePosition{};
+    bool pointerHoverSuppressed = false;
+    std::optional<POINT> keyboardPointerPosition; // Screen coordinates survive layout/scroll changes.
     std::optional<POINT> capturedPointer;
     bool scrollbarTrackPending = false;
     bool verticalScrollbarHot = false;
@@ -2953,6 +3031,13 @@ struct ViewState {
     // Only content painted in the preceding viewport is eligible to fade.
     // Navigation/hidden surfaces discard these observations, never cache them.
     std::map<std::wstring, ItemOpacityMotion, ClipboardPathLess> itemOpacityRows;
+    SelectionFlags checkboxSelection;
+    size_t checkboxSelectedCount = 0;
+    int checkboxSummaryTotal = -1, checkboxSummaryState = -1;
+    bool checkboxHeaderActionPending = false;
+    SelectionFlags checkboxHeaderActionSelection;
+    int checkboxHeaderActionTotal = 0;
+    unsigned long long checkboxHeaderActionToken = 0, checkboxHeaderActionEpoch = 0;
     unsigned long long itemOpacityToken = 0, itemOpacityPaint = 0;
     LARGE_INTEGER itemOpacityNow{};
     bool itemOpacityAnimating = false;
@@ -3025,10 +3110,17 @@ struct ViewState {
     ComPtr<IEnumIDList> nativeSelectionCapture;
     std::shared_ptr<PreparedNativeSelection> nativeSelectionCaptureJob;
     std::shared_ptr<PreparedNativeSelection> confirmedNativeSelection;
+    SelectionFlags verifiedSelectionFlags;
+    int verifiedSelectionRow = -1, verifiedSelectionAnchor = -1;
+    unsigned long long verifiedSelectionToken = 0, verifiedSelectionDirectory = 0, verifiedSelectionOrder = 0;
+    ComPtr<IEnumIDList> nativeCatalogCapture;
+    std::shared_ptr<DirectoryJob> nativeCatalogJob;
+    HWND nativeCatalogView = nullptr;
+    int nativeCatalogCount = -1;
     bool pendingSelectionContextMenu = false;
     bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
-    struct DeferredSelectionKey { WPARAM key = 0; DWORD modifiers = 0; };
+    struct DeferredSelectionKey { WPARAM key = 0; DWORD modifiers = 0; bool newTab = false; };
     std::deque<DeferredSelectionKey> deferredSelectionKeys;
     std::vector<std::wstring> nativeSelectionPaths;
     std::wstring nativeFocusedPath;
@@ -3083,6 +3175,8 @@ struct ViewState {
     ULONGLONG mouseClickTick = 0;
     int mousePressRow = -1;
     int mouseClickRow = -1;
+    ClickSource mousePressSource = ClickSource::Mouse, mouseClickSource = ClickSource::Mouse;
+    bool mousePressBackground = false, mouseClickBackground = false;
     // The first divider click belongs to this folder and this tab's divider
     // before a WM_LBUTTONDBLCLK can request an animated fit.
     int dividerClickIndex = -1;
@@ -3234,10 +3328,13 @@ struct ViewState {
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
     ULONGLONG startupStartedAt = 0;
     ULONGLONG firstContentSubmittedAt = 0;
+    bool preparingTab = false; // Prepare one hidden first-content surface; then use normal standby.
+    bool tabSurfaceWakeQueued = false;
     ComPtr<IDispatch> pendingAutomation;
     bool deferColumnProviders = true; // Clear after the first names/empty-folder submission.
     DWORD enumerationError = ERROR_SUCCESS;
     ComPtr<ID2D1Factory1> d2dFactory;
+    ComPtr<ID2D1PathGeometry> selectionCheckGlyph;
     ComPtr<ID3D11Device> d3d;
     ComPtr<IDXGIDevice> dxgiDevice;
     ComPtr<IDXGIFactory2> dxgiFactory;
@@ -3410,7 +3507,7 @@ struct SwipeFeedbackSnapshot {
     X(keyboardSelectionTo) X(keyboardSelectionStartedQpc) X(hoverAnimationActive) X(hoverFromRow) X(hoverToRow) \
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
-    X(hovered) X(clickPolicy) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
+    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
@@ -3464,6 +3561,9 @@ struct PresentationReceipt {
     int itemsPerRow=1;
     UINT imageTextureLimit=kPlatformImageDimension;
     unsigned long long clipboardSequence=0,observerAcknowledged=0,styleRevision=0;
+    SelectionFlags checkboxSelection;
+    size_t checkboxSelectedCount=0;
+    int checkboxTotal=-1,checkboxState=-1;
     std::vector<ExplorerColumn> columnPoses;
     std::shared_ptr<const ViewState::GroupIntents> groupIntents;
     LARGE_INTEGER groupFrame{};
@@ -3559,6 +3659,7 @@ bool StartPresentation(ViewState& state);
 void SubmitPresentation(ViewState& state);
 void SynchronizePresentationGeneration(ViewState& state);
 void ConsumePresentation(ViewState& state);
+void CompleteHeaderCheckboxAction(ViewState& state);
 void ReleasePresentation(ViewState& state,bool stop=false);
 
 // A single reset point for all explicit selection, native view changes,
@@ -3691,6 +3792,7 @@ float GroupHeadingHeight(const ViewState& state) {
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
 }
+float SelectionCheckboxSpace(const ViewState& state);
 void LayoutGroupSections(ViewState& state) {
     state.itemsPerRow = 1;
     if (state.gridView) {
@@ -3701,13 +3803,14 @@ void LayoutGroupSections(ViewState& state) {
         // integer column boundary partway through an otherwise smooth zoom.
         const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
         const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float minimum = DriveTiles(state) ?
+        const float checkboxSpace = (DriveTiles(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state) : 0.f;
+        const float minimum = checkboxSpace + (DriveTiles(state) ?
             std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
                 icon + font * 12.f + Scale96(24, dpi)) :
             state.cachedNativeMode == FVM_SMALLICON ?
             std::max(Scale96(180, dpi) * font / std::max(1.f, static_cast<float>(Scale96(15, dpi))),
                 icon + font * 6.f) :
-            std::max(static_cast<float>(Scale96(96, dpi)), icon + Scale96(32, dpi));
+            std::max(static_cast<float>(Scale96(96, dpi)), icon + Scale96(32, dpi)));
         float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
         auto extent = [&](int columns) {
             const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
@@ -4105,7 +4208,7 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
 bool PointerDragActive(const ViewState& state) {
     return !state.columnWiggleAwaitRelease &&
         (state.draggingScrollbar || state.draggingHorizontal ||
-         state.dragDivider >= 0 || state.columnDragArmed || state.marqueePossible);
+         state.dragDivider >= 0 || state.columnDragArmed || state.marqueePossible || state.checkboxPress!=-1);
 }
 
 bool NeedsAnimationFrames(const ViewState& state) {
@@ -4380,13 +4483,23 @@ void ClearImmediateBackHint(ViewState& state) {
 // pairing therefore cannot by itself prove that two presses hit the SAME row
 // in the SAME directory. Invalidate the pair at every dataset/tab transition.
 void DiscardCompletedMouseClick(ViewState& state) {
+    state.mouseClickBackground = false;
     state.mouseClickRow = -1;
     state.mouseClickEpoch = 0;
     state.mouseClickTick = 0;
 }
 
+ClickSource CurrentClickSource(const ViewState& state) {
+    if (state.touch.replaying) return ClickSource::Touch;
+    INPUT_MESSAGE_SOURCE source{};
+    return GetCurrentInputMessageSource(&source) && source.originId==IMO_INJECTED ? ClickSource::Injected : ClickSource::Mouse;
+}
+
 void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
-    if (folderChanged) ++state.mouseFolderEpoch;
+    state.mousePressBackground = false;
+    if (folderChanged) {++state.mouseFolderEpoch; state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
+    state.checkboxPress = -1;
+    state.checkboxPressItem.clear();
     state.mousePressActive = false;
     state.mousePressControl = false;
     state.mousePressShift = false;
@@ -5084,7 +5197,7 @@ static HWND FolderContentHost(HWND native) {
 
 // Our intentionally hidden ancestor does not invalidate the live Shell view.
 // Explicitly hidden Shell views still fail this test before that ancestor.
-bool NativeViewAvailable(HWND hwnd) {
+bool NativeViewAvailable(HWND hwnd, HWND backgroundTab = nullptr) {
     if (IsWindowVisible(hwnd)) return true;
     // Shell can hide the selected content host while iconic. After unloading
     // an older overlay there may be no owner property left on that host.
@@ -5094,9 +5207,9 @@ bool NativeViewAvailable(HWND hwnd) {
     for (HWND current = hwnd; current && IsWindow(current); current = GetParent(current)) {
         if (IsSuppressedNativeHost(current)) return true;
         if (!(GetWindowLongPtrW(current, GWL_STYLE) & WS_VISIBLE) &&
-            current != minimizedHost) return false;
+            current != minimizedHost && current != backgroundTab) return false;
     }
-    return minimizedHost != nullptr;
+    return minimizedHost != nullptr || (backgroundTab && IsChild(backgroundTab,hwnd));
 }
 
 // Keep the native presentation child's real layout while its host is hidden.
@@ -5302,8 +5415,42 @@ void ArmTabSwitchProbe(HWND frame, const wchar_t* reason);
 void TraceTabHostSnapshot(HWND frame, const wchar_t* source);
 void PresentCachedTabSurface(ViewState& state);
 
+HWND OverlayStackPredecessor(const ViewState& state) {
+    if(state.rename.editor && IsWindow(state.rename.editor) &&
+        GetParent(state.rename.editor)==state.frameHwnd && IsWindowVisible(state.rename.editor)) return state.rename.editor;
+    return IsWindowVisible(state.viewToggle) ? state.viewToggle : nullptr;
+}
+
+thread_local bool t_overlayStacking=false;
+
+HWND FirstVisibleFrameChild(HWND frame) {
+    HWND first=GetWindow(frame,GW_CHILD);
+    while(first && !IsWindowVisible(first)) first=GetWindow(first,GW_HWNDNEXT);
+    return first;
+}
+
+bool OverlayStackingNeeded(const ViewState& state, HWND pinned) {
+    return FirstVisibleFrameChild(state.frameHwnd)!=(pinned ? pinned : state.hwnd) ||
+        (pinned && GetWindow(state.hwnd,GW_HWNDPREV)!=pinned);
+}
+
+void EnsureOverlayStacking(ViewState& state) {
+    if(t_overlayStacking) return;
+    const HWND pinned=OverlayStackPredecessor(state);
+    if(!OverlayStackingNeeded(state,pinned)) return;
+    ScopedFlag repair(t_overlayStacking);
+    // An adjacent editor/button can itself be below a newly created native
+    // sibling. Raise the pinned control as well, retaining both rectangles.
+    if(pinned && FirstVisibleFrameChild(state.frameHwnd)!=pinned)
+        SetWindowPos(pinned,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    SetWindowPos(state.hwnd,pinned ? pinned : HWND_TOP,0,0,0,0,
+        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+}
+
 bool PositionOverlayOverNative(ViewState& state, bool top = true) {
     if (PresentationMinimized(state)) return false;
+    const bool active=TabOwnsActiveView(state);
+    if(!active && state.preparingTab) top=false;
     const auto pending = [&](const wchar_t* reason) {
         // Layout/ownership can be transient during a Shell view handoff.
         // Preserve the user's GPU preference and retry through frame pacing.
@@ -5321,7 +5468,7 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         return false;
     };
     if (!IsWindow(state.frameHwnd) || !IsWindow(state.nativeHwnd) ||
-        !IsWindow(state.hwnd) || !TabOwnsActiveView(state)) return pending(L"presentation.pending.ownership[kept,rows]");
+        !IsWindow(state.hwnd) || (!active && !state.preparingTab)) return pending(L"presentation.pending.ownership[kept,rows]");
     // Suppression precedes even the size check: a zero-sized view may be
     // populated and shown by Explorer before its next GPU-side layout pass.
     if (state.visible && state.inScope && state.detailsViewActive && state.pendingShellView &&
@@ -5348,14 +5495,12 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         current.bottom - current.top != height;
     // A rename editor is a FRAME sibling, not a composited child of the
     // overlay. Keep it above the GPU HWND throughout position/top repairs.
-    const HWND edit = state.rename.editor && IsWindow(state.rename.editor) &&
-        GetParent(state.rename.editor) == owner &&
-        IsWindowVisible(state.rename.editor) ? state.rename.editor : nullptr;
-    const HWND pinned = edit ? edit :
-        (IsWindowVisible(state.viewToggle) ? state.viewToggle : nullptr);
-    const bool behind = pinned ? GetWindow(state.hwnd, GW_HWNDPREV) != pinned :
-        GetWindow(owner, GW_CHILD) != state.hwnd;
+    const HWND pinned = OverlayStackPredecessor(state);
+    const bool behind = OverlayStackingNeeded(state,pinned);
     if (moved || (top && behind)) {
+        ScopedFlag repair(t_overlayStacking,t_overlayStacking || top);
+        if(top && pinned && FirstVisibleFrameChild(owner)!=pinned)
+            SetWindowPos(pinned,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowPos(state.hwnd, top ? (pinned ? pinned : HWND_TOP) : nullptr,
             rect.left, rect.top, width, height,
             SWP_NOACTIVATE | (top ? 0 : SWP_NOZORDER));
@@ -5633,6 +5778,8 @@ unsigned SystemStyleChangeMask(UINT message, WPARAM action, LPARAM area) {
         const auto name=reinterpret_cast<const wchar_t*>(area);
         if (!name || !*name) return action==0 ? kStyleColors | kStyleFonts | kStyleInput : 0;
         if (_wcsicmp(name,L"ShellState")==0 ||
+            _wcsicmp(name,L"Advanced")==0 ||
+            _wcsicmp(name,L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced")==0 ||
             _wcsicmp(name,L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\IconUnderline")==0 ||
             _wcsicmp(name,L"Software\\Microsoft\\Internet Explorer\\Main")==0)
             return kStyleInput;
@@ -5680,11 +5827,15 @@ void LoadSettings() {
     g_emptyRows.store(Wh_GetIntSetting(L"Appearance.showEmptyRows") != 0);
     g_zebraOpacity.store(std::clamp(Wh_GetIntSetting(L"Appearance.zebraOpacity"), 0, 100));
     g_smooth.store(Wh_GetIntSetting(L"Navigation.smoothScrolling") != 0);
+    g_doubleClickUp.store(Wh_GetIntSetting(L"Gestures.doubleClickUp") != 0);
+    g_middleClickNewTab.store(Wh_GetIntSetting(L"Gestures.middleClickNewTab") != 0);
+    g_twoFingerContextMenu.store(Wh_GetIntSetting(L"Gestures.twoFingerContextMenu") != 0);
     g_showNativeViewToggleButton.store(Wh_GetIntSetting(L"Navigation.showNativeViewToggleButton") != 0);
     g_touchpadDirectManipulation.store(
         Wh_GetIntSetting(L"Navigation.touchpadDirectManipulation") != 0);
     g_touchpadSwipeNavigation.store(
         Wh_GetIntSetting(L"Navigation.touchpadSwipeNavigation") != 0);
+    g_preSort.store(Wh_GetIntSetting(L"Columns.preSort") != 0);
     UINT wheelLines = 3;
     if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0) ||
         (wheelLines != WHEEL_PAGESCROLL && wheelLines > 100)) wheelLines = 3;
@@ -6361,6 +6512,7 @@ void StopKeyboardSelectionAnimation(ViewState& state);
 void StopSelectionFade(ViewState& state);
 void RefreshHoverUnderCursor(ViewState& state);
 void ClearPointerHover(ViewState& state, bool animate = false);
+void SuppressPointerHoverForKeyboard(ViewState& state);
 void Redraw(ViewState& state);
 void ReconcileColumnViewportAfterRowCount(ViewState& state);
 
@@ -6766,11 +6918,11 @@ void RegisterSystemShellNotifications(ViewState& state) {
 ULONGLONG FileTimeNumber(const FILETIME& ft) {
     return (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
-int CompareEntryNames(const Entry& a, const Entry& b) {
+int CompareEntryNames(const EntrySortKey& a, const EntrySortKey& b) {
     int c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
     return c ? c : wcscmp(a.name.c_str(), b.name.c_str());
 }
-const wchar_t* EntryExtension(const Entry& e) {
+const wchar_t* EntryExtension(const EntrySortKey& e) {
     const wchar_t* ext = PathFindExtensionW(e.name.c_str());
     return ext ? ext : L"";
 }
@@ -6827,6 +6979,68 @@ void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key) {
     }
     PropVariantClear(&pv);
 }
+// Natural merge sort reuses ascending runs and reverses strictly descending
+// runs. Balanced merge rounds bound arbitrary inputs by O(n log n), preserve
+// equal-key order and make already ordered/reversed input linear. All buffers
+// belong to the calling tab's worker; no parallel pool or provider calls.
+template<class Less>
+void NaturalSortIndices(std::vector<size_t>& order, Less&& less) {
+    if (order.size()<2) return;
+    std::vector<size_t> runs{0};
+    for (size_t begin=0;begin<order.size();) {
+        size_t end=begin+1;
+        if (end<order.size()) {
+            if (less(order[end],order[begin])) {
+                while (++end<order.size() && less(order[end],order[end-1])) {}
+                std::reverse(order.begin()+begin,order.begin()+end);
+            } else {
+                while (++end<order.size() && !less(order[end],order[end-1])) {}
+            }
+        }
+        runs.push_back(end); begin=end;
+    }
+    if (runs.size()==2) return;
+    std::vector<size_t> scratch(order.size());
+    while (runs.size()>2) {
+        size_t write=1;
+        for (size_t run=0;run+1<runs.size();run+=2) {
+            const size_t begin=runs[run],middle=runs[run+1];
+            const size_t end=run+2<runs.size() ? runs[run+2] : middle;
+            if (middle==end || !less(order[middle],order[middle-1]))
+                std::copy(order.begin()+begin,order.begin()+end,scratch.begin()+begin);
+            else std::merge(order.begin()+begin,order.begin()+middle,
+                order.begin()+middle,order.begin()+end,scratch.begin()+begin,less);
+            runs[write++]=end;
+        }
+        runs.resize(write); order.swap(scratch);
+    }
+}
+
+enum class EntrySortAlgorithm { Intro, Merge, Natural };
+// Compare stationary rows and sort only compact indices. Moving the full Entry
+// (strings, cells, shared identities) at every partition costs much more than
+// applying the resulting permutation once. The same Windows comparator is used.
+template<EntrySortAlgorithm Algorithm=EntrySortAlgorithm::Natural, class Less>
+void SortEntriesByIndex(std::vector<Entry>& entries, Less&& less) {
+    std::vector<size_t> order(entries.size());
+    for (size_t i=0;i<order.size();++i) order[i]=i;
+    const auto compare=[&](size_t a,size_t b) {return less(entries[a],entries[b]);};
+    if constexpr (Algorithm==EntrySortAlgorithm::Merge) std::stable_sort(order.begin(),order.end(),compare);
+    else if constexpr (Algorithm==EntrySortAlgorithm::Intro) std::sort(order.begin(),order.end(),compare);
+    else NaturalSortIndices(order,compare);
+    for (size_t i=0;i<order.size();++i) {
+        if (order[i]==i) continue;
+        Entry saved=std::move(entries[i]);
+        size_t row=i;
+        while (order[row]!=i) {
+            const size_t next=order[row];
+            entries[row]=std::move(entries[next]);
+            order[row]=row; row=next;
+        }
+        entries[row]=std::move(saved); order[row]=row;
+    }
+}
+
 // Compute group identities before publishing a directory snapshot. This runs
 // on the existing background Shell worker; never on WM_PAINT or Explorer's STA.
 void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& group,
@@ -6838,8 +7052,13 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
         if (!DirectoryJobCurrent(work, token)) return;
         Entry& e = entries[i];
         if (e.shellIdentity && e.path.starts_with(L"windhawk:pidl:") &&
-            kind != SortKind::Name && kind != SortKind::Extension)
+            kind != SortKind::Name && kind != SortKind::Extension) {
+            auto sortText=std::move(e.sortText);
+            const auto sortNumber=e.sortNumber;
+            const auto sortValueKind=e.sortValueKind;
             ReadExtraShellSortValue(e, group.key);
+            e.sortText=std::move(sortText); e.sortNumber=sortNumber; e.sortValueKind=sortValueKind;
+        }
         switch (kind) {
         case SortKind::Name: {
             wchar_t letter = e.name.empty() ? L'#' : towupper(e.name[0]);
@@ -6919,37 +7138,39 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
     }
     if (!DirectoryJobCurrent(work, token)) return;
     const bool ascending = group.ascending != FALSE;
-    std::stable_sort(entries.begin(), entries.end(), [ascending](const Entry& a,
+    SortEntriesByIndex(entries, [ascending](const Entry& a,
             const Entry& b) {
         const int comparison = StrCmpLogicalW(a.groupKey.c_str(), b.groupKey.c_str());
         return ascending ? comparison < 0 : comparison > 0;
     });
 }
 
-Entry SortEntrySnapshot(const Entry& entry, bool includeIdentity = false) {
-    Entry key; key.path=entry.path; key.name=entry.name; key.folder=entry.folder;
-    if (includeIdentity) key.shellIdentity=entry.shellIdentity;
-    key.lastWrite=entry.lastWrite; key.created=entry.created; key.accessed=entry.accessed;
-    key.byteSize=entry.byteSize; key.sortText=entry.sortText;
-    key.sortNumber=entry.sortNumber; key.sortValueKind=entry.sortValueKind;
+EntrySortKey SortEntrySnapshot(const Entry& entry, bool includeIdentity = false) {
+    EntrySortKey key=entry;
+    if (!includeIdentity) key.shellIdentity.reset();
     return key;
 }
 
-SortKind EntrySortKind(const SortSpec& sort, const Entry& entry) {
+SortKind EntrySortKind(const SortSpec& sort, const EntrySortKey& entry) {
     if (!sort.explicitOrder) return SortKind::Name;
     return sort.kind != SortKind::Name && sort.kind != SortKind::Extension &&
         entry.path.starts_with(L"windhawk:pidl:") ? SortKind::ShellProperty : sort.kind;
 }
-bool EntryPrecedes(const Entry& a, const Entry& b, const SortSpec& spec) {
-    const bool descending = spec.direction == SORT_DESCENDING;
-    const SortKind kind = spec.kind;
-    // One grouping rule for every Shell sort key. Mixed mode compares the
-    // actual sort keys across types; no separate folder/file partitions.
-    if (a.folder != b.folder && spec.placement != FolderPlacement::Mixed) {
-        const bool foldersFirst = spec.placement == FolderPlacement::AlwaysTop ||
-            (spec.placement == FolderPlacement::ExplorerDefault && !descending);
-        return foldersFirst ? a.folder : !a.folder;
-    }
+int CompareEntrySortKey(const EntrySortKey& a, const EntrySortKey& b, SortKind kind,
+                        const PROPERTYKEY& key, SORTDIRECTION direction, bool secondary=false) {
+    const bool descending = direction == SORT_DESCENDING;
+    const auto extra=[&](const EntrySortKey& entry) -> const ExtraSortValue* {
+        const auto it=std::find_if(entry.secondarySortValues.begin(),entry.secondarySortValues.end(),
+            [&](const ExtraSortValue& value) {return SameKey(value.key,key);});
+        return it==entry.secondarySortValues.end() ? nullptr : &*it;
+    };
+    const auto av=secondary ? extra(a) : nullptr, bv=secondary ? extra(b) : nullptr;
+    const wchar_t* at=secondary ? (av ? av->text.c_str() : L"") : a.sortText.c_str();
+    const wchar_t* bt=secondary ? (bv ? bv->text.c_str() : L"") : b.sortText.c_str();
+    const auto ak=secondary ? (av ? av->kind : 0) : a.sortValueKind;
+    const auto bk=secondary ? (bv ? bv->kind : 0) : b.sortValueKind;
+    const double an=secondary ? (av ? av->number : 0) : a.sortNumber;
+    const double bn=secondary ? (bv ? bv->number : 0) : b.sortNumber;
     int result = 0;
     switch (kind) {
     case SortKind::Name:
@@ -6975,36 +7196,58 @@ bool EntryPrecedes(const Entry& a, const Entry& b, const SortSpec& spec) {
         result = StrCmpLogicalW(EntryExtension(a), EntryExtension(b));
         break;
     case SortKind::Type:
-        result = StrCmpLogicalW(a.sortText.c_str(), b.sortText.c_str());
+        result = StrCmpLogicalW(at,bt);
         break;
     case SortKind::ShellProperty:
-        if (a.sortValueKind != b.sortValueKind) {
+        if (ak != bk) {
             // Missing values always go last, regardless of direction.
-            if (!a.sortValueKind || !b.sortValueKind)
-                return a.sortValueKind != 0;
-            result = a.sortValueKind < b.sortValueKind ? -1 : 1;
-        } else if (a.sortValueKind == 2) {
-            result = a.sortNumber < b.sortNumber ? -1 :
-                a.sortNumber > b.sortNumber ? 1 : 0;
-        } else if (a.sortValueKind == 1) {
-            result = StrCmpLogicalW(a.sortText.c_str(), b.sortText.c_str());
+            if (!ak || !bk) return ak ? -1 : 1;
+            result = ak < bk ? -1 : 1;
+        } else if (ak == 2) {
+            result = an < bn ? -1 : an > bn ? 1 : 0;
+        } else if (ak == 1) {
+            result = StrCmpLogicalW(at,bt);
         }
         break;
     }
-    if (result != 0) return descending ? result > 0 : result < 0;
+    return descending ? -result : result;
+}
+bool EntryPrecedes(const EntrySortKey& a, const EntrySortKey& b, const SortSpec& spec) {
+    const bool descending = spec.direction == SORT_DESCENDING;
+    if (a.folder != b.folder && spec.placement != FolderPlacement::Mixed) {
+        const bool foldersFirst = spec.placement == FolderPlacement::AlwaysTop ||
+            (spec.placement == FolderPlacement::ExplorerDefault && !descending);
+        return foldersFirst ? a.folder : !a.folder;
+    }
+    int result=CompareEntrySortKey(a,b,spec.kind,spec.key,spec.direction);
+    if (result) return result<0;
+    for (const auto& column : spec.secondary) {
+        auto kind=ClassifySort(column.propkey);
+        if (kind!=SortKind::Name && kind!=SortKind::Extension && a.path.starts_with(L"windhawk:pidl:"))
+            kind=SortKind::ShellProperty;
+        result=CompareEntrySortKey(a,b,kind,column.propkey,column.direction,true);
+        if (result) return result<0;
+    }
     // Apply the same direction to name tie-breaking within each group.
     const int nameOrder = CompareEntryNames(a, b);
     return descending ? nameOrder > 0 : nameOrder < 0;
 }
 
+bool SortNeedsProvider(const SortSpec& sort) {
+    const auto provider=[](SortKind kind) {return kind==SortKind::Type || kind==SortKind::ShellProperty;};
+    return sort.explicitOrder && (provider(sort.kind) ||
+        std::any_of(sort.secondary.begin(),sort.secondary.end(),[&](const SORTCOLUMN& c) {return provider(ClassifySort(c.propkey));}));
+}
+
 void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested,
                           std::map<std::wstring, std::wstring>& typeNames,
-                          const TabBackground& work, unsigned long long token, bool nativeNamespace = false) {
+                          TabBackground& work, unsigned long long token, bool nativeNamespace = false) {
+    PipelineScope timing(work, L"directory.sort", token, entries.size());
     SortSpec spec = requested;
     if (!entries.empty()) spec.kind = EntrySortKind(spec,entries.front());
-    // The filesystem's completed enumeration is the initial GPU layout.
-    // No sort-provider calls or comparison pass until a header is clicked.
+    // The opt-out policy retains enumeration order without provider calls.
     if (!spec.explicitOrder) return;
+    for (auto& entry : entries) entry.secondarySortValues.clear();
     if (spec.kind == SortKind::Type) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
@@ -7019,20 +7262,44 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
             ReadExtraShellSortValue(entries[i], spec.key);
         }
     }
+    for (const auto& column : spec.secondary) {
+        auto kind=ClassifySort(column.propkey);
+        if (!entries.empty() && kind!=SortKind::Name && kind!=SortKind::Extension &&
+            entries.front().path.starts_with(L"windhawk:pidl:")) kind=SortKind::ShellProperty;
+        if (kind!=SortKind::Type && kind!=SortKind::ShellProperty) continue;
+        for (auto& entry : entries) {
+            if (!DirectoryJobCurrent(work,token,nativeNamespace)) return;
+            ExtraSortValue value; value.key=column.propkey;
+            if (kind==SortKind::Type) {
+                value.text=nativeNamespace && !entry.type.empty() ? entry.type : GetTypeName(typeNames,entry.path,entry.folder);
+                value.kind=1;
+            } else {
+                // Reuse the property conversion without overwriting the primary
+                // key. Only provider-backed secondary keys need extra storage.
+                Entry probe; probe.path=entry.path; probe.shellIdentity=entry.shellIdentity;
+                ReadExtraShellSortValue(probe,column.propkey);
+                value.text=std::move(probe.sortText); value.number=probe.sortNumber; value.kind=probe.sortValueKind;
+            }
+            entry.secondarySortValues.push_back(std::move(value));
+        }
+    }
     if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
-    std::sort(entries.begin(), entries.end(), [&spec](const Entry& a, const Entry& b) {
+    SortEntriesByIndex(entries, [&spec](const Entry& a, const Entry& b) {
         return EntryPrecedes(a,b,spec);
     });
 }
 
 // Stable order fingerprint is computed off the Explorer STA. If a refresh
 // returns exactly the same ordered names, the live rows stay where they are.
-unsigned long long DirectoryOrderHash(const std::vector<Entry>& entries) {
+unsigned long long DirectoryOrderHash(const std::vector<Entry>& entries,
+                                     const EntryPathIndex* rowHashes = nullptr) {
     unsigned long long hash = 14695981039346656037ULL; // FNV-1a 64
-    for (const auto& e : entries) {
+    for (size_t i=0;i<entries.size();++i) {
+        const auto& e=entries[i];
         // Equal display labels are common in namespaces. Membership/order
         // belongs to item identity, not just the caption or number of rows.
-        hash ^= SelectionPathHash(e.path);
+        // Optional hashes are in ROW order, before sorting the path index.
+        hash ^= rowHashes ? (*rowHashes)[i].first : SelectionPathHash(e.path);
         hash *= 1099511628211ULL;
         for (wchar_t ch : e.name) {
             hash ^= static_cast<unsigned long long>(ch);
@@ -7076,6 +7343,11 @@ unsigned long long DirectoryMetadataHash(const std::vector<Entry>& entries) {
         ULONGLONG number=0; memcpy(&number,&entry.sortNumber,sizeof(number)); mix(number);
         mix(entry.sortText.size());
         for (wchar_t ch : entry.sortText) mix(ch);
+        mix(entry.secondarySortValues.size());
+        for (const auto& value : entry.secondarySortValues) {
+            mix(value.kind); memcpy(&number,&value.number,sizeof(number)); mix(number);
+            mix(value.text.size()); for (wchar_t ch : value.text) mix(ch);
+        }
     }
     return hash;
 }
@@ -7135,9 +7407,40 @@ bool ShellStoragePercent(IPropertyStore* store, REFPROPERTYKEY key,
     return true;
 }
 
+struct DirectorySnapshotIndex {
+    EntryPathIndex paths;
+    unsigned long long orderHash=0, metadataHash=0;
+};
+template<class Current>
+DirectorySnapshotIndex BuildDirectorySnapshotIndex(const std::vector<Entry>& names, Current&& current) {
+    DirectorySnapshotIndex result;
+    result.paths.reserve(names.size());
+    // FNV can resume from an existing state. Verify the actual prefix per row
+    // before reusing it, including for mixed/provider identities. Folding uses
+    // the same CRT function as a complete path hash, including non-ASCII text.
+    std::wstring_view prefix;
+    if (!names.empty()) {
+        const auto end=names.front().path.find_last_of(L"\\/");
+        if (end!=std::wstring::npos) prefix=std::wstring_view(names.front().path).substr(0,end+1);
+    }
+    const size_t prefixHash=ContinueSelectionPathHash(static_cast<size_t>(2166136261u),prefix);
+    for (size_t i=0;i<names.size();++i) {
+        if ((i&1023u)==0 && !current()) return result;
+        const std::wstring_view path=names[i].path;
+        const size_t hash=path.starts_with(prefix) ? ContinueSelectionPathHash(prefixHash,path.substr(prefix.size())) :
+            SelectionPathHash(names[i].path);
+        result.paths.emplace_back(hash,static_cast<int>(i));
+    }
+    result.orderHash=DirectoryOrderHash(names,&result.paths);
+    result.metadataHash=DirectoryMetadataHash(names);
+    std::sort(result.paths.begin(),result.paths.end());
+    return result;
+}
+
 template<class Current>
 DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
-    std::vector<Entry>& names, DWORD error, Current&& current) {
+    std::vector<Entry>& names, DWORD error, Current&& current,
+    std::optional<DirectorySnapshotIndex> prepared = std::nullopt) {
     DirectoryResult result;
     if (directory.checkSort) {
         result.kind = DirectoryResult::SortCheck;
@@ -7157,21 +7460,20 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
         for (const auto& entry : names) identities->emplace(entry.path, entry.shellChild);
         result.namespaceIdentities = std::move(identities);
     }
-    result.pathIndex.reserve(names.size());
-    for (size_t i = 0; i < names.size(); ++i) {
+    if (!prepared) prepared=BuildDirectorySnapshotIndex(names,current);
+    if (!current()) return result;
+    result.pathIndex=std::move(prepared->paths);
+    result.orderHash=prepared->orderHash;
+    result.metadataHash=prepared->metadataHash;
+    if (directory.sortRevealOldIndex>=0) for (size_t i = 0; i < names.size(); ++i) {
         if ((i & 1023u) == 0 &&
             !current()) break;
-        result.pathIndex.emplace_back(SelectionPathHash(names[i].path),
-            static_cast<int>(i));
         if (directory.sortRevealOldIndex >= 0 &&
             directory.sortRevealOldIndex != static_cast<int>(i) &&
             names[i].path == directory.sortRevealPath)
             result.sortRevealIndex = static_cast<int>(i);
     }
     if (!current()) return result;
-    std::sort(result.pathIndex.begin(), result.pathIndex.end());
-    result.orderHash = DirectoryOrderHash(names);
-    result.metadataHash = DirectoryMetadataHash(names);
     result.viewportAnchorOffsetPx = directory.viewportAnchorOffsetPx;
     result.viewportCapturedScrollPx = directory.viewportCapturedScrollPx;
     result.restoreViewport = directory.restoreViewport;
@@ -7262,10 +7564,12 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
 }
 
 DirectoryResult PrepareDirectoryResult(TabBackground& work, DirectoryJob& directory,
-    std::vector<Entry>& names, DWORD error) {
+    std::vector<Entry>& names, DWORD error,
+    std::optional<DirectorySnapshotIndex> prepared = std::nullopt) {
+    PipelineScope timing(work, L"directory.snapshot", directory.token, names.size());
     return PrepareItemSnapshot(directory, names, error, [&] {
         return DirectoryJobCurrent(work, directory.token);
-    });
+    }, std::move(prepared));
 }
 
 DriveCapacity ProbeThisPcCapacity(const std::wstring& path) {
@@ -7441,6 +7745,7 @@ void PublishNativeRows(TabBackground& work, const NativeRowsJob& job,
         PublishDirectoryResult(work, std::move(preview));
         return;
     }
+    if (job.sort.explicitOrder && !complete && error == ERROR_SUCCESS) return;
     DirectoryResult result;
     result.kind = DirectoryResult::NativeRows;
     result.hwnd = work.hwnd;
@@ -8073,10 +8378,13 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 // A hint observes only its item's active key, including offscreen
                 // items. An unchanged provider completion must not enumerate or
                 // animate the folder again. All I/O remains on this tab's lane.
-                if (directory.sort.kind == SortKind::Type) typeNames.clear();
+                if (directory.sort.kind == SortKind::Type ||
+                    std::any_of(directory.sort.secondary.begin(),directory.sort.secondary.end(),[](const SORTCOLUMN& c) {
+                        return ClassifySort(c.propkey)==SortKind::Type;
+                    })) typeNames.clear();
                 for (const auto& previous : directory.sortChecks) {
                     if (!DirectoryJobCurrent(work,directory.token)) break;
-                    Entry current=previous;
+                    Entry current; static_cast<EntrySortKey&>(current)=previous;
                     current.sortText.clear(); current.sortNumber=0; current.sortValueKind=0;
                     if (current.path.starts_with(L"windhawk:pidl:")) {
                         if (directory.sort.kind == SortKind::Name || directory.sort.kind == SortKind::Extension) {
@@ -8112,6 +8420,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             }
             ComPtr<IShellFolder> provider;
             if (!directory.enumerated && !directory.namespaceFolder && !IsThisPcLocation(directory.path)) {
+                PipelineScope timing(work, L"directory.bind", directory.token);
                 HRESULT hr = BindDirectoryProvider(directory.path, provider, directory.folderIdentity.get());
                 if (SUCCEEDED(hr) && !PlainFilesystemProvider(provider.Get(), directory.path)) {
                     PIDLIST_ABSOLUTE root = nullptr;
@@ -8129,6 +8438,14 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
             }
             if (directory.namespaceFolder && !directory.enumerated) {
+                if (directory.captureNativeCatalog && !directory.nativeCatalogChecked) {
+                    ExclusiveSrwLock lock(work.directoryLock);
+                    if (DirectoryJobCurrent(work,directory.token)) {
+                        work.nativeCatalogRequest=std::make_shared<DirectoryJob>(std::move(directory));
+                        PostMessageW(work.hwnd,kMsgNativeCatalog,0,0);
+                    }
+                    continue;
+                }
                 NativeRowsJob job;
                 job.token = directory.token;
                 job.folder.reset(ILCloneFull(directory.namespaceFolder.get()));
@@ -8137,7 +8454,38 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 job.requestedAt = GetTickCount64();
                 const bool filesystem = IsTargetPath(directory.path);
                 job.presentation = std::make_unique<DirectoryJob>(std::move(directory));
-                if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
+                if (job.folder && job.presentation->nativeCatalogAvailable) {
+                    if (const auto expected=job.presentation->verifyIdentities) {
+                        DirectoryResult result;
+                        result.kind=DirectoryResult::NamespaceCheck; result.token=job.token; result.hwnd=work.hwnd;
+                        result.namespaceChanged=job.presentation->nativeChildren.size()!=expected->size();
+                        for (const auto& child:job.presentation->nativeChildren) {
+                            if (!DirectoryJobCurrent(work,job.token)) break;
+                            OwnedPidl absolute(ILCombine(job.folder.get(),child.get()));
+                            if (!absolute || !expected->contains(NamespaceItemKey(absolute.get()))) {
+                                result.namespaceChanged=true; break;
+                            }
+                        }
+                        PublishDirectoryResult(work,std::move(result));
+                        continue;
+                    }
+                    if (!provider && FAILED(BindDirectoryProvider(job.presentation->path,provider,job.folder.get()))) {
+                        std::vector<Entry> empty;
+                        auto result=PrepareDirectoryResult(work,*job.presentation,empty,ERROR_NOT_READY);
+                        PublishDirectoryResult(work,std::move(result));
+                        continue;
+                    }
+                    for (auto& child:job.presentation->nativeChildren) {
+                        NativeRowIdentity identity;
+                        identity.absolute.reset(ILCombine(job.folder.get(),child.get()));
+                        identity.child.reset(ILCloneFull(child.get())); identity.namespaceItem=true;
+                        job.identities.push_back(std::move(identity));
+                    }
+                    const auto resolve=[&](const NativeRowIdentity& identity,Entry& entry) {
+                        return ResolveNativeRowIdentity(identity,entry,provider.Get(),filesystem);
+                    };
+                    ResolveNativeRowsJob(work,job,resolve);
+                } else if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
                 continue;
             }
             if (IsThisPcLocation(directory.path)) {
@@ -8163,6 +8511,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             std::vector<Entry> names = std::move(directory.enumeratedEntries);
             DWORD error = directory.enumerationError;
             if (!directory.enumerated) {
+                PipelineScope timing(work, L"directory.enumerate", directory.token);
                 names.reserve(directory.previewRows);
                 size_t nextPreview = 1;
                 size_t visited = 0;
@@ -8235,7 +8584,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
                 if (!DirectoryJobCurrent(work, directory.token)) continue;
             }
-            if (namesLane && (directory.sort.explicitOrder || directory.grouping.enabled)) {
+            // Win32 already supplies names, dates and sizes. Keep those sorts
+            // independent of an old folder's blocked type/property provider.
+            if (namesLane && (directory.grouping.enabled || SortNeedsProvider(directory.sort))) {
                 directory.enumerated = true;
                 directory.enumeratedEntries = std::move(names);
                 directory.enumerationError = error;
@@ -8246,44 +8597,70 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 }
                 continue;
             }
-            // Only an explicit GPU header sort runs the worker comparison;
-            // otherwise retain the filesystem's enumeration order.
+            // Saved native sorts and header/menu choices share this comparator.
             SortDirectoryEntries(names, directory.sort, typeNames,
                                  work, directory.token);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             ResolveDirectoryGroups(names, directory.grouping, typeNames,
                                    work, directory.token);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
+            std::optional<DirectorySnapshotIndex> prepared;
             if (!directory.checkSort && error == ERROR_SUCCESS) {
+                PipelineScope timing(work, L"directory.baseline", directory.token, names.size());
                 const bool compare = lane.sortedFolder == directory.path &&
                     SameSort(lane.sortedOrder,directory.sort) &&
                     lane.sortedOrderHash == directory.previousOrderHash &&
                     lane.sortedMetadataHash == directory.previousMetadataHash;
-                std::unordered_map<std::wstring,std::pair<int,Entry>> fresh;
+                prepared=BuildDirectorySnapshotIndex(names,[&] {return DirectoryJobCurrent(work,directory.token);});
+                if (!DirectoryJobCurrent(work,directory.token)) continue;
+                // Unchanged revalidations already have the exact comparison
+                // baseline. Keep its allocations and immutable key snapshots.
+                const bool baselineCurrent=lane.sortedFolder==directory.path &&
+                    SameSort(lane.sortedOrder,directory.sort) &&
+                    lane.sortedOrderHash==prepared->orderHash &&
+                    lane.sortedMetadataHash==prepared->metadataHash;
+                if (!baselineCurrent) {
+                std::vector<EntrySortKey> fresh;
                 fresh.reserve(names.size());
                 SortSpec comparison=directory.sort;
                 if (!names.empty()) comparison.kind=EntrySortKind(comparison,names.front());
                 for (size_t i=0;i<names.size();++i) {
                     if ((i&1023u)==0 && !DirectoryJobCurrent(work,directory.token)) break;
                     const auto& entry=names[i];
-                    if (compare && directory.sortRevealPath.empty()) {
-                        const auto old=lane.sortedEntries.find(entry.path);
-                        if (old!=lane.sortedEntries.end() && old->second.first!=static_cast<int>(i) &&
-                            (EntryPrecedes(old->second.second,entry,comparison) ||
-                             EntryPrecedes(entry,old->second.second,comparison))) {
+                    fresh.push_back(SortEntrySnapshot(entry));
+                }
+                if (!DirectoryJobCurrent(work,directory.token)) continue;
+                // Reuse the published identity index for refresh comparisons.
+                // Exact paths resolve folded-hash collisions, as in GPU lookup.
+                int revealRow=INT_MAX;
+                size_t checked=0;
+                const bool findReveal=compare && directory.sortRevealPath.empty();
+                if (findReveal) for (const auto& [hash,row] : prepared->paths) {
+                    if ((checked++&1023u)==0 && !DirectoryJobCurrent(work,directory.token)) break;
+                    if (row>=revealRow) continue;
+                    auto old=std::lower_bound(lane.sortedPathIndex.begin(),lane.sortedPathIndex.end(),std::pair{hash,0});
+                    for (;old!=lane.sortedPathIndex.end() && old->first==hash;++old) {
+                        const auto& previous=lane.sortedEntries[old->second];
+                        const auto& entry=names[row];
+                        if (previous.path!=entry.path) continue;
+                        if (old->second!=row && (EntryPrecedes(previous,entry,comparison) ||
+                            EntryPrecedes(entry,previous,comparison))) {
                             directory.sortRevealPath=entry.path;
-                            directory.sortRevealOldIndex=old->second.first;
+                            directory.sortRevealOldIndex=old->second;
+                            revealRow=row; // Preserve the first changed row in display order.
                         }
+                        break;
                     }
-                    fresh.emplace(entry.path,std::make_pair(static_cast<int>(i),SortEntrySnapshot(entry)));
                 }
                 if (!DirectoryJobCurrent(work,directory.token)) continue;
                 lane.sortedEntries.swap(fresh);
+                lane.sortedPathIndex=prepared->paths;
+                }
                 lane.sortedFolder=directory.path; lane.sortedOrder=directory.sort;
-                lane.sortedOrderHash=DirectoryOrderHash(names);
-                lane.sortedMetadataHash=DirectoryMetadataHash(names);
+                lane.sortedOrderHash=prepared->orderHash;
+                lane.sortedMetadataHash=prepared->metadataHash;
             }
-            auto result = PrepareDirectoryResult(work, directory, names, error);
+            auto result = PrepareDirectoryResult(work, directory, names, error, std::move(prepared));
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             PublishDirectoryResult(work, std::move(result));
         } else if (haveDetail) {
@@ -8377,6 +8754,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     // Release the potentially large plain-key snapshot on its owning worker,
     // before the tab lifetime regulator lets Explorer retire the state.
     lane.sortedEntries.clear();
+    lane.sortedPathIndex.clear();
     return 0;
 }
 
@@ -8465,7 +8843,10 @@ bool RequestColumnCatalog(ViewState& state) {
     return true;
 }
 
+void CancelNativeCatalog(ViewState& state);
+
 void ForgetDirectory(ViewState& state) {
+    CancelNativeCatalog(state);
     InvalidateColumnCatalog(state);
     state.zebraExtentAnimating = false;
     auto& work = *state.background;
@@ -8480,6 +8861,7 @@ void ForgetDirectory(ViewState& state) {
         if (state.namespaceIdentities)
             work.retiredEntries.emplace_back(std::exchange(state.namespaceIdentities, {}));
         work.directoryJobs.clear();
+        work.nativeCatalogRequest.reset();
         work.nativeRowsJobs.clear();
         for (auto& job : work.layoutJobs)
             if (!job.enumeratedEntries.empty()) work.retiredEntries.push_back(std::move(job.enumeratedEntries));
@@ -8524,6 +8906,91 @@ bool RetireCachedEntries(ViewState& state, Entries& entries, bool nonblocking = 
     return true;
 }
 
+void CancelNativeCatalog(ViewState& state) {
+    state.nativeCatalogCapture.Reset(); // Release the live enumerator on its owner STA.
+    if (state.nativeCatalogJob) RetireCachedEntries(state,state.nativeCatalogJob->nativeChildren);
+    state.nativeCatalogJob.reset(); state.nativeCatalogView=nullptr;
+    state.nativeCatalogCount=-1;
+}
+
+// Shell folder enumeration can include identities filtered or replaced by its
+// view. Copy the actual view's PIDLs in bounded owner-STA slices; all provider
+// binding, names, attributes and layout remain on the tab's names lane.
+void AdvanceNativeCatalog(ViewState& state) {
+    auto& work=*state.background;
+    std::shared_ptr<DirectoryJob> request;
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        request=std::move(work.nativeCatalogRequest);
+    }
+    if (request && request->token==state.directoryToken) {
+        CancelNativeCatalog(state);
+        state.nativeCatalogJob=std::move(request);
+        state.nativeCatalogView=state.nativeHwnd;
+    }
+    const auto job=state.nativeCatalogJob;
+    const auto view=state.folderView;
+    const HWND owner=state.hwnd;
+    if (!job) return;
+    const auto current=[&] {
+        return IsWindow(owner) && State(owner)==&state && state.nativeCatalogJob==job &&
+            job->token==state.directoryToken && state.nativeHwnd==state.nativeCatalogView &&
+            state.folderView.Get()==view.Get() && DirectoryJobCurrent(work,job->token);
+    };
+    if (!current()) { CancelNativeCatalog(state); return; }
+    bool complete=false, available=false;
+    if (!state.nativeCatalogCapture) {
+        ComPtr<IEnumIDList> items;
+        int count=-1;
+        const HRESULT hr=view ? view->ItemCount(SVGIO_ALLVIEW,&count) : E_NOINTERFACE;
+        if (!current()) return;
+        const HRESULT enumHr=SUCCEEDED(hr) && count>=0 ?
+            view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items)) : E_FAIL;
+        if (!current()) return;
+        if (SUCCEEDED(hr) && count==0 && enumHr!=E_NOTIMPL && enumHr!=E_NOINTERFACE) {
+            state.nativeCatalogCount=0; complete=available=true;
+        }
+        else if (FAILED(enumHr) || !items) complete=true;
+        else { state.nativeCatalogCount=count; state.nativeCatalogCapture=std::move(items); }
+    }
+    const auto enumerator=state.nativeCatalogCapture;
+    const ULONGLONG started=GetTickCount64();
+    for (unsigned copied=0; !complete && copied<64 && GetTickCount64()-started<1;) {
+        PITEMID_CHILD children[16]{}; ULONG fetched=0;
+        const HRESULT hr=enumerator->Next(ARRAYSIZE(children),children,&fetched);
+        const bool valid=current();
+        for (ULONG i=0;i<fetched;++i) {
+            SharedPidl child(children[i],TaskMemDeleter{});
+            if (valid && child) job->nativeChildren.push_back(std::move(child));
+        }
+        if (!valid) return;
+        copied+=fetched;
+        complete=hr!=S_OK || !fetched;
+        available=SUCCEEDED(hr);
+    }
+    if (!complete) { PostMessageW(owner,kMsgNativeCatalog,0,0); return; }
+    if (available) {
+        int count=-1;
+        const HRESULT hr=view->ItemCount(SVGIO_ALLVIEW,&count);
+        if (!current()) return;
+        if (SUCCEEDED(hr) && (count!=state.nativeCatalogCount || size_t(count)!=job->nativeChildren.size())) {
+            state.nativeCatalogCapture.Reset();
+            RetireCachedEntries(state,job->nativeChildren);
+            PostMessageW(owner,kMsgNativeCatalog,0,0); // Model changed during capture; take a fresh snapshot.
+            return;
+        }
+        available=SUCCEEDED(hr);
+    }
+    state.nativeCatalogCapture.Reset(); state.nativeCatalogJob.reset();
+    job->nativeCatalogChecked=true; job->nativeCatalogAvailable=available;
+    if (!available) { state.nativeCatalogCount=-1; RetireCachedEntries(state,job->nativeChildren); }
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        if (DirectoryJobCurrent(work,job->token)) work.directoryJobs.push_back(std::move(*job));
+    }
+    SetEvent(work.directory.wake);
+}
+
 size_t FolderCacheBudget(FolderCache& cache) {
     if (cache.budgetBytes) return cache.budgetBytes;
     MEMORYSTATUSEX memory{};
@@ -8545,6 +9012,8 @@ size_t EntryPayloadBytes(const Entry& entry) {
         entry.date.capacity() + entry.type.capacity() + entry.size.capacity() +
         entry.groupKey.capacity() + entry.groupTitle.capacity()) * sizeof(wchar_t) +
         entry.cells.capacity()*sizeof(ColumnCell);
+    bytes += entry.secondarySortValues.capacity()*sizeof(ExtraSortValue);
+    for (const auto& value : entry.secondarySortValues) bytes += value.text.capacity()*sizeof(wchar_t);
     for (const auto& cell : entry.cells) bytes += cell.text.capacity()*sizeof(wchar_t);
     if (entry.shellIdentity) bytes += ILGetSize(entry.shellIdentity.get());
     if (entry.shellChild) bytes += ILGetSize(entry.shellChild.get());
@@ -8693,14 +9162,15 @@ void ClearFolderSnapshots(ViewState& state) {
     cache.usedBytes = cache.snapshotCount = 0;
 }
 
-// A cached folder carries its own GPU sort choice (including "unsorted").
-// Never compare it to the departing folder's sort or adopt a newly created
-// Shell view's temporarily restored sort preference.
+// Cached previews carry their folder's sort, never the departing folder's.
+// A confirmed native binding revalidates it before restoring the snapshot.
 bool CachedFolderSort(const ViewState& state,
                       const std::wstring& path, SortSpec& sort,
                       ShellGroupSpec* grouping = nullptr) {
     const auto it = state.folderCache.folders.find(path);
     if (it == state.folderCache.folders.end() || it->second.visibility != state.visibility ||
+        (g_preSort.load(std::memory_order_relaxed) && !it->second.sort.explicitOrder) ||
+        (!g_preSort.load(std::memory_order_relaxed) && it->second.sort.explicitOrder && !it->second.sort.userChosen) ||
         (it->second.sort.explicitOrder &&
          it->second.sort.placement != g_folderPlacement.load(std::memory_order_relaxed)))
         return false;
@@ -9016,6 +9486,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         e.note=std::make_shared<const std::wstring>(state.folderPath); PipelineEvent(*state.background,std::move(e));
     }
     if ((state.directoryPending && !replacePending) || !state.hwnd ||
+        state.nativeSortPending ||
         (state.optimisticStartedAt && !state.directoryFolderIdentity) ||
         g_unloading.load()) return;
     if (state.thisPcGpu) {
@@ -9054,7 +9525,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         return;
     }
     if (!EnsureDirectoryFolderIdentity(state) || !EnsureDirectoryWorker(state) ||
-        ((state.sort.explicitOrder || state.grouping.enabled) &&
+        ((state.grouping.enabled || state.sort.explicitOrder) &&
          !StartTabWorker(state.background, state.background->layout,
                          DirectoryWorkerProc, THREAD_PRIORITY_BELOW_NORMAL))) {
         // Worker creation failed: never strand the native folder host under
@@ -9071,6 +9542,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         check.hwnd = state.hwnd; check.token = state.directoryToken;
         check.path = state.folderPath; check.visibility = state.visibility;
         check.namespaceFolder = state.directoryFolderIdentity;
+        check.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
         check.verifyIdentities = state.namespaceIdentities;
         ExclusiveSrwLock lock(state.background->directoryLock, true);
         if (!lock) {
@@ -9098,6 +9570,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // navigation, the new view starts with an empty names-only surface.
     state.directoryPending = true;
     state.directoryRequestedAt = GetTickCount64();
+    CancelNativeCatalog(state);
     state.directoryToken = g_nextToken.fetch_add(1);
     state.namesPreview = false;
     // Build the bounded viewport snapshot without holding the global worker
@@ -9118,6 +9591,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     newJob.token = state.directoryToken;
     newJob.path = state.folderPath;
     newJob.folderIdentity = state.directoryFolderIdentity;
+    newJob.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
     newJob.previousOrderHash=state.displayedOrderHash;
     newJob.previousMetadataHash=state.displayedMetadataHash;
     newJob.sortRevealPath=std::move(state.sortRevealPath);
@@ -9129,7 +9603,8 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // An ancestor return has a known child to reveal. A prefix at row zero
     // cannot position that child in the final layout; publish the complete,
     // positioned snapshot instead of showing a viewport we must later move.
-    newJob.allowInitialPreview = !state.loaded && state.lastFolderToReveal.empty();
+    newJob.allowInitialPreview = !state.loaded && state.lastFolderToReveal.empty() &&
+        !state.sort.explicitOrder && !state.grouping.enabled;
     newJob.previewRows = static_cast<size_t>(std::clamp(
         (ViewHeight(state) / std::max(1.f, state.rowPx) + 2 * kRowTransitionOverscan) * state.itemsPerRow, 16.f, 4096.f));
     newJob.lastFolderName = state.lastFolderToReveal;
@@ -9506,9 +9981,21 @@ void ReconcileShellVisibility(ViewState& state) {
 // guarantee. Actual resorting and property enrichment run on the worker.
 bool ReadShellSort(ViewState& state, SortSpec& out) {
     if (!state.folderView) return false;
+    const auto view = state.folderView;
+    const auto token = state.token;
+    const HWND native = state.nativeHwnd;
     PipelineScope query(state.background,L"shell.view.sort",state.token);
-    SORTCOLUMN column{};
-    if (FAILED(state.folderView->GetSortColumns(&column, 1))) return false;
+    int count=1;
+    const HRESULT countResult=view->GetSortColumnCount(&count);
+    if (state.folderView.Get()!=view.Get() || state.token!=token || state.nativeHwnd!=native) return false;
+    if (FAILED(countResult)) count=1;
+    if (count<1 || count>static_cast<int>(kMaxShellColumns)) return false;
+    std::vector<SORTCOLUMN> columns(count);
+    if (FAILED(view->GetSortColumns(columns.data(), count)) || state.folderView.Get() != view.Get() ||
+        state.token != token || state.nativeHwnd != native) return false;
+    for (const auto& column : columns)
+        if (IsEqualGUID(column.propkey.fmtid,GUID_NULL) || !column.propkey.pid) return false;
+    const auto& column=columns.front();
     if (IsEqualGUID(column.propkey.fmtid, GUID_NULL) || !column.propkey.pid)
         return false;
     out.key = column.propkey;
@@ -9516,7 +10003,36 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
     out.kind = ClassifySort(out.key);
     out.placement = g_folderPlacement.load(std::memory_order_relaxed);
     out.explicitOrder = true;
+    out.secondary.assign(columns.begin()+1,columns.end());
     return true;
+}
+
+void InitializeFolderSort(ViewState& state, const std::wstring& path, bool provisional = false) {
+    state.instantInteractionSort.reset();
+    state.preSortEnabled = g_preSort.load(std::memory_order_relaxed);
+    state.sort = DefaultSort();
+    state.sortInitialized = state.trackNativeSort = state.nativeSortPending = false;
+    SortSpec cached;
+    if (CachedFolderSort(state, path, cached, provisional ? &state.grouping : nullptr)) {
+        state.sort = cached;
+        state.sortInitialized = cached.explicitOrder;
+        state.trackNativeSort = cached.explicitOrder;
+    }
+    if (provisional) {
+        state.nativeSortPending = state.preSortEnabled && !state.sortInitialized;
+        return;
+    }
+    if (!state.preSortEnabled && !state.trackNativeSort) return;
+    SortSpec native;
+    if (ReadShellSort(state, native)) {
+        native.userChosen = state.sort.userChosen;
+        state.sort = native;
+        state.sortInitialized = state.trackNativeSort = true;
+    } else {
+        // Do not flash enumeration order or guess a sort on a transient COM
+        // failure. The existing view/enumeration events and maintenance retry.
+        state.nativeSortPending = true;
+    }
 }
 // A single authoritative source for Group by, including This PC.
 // S_FALSE means Group by None; an actual COM error means "unknown", NOT None.
@@ -9545,14 +10061,14 @@ ShellGroupSpec ReadShellGrouping(ViewState& state) {
     return result;
 }
 
-void ReconcileShellGrouping(ViewState& state, bool force = false) {
+bool ReconcileShellGrouping(ViewState& state, bool force = false, bool queueIfChanged = true) {
     // A hidden namespace's provider/layout notifications do not represent
     // user Group by changes. Its explicit commands own live settings reads.
-    if (IsRecycleBinLocation(state.folderPath) && !force) return;
-    if (!state.folderView || !state.inScope || state.optimisticStartedAt) return;
+    if (IsRecycleBinLocation(state.folderPath) && !force) return false;
+    if (!state.folderView || !state.inScope || state.optimisticStartedAt) return false;
     ShellGroupSpec next;
-    if (!TryReadShellGrouping(state, next)) return;
-    if (SameShellGroup(state.grouping, next)) return;
+    if (!TryReadShellGrouping(state, next)) return false;
+    if (SameShellGroup(state.grouping, next)) return false;
     state.grouping = next;
     if (state.thisPcGpu) {
         // Grouping affects the GPU row order and section geometry, but not
@@ -9560,27 +10076,58 @@ void ReconcileShellGrouping(ViewState& state, bool force = false) {
         // can rebuild it without directory enumeration or a new worker.
         state.thisPcRowsDirty = true;
         state.thisPcSnapshotRetries = 0;
-    } else if (state.loaded) {
+    } else if (state.loaded && queueIfChanged) {
         QueueDirectoryRefresh(state, true, true);
     }
+    return true;
 }
 
 void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force = false,
                              bool acceptUntrackedSort = false) {
-    ReconcileShellGrouping(state, force);
-    if (IsRecycleBinLocation(state.folderPath) && !force) return;
-    if (!acceptUntrackedSort && (!state.trackNativeSort || !state.sort.explicitOrder)) return;
+    if (!state.inScope || state.optimisticStartedAt) return;
+    if (acceptUntrackedSort) state.instantInteractionSort.reset(); // Explicit native/menu command.
+    const bool groupingChanged=ReconcileShellGrouping(state, force, false);
+    bool sortChanged=false;
     SortSpec updated;
-    if (!ReadShellSort(state, updated)) return;
-    state.trackNativeSort = true;
-    if (state.sortInitialized && SameSort(updated, state.sort)) return;
-    state.sort = updated;
-    state.sortInitialized = true;
+    if ((!IsRecycleBinLocation(state.folderPath) || force || state.nativeSortPending) &&
+        (state.preSortEnabled || acceptUntrackedSort || state.trackNativeSort) && ReadShellSort(state, updated)) {
+        state.trackNativeSort = true;
+        const bool pending = std::exchange(state.nativeSortPending, false);
+        sortChanged = pending || !state.sortInitialized || !SameSort(updated, state.sort);
+        updated.userChosen = state.sort.userChosen || acceptUntrackedSort ||
+            (state.sortInitialized && !SameSort(updated,state.sort));
+        if (state.instantInteractionSort && !SameSort(*state.instantInteractionSort,updated))
+            state.instantInteractionSort.reset();
+        state.sort = std::move(updated);
+        state.sortInitialized = true;
+        if (SameSort(state.displayedSort,state.sort)) state.displayedSort.userChosen=state.sort.userChosen;
+    }
+    if (!sortChanged && !groupingChanged) return;
     if (queueIfChanged && state.inScope) {
-        if (state.thisPcGpu) QueueNativeRows(state);
+        if (state.thisPcGpu) QueueNativeRows(state,sortChanged);
         else QueueDirectoryRefresh(state, true, true);
     }
     Redraw(state);
+}
+
+// Settings can arrive while an old unsorted enumeration is still pending.
+// Return whether its generation must be replaced, even when placement stayed
+// equal. Merely updating the header policy would mislabel that old result.
+bool ReconcileSortSettings(ViewState& state) {
+    const auto placement=g_folderPlacement.load(std::memory_order_relaxed);
+    const bool preSort=g_preSort.load(std::memory_order_relaxed);
+    const bool changed=state.preSortEnabled!=preSort;
+    const bool placementChanged=state.sort.placement!=placement;
+    if (changed || placementChanged) state.instantInteractionSort.reset();
+    if (changed) {
+        state.preSortEnabled=preSort;
+        if (preSort) {
+            state.nativeSortPending=true;
+            RefreshSortFromExplorer(state,false,true);
+        } else state.nativeSortPending=false;
+    }
+    state.sort.placement=placement;
+    return changed || placementChanged;
 }
 // Resolve header property keys from the folder's actual column mapping when
 // available; filesystem-folder fallback matches the four displayed columns.
@@ -9612,16 +10159,23 @@ void SortByHeader(ViewState& state, int column) {
     if (state.visible && state.inScope && state.detailsViewActive)
         SuppressNativeContent(state);
     if (!current()) return;
+    SortSpec sort;
+    sort.key = key;
+    sort.direction = direction;
+    sort.kind = ClassifySort(key);
+    sort.placement = g_folderPlacement.load(std::memory_order_relaxed);
+    sort.explicitOrder = true;
+    sort.userChosen = true;
+    const auto previousInstantSort=state.instantInteractionSort;
+    // SetSortColumns may reenter native sort observation and queue a result.
+    // Tag the intended order before COM, then consume it at the shared commit.
+    state.instantInteractionSort = g_animateItemInteractions.load(std::memory_order_relaxed) ?
+        std::nullopt : std::optional<SortSpec>(sort);
     PipelineScope pipeline(state.background,L"native.sort",key.pid,static_cast<int>(direction));
     const HRESULT result=view->SetSortColumns(&requested,1);
     if (SUCCEEDED(result) && current()) {
-        SortSpec sort;
-        sort.key = key;
-        sort.direction = direction;
-        sort.kind = ClassifySort(key);
-        sort.placement = g_folderPlacement.load(std::memory_order_relaxed);
-        sort.explicitOrder = true;
         state.trackNativeSort = true;
+        state.nativeSortPending = false;
         if (!state.sortInitialized || !SameSort(sort, state.sort)) {
             state.sort = sort;
             state.sortInitialized = true;
@@ -9629,6 +10183,8 @@ void SortByHeader(ViewState& state, int column) {
             else QueueDirectoryRefresh(state, true, true);
         }
         Redraw(state);
+    } else if (current() && state.instantInteractionSort && SameSort(*state.instantInteractionSort,sort)) {
+        state.instantInteractionSort=previousInstantSort;
     }
 }
 
@@ -9861,6 +10417,11 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
                          int sortRevealIndex = -1, bool completesDirectoryRequest = true,
                          bool requestData = true) {
     TabTraceSlowScope trace(L"directory names/selection commit", state.hwnd);
+    const bool instantInteraction=state.instantInteractionSort && SameSort(*state.instantInteractionSort,state.sort);
+    if (instantInteraction) {
+        StopRowTransition(state);
+        if (complete && error==ERROR_SUCCESS) state.instantInteractionSort.reset();
+    }
     if (complete) TraceSelectionIdentity(state, L"names.before");
     const bool allowSortReveal=!PointerDragActive(state) && !state.marqueeActive &&
         !state.manipulationFrameActive;
@@ -10140,7 +10701,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         state.nativeSelectionMessageQueued = PostMessageW(state.hwnd,
             kMsgNativeSelectionChanged,
             reinterpret_cast<WPARAM>(state.nativeHwnd), 0) != FALSE;
-    if (complete && error == ERROR_SUCCESS && state.loaded &&
+    if (!instantInteraction && complete && error == ERROR_SUCCESS && state.loaded &&
         SameSort(state.displayedSort, state.sort)) {
         if (groupingChanged || !state.sections.empty() || !oldHeaders.empty())
             StartGroupingTransition(state, std::move(oldViewport),
@@ -10643,16 +11204,24 @@ float InlineDriveLabelWidth(float available, float label, int dpi) {
     // A track is optional; never shrink the shared label band to keep it.
     return available >= InlineDriveContentWidth(label,dpi) ? std::ceil(label+1.f) : 0.f;
 }
+// A fixed Fluent control band at the window DPI, independent of input mode,
+// font zoom and checkbox opacity. Compact grids reserve the same leading band.
+float SelectionCheckboxSize(const ViewState& state) {
+    return static_cast<float>(Scale96(20, ViewDpi(state)));
+}
+float SelectionCheckboxSpace(const ViewState& state) {
+    return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
+}
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
-    return start + Scale96(16, dpi) + IconPixelSize(state, header) + Scale96(10, dpi);
+    return start + SelectionCheckboxSpace(state) + Scale96(16, dpi) + IconPixelSize(state, header) + Scale96(10, dpi);
 }
 
 // One item layout feeds drawing, selection, rename and pointer geometry.
 // Coordinates are logical; the existing Fill/Text/icon paths mirror RTL.
 struct ItemGeometry {
-    D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{};
+    D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{}, checkbox{};
     bool wrapped = false;
 };
 ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
@@ -10668,7 +11237,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const bool tiles = DriveTiles(state);
         const bool compact = tiles || state.cachedNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
-        const float iconX = compact ? g.cell.left + pad :
+        const float iconX = compact ? g.cell.left + pad + SelectionCheckboxSpace(state) :
             (g.cell.left + g.cell.right - side) * .5f;
         const float iconY = compact ? visual.top + (state.rowPx-side)*.5f : visual.top + pad;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
@@ -10691,15 +11260,56 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
                 g.text.right, g.usage.bottom + gap + line);
         }
     } else {
-        const float iconX = ColumnsPresented(state) ? NameColumnStart(state) + Scale96(16, dpi) :
-            start + Scale96(16, dpi);
+        const float iconX = (ColumnsPresented(state) ? NameColumnStart(state) : start) +
+            Scale96(16, dpi) + SelectionCheckboxSpace(state);
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
             NameContentEnd(state)-8.f,
             visual.top+state.rowPx);
     }
+    if (state.clickPolicy.checkSelect) {
+        const float inset = state.gridView ? std::min(float(Scale96(6,dpi)),std::max(0.f,g.cell.right-g.cell.left)*.125f) : 0.f;
+        const float available = state.gridView ? std::max(0.f,(g.cell.right-g.cell.left)*.5f-inset) : SelectionCheckboxSize(state);
+        const float size = std::min({SelectionCheckboxSize(state),std::max(0.f,state.rowPx-Scale96(4,dpi)),available});
+        const float left = state.gridView ? g.cell.left + inset :
+            (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi);
+        const float top = state.gridView && !DriveTiles(state) && state.cachedNativeMode != FVM_SMALLICON ?
+            g.cell.top + Scale96(4,dpi) : visual.top + (state.rowPx-size)*.5f;
+        g.checkbox = D2D1::RectF(left,top,left+size,top+size);
+    }
     return g;
+}
+
+D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item,const RowVisual& visual) {
+    auto box=item.checkbox;
+    if (!state.gridView) return D2D1::RectF(ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state),
+        visual.top,item.icon.left,visual.top+visual.height);
+    // Double the visible box for either input device, within this cell's
+    // leading half. The trailing half remains available to open the item.
+    const float width=std::max(0.f,item.cell.right-item.cell.left);
+    const float height=std::max(0.f,item.cell.bottom-item.cell.top);
+    if (width<=0.f || height<=0.f) return {};
+    const float w=std::min((box.right-box.left)*2.f,width*.5f),h=std::min((box.bottom-box.top)*2.f,height);
+    const float left=std::clamp((box.left+box.right-w)*.5f,item.cell.left,item.cell.left+width*.5f-w);
+    const float top=std::clamp((box.top+box.bottom-h)*.5f,item.cell.top,item.cell.bottom-h);
+    return D2D1::RectF(left,top,left+w,top+h);
+}
+
+D2D1_RECT_F HeaderSelectionCheckbox(ViewState& state) {
+    const float size = SelectionCheckboxSize(state);
+    const float left = NameColumnStart(state) + Scale96(12,ViewDpi(state));
+    const float top = ColumnHeaderOffset(state,ViewDpi(state)) +
+        (Scale96(kHeader96,ViewDpi(state))-size)*.5f;
+    return D2D1::RectF(left,top,left+size,top+size);
+}
+
+int HeaderSelectionCheckboxState(const ViewState& state) {
+    if (!state.clickPolicy.checkSelect || state.total<=0) return -1;
+    // Only a worker result for this exact immutable selection/membership may
+    // authorize a click. -3 means the tab's worker has not assessed it yet.
+    if (state.checkboxSummaryTotal!=state.total || !state.checkboxSelection.SharesStorage(state.selectedFlags)) return -3;
+    return state.checkboxSummaryState;
 }
 
 struct DriveBarGeometry {
@@ -13482,8 +14092,8 @@ void ProfileGpuMemory(ViewState& state, const wchar_t* reason, bool force=false,
 bool InactiveGraphics(const ViewState& state) {
     if(state.presentationOnly) return !state.presentationActive || !state.visible || !state.inScope || !state.detailsViewActive;
     return !state.visible || !state.inScope || !state.detailsViewActive || PresentationMinimized(state) ||
-        !TabOwnsActiveView(state) || (!PresentationVisible(state) &&
-            !state.nativePresentationPending && !state.initialModePending);
+        (!state.preparingTab && (!TabOwnsActiveView(state) || (!PresentationVisible(state) &&
+            !state.nativePresentationPending && !state.initialModePending)));
 }
 void QueueInactiveGraphicsRelease(ViewState& state) {
     if(state.presenter && !state.presentationOnly) {
@@ -13634,6 +14244,7 @@ void DropTarget(ViewState& state) {
     state.compositionSurfacePoolUsed=false;
     if (state.d2dDevice) state.d2dDevice->ClearResources(0);
     state.d2dDevice.Reset();
+    state.selectionCheckGlyph.Reset();
     state.d2dFactory.Reset();
     state.dxgiFactory.Reset();
     // Flush deferred driver references only after releasing middleware resources.
@@ -14833,6 +15444,7 @@ void SetTouchInputMode(ViewState& state, bool touch) {
             state.pointerInside = false;
             ClearPointerHover(state,false);
         }
+        Redraw(state);
     }
     UpdateTouchScrollbars(state);
 }
@@ -15201,6 +15813,10 @@ float SelectedFilenameWidth(ViewState& state, int index, float available) {
     return width;
 }
 
+float FilenameSelectionPadding(const ViewState& state) {
+    return 2.f * std::max(96, ViewDpi(state)) / 96.f;
+}
+
 // All normal and moving selection backgrounds use the SAME bounds and fill.
 // Interpolating this rectangle also handles filename-only pills with different
 // text widths, rather than jumping to the next filename's width.
@@ -15263,8 +15879,8 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         SelectionShape result;
         // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
         const float origin = state.rtlLayout ? state.paintWidth-
-            roundf(state.paintWidth-text.right)-(text.right-text.left) : roundf(text.left);
-        const float padding = 2.f * std::max(96,state.textFormatDpi) / 96.f;
+            roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
+        const float padding = FilenameSelectionPadding(state);
         for (unsigned i=0;i<cached.filenameSelection.count;++i) {
             auto rc=cached.filenameSelection.lines[i];
             rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
@@ -15613,6 +16229,23 @@ void ResetItemContentOpacity(ViewState& state) {
     state.itemOpacityAnimating = false;
 }
 
+// Runs on the tab's existing presentation worker after adopting its immutable
+// model. UI capture only shares COW selection storage; it never scans rows.
+void AssessHeaderCheckboxSelection(ViewState& state) {
+    if (!state.clickPolicy.checkSelect) {
+        state.checkboxSelection.clear(); state.checkboxSelectedCount=0;
+        state.checkboxSummaryTotal=state.total; state.checkboxSummaryState=-1;
+        return;
+    }
+    if (!state.checkboxSelection.SharesStorage(state.selectedFlags)) {
+        state.checkboxSelectedCount=std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1);
+        state.checkboxSelection=state.selectedFlags;
+    }
+    if (state.total<=0) state.checkboxSelectedCount=0;
+    state.checkboxSummaryTotal=state.total;
+    state.checkboxSummaryState=state.total<=0 ? -1 : state.checkboxSelectedCount==size_t(state.total) ? 1 : 0;
+}
+
 float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = false) {
     const bool dim = (entry.attributes & FILE_ATTRIBUTE_HIDDEN) ||
         (g_dimDotFiles.load(std::memory_order_relaxed) && !entry.name.empty() && entry.name.front() == L'.') ||
@@ -15651,6 +16284,53 @@ float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = f
     const float opacity = sample();
     state.itemOpacityAnimating |= motion.started.QuadPart != 0;
     return opacity;
+}
+
+// Fluent-style rounded boxes and a single filled check path. Native colors
+// were captured on the owner; paint performs no theme, Shell or registry calls.
+void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, float opacity) {
+    if (!VisibleOpacity(opacity) || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    if (state.rtlLayout) {
+        const float left = state.paintWidth-rect.right;
+        rect.right = state.paintWidth-rect.left; rect.left = left;
+    }
+    const float unit = (rect.right-rect.left)/20.f;
+    const float border = std::min(std::max(1.f,unit),(rect.right-rect.left)*.5f);
+    const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
+        rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
+    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const unsigned foreground = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
+    state.brush->SetColor(Packed(checked ? ThemeRgb(COLORREF(palette&0xFFFFFF)) : foreground,
+        opacity*(checked ? 1.f : .08f)));
+    state.target->FillRoundedRectangle(shape,state.brush.Get());
+    state.brush->SetColor(Packed(foreground,opacity*.8f));
+    state.target->DrawRoundedRectangle(shape,state.brush.Get(),border);
+    if (!checked) return;
+    state.brush->SetColor(Packed(ThemeRgb(COLORREF((palette>>24)&0xFFFFFF)),opacity));
+    if (!state.selectionCheckGlyph && state.d2dFactory) {
+        ComPtr<ID2D1PathGeometry> path,filled; ComPtr<ID2D1GeometrySink> sink;
+        ComPtr<ID2D1StrokeStyle> stroke;
+        if (SUCCEEDED(state.d2dFactory->CreatePathGeometry(&path)) && SUCCEEDED(path->Open(&sink))) {
+            sink->BeginFigure(D2D1::Point2F(4.5f,10.5f),D2D1_FIGURE_BEGIN_HOLLOW);
+            const D2D1_POINT_2F points[]={{8.5f,14.5f},{15.5f,5.5f}};
+            sink->AddLines(points,ARRAYSIZE(points)); sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            if (SUCCEEDED(sink->Close()) && SUCCEEDED(state.d2dFactory->CreateStrokeStyle(
+                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,
+                    D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,&stroke)) &&
+                SUCCEEDED(state.d2dFactory->CreatePathGeometry(&filled))) {
+                sink.Reset();
+                if (SUCCEEDED(filled->Open(&sink)) && SUCCEEDED(path->Widen(3.2f,stroke.Get(),nullptr,sink.Get())) &&
+                    SUCCEEDED(sink->Close())) state.selectionCheckGlyph = std::move(filled);
+            }
+        }
+    }
+    if (state.selectionCheckGlyph) {
+        D2D1_MATRIX_3X2_F previous{}; state.target->GetTransform(&previous);
+        state.target->SetTransform(D2D1::Matrix3x2F::Scale(unit,unit)*
+            D2D1::Matrix3x2F::Translation(rect.left,rect.top)*previous);
+        state.target->FillGeometry(state.selectionCheckGlyph.Get(),state.brush.Get());
+        state.target->SetTransform(previous);
+    }
 }
 
 // DWM uses the same absolute QPC origin and cubic as the existing input/hit
@@ -16877,6 +17557,18 @@ void Paint(ViewState& state) {
                     SameKey(col.key, state.sort.key);
                 const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
                 const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, listEnd, dpi);
+                const int checked = HeaderSelectionCheckboxState(state);
+                if (checked>=0 && ClassifySort(col.key)==SortKind::Name) {
+                    const auto box = HeaderSelectionCheckbox(state);
+                    // Narrow/reordered/scrolled Name columns retain their own clip.
+                    const float l = std::max(from,listStart), r = std::min(to,listEnd);
+                    if (r>l) {
+                        state.target->PushAxisAlignedClip(state.rtlLayout ?
+                            D2D1::RectF(w-r,0.f,w-l,header) : D2D1::RectF(l,0.f,r,header),D2D1_ANTIALIAS_MODE_ALIASED);
+                        DrawSelectionCheckbox(state,box,checked!=0,fade);
+                        state.target->PopAxisAlignedClip();
+                    }
+                }
                 if (caption.right > caption.left)
                     Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
                          headerColor, true, fade, sorted);
@@ -17262,6 +17954,17 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
+        const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
+        if (state.clickPolicy.checkSelect && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
+            const float l = ColumnsPresented(state) && !state.gridView ? std::max(listStart,NameColumnStart(state)) : listStart;
+            const float r = ColumnsPresented(state) && !state.gridView ? NameContentEnd(state) : listEnd;
+            if (r>l) {
+                state.target->PushAxisAlignedClip(state.rtlLayout ? D2D1::RectF(w-r,header,w-l,contentBottom) :
+                    D2D1::RectF(l,header,r,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
+                DrawSelectionCheckbox(state,geometry.checkbox,checked,v.opacity);
+                state.target->PopAxisAlignedClip();
+            }
+        }
         if (usage.visible) {
             const auto& bar = usage.track;
             const float radius = (bar.bottom - bar.top) * .5f;
@@ -17827,6 +18530,7 @@ void EnsureVisible(ViewState& state, int index) {
 struct PidlSelection {
     std::vector<PITEMID_CHILD> owned;
     std::vector<PCUITEMID_CHILD> children;
+    std::vector<int> rejected;
     // Borrowed from owned: no second potentially blocking Shell parse just
     // to mark the same selected item as focused.
     PCUITEMID_CHILD focused = nullptr;
@@ -17838,6 +18542,44 @@ void BorrowPreparedSelection(PidlSelection& pidls, const PreparedNativeSelection
     for (const auto& child : prepared.children) pidls.children.push_back(child.get());
     if (prepared.focused >= 0 && static_cast<size_t>(prepared.focused) < pidls.children.size())
         pidls.focused = pidls.children[static_cast<size_t>(prepared.focused)];
+}
+
+void RememberVerifiedSelection(ViewState& state) {
+    state.verifiedSelectionFlags=state.selectedFlags;
+    state.verifiedSelectionRow=state.selected; state.verifiedSelectionAnchor=state.anchor;
+    state.verifiedSelectionToken=state.token; state.verifiedSelectionDirectory=state.directoryToken;
+    state.verifiedSelectionOrder=state.displayedOrderHash;
+}
+
+void RestoreVerifiedSelection(ViewState& state) {
+    const bool retained=state.verifiedSelectionToken==state.token && (state.verifiedSelectionDirectory==state.directoryToken ||
+        (state.verifiedSelectionOrder && state.verifiedSelectionOrder==state.displayedOrderHash)) &&
+        state.verifiedSelectionFlags.size()==state.selectedFlags.size();
+    if (retained) {
+        state.selectedFlags=state.verifiedSelectionFlags;
+        state.selected=state.verifiedSelectionRow; state.anchor=state.verifiedSelectionAnchor;
+    } else { state.selectedFlags.Fill(0); state.selected=state.anchor=-1; }
+    state.nativeSelectionUnsafe=!retained;
+    QueueNativeSelectionHint(state);
+    Redraw(state);
+}
+
+bool NativeSelectionTarget(IFolderView2* view, PCUITEMID_CHILD child) {
+    if (!child) return false;
+    DWORD flags=0;
+    const HRESULT hr=view->GetSelectionState(child,&flags);
+    return SUCCEEDED(hr) || hr==E_NOTIMPL || hr==E_NOINTERFACE;
+}
+
+void RejectSelectionRows(ViewState& state, const std::vector<int>& rejected) {
+    for (int row:rejected) if (row>=0 && size_t(row)<state.selectedFlags.size())
+        state.selectedFlags[size_t(row)]=0;
+    const auto selected=[&](int row) {return row>=0 && size_t(row)<state.selectedFlags.size() && state.selectedFlags[size_t(row)];};
+    if (!selected(state.selected)) {
+        state.selected=-1;
+        for (size_t i=0;i<state.selectedFlags.size();++i) if (state.selectedFlags[i]) { state.selected=int(i); break; }
+    }
+    if (!selected(state.anchor)) state.anchor=state.selected;
 }
 
 bool VerifyNativeSelection(ViewState& state, const PidlSelection& expected);
@@ -17987,12 +18729,9 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
             for (const Entry& entry : job->entries) {
                 if (!current()) break;
                 PITEMID_CHILD child = nullptr;
-                job->result = EntryChildPidl(folder.Get(), nullptr, entry, &child);
+                const HRESULT hr = EntryChildPidl(folder.Get(), nullptr, entry, &child);
                 OwnedPidl owned(child);
-                if (FAILED(job->result) || !owned) {
-                    if (SUCCEEDED(job->result)) job->result = E_FAIL;
-                    break;
-                }
+                if (FAILED(hr)) owned.reset(); // Reject this identity, retaining the rest of the group.
                 job->children.push_back(std::move(owned));
             }
             }
@@ -18008,7 +18747,7 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
 }
 
 bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& selection) {
-    if (state.token != selection.viewToken || state.nativeHwnd != selection.native ||
+    if (state.token != selection.viewToken || state.directoryToken != selection.directoryToken || state.nativeHwnd != selection.native ||
         static_cast<size_t>(std::count_if(state.selectedFlags.begin(), state.selectedFlags.end(),
             [](unsigned char flag) { return flag != 0; })) != selection.entries.size()) return false;
     for (const Entry& entry : selection.entries) {
@@ -18019,19 +18758,67 @@ bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& 
     return true;
 }
 
+bool ValidatePreparedSelection(ViewState& state, const std::shared_ptr<PreparedNativeSelection>& job) {
+    const auto view=state.folderView;
+    const HWND owner=state.hwnd;
+    const auto current=[&] {
+        return IsWindow(owner) && State(owner)==&state && state.pendingNativeSelection==job->generation &&
+            state.token==job->viewToken && state.directoryToken==job->directoryToken &&
+            state.nativeHwnd==job->native && state.folderView.Get()==view.Get();
+    };
+    if (!current() || !view) return false;
+    const ULONGLONG started=GetTickCount64();
+    for (unsigned copied=0; job->validationCursor<job->children.size() && copied<64 && GetTickCount64()-started<1; ++copied) {
+        auto& child=job->children[job->validationCursor++];
+        const bool valid=NativeSelectionTarget(view.Get(),child.get());
+        if (!current()) return false;
+        if (!valid) child.reset();
+    }
+    if (job->validationCursor<job->children.size()) {
+        ExclusiveSrwLock lock(state.background->selectionLock);
+        state.background->selectionResult=job;
+        state.background->selectionNotificationQueued=PostMessageW(owner,kMsgPreparedSelection,0,0)!=FALSE;
+        return false;
+    }
+    std::vector<int> rejected;
+    size_t accepted=0; int focused=-1;
+    for (size_t i=0;i<job->children.size();++i) {
+        if (!job->children[i]) { rejected.push_back(GpuRowForNativePath(state,job->entries[i].path)); continue; }
+        if (int(i)==job->focused) focused=int(accepted);
+        if (accepted!=i) { job->entries[accepted]=std::move(job->entries[i]); job->children[accepted]=std::move(job->children[i]); }
+        ++accepted;
+    }
+    job->entries.resize(accepted); job->children.resize(accepted);
+    job->focused=focused>=0 ? focused : accepted ? 0 : -1;
+    if (!rejected.empty()) {
+        if (!accepted) RestoreVerifiedSelection(state);
+        RejectSelectionRows(state,rejected);
+        if (!accepted && !state.nativeSelectionUnsafe) RememberVerifiedSelection(state);
+    }
+    return true;
+}
+
 bool CollectSelectedPidls(ViewState& state, PidlSelection& pidls) {
     if (!state.folder || !state.folderView) return false;
+    const auto view=state.folderView;
+    const auto token=state.token, directory=state.directoryToken;
+    const HWND owner=state.hwnd;
     for (int i = 0; i < state.total; ++i) {
         if (i >= static_cast<int>(state.selectedFlags.size()) ||
             !state.selectedFlags[static_cast<size_t>(i)]) continue;
         if (static_cast<size_t>(i) >= state.entries.size()) return false;
         PITEMID_CHILD child = nullptr;
-        if (SUCCEEDED(EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child)) && child) {
+        const HRESULT hr=EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
+        OwnedPidl owned(child);
+        const bool valid=SUCCEEDED(hr) && child && NativeSelectionTarget(view.Get(),child);
+        if (State(owner)!=&state || state.token!=token || state.directoryToken!=directory || state.folderView.Get()!=view.Get()) return false;
+        if (valid) {
             pidls.owned.push_back(child);
             pidls.children.push_back(child);
+            owned.release();
             if (i == state.selected) pidls.focused = child;
         } else {
-            return false; // don't silently operate on only some files
+            pidls.rejected.push_back(i);
         }
     }
     return true;
@@ -18327,6 +19114,7 @@ void ApplyImportedNativeSelection(ViewState& state,
                     RevealNativeSelection(state, state.selected);
                 if (preserveViewport) state.nativeSelectionViewportOwned=true;
                 state.nativeSelectionImportPreserveViewport=false;
+                RememberVerifiedSelection(state);
                 return;
             }
         }
@@ -18354,6 +19142,7 @@ void ApplyImportedNativeSelection(ViewState& state,
         ClearPostDeletionCaret(state);
         state.selectedFlags.assign(state.entries.size(), 1);
         state.selected = state.anchor = state.selected>=0 && state.selected<state.total ? state.selected : state.total ? 0 : -1;
+        RememberVerifiedSelection(state);
         AnimateVisibleSelection(state, previousVisible);
         Redraw(state);
         return;
@@ -18405,6 +19194,7 @@ void ApplyImportedNativeSelection(ViewState& state,
     if (!preserveViewport) RevealNativeSelection(state, state.selected);
     // The native view already owns these selections: never echo them back
     // with SelectAndPositionItems during import.
+    RememberVerifiedSelection(state);
     Redraw(state);
 }
 
@@ -18443,6 +19233,11 @@ bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool comm
     }
     if (state.thisPcGpu && !ShellRowsInteractive(state)) return false;
     if (!state.folderView) return false;
+    if (eventDriven && state.nativeCatalogCount>=0 && !state.directoryPending) {
+        int count=-1;
+        if (SUCCEEDED(state.folderView->ItemCount(SVGIO_ALLVIEW,&count)) && count!=state.nativeCatalogCount)
+            QueueDirectoryRefresh(state,false,true);
+    }
     TabTraceSlowScope trace(L"native selection snapshot", state.hwnd);
     if (state.thisPcGpu && state.total > 0) {
         int nativeTotal = 0;
@@ -18733,6 +19528,7 @@ void MaybeRecoverNativeSelection(ViewState& state) {
     state.nativeSelectionObservedCount=0; state.nativeSelectionObservedPaths.clear();
     state.nativeSelectionAwaitingRefresh=state.nativeSelectionUnsafe=false;
     state.nativeSelectionRecoveryPending=state.nativeSelectionDirty=false;
+    RememberVerifiedSelection(state);
     PipelineEvent(*state.background,{.operation=L"selection.recovery.cleared",.a=state.token});
     Redraw(state);
 }
@@ -18791,9 +19587,8 @@ bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool rev
         job->entries.push_back(std::move(entry));
     }
     if (!StartTabWorker(state.background, work.selection, SelectionWorkerProc, THREAD_PRIORITY_NORMAL)) return false;
-    // Clear the old native selection before any asynchronous work: commands
-    // must never operate on items from the preceding click while preparing.
-    if (!ClearNativeSelection(state)) return false;
+    // Commands are gated by pendingNativeSelection. Keep the verified native
+    // set intact until the new identities have been prepared and validated.
     state.pendingNativeSelection = job->generation;
     work.selectionGeneration.store(job->generation, std::memory_order_release);
     {
@@ -18905,6 +19700,10 @@ bool CapturedSelectionStillCurrent(ViewState& state, const PreparedNativeSelecti
 }
 
 bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelection> prepared) {
+    WindowCallbackGuard callback;
+    const HWND owner=state.hwnd;
+    const auto view=state.folderView;
+    const auto token=state.token, directory=state.directoryToken;
     TraceSelectionIdentity(state, L"native.sync.before");
     // A fresh explicit selection supersedes an older queued recovery. Failed
     // commits still use the normal verified import/recovery path.
@@ -18937,13 +19736,13 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
             i < state.entries.size())
             selectedPaths.push_back(state.entries[i].path);
     }
-    if (desired <= kMaxDirectNativeSelectionItems) CancelNativeSelectionPreparation(state);
+    if (desired <= kMaxDirectNativeSelectionItems && !prepared) CancelNativeSelectionPreparation(state);
     state.nativeSelectionImportPending = state.nativeSelectionAllPending = false;
     state.nativeSelectionAllCount = -1;
     state.nativeSelectionAwaitingRefresh = false;
     state.nativeSelectionPaths.clear(); state.nativeFocusedPath.clear();
     if (desired == 0) {
-        if (ClearNativeSelection(state)) return true;
+        if (ClearNativeSelection(state)) { RememberVerifiedSelection(state); return true; }
         ReconcileFailedNativeSelection(state);
         return false;
     }
@@ -18964,11 +19763,24 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
         prepared->children.size() == desired && GpuSelectionMatches(state, *prepared);
     if (havePrepared) BorrowPreparedSelection(pidls, *prepared);
     if ((prepared && !havePrepared) || (!prepared && !CollectSelectedPidls(state, pidls))) {
+        if (State(owner)!=&state || state.token!=token || state.directoryToken!=directory || state.folderView.Get()!=view.Get()) return false;
         Wh_Log(L"[GPU selection] PIDL parsing failed: wanted=%zu rows=%d elapsed=%llu ms",
             desired, state.total,
             static_cast<unsigned long long>(GetTickCount64() - started));
-        ReconcileFailedNativeSelection(state);
+        RestoreVerifiedSelection(state); // No native transaction has been attempted.
         return false;
+    }
+    if (!pidls.rejected.empty()) {
+        RejectSelectionRows(state,pidls.rejected);
+        if (pidls.children.empty()) {
+            RestoreVerifiedSelection(state); RejectSelectionRows(state,pidls.rejected);
+            if (!state.nativeSelectionUnsafe) RememberVerifiedSelection(state);
+            return true;
+        }
+        desired=pidls.children.size();
+        selectedPaths.clear();
+        for (size_t i=0;i<state.entries.size();++i) if (state.selectedFlags[i]) selectedPaths.push_back(state.entries[i].path);
+        if (!pidls.focused) pidls.focused=pidls.children.front();
     }
     // A single selected item can also own the native caret atomically. The
     // separate focus transaction is needed only for multi-selection, whose
@@ -19037,6 +19849,7 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
     }
     if (verified) {
         state.nativeSelectionUnsafe=false;
+        RememberVerifiedSelection(state);
         state.confirmedNativeSelection = std::move(prepared);
         state.nativeSelectionViewportOwned = true;
         if (selectedPaths.size() > 1)
@@ -19354,8 +20167,11 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
     if (state.optimisticStartedAt) return;
     if ((key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
         state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0)
-        RefreshHoverUnderCursor(state); // Navigation may leave the pointer stationary over new rows.
+        RefreshHoverUnderCursor(state);
     const int target = KeyboardNavigationTarget(state, key, !control && !shift);
+    // Resolve the initial hover seed before keyboard input retires its visual
+    // and point-to-select tracking. Subsequent keys use the keyboard selection.
+    SuppressPointerHoverForKeyboard(state);
     if (g_perf.load(std::memory_order_relaxed) &&
         (target < 0 || !state.postDeletionFocusPath.empty()))
         Wh_Log(L"[GPU selection] KEY_TARGET key=0x%X index=%d target=%d restored=%d vacant=%d rows=%d",
@@ -19426,6 +20242,7 @@ void ToggleKeyboardFocusedItem(ViewState& state) {
 }
 
 void BeginNativeSelectAll(ViewState& state, bool nativeCommand = false) {
+    SuppressPointerHoverForKeyboard(state);
     // A previous marquee/bulk preparation must not overwrite a later Ctrl+A.
     // Cancel its generation before Explorer handles this newer command.
     CancelNativeSelectionPreparation(state);
@@ -19486,6 +20303,33 @@ void SelectAllKeyboardItems(ViewState& state) {
         reinterpret_cast<WPARAM>(state.nativeHwnd), static_cast<LPARAM>(state.token));
 }
 
+void SelectAllCheckboxItems(ViewState& state) {
+    if (state.optimisticStartedAt || !state.folderView || !state.loaded || !TabOwnsActiveView(state)) return;
+    ComPtr<IShellView> view;
+    if (!state.shellBrowser || FAILED(state.shellBrowser->QueryActiveShellView(&view)) ||
+        !view) return;
+    HWND actual=nullptr;
+    if (FAILED(view->GetWindow(&actual)) || actual!=state.nativeHwnd) return;
+    // ShlObj declares this IID on IShellFolderView, but the bundled MinGW
+    // headers omit its __mingw_uuidof specialization and IID constant.
+    constexpr IID iidShellFolderView{0x37A378C0,0xF82D,0x11CE,{0xAE,0x65,0x08,0x00,0x2B,0x2E,0x12,0x62}};
+    ComPtr<IShellFolderView> folderView;
+    ComPtr<IOleCommandTarget> commands;
+    view->QueryInterface(iidShellFolderView,reinterpret_cast<void**>(folderView.GetAddressOf()));
+    if (!folderView && FAILED(view.As(&commands))) return;
+    const HWND owner=state.hwnd, native=state.nativeHwnd;
+    const auto lifetime=state.lifetimeToken, token=state.token;
+    BeginNativeSelectAll(state);
+    // Invoke Shell's actual Select All command; no fake Ctrl key state,
+    // per-item PIDL work, or assumption about the hidden native row order.
+    const HRESULT hr=folderView ? folderView->Select(SFVS_SELECT_ALLITEMS) :
+        commands->Exec(nullptr,OLECMDID_SELECTALL,OLECMDEXECOPT_DODEFAULT,nullptr,nullptr);
+    if (auto* live=State(owner); live && live->lifetimeToken==lifetime && live->token==token && live->nativeHwnd==native) {
+        PostMessageW(owner,kMsgAdoptNativeSelectAll,reinterpret_cast<WPARAM>(native),static_cast<LPARAM>(token));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] checkbox Select All hr=0x%08X",static_cast<unsigned>(hr));
+    }
+}
+
 void InvertKeyboardSelection(ViewState& state) {
     const auto beforeSelection = CaptureVisibleSelection(state);
     StopKeyboardSelectionAnimation(state);
@@ -19541,6 +20385,8 @@ struct NativeFileCommandScope {
 HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
                                  const ViewState::DeferredSelectionKey& key) {
     if (!native) return E_NOINTERFACE;
+    if (key.newTab && !g_middleClickNewTab.load(std::memory_order_relaxed))
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     PipelineScope pipeline(state.background,L"file.selection.key",key.key,state.token);
     NativeFileCommandScope commandScope(&state);
     const HWND owner=state.hwnd, frame=state.frameHwnd, target=state.nativeHwnd;
@@ -19549,6 +20395,51 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
     HWND window=nullptr;
     if (FAILED(native->GetWindow(&window)) || window!=target)
         return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    if (key.newTab) {
+        auto* live=State(owner);
+        if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken || live->nativeHwnd!=target ||
+            !live->visible || live->optimisticStartedAt || !TabOwnsActiveView(*live) ||
+            g_unloading.load(std::memory_order_acquire)) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        const auto selection=live->selectedFlags;
+        const HWND tab=live->activeTabHost;
+        const auto browser=live->shellBrowser;
+        const auto folderView=live->folderView;
+        HWND browserWindow=nullptr;
+        if (tab==frame || !IsWindow(tab) || GetAncestor(tab,GA_ROOT)!=frame ||
+            !browser || FAILED(browser->GetWindow(&browserWindow)) || browserWindow!=tab)
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        // Reuse the native selection prepared by the tab's existing PIDL lane,
+        // including provider folders. No context-menu extensions are loaded.
+        ComPtr<IShellItemArray> items;
+        ComPtr<IShellItem> item;
+        DWORD count=0;
+        HRESULT hr=folderView ? folderView->GetSelection(FALSE,&items) : E_NOINTERFACE;
+        if (FAILED(hr) || !items || FAILED(hr=items->GetCount(&count))) return FAILED(hr) ? hr : E_FAIL;
+        if (count!=1) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        if (FAILED(hr=items->GetItemAt(0,&item))) return hr;
+        PIDLIST_ABSOLUTE raw=nullptr;
+        if (FAILED(hr=SHGetIDListFromObject(item.Get(),&raw))) return hr;
+        OwnedPidl identity(raw);
+        live=State(owner);
+        if (!identity || !live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
+            live->nativeHwnd!=target || live->activeTabHost!=tab || live->shellBrowser.Get()!=browser.Get() ||
+            live->folderView.Get()!=folderView.Get() || !live->selectedFlags.SharesStorage(selection) ||
+            !live->visible || live->optimisticStartedAt || !TabOwnsActiveView(*live) ||
+            !g_middleClickNewTab.load(std::memory_order_relaxed) || g_unloading.load(std::memory_order_acquire))
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        // Tracing native Open in new tab shows BrowseObject(0x411), followed
+        // asynchronously by AddTab/AddTabAtIndex on the owning frame. Match
+        // that request on its real tab browser; Explorer queues tab creation.
+        // The 0x400 disposition is also used by Explorer Column View:
+        // https://github.com/ramensoftware/windhawk-mods/blob/main/mods/explorer-column-view.wh.cpp
+        constexpr UINT kNativeNewTabBrowse=0x00000400;
+        constexpr UINT flags=SBSP_ABSOLUTE | SBSP_SAMEBROWSER | SBSP_OPENMODE | kNativeNewTabBrowse;
+        PipelineScope invocation(live->background,L"folder.newTab.browse",viewToken,0);
+        hr=browser->BrowseObject(identity.get(),flags);
+        Wh_Log(L"[GPU gestures] folder new-tab browse hwnd=%p tab=%p flags=0x%08X hr=0x%08X",
+            owner,tab,flags,static_cast<unsigned>(hr));
+        return hr;
+    }
     ComPtr<IContextMenu> command;
     HRESULT resolved;
     {
@@ -19880,10 +20771,39 @@ RECT RenameViewport(ViewState& state, bool frameCoordinates = true) {
     return viewport;
 }
 
+ItemGeometry RenameItemGeometry(ViewState& state, int index) {
+    return LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
+        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+}
+
 RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true) {
     const int dpi = ViewDpi(state);
-    const auto geometry = LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
-        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+    const auto geometry = RenameItemGeometry(state, index);
+    if (geometry.wrapped) {
+        // Enclose the label and its filename-only selection padding. Insetting
+        // this band exposed the old selection above the frame-child EDIT.
+        const RECT viewport = RenameViewport(state, false);
+        RECT client{}; ViewClientRect(state, &client);
+        const auto& text = geometry.text;
+        const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? client.right - text.right : text.left));
+        const LONG top = static_cast<LONG>(std::lround(text.top));
+        const LONG padding = ViewOptionEnabled(state, g_filenameOnly) ?
+            static_cast<LONG>(std::ceil(FilenameSelectionPadding(state))) : 0;
+        const LONG borderX = std::max<LONG>(padding, GetSystemMetricsForDpi(SM_CXBORDER, dpi));
+        const LONG borderY = std::max<LONG>(padding, GetSystemMetricsForDpi(SM_CYBORDER, dpi));
+        RECT rc{left - borderX, top - borderY,
+            left + static_cast<LONG>(std::ceil(text.right - text.left)) + borderX,
+            top + static_cast<LONG>(std::ceil(text.bottom - text.top)) + borderY};
+        rc.left = std::max(rc.left, static_cast<LONG>(std::floor(state.rtlLayout ? client.right - geometry.cell.right : geometry.cell.left)));
+        rc.right = std::min(rc.right, static_cast<LONG>(std::ceil(state.rtlLayout ? client.right - geometry.cell.left : geometry.cell.right)));
+        rc.top = std::max(rc.top, static_cast<LONG>(std::floor(geometry.cell.top)));
+        rc.bottom = std::min(rc.bottom, static_cast<LONG>(std::ceil(geometry.cell.bottom)));
+        rc.right = rc.left + std::max(1L, std::min(rc.right - rc.left, viewport.right - viewport.left));
+        rc.bottom = rc.top + std::max(1L, std::min(rc.bottom - rc.top, viewport.bottom - viewport.top));
+        if (frameCoordinates)
+            MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&rc), 2);
+        return rc;
+    }
     const float nameStart = geometry.text.left;
     // Use the whole Name column even when its current origin is offscreen.
     // Measuring against the clipped draw extent could collapse the EDIT to 1px.
@@ -19910,7 +20830,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
         }
     }
     const int limit = std::max(1, static_cast<int>(maxWidth));
-    const int width = geometry.wrapped ? limit : std::clamp(static_cast<int>(std::ceil(measured)) + Scale96(28, dpi),
+    const int width = std::clamp(static_cast<int>(std::ceil(measured)) + Scale96(28, dpi),
         std::min(Scale96(85, dpi), limit), limit);
     RECT client{}; ViewClientRect(state, &client);
     const int x = state.rtlLayout ?
@@ -20047,18 +20967,28 @@ int RenameLineHeight(HWND editor) {
     return height;
 }
 
-void CenterWrappedRenameText(HWND editor) {
+void AlignWrappedRenameText(ViewState& state) {
+    const HWND editor = state.rename.editor;
     if (!(GetWindowLongPtrW(editor, GWL_STYLE) & ES_MULTILINE)) return;
-    RECT client{}, format{};
+    RECT client{}, format{}, overlay{};
     GetClientRect(editor, &client);
     SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
-    const int line = RenameLineHeight(editor);
-    const int lines = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
-    const LONG top = std::max(0L, (client.bottom - line * lines) / 2);
-    if (format.top == top) return;
-    format.top = top;
-    format.bottom = client.bottom;
-    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&format));
+    ViewClientRect(state, &overlay);
+    const auto text = RenameItemGeometry(state, state.rename.index).text;
+    // Match Text()'s physical origin and wrapping width, independent of the
+    // selection's padding or a mirrored Explorer frame. Grid labels start at
+    // the top of this band; centering vertically made short names jump down.
+    const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? overlay.right - text.right : text.left));
+    RECT aligned{left, static_cast<LONG>(std::lround(text.top)),
+        left + static_cast<LONG>(std::lround(text.right - text.left)),
+        static_cast<LONG>(std::lround(text.bottom))};
+    MapWindowPoints(state.hwnd, editor, reinterpret_cast<POINT*>(&aligned), 2);
+    aligned.left = std::clamp(aligned.left, 0L, std::max(0L, client.right - 1));
+    aligned.right = std::clamp(aligned.right, aligned.left + 1, std::max(aligned.left + 1, client.right));
+    aligned.top = std::clamp(aligned.top, 0L, std::max(0L, client.bottom - 1));
+    aligned.bottom = client.bottom;
+    if (EqualRect(&format, &aligned)) return;
+    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
     InvalidateRect(editor, nullptr, FALSE);
 }
 
@@ -20149,7 +21079,7 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) CenterWrappedRenameText(hwnd);
+    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) AlignWrappedRenameText(*state);
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
@@ -20194,9 +21124,10 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     const std::wstring name = state.entries[static_cast<size_t>(index)].name;
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
+    const bool wrapped = RenameItemGeometry(state, index).wrapped;
     const DWORD style = WS_CHILD | WS_CLIPSIBLINGS |
-        (state.gridView && state.cachedNativeMode != FVM_SMALLICON ? ES_MULTILINE | ES_AUTOVSCROLL : ES_AUTOHSCROLL) |
-        (state.rtlLayout ? ES_RIGHT : ES_LEFT);
+        (wrapped ? ES_MULTILINE | ES_AUTOVSCROLL | ES_CENTER :
+            ES_AUTOHSCROLL | (state.rtlLayout ? ES_RIGHT : ES_LEFT));
     HWND edit = CreateWindowExW(state.rtlLayout ? WS_EX_RTLREADING : 0,
         L"EDIT", name.c_str(), style, rc.left, rc.top,
         rc.right - rc.left, rc.bottom - rc.top, state.frameHwnd, nullptr,
@@ -20437,15 +21368,18 @@ void RepositionRenameEdit(ViewState& state) {
     OffsetRect(&local, std::clamp(local.left, overlayArea.left, std::max(overlayArea.left, overlayArea.right-width)) - local.left,
         std::clamp(local.top, overlayArea.top, std::max(overlayArea.top, overlayArea.bottom-height)) - local.top);
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
-    CenterWrappedRenameText(state.rename.editor);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
     if (EqualRect(&local, &state.rename.frameRect) && IsWindowVisible(state.rename.editor) &&
-        GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) return;
+        GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) {
+        AlignWrappedRenameText(state);
+        return;
+    }
     if (SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
         local.right - local.left, local.bottom - local.top,
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS | SWP_FRAMECHANGED))
         state.rename.frameRect = local;
+    AlignWrappedRenameText(state);
 }
 
 void FinishRename(ViewState& state, bool commit) {
@@ -20611,18 +21545,24 @@ void BeginOptimisticNavigation(ViewState& state, const std::wstring& path,
 void MaybeDisplayImmediateBack(HWND overlay, const wchar_t* reason);
 void RollbackOptimisticNavigation(HWND overlay, const std::wstring& destination);
 
-void Open(ViewState& state, int index) {
+void Open(ViewState& state, int index, bool newTab = false) {
     if (index < 0 || index >= state.total || state.optimisticStartedAt ||
         (state.thisPcGpu && !ShellRowsInteractive(state) &&
          !state.entries[static_cast<size_t>(index)].shellIdentity)) return;
+    if (newTab && (!g_middleClickNewTab.load(std::memory_order_relaxed) ||
+        !state.entries[static_cast<size_t>(index)].folder || IsRecycleBinLocation(state.folderPath) ||
+        !state.loaded || !ShellRowsInteractive(state) || !state.visible || !TabOwnsActiveView(state))) return;
+    const HWND ownerBeforeSelection = state.hwnd;
+    const auto lifetimeBeforeSelection = state.lifetimeToken, epochBeforeSelection = state.mouseFolderEpoch;
+    const std::wstring tabItem = newTab ? state.entries[static_cast<size_t>(index)].path : std::wstring{};
     // The first click already synchronized Explorer's PIDL selection. Avoid
     // doing those Shell COM calls a second time on double-click navigation.
-    if (state.selected != index ||
+    if (newTab || state.selected != index ||
         index >= static_cast<int>(state.selectedFlags.size()) ||
         !state.selectedFlags[static_cast<size_t>(index)]) {
         // Single-click selection has its own native synchronization; for a
         // double-click on a *folder*, don't pay for that COM round-trip first.
-        if (state.entries[static_cast<size_t>(index)].folder && !state.namespaceIdentities) {
+        if (!newTab && state.entries[static_cast<size_t>(index)].folder && !state.namespaceIdentities) {
             state.selectedFlags.assign(state.entries.size(), 0);
             state.selectedFlags[static_cast<size_t>(index)] = 1;
             state.selected = state.anchor = index;
@@ -20630,6 +21570,9 @@ void Open(ViewState& state, int index) {
             Redraw(state);
         } else Select(state, index);
     }
+    if (newTab && (State(ownerBeforeSelection)!=&state || state.lifetimeToken!=lifetimeBeforeSelection ||
+        state.mouseFolderEpoch!=epochBeforeSelection || size_t(index)>=state.entries.size() ||
+        state.entries[size_t(index)].path!=tabItem || !state.visible || !TabOwnsActiveView(state))) return;
     const std::wstring path = state.entries[static_cast<size_t>(index)].path;
     const bool folder = state.entries[static_cast<size_t>(index)].folder;
     if (IsRecycleBinLocation(state.folderPath)) {
@@ -20645,7 +21588,7 @@ void Open(ViewState& state, int index) {
         ShellExecuteExW(&invoke);
         return;
     }
-    if (state.thisPcGpu) {
+    if (state.thisPcGpu && !newTab) {
         if (!state.shellBrowser || !state.entries[static_cast<size_t>(index)].shellIdentity) return;
         const auto identity = state.entries[static_cast<size_t>(index)].shellIdentity;
         ResetMouseClickSequence(state);
@@ -20654,13 +21597,13 @@ void Open(ViewState& state, int index) {
         if (FAILED(hr)) ClearNavigationProbe(state);
         return;
     }
-    if (!folder || state.namespaceIdentities) {
+    if (!folder || state.namespaceIdentities || newTab) {
         // A provider row's FOLDER flag does not imply a disk directory:
         // streams can also be containers and may require materialization.
         // Let the live native view choose its own default action and site.
         // Reuse native selection verification and its asynchronous PIDL lane.
         // No path-based forced verb, wrong working directory, or per-file loop.
-        ViewState::DeferredSelectionKey key{VK_RETURN,0};
+        ViewState::DeferredSelectionKey key{VK_RETURN,0,newTab};
         if (state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(key); return; }
         if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) return;
         if (!SyncNativeSelection(state)) {
@@ -20675,7 +21618,8 @@ void Open(ViewState& state, int index) {
         auto* live=State(owner);
         if (!live || live->token!=token || live->lifetimeToken!=lifetime) return;
         const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
-        if (FAILED(hr)) Wh_Log(L"[GPU selection] default command failed hr=0x%08X",static_cast<unsigned>(hr));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] %s command failed hr=0x%08X",
+            newTab ? L"new-tab" : L"default",static_cast<unsigned>(hr));
         return;
     }
 
@@ -21034,6 +21978,8 @@ bool MatchesTypeSearchPrefix(const std::wstring& name,
 }
 
 void TypeToSelect(ViewState& state, wchar_t ch) {
+    if (ch == L'\b' || (ch >= L' ' && ch != 0x7F))
+        SuppressPointerHoverForKeyboard(state);
     const ULONGLONG now = GetTickCount64();
     if (now - state.lastTyped > kTypeSearchTimeoutMs)
         state.typeSearch.clear();
@@ -21127,7 +22073,7 @@ void UpdateDirectory(ViewState& state) {
     }
 }
 
-void ScanShellWindow(HWND explorerFrame);
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr);
 
 ViewState* State(HWND hwnd) {
     // A process-wide foreground/WinEvent can name another Explorer UI thread.
@@ -21425,6 +22371,10 @@ void SetActive(HWND hwnd, bool on) {
         StopKeyboardSelectionAnimation(*s);
     }
     s->visible = on;
+    // Native headers/menus may change sorting while the overlay is disabled.
+    // Import the authoritative descriptor before showing the GPU view again,
+    // including the opt-out mode after a native user sort choice.
+    if (on) RefreshSortFromExplorer(*s, true, true, true);
     if (on) QueueFeatureInitialization(*s);
     if (on && (previousLocation != s->folderPath ||
         s->autoRefitConfiguredEnabled !=
@@ -21693,7 +22643,7 @@ void ClearSwipeFeedback(ViewState& state) {
 
 // Validate that this view still belongs to the active Explorer tab. Do not
 // issue a history command to an inactive tab or merely the closest frame.
-void NavigateCurrentShellTab(ViewState& state, bool backward) {
+void NavigateCurrentShellTab(ViewState& state, UINT navigation) {
     // Never carry an editor into another directory, even if the next Shell
     // view takes time to bind. Cancellation is not a rename commit.
     CancelRename(state);
@@ -21720,7 +22670,7 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
     // Prepare the same known cached return as native Back input BEFORE the
     // Shell call. BrowseObject can announce/rebind the destination reentrantly,
     // at which point the departing path and its Back hint are already gone.
-    if (backward) MaybeDisplayImmediateBack(overlay, L"swipe Back");
+    if (navigation == SBSP_NAVIGATEBACK) MaybeDisplayImmediateBack(overlay, L"Back");
     live = current();
     if (!live) return;
     const auto previewToken = live->token;
@@ -21728,13 +22678,12 @@ void NavigateCurrentShellTab(ViewState& state, bool backward) {
     // Start bounded Shell rebind checks before BrowseObject can replace
     // SHELLDLL_DefView; the frame-owned GPU window remains on top throughout.
     ScheduleNavigationProbe(*live);
-    const HRESULT hr = browser->BrowseObject(nullptr,
-        backward ? SBSP_NAVIGATEBACK : SBSP_NAVIGATEFORWARD);
+    const HRESULT hr = browser->BrowseObject(nullptr, navigation);
     if (FAILED(hr)) {
         live = current();
         if (live && live->token == previewToken && !preview.empty())
             RollbackOptimisticNavigation(overlay, preview);
-        Wh_Log(L"[GPU overlay] swipe history navigation failed hr=0x%08X",
+        Wh_Log(L"[GPU overlay] folder navigation failed hr=0x%08X",
                static_cast<unsigned>(hr));
     }
 }
@@ -21924,6 +22873,38 @@ int RowFromPoint(ViewState& state, int y, int x) {
     const RECT viewport = ContentViewport(state, true);
     if (y < viewport.top || y >= viewport.bottom) return -1;
     return RowAtDocument(state, y - state.headerPx + state.scrollNow, LogicalX(state, x) - ListStartX(state));
+}
+
+// Use the shared viewport and hit testing in every layout, including mirrored
+// margins. Headers, group headings and scrollbars are controls, not empty space.
+bool EmptySpaceAt(ViewState& state, POINT point) {
+    RECT client{};
+    GetClientRect(state.hwnd, &client);
+    const RECT viewport = ContentViewport(state, true);
+    return PtInRect(&client, point) && point.y >= viewport.top && point.y < viewport.bottom &&
+        !OnScrollbar(state,point.x,point.y) && !OnHorizontalBar(state,point.x,point.y) &&
+        GroupHeaderAtPoint(state,point.x,point.y) < 0 &&
+        (!InsideListX(state,point.x) || RowFromPoint(state,point.y,point.x) < 0);
+}
+
+// -2 = Name header, -1 = background, otherwise the authoritative item row.
+// Test logical bounds, so grid corner placement and hit targets mirror together.
+int SelectionCheckboxAt(ViewState& state, POINT point) {
+    if (!state.clickPolicy.checkSelect || !InsideListX(state,point.x) ||
+        OnScrollbar(state,point.x,point.y) || OnHorizontalBar(state,point.x,point.y)) return -1;
+    const float x=static_cast<float>(LogicalX(state,point.x));
+    const auto contains=[&](const D2D1_RECT_F& box) {
+        const float end=ColumnsPresented(state) && !state.gridView ? NameContentEnd(state) : ListEndX(state);
+        return x>=box.left && x< std::min(box.right,end) && point.y>=box.top && point.y<box.bottom;
+    };
+    if (point.y<ColumnHeaderHeight(state))
+        return state.columnsView && state.total>0 && DividerAt(state,point.x,point.y)<0 &&
+            contains(HeaderSelectionCheckbox(state)) ? -2 : -1;
+    const int row=RowFromPoint(state,point.y,point.x);
+    if (row<0) return -1;
+    const auto visual=LayoutRowVisual(state,row,1.f);
+    const auto item=LayoutItem(state,visual);
+    return contains(SelectionCheckboxHitRect(state,item,visual)) ? row : -1;
 }
 
 // A Shell drag that originated in this overlay must not be handed back to
@@ -22505,10 +23486,32 @@ void StartNativeShellDrag(ViewState& state, int row) {
             (unsigned long long)(GetTickCount64() - started));
 }
 
+void SuppressPointerHoverForKeyboard(ViewState& state) {
+    state.pointerHoverSuppressed = true;
+    POINT cursor{};
+    state.keyboardPointerPosition = GetCursorPos(&cursor) ?
+        std::optional<POINT>(cursor) : std::nullopt;
+    TRACKMOUSEEVENT cancel{sizeof(cancel),TME_CANCEL|TME_LEAVE|TME_HOVER,state.hwnd,0};
+    TrackMouseEvent(&cancel);
+    state.mouseTracking = false;
+    ClearPointerHover(state);
+}
+
+bool PointerHoverSuppressed(ViewState& state) {
+    if (!state.pointerHoverSuppressed) return false;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return true;
+    if (!state.keyboardPointerPosition) state.keyboardPointerPosition = cursor;
+    const POINT previous = *state.keyboardPointerPosition;
+    if (cursor.x == previous.x && cursor.y == previous.y) return true;
+    state.pointerHoverSuppressed = false;
+    return false;
+}
+
 // All pointer-based hover states are derived from the same hit tests, for
 // mouse motion and for stationary-pointer touchpad/animated scrolling alike.
 void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
-    if (state.pointingDevice == PointingDevice::Touch) return;
+    if (state.pointingDevice == PointingDevice::Touch || PointerHoverSuppressed(state)) return;
     RECT client{};
     ViewClientRect(state, &client);
     const bool inside = PtInRect(&client, pos) != FALSE;
@@ -22559,7 +23562,15 @@ void ReleasePointerCapture(ViewState& state, POINT pos) {
     ReleaseCapture();
 }
 
-// Scrolling and fresh keyboard entry can put new content under a stationary
+void ReleaseOrphanedMouseCapture(ViewState& state, bool deliveredButtonDown) {
+    if (deliveredButtonDown || state.touch.active || state.touch.replaying ||
+        state.shellDragRunning || GetCapture()!=state.hwnd) return;
+    const bool held=((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+        GetAsyncKeyState(VK_MBUTTON) | GetAsyncKeyState(VK_XBUTTON1) | GetAsyncKeyState(VK_XBUTTON2)) & 0x8000)!=0;
+    if (!held) ReleaseCapture();
+}
+
+// Scrolling and folder navigation can put new content under a stationary
 // pointer without WM_MOUSEMOVE. Reconcile only on demand, never on an idle
 // timer. Ignore other foreground windows and active drag operations.
 void RefreshHoverUnderCursor(ViewState& state) {
@@ -22905,6 +23916,7 @@ UINT g_bootstrapAttachMessage = 0;
 HANDLE g_bootstrapStopEvent = nullptr;
 HANDLE g_bootstrapThread = nullptr;
 struct BootstrapPendingFrame {
+    HWND frame = nullptr;
     HWND eventSource = nullptr;
     ULONGLONG started = 0;
     unsigned attempt = 0;
@@ -22927,17 +23939,21 @@ struct BootstrapObserverState {
 thread_local BootstrapObserverState* t_bootstrapPending = nullptr;
 
 void CheckOverlaySize(HWND frame);
-void HandleColdAttach(HWND frame) {
+HWND OverlayForTab(HWND tabHost);
+void HandleColdAttach(HWND frame, HWND requestedTab = nullptr) {
+    const HWND key=requestedTab ? requestedTab : frame;
+    const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
     if (!g_unloading.load(std::memory_order_acquire) && IsExplorerFrame(frame) &&
         BelongsToThisProcess(frame) &&
-        GetWindowThreadProcessId(frame, nullptr) == GetCurrentThreadId() && !IsIconic(frame) && !OverlayUnder(frame)) {
+        GetWindowThreadProcessId(frame, nullptr) == GetCurrentThreadId() && !IsIconic(frame) &&
+        IsWindow(target) && (target==frame || GetAncestor(target,GA_ROOT)==frame) && !OverlayForTab(target)) {
         if (g_perf.load(std::memory_order_relaxed))
-            Wh_Log(L"[GPU startup] COLD_WAKE frame=%p iconic=%d thread=%lu",
-                frame, IsIconic(frame), GetCurrentThreadId());
-        ScanShellWindow(frame);
-        CheckOverlaySize(frame);
+            Wh_Log(L"[GPU startup] COLD_WAKE frame=%p tab=%p background=%d thread=%lu",
+                frame,target,target!=ActiveExplorerTab(frame),GetCurrentThreadId());
+        ScanShellWindow(frame,requestedTab ? target : nullptr);
+        if(target==ActiveExplorerTab(frame)) CheckOverlaySize(frame);
     }
-    RemovePropW(frame, kBootstrapQueuedProperty);
+    RemovePropW(key, kBootstrapQueuedProperty);
 }
 
 // Explorer may consume a registered message before DispatchMessageW. Claim
@@ -22949,27 +23965,32 @@ LRESULT CALLBACK ColdAttachGetMessageHook(int code, WPARAM removal, LPARAM data)
         if (g_bootstrapAttachMessage && msg.message == g_bootstrapAttachMessage &&
             IsExplorerFrame(msg.hwnd) && BelongsToThisProcess(msg.hwnd)) {
             const HWND frame = msg.hwnd;
+            const HWND target=reinterpret_cast<HWND>(msg.wParam);
             msg.message = WM_NULL;
             msg.wParam = msg.lParam = 0;
-            HandleColdAttach(frame);
+            HandleColdAttach(frame,target);
         }
     }
     return CallNextHookEx(nullptr, code, removal, data);
 }
 
-void PostColdAttach(HWND frame) {
+void PostColdAttach(HWND frame, HWND requestedTab = nullptr) {
     // The observer is the only writer setting this property; the owner STA
     // clears it after handling the queued scan, including failure paths.
-    if (GetPropW(frame, kBootstrapQueuedProperty)) return;
-    if (!SetPropW(frame, kBootstrapQueuedProperty, reinterpret_cast<HANDLE>(1))) return;
-    if (!PostMessageW(frame, g_bootstrapAttachMessage, 0, 0))
-        RemovePropW(frame, kBootstrapQueuedProperty);
+    const HWND key=requestedTab ? requestedTab : frame;
+    if (GetPropW(key, kBootstrapQueuedProperty)) return;
+    if (!SetPropW(key, kBootstrapQueuedProperty, reinterpret_cast<HANDLE>(1))) return;
+    if (!PostMessageW(frame, g_bootstrapAttachMessage, reinterpret_cast<WPARAM>(requestedTab), 0))
+        RemovePropW(key, kBootstrapQueuedProperty);
 }
 
-bool QueueColdAttach(HWND frame, HWND source) {
+bool QueueColdAttach(HWND frame, HWND source, HWND requestedTab = nullptr) {
+    const HWND key=requestedTab ? requestedTab : frame;
+    const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
     if (!t_bootstrapPending || !g_bootstrapAttachMessage ||
         !IsExplorerFrame(frame) || !BelongsToThisProcess(frame) ||
-        WatchRegisteredOverlay(ActiveExplorerTab(frame))) return false;
+        !IsWindow(target) || (target!=frame && GetAncestor(target,GA_ROOT)!=frame) ||
+        WatchRegisteredOverlay(target)) return false;
     const DWORD thread = GetWindowThreadProcessId(frame, nullptr);
     auto& threads = t_bootstrapPending->threads;
     auto foundThread = threads.find(thread);
@@ -22993,15 +24014,15 @@ bool QueueColdAttach(HWND frame, HWND source) {
         threads.emplace(thread, std::move(subscription));
     }
     auto& pending = t_bootstrapPending->pending;
-    RemovePropW(frame,kColdAttachResolvedProperty);
-    const auto found = pending.find(frame);
+    RemovePropW(key,kColdAttachResolvedProperty);
+    const auto found = pending.find(key);
     // Multiple CREATE/SHOW notifications are normal during one layout.
     // Don't rearm a retry chain for the same view, and don't force extra
     // work on another frame's already-present GPU surface.
     if (found != pending.end() &&
         (found->second.eventSource == source ||
          (GetTickCount64() == found->second.started))) return true;
-    pending[frame] = {source, GetTickCount64(), 0};
+    pending[key] = {frame, source, GetTickCount64(), 0};
     return true;
 }
 
@@ -23033,6 +24054,13 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
             _wcsicmp(parentClass, L"SHELLDLL_DefView") != 0) return;
     }
     const HWND frame = frameEvent ? changed : GetAncestor(changed, GA_ROOT);
+    // New Shell tabs need their own startup request even while another tab
+    // already has a renderer. CREATE is sufficient; retries retain this tab's
+    // identity until its browser/view is ready, without waiting for input.
+    if (tabEvent) {
+        if(QueueColdAttach(frame,changed,changed)) PostColdAttach(frame,changed);
+        return;
+    }
     if (HWND overlay = WatchRegisteredOverlay(ActiveExplorerTab(frame))) {
         if (viewEvent || contentEvent)
             PostMessageW(overlay, kMsgNativeRowsHint, 0, reinterpret_cast<LPARAM>(changed));
@@ -23043,7 +24071,12 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
 }
 
 BOOL CALLBACK BootstrapExistingFrame(HWND frame, LPARAM) {
-    if (IsWindowVisible(frame)) QueueColdAttach(frame, frame);
+    if (IsWindowVisible(frame)) {
+        const HWND first=FindWindowExW(frame,nullptr,L"ShellTabWindowClass",nullptr);
+        if(!first) QueueColdAttach(frame,frame);
+        for(HWND tab=first;tab;tab=FindWindowExW(frame,tab,L"ShellTabWindowClass",nullptr))
+            QueueColdAttach(frame,tab,tab);
+    }
     return TRUE;
 }
 
@@ -23070,11 +24103,12 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
         const ULONGLONG now = GetTickCount64();
         DWORD waitMs = INFINITE;
         for (auto it = pending.begin(); it != pending.end();) {
-            const HWND frame = it->first;
+            const HWND key = it->first;
             auto& task = it->second;
-            if (!IsWindow(frame) || !IsWindowVisible(frame) ||
-                WatchRegisteredOverlay(ActiveExplorerTab(frame)) ||
-                GetPropW(frame,kColdAttachResolvedProperty)) {
+            const HWND frame=task.frame;
+            const HWND target=key==frame ? ActiveExplorerTab(frame) : key;
+            if (!IsWindow(key) || !IsWindow(frame) || !IsWindowVisible(frame) ||
+                WatchRegisteredOverlay(target) || GetPropW(key,kColdAttachResolvedProperty)) {
                 it = pending.erase(it);
                 continue;
             }
@@ -23082,7 +24116,7 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
             if (now >= due) {
                 // The native Shell view can still be initializing. Explorer's
                 // own STA receives and performs every Shell discovery scan.
-                PostColdAttach(frame);
+                PostColdAttach(frame,key==frame ? nullptr : key);
                 task.nextAttemptAt=now+retryIntervals[std::min<size_t>(task.attempt,ARRAYSIZE(retryIntervals)-1)];
                 task.attempt=std::min<unsigned>(task.attempt+1,ARRAYSIZE(retryIntervals)-1);
             }
@@ -23105,7 +24139,12 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
     }
     t_bootstrapPending = nullptr;
     EnumWindows(+[](HWND frame,LPARAM)->BOOL {
-        if (BelongsToThisProcess(frame)) RemovePropW(frame,kColdAttachResolvedProperty);
+        if (BelongsToThisProcess(frame)) {
+            RemovePropW(frame,kColdAttachResolvedProperty);
+            EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
+                RemovePropW(child,kColdAttachResolvedProperty); return TRUE;
+            },0);
+        }
         return TRUE;
     },0);
     if (hook) UnhookWinEvent(hook);
@@ -23140,8 +24179,12 @@ void StopColdAttachObserver() {
         g_bootstrapStopEvent = nullptr;
     }
     EnumWindows([](HWND frame, LPARAM) -> BOOL {
-        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame))
+        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
             RemovePropW(frame, kBootstrapQueuedProperty);
+            EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
+                RemovePropW(child,kBootstrapQueuedProperty); return TRUE;
+            },0);
+        }
         return TRUE;
     }, 0);
 }
@@ -23672,7 +24715,7 @@ void InitializeOverlayFeatures(ViewState& state) {
             ComPtr<IDispatch> browser = std::move(state.pendingAutomation);
             BindShellAutomation(state, browser.Get());
         } else AttachShellSelectionEvents(state, nullptr);
-        ReconcileShellGrouping(state, true);
+        RefreshSortFromExplorer(state, true, true);
         RefreshExplorerColumns(state);
         RefreshViewToggleForFrame(state.frameHwnd);
         break;
@@ -24030,6 +25073,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
 #define APPLY_PRESENTATION(name) state.name=model.name;
     PRESENTATION_MODEL_FIELDS(APPLY_PRESENTATION)
 #undef APPLY_PRESENTATION
+    AssessHeaderCheckboxSelection(state);
     state.presentationOnly=true; state.presentationSequence=model.sequence;
     state.presentationRowRevision=model.rowSceneRevision; state.presentationColumnOrigin=model.columnIntentOrigin;
     state.presentationClient=model.client; state.presentationDpi=model.dpi; state.presentationFont=model.font;
@@ -24171,6 +25215,10 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->foregroundFrames=state.swipeCompositionSerial;
     receipt->contentPending=NeedsAnimationPaint(state,true,false) ||
         (state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive);
+    receipt->checkboxSelection=state.checkboxSelection;
+    receipt->checkboxSelectedCount=state.checkboxSelectedCount;
+    receipt->checkboxTotal=state.checkboxSummaryTotal;
+    receipt->checkboxState=state.checkboxSummaryState;
     for(size_t i=0;i<state.swipeComposition.size();++i) {
         receipt->foregroundVisuals[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].visual.Get());
         receipt->foregroundFades[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].fade.Get());
@@ -24499,10 +25547,24 @@ void ConsumePresentation(ViewState& state) {
         return;
     }
     if(receipt->token!=state.token || receipt->directoryToken!=state.directoryToken) return;
+    if (!receipt->failed && receipt->checkboxTotal==state.total && receipt->checkboxSelection.SharesStorage(state.selectedFlags)) {
+        state.checkboxSelection=receipt->checkboxSelection;
+        state.checkboxSelectedCount=receipt->checkboxSelectedCount;
+        state.checkboxSummaryTotal=receipt->checkboxTotal;
+        state.checkboxSummaryState=receipt->checkboxState;
+        const HWND owner=state.hwnd;
+        const auto lifetime=state.lifetimeToken, token=state.token;
+        CompleteHeaderCheckboxAction(state);
+        auto* live=State(owner);
+        if (live!=&state || live->lifetimeToken!=lifetime || live->token!=token) return;
+    }
     if(receipt->failed) {
+        const bool preparing=state.preparingTab;
+        state.preparingTab=false;
+        state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();
         state.graphicsFailure=receipt->failure; state.graphicsFailureStage=receipt->failureStage;
         state.graphicsReady=false; state.graphicsSuspended=true;
-        if(!InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
+        if(preparing || !InactiveGraphics(state)) {RestoreNativeContent(state); SetPresentationVisibility(state.hwnd,false);}
         return;
     }
     if(receipt->ready) {
@@ -24572,6 +25634,7 @@ void ConsumePresentation(ViewState& state) {
         // Only accepted content from the current view/directory can release
         // it. A loading frame or a departing-directory receipt cannot.
         if(!state.firstContentSubmittedAt) state.firstContentSubmittedAt=GetTickCount64();
+        state.preparingTab=false;
         if(state.deferColumnProviders) {
             state.deferColumnProviders=false; state.lastColumnsProbe=0;
             PipelineEvent(*state.background,{.operation=L"columns.providers.ready[step,dirty,rows,first]",
@@ -24614,6 +25677,83 @@ bool TouchControlAt(ViewState& state, POINT point) {
         OnScrollbar(state, point.x, point.y) || OnHorizontalBar(state, point.x, point.y);
 }
 
+void CompleteHeaderCheckboxAction(ViewState& state) {
+    if (!state.checkboxHeaderActionPending) return;
+    const bool current=state.visible && state.inScope && state.loaded && !state.namesPreview && state.clickPolicy.checkSelect &&
+        !state.optimisticStartedAt && TabOwnsActiveView(state) &&
+        state.checkboxHeaderActionToken==state.token && state.checkboxHeaderActionEpoch==state.mouseFolderEpoch &&
+        state.checkboxHeaderActionTotal==state.total && state.checkboxHeaderActionSelection.SharesStorage(state.selectedFlags);
+    const int checked=current ? HeaderSelectionCheckboxState(state) : -1;
+    if (checked==-3) return; // A paced worker receipt will complete it.
+    state.checkboxHeaderActionPending=false;
+    state.checkboxHeaderActionSelection.clear();
+    if (checked==1) ClearSelectionForFolderMenu(state);
+    else if (checked==0) SelectAllCheckboxItems(state);
+}
+
+void RequestHeaderCheckboxToggle(ViewState& state) {
+    // Two clicks on the same unassessed snapshot cancel each other. Selection
+    // changes or navigation invalidate an outstanding request by identity.
+    const bool cancel=state.checkboxHeaderActionPending && state.checkboxHeaderActionTotal==state.total &&
+        state.checkboxHeaderActionSelection.SharesStorage(state.selectedFlags);
+    state.checkboxHeaderActionPending=!cancel;
+    state.checkboxHeaderActionSelection=cancel ? SelectionFlags{} : state.selectedFlags;
+    state.checkboxHeaderActionTotal=state.total;
+    state.checkboxHeaderActionToken=state.token;
+    state.checkboxHeaderActionEpoch=state.mouseFolderEpoch;
+    Redraw(state);
+    CompleteHeaderCheckboxAction(state);
+}
+
+bool HandleSelectionCheckboxInput(ViewState& state, UINT message, POINT point) {
+    if (message==WM_KEYDOWN || message==WM_SYSKEYDOWN || message==WM_CANCELMODE) {
+        state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();
+    }
+    if (state.checkboxPress!=-1 && (message==WM_CANCELMODE || message==WM_KEYDOWN || message==WM_SYSKEYDOWN)) {
+        ResetMouseClickSequence(state);
+        if (GetCapture()==state.hwnd) ReleaseCapture();
+    }
+    if (state.checkboxPress != -1 && message==WM_MOUSEMOVE) {
+        UpdatePointerHover(state,point);
+        return true;
+    }
+    if (state.checkboxPress != -1 && message==WM_LBUTTONUP) {
+        const int pressed=state.checkboxPress;
+        const bool valid=state.visible && state.inScope && state.loaded && !state.namesPreview && TabOwnsActiveView(state) &&
+            !state.optimisticStartedAt && state.checkboxPressEpoch==state.mouseFolderEpoch &&
+            state.checkboxPressToken==state.token && SelectionCheckboxAt(state,point)==pressed &&
+            (pressed==-2 || (size_t(pressed)<state.entries.size() &&
+                state.checkboxPressItem==state.entries[size_t(pressed)].path));
+        ResetMouseClickSequence(state);
+        ReleasePointerCapture(state,point);
+        if (valid) {
+            if (pressed>=0) SelectWithModifiers(state,pressed,true,false);
+            else RequestHeaderCheckboxToggle(state);
+        }
+        return true;
+    }
+    if (message!=WM_LBUTTONDOWN && message!=WM_LBUTTONDBLCLK) return false;
+    const int hit=SelectionCheckboxAt(state,point);
+    if (hit==-1) return false;
+    if (hit>=0) {state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
+    ResetMouseClickSequence(state);
+    if (!state.loaded || state.namesPreview || state.optimisticStartedAt || !state.visible || !state.inScope || !TabOwnsActiveView(state)) return true;
+    if (state.pendingNativeSelection) CancelNativeSelectionPreparation(state);
+    if (state.rowTransitionActive) StopRowTransition(state);
+    const HWND owner=state.hwnd;
+    const auto epoch=state.mouseFolderEpoch;
+    if (state.rename.editor) FinishRename(state,true);
+    if (State(owner)!=&state || state.mouseFolderEpoch!=epoch) return true;
+    SetFocus(IsWindow(state.nativeHwnd) ? state.nativeHwnd : state.hwnd);
+    if (State(owner)!=&state || state.mouseFolderEpoch!=epoch) return true;
+    state.checkboxPress=hit;
+    state.checkboxPressEpoch=state.mouseFolderEpoch;
+    state.checkboxPressToken=state.token;
+    if (hit>=0) state.checkboxPressItem=state.entries[size_t(hit)].path;
+    SetCapture(state.hwnd);
+    return true;
+}
+
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 HRESULT ConfigureTouchRecognizer(TouchRecognizer& session) {
@@ -24648,6 +25788,19 @@ bool StartTouchRecognizer(ViewState& state) {
         INTERACTION_CONTEXT_PROPERTY_INTERACTION_UI_FEEDBACK, TRUE);
     if (SUCCEEDED(hr)) hr = RegisterOutputCallbackInteractionContext2(session->context,
         TouchRecognizer::Output, session.get());
+    // Enabling multi-finger taps on the manipulation context makes Ninput
+    // withhold small pinches/pans as candidate taps. Keep the existing context
+    // unchanged and recognize only two-contact taps alongside it. Both contexts
+    // share calibrated packets, the bounded output queue and the tab's lifetime.
+    if (SUCCEEDED(hr)) hr = CreateInteractionContext(&session->tapContext);
+    const INTERACTION_CONTEXT_CONFIGURATION taps[] = {
+        {INTERACTION_ID_TAP,INTERACTION_CONFIGURATION_FLAG_TAP | INTERACTION_CONFIGURATION_FLAG_TAP_MULTIPLE_FINGER}
+    };
+    if (SUCCEEDED(hr)) hr = SetInteractionConfigurationInteractionContext(session->tapContext,ARRAYSIZE(taps),taps);
+    if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->tapContext,INTERACTION_CONTEXT_PROPERTY_MEASUREMENT_UNITS,1);
+    if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->tapContext,INTERACTION_CONTEXT_PROPERTY_FILTER_POINTERS,FALSE);
+    if (SUCCEEDED(hr)) hr = SetPropertyInteractionContext(session->tapContext,INTERACTION_CONTEXT_PROPERTY_INTERACTION_UI_FEEDBACK,FALSE);
+    if (SUCCEEDED(hr)) hr = RegisterOutputCallbackInteractionContext2(session->tapContext,TouchRecognizer::TapOutput,session.get());
     if (FAILED(hr)) {
         Wh_Log(L"[GPU touch] recognizer initialization failed hr=0x%08X; restoring native input", unsigned(hr));
         return false;
@@ -24786,10 +25939,12 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
         StopTouch(state); return;
     }
     for (unsigned i = 0; i < count; ++i) {
-        if (State(hwnd) != expected || expected->mouseFolderEpoch != epoch ||
-            !expected->touch.active || expected->touch.epoch != epoch || expected->touch.generation != generation ||
-            !expected->visible || !TabOwnsActiveView(*expected)) return;
         const auto& event = output[i];
+        if (State(hwnd) != expected || expected->mouseFolderEpoch != epoch ||
+            expected->touch.epoch != epoch || expected->touch.generation != generation ||
+            (!expected->touch.active && !(event.interactionId==INTERACTION_ID_TAP && event.contactCount==2 &&
+                !expected->touch.down && expected->touch.gesture==TouchGesture::Pending)) ||
+            !expected->visible || !TabOwnsActiveView(*expected)) return;
         if (event.inputType != PT_TOUCH) continue;
         const bool canceled = (event.interactionFlags & INTERACTION_FLAG_CANCEL) != 0;
         const bool ended = (event.interactionFlags & INTERACTION_FLAG_END) != 0;
@@ -24800,6 +25955,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                 double(event.currentContactCount),event.interactionId == INTERACTION_ID_MANIPULATION ?
                     event.arguments.manipulation.delta.scale : 1.}});
         if (event.interactionId == INTERACTION_ID_HOLD) {
+            if (state.touch.checkbox!=-1) {KillTimer(hwnd,kTouchHoldTimerId); continue;}
             if (canceled && state.touch.scrollbarAxis >= 0) {
                 state.touch.holding = false;
                 state.touch.scrollbarMenuEligible = false;
@@ -24816,6 +25972,23 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_TAP && !canceled && TouchItemValid(state)) {
+            if (state.touch.contacts > 1) {
+                // Native recognition owns tap timing and movement tolerance.
+                // Anchor to the first finger, never the centroid between rows.
+                // Consume multi-finger taps even with the option disabled.
+                if (state.touch.contacts == 2 && !state.touch.multiTapDelivered && state.touch.gesture==TouchGesture::Pending &&
+                    g_twoFingerContextMenu.load(std::memory_order_relaxed)) {
+                    POINT origin = state.touch.start;
+                    if (MapUiPoint(nullptr,hwnd,origin) && !TouchControlAt(state,origin) &&
+                        GroupHeaderAtPoint(state,origin.x,origin.y) < 0) {
+                        state.touch.consumed = true;
+                        state.touch.multiTapDelivered = true;
+                        ReplayTouchMouse(state, WM_RBUTTONUP, origin);
+                    }
+                }
+                continue;
+            }
+            if (state.touch.checkbox!=-1 && SelectionCheckboxAt(state,point)!=state.touch.checkbox) continue;
             if (state.touch.control) {
                 if (state.touch.doubleDivider >= 0) {
                     // Ninput can finish a double tap while the second raw
@@ -24834,7 +26007,8 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             // interval as mouse clicks and the shared item hit identity, using
             // packet time rather than dispatch. Each tap's contact movement
             // tolerance remains native; don't impose a mouse-sized touch target.
-            const bool paired = !state.clickPolicy.singleClick && state.mouseClickTick && state.mouseClickEpoch == epoch &&
+            const bool paired = !state.clickPolicy.singleClick && state.mouseClickSource==ClickSource::Touch &&
+                state.mouseClickTick && state.mouseClickEpoch == epoch &&
                 state.mouseClickRow == state.touch.row &&
                 DWORD(state.touch.time-DWORD(state.mouseClickTick)) <= GetDoubleClickTime();
             const UINT press = paired ? WM_LBUTTONDBLCLK : WM_LBUTTONDOWN;
@@ -24849,10 +26023,21 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_SECONDARY_TAP && !canceled && TouchItemValid(state)) {
+            // A second-contact tap can also be reported as a secondary tap.
+            // Apply the same option and one-menu rule as simultaneous taps.
+            if (state.touch.contacts > 1) {
+                if (state.touch.contacts!=2 || state.touch.multiTapDelivered || state.touch.gesture!=TouchGesture::Pending ||
+                    !g_twoFingerContextMenu.load(std::memory_order_relaxed)) continue;
+                point=state.touch.start;
+                if (!MapUiPoint(nullptr,hwnd,point) || TouchControlAt(state,point) ||
+                    GroupHeaderAtPoint(state,point.x,point.y)>=0) continue;
+            }
+            if (state.touch.contacts<=1 && state.touch.checkbox!=-1) continue;
             if ((state.touch.scrollbarAxis >= 0 || OnScrollbar(state, point.x, point.y) ||
                  OnHorizontalBar(state, point.x, point.y)) &&
                 (!state.touch.scrollbarMenuEligible || !state.touch.holding)) continue;
             state.touch.consumed = true;
+            if (state.touch.contacts==2) state.touch.multiTapDelivered = true;
             if (state.touch.control) {
                 ReplayTouchMouse(state, WM_CAPTURECHANGED, {});
                 if (State(hwnd) != expected || state.touch.generation != generation) return;
@@ -25011,7 +26196,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
 
 void ArmTouchHold(ViewState& state, const std::shared_ptr<TouchRecognizer>& session) {
     if (!state.touch.down || session->contacts.size() != 1 ||
-        state.touch.consumed || state.touch.holdDeadline) return;
+        state.touch.consumed || state.touch.holdDeadline || state.touch.checkbox!=-1) return;
     // The recognizer exposes its effective threshold after first input has
     // initialized device calibration. One deadline, no empirical polling.
     float delay = 0.f;
@@ -25166,6 +26351,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             MapUiPoint(nullptr, hwnd, point);
             SetTouchInputMode(state, true);
             ClearPointerHover(state);
+            state.touch.checkbox=SelectionCheckboxAt(state,point);
             state.touch.control = std::count_if(frame,frame+pointers,[](const auto& p) {
                 return p.pointerType == PT_TOUCH && (p.pointerFlags & POINTER_FLAG_INCONTACT) &&
                     !(p.pointerFlags & POINTER_FLAG_UP);
@@ -25262,7 +26448,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             KillTimer(hwnd,kTouchHoldTimerId);
         }
         if (state.touch.control) {
-            const HRESULT hr = ProcessPointerFramesInteractionContext(session->context, 1, pointers, frame);
+            const HRESULT hr = session->Process(pointers, frame);
             if (FAILED(hr)) { StopTouch(state); SetActive(hwnd,false); return; }
             DrainTouchOutput(state, session);
             if (State(hwnd) != expected || state.touch.generation != generation) return;
@@ -25280,7 +26466,7 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 state.touch.active = false;
             }
         } else {
-            const HRESULT hr = ProcessPointerFramesInteractionContext(session->context, 1, pointers, frame);
+            const HRESULT hr = session->Process(pointers, frame);
             if (FAILED(hr)) {
                 Wh_Log(L"[GPU touch] native packet rejected hr=0x%08X pointer=%u frame=%u",unsigned(hr),first.pointerId,first.frameId);
                 StopTouch(state); SetActive(hwnd,false); return;
@@ -25407,6 +26593,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->pointingDevice = source.deviceType == IMDT_PEN ? PointingDevice::Pen : PointingDevice::Mouse;
             }
             if (s->pointingDevice == PointingDevice::Touch || s->touch.dragPromoted) return 0;
+            if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+                msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK ||
+                msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK ||
+                msg == WM_XBUTTONDOWN || msg == WM_XBUTTONDBLCLK ||
+                msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+                s->pointerHoverSuppressed = false;
         }
     }
     // CS_DBLCLKS replaces a rapid second DOWN even when a track click has
@@ -25521,6 +26713,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
          msg == WM_CHAR || msg == WM_CONTEXTMENU)) {
         if (msg == WM_LBUTTONDOWN) {
             ResetMouseClickSequence(*s);
+            s->mousePressSource = CurrentClickSource(*s);
             s->mousePressActive = previewRow >= 0;
             s->mousePressRow = previewRow;
             s->mousePressEpoch = s->mouseFolderEpoch;
@@ -25528,6 +26721,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->mousePressActive && s->mousePressRow == previewRow &&
                 s->mousePressEpoch == s->mouseFolderEpoch && previewRow >= 0) {
                 s->mouseClickRow = previewRow;
+                s->mouseClickSource = s->mousePressSource;
                 s->mouseClickEpoch = s->mouseFolderEpoch;
                 s->mouseClickTick = GetTickCount64();
             }
@@ -25535,6 +26729,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     }
+    if (s && HandleSelectionCheckboxInput(*s,msg,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)})) return 0;
     switch (msg) {
     case kMsgRetireGraphics:
         if (s && s->lifetimeToken==static_cast<unsigned long long>(wParam)) {
@@ -25743,8 +26938,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (s->target || s->presenter) MakeTextFormats(*s);
             }
             if (changes & kStyleInput) {
+                s->checkboxHeaderActionPending=false; s->checkboxHeaderActionSelection.clear();
+                const bool checkSelect=s->clickPolicy.checkSelect;
                 s->clickPolicy = ReadShellClickPolicy();
+                if (s->checkboxPress!=-1 && GetCapture()==hwnd) ReleaseCapture();
                 ResetMouseClickSequence(*s);
+                if (checkSelect!=s->clickPolicy.checkSelect) {
+                    LayoutGroupSections(*s); ClampScroll(*s); RepositionRenameEdit(*s);
+                }
                 TRACKMOUSEEVENT cancel{sizeof(cancel),TME_CANCEL|TME_HOVER,hwnd,0};
                 TrackMouseEvent(&cancel);
             }
@@ -25767,6 +26968,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->selectedFlags.assign(s->entries.size(), 1);
                 s->selected = s->selected>=0 && s->selected<s->total ? s->selected : s->total ? 0 : -1;
                 s->anchor = s->selected;
+                RememberVerifiedSelection(*s);
                 s->keyboardCaretVisible = false;
                 StopKeyboardSelectionAnimation(*s);
                 ClearPostDeletionCaret(*s);
@@ -25801,8 +27003,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->enumerationEventMessageQueued &&
                 s->enumerationEventMessageQueued->exchange(false, std::memory_order_acq_rel) &&
                 s->visible && s->inScope && s->detailsViewActive && !s->optimisticStartedAt &&
-                !PresentationMinimized(*s) && TabOwnsActiveView(*s))
+                !PresentationMinimized(*s) && TabOwnsActiveView(*s)) {
+                RefreshSortFromExplorer(*s, false, true);
                 ForceRefresh(*s);
+            }
             if (s->folderView && s->inScope && TabOwnsActiveView(*s))
                 QueueNativeSelectionHint(*s);
         }
@@ -25841,6 +27045,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!s->pendingCreatedItemPath.empty())
                 TryStartCreatedItemRename(*s);
         }
+        return 0;
+    case kMsgNativeCatalog:
+        if (s) AdvanceNativeCatalog(*s);
         return 0;
     case kMsgPreparedSelection:
         if (s) {
@@ -25917,7 +27124,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             } else if (!GpuSelectionMatches(*s, *prepared)) {
                 CancelNativeSelectionPreparation(*s);
                 return 0;
-            } else committed=SyncNativeSelection(*s, prepared);
+            } else {
+                if (FAILED(prepared->result)) {
+                    CancelNativeSelectionPreparation(*s);
+                    RestoreVerifiedSelection(*s);
+                    return 0;
+                }
+                if (SUCCEEDED(prepared->result)) {
+                    if (!ValidatePreparedSelection(*s,prepared)) return 0;
+                    if (prepared->entries.empty()) {
+                        CancelNativeSelectionPreparation(*s);
+                        Redraw(*s);
+                        return 0;
+                    }
+                }
+                committed=SyncNativeSelection(*s, prepared);
+            }
             if (!IsWindow(hwnd) || State(hwnd) != s) return 0;
             if (s->pendingNativeSelection != prepared->generation) return 0;
             s->pendingNativeSelection = 0;
@@ -25943,8 +27165,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         live->token != viewToken || live->nativeHwnd != target ||
                         !GpuSelectionMatches(*live, *prepared)) break;
                     const HRESULT hr = InvokeNativeFileKey(*live,native.Get(),key);
-                    if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred native command failed hr=0x%08X",
-                        static_cast<unsigned>(hr));
+                    if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred %s command failed hr=0x%08X",
+                        key.newTab ? L"new-tab" : L"native",static_cast<unsigned>(hr));
                 }
                 ViewState* live = IsWindow(hwnd) ? State(hwnd) : nullptr;
                 if (menu && live && live->token == viewToken && live->nativeHwnd == target &&
@@ -25966,12 +27188,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case kMsgThisPcRows:
-        if (s && s->thisPcGpu && s->visible && TabOwnsActiveView(*s)) {
+        if (s && s->thisPcGpu && s->visible && (TabOwnsActiveView(*s) || s->preparingTab)) {
             if (s->nativeRowsNeedCapture && !s->nativeRowsPending) RequestNativeRows(*s);
             if (s->thisPcRowsDirty && !s->nativeRowsPending) {
                 if (s->loaded && s->nativeRowsComplete) QueueVisibleDataFrame(*s);
                 else RefreshThisPcRows(*s);
             }
+            if(s->preparingTab && s->presenter) SubmitPresentation(*s);
         }
         if (s) s->nativeRowsMessageQueued = false;
         return 0;
@@ -26099,6 +27322,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case kMsgTabActivated:
+        if(s) s->tabSurfaceWakeQueued=false;
         // Existing tabs have independent, already-presented surfaces. No
         // synchronous Shell COM or directory scan is permitted on activation.
         // wParam=2 is an HWND-only wake from the low-priority observer or a
@@ -26198,7 +27422,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && s->visible && !s->emptyNative &&
             static_cast<unsigned long long>(lParam) == s->mouseFolderEpoch &&
             g_touchpadSwipeNavigation.load(std::memory_order_relaxed))
-            NavigateCurrentShellTab(*s, wParam != 0);
+            NavigateCurrentShellTab(*s, wParam ? SBSP_NAVIGATEBACK : SBSP_NAVIGATEFORWARD);
         return 0;
     case kMsgTouchDrag:
         if (s && WPARAM(s->lifetimeToken) == wParam && LPARAM(s->touch.generation) == lParam &&
@@ -26358,7 +27582,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->nativeSettingsHintPending && !s->visibilitySignalQueued)
                 PostShellVisibilityProbe(*s);
             if (s->thisPcGpu) {
-                ReconcileShellGrouping(*s);
+                RefreshSortFromExplorer(*s, true);
                 if (!s->directoryPending &&
                     timerNow - s->driveCapacityRequestedAt >= kDriveSpaceRefreshMs) {
                     s->driveCapacityRequestedAt = timerNow;
@@ -26501,7 +27725,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->lastFolderNativePresentAfter=0;
                 if (!s->lastFolderNativePending.empty()) PostMessageW(hwnd,kMsgLastFolderSelection,0,0);
             }
-            if (s->initialModePending && s->visible && TabOwnsActiveView(*s)) PrepareInitialOverlay(*s);
+            if (s->initialModePending && s->visible && (TabOwnsActiveView(*s) || s->preparingTab)) PrepareInitialOverlay(*s);
             if (s->nativePresentationPending && s->visible && TabOwnsActiveView(*s)) ApplyNativePresentation(*s);
             if (s->thisPcGpu && s->nativeRowsNeedCapture && !s->nativeRowsPending &&
                 s->visible && TabOwnsActiveView(*s)) QueueNativeRows(*s, false);
@@ -26791,6 +28015,25 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         return 0;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDBLCLK:
+        if (s) {
+            if ((wParam & (MK_LBUTTON | MK_RBUTTON)) || s->mousePressActive ||
+                PointerDragActive(*s) || s->shellDragRunning) return 0;
+            ResetMouseClickSequence(*s);
+            const POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+            if (!g_middleClickNewTab.load(std::memory_order_relaxed) || !s->visible || !s->inScope ||
+                !s->detailsViewActive || !s->loaded || !ShellRowsInteractive(*s) || s->optimisticStartedAt ||
+                TouchControlAt(*s,point) || !InsideListX(*s,point.x)) return 0;
+            if (s->rowTransitionActive) StopRowTransition(*s);
+            const int row = RowFromPoint(*s,point.y,point.x);
+            if (row < 0 || size_t(row) >= s->entries.size() || !s->entries[size_t(row)].folder ||
+                IsRecycleBinLocation(s->folderPath)) return 0;
+            // Dispatch on press, with no capture or pending button state: injected
+            // selection clicks, focus changes and missing UP cannot trap input.
+            Open(*s,row,true);
+        }
+        return 0;
     case WM_LBUTTONDOWN:
         if (s && s->pendingNativeSelection) CancelNativeSelectionPreparation(*s);
         if (s && s->optimisticStartedAt && !scrollbarButton) {
@@ -26816,8 +28059,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ResetMouseClickSequence(*s);
             s->mousePressActive = true;
             s->mousePressEpoch = s->mouseFolderEpoch;
+            s->mousePressSource = CurrentClickSource(*s);
             const int pressX = GET_X_LPARAM(lParam);
             const int pressY = GET_Y_LPARAM(lParam);
+            s->mousePressBackground = g_doubleClickUp.load(std::memory_order_relaxed) &&
+                !s->touch.replaying && !(wParam & (MK_CONTROL | MK_SHIFT)) &&
+                EmptySpaceAt(*s,POINT{pressX,pressY});
             if (pressY >= s->headerPx && InsideListX(*s, pressX) &&
                 !OnScrollbar(*s, pressX, pressY) &&
                 !OnHorizontalBar(*s, pressX, pressY))
@@ -26898,10 +28145,17 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_MOUSEMOVE:
+        // A canceled/replaced button sequence can lose its UP (for example
+        // when another input handler injects a click). A real button-free move
+        // must not leave capture trapping the rest of the Explorer frame.
+        if (s) {
+            ReleaseOrphanedMouseCapture(*s,(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))!=0);
+            if (State(hwnd)!=s) return 0;
+        }
         // The wiggle has already docked. Hold capture solely to swallow UP;
         // ignore all further drag movements until that button is released.
         if (s && s->columnWiggleAwaitRelease) return 0;
-        if (s && (!s->mouseTracking || s->clickPolicy.singleClick)) {
+        if (s && !PointerHoverSuppressed(*s) && (!s->mouseTracking || s->clickPolicy.singleClick)) {
             TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE | (s->clickPolicy.singleClick ? TME_HOVER : 0u),hwnd,HOVER_DEFAULT};
             if (TrackMouseEvent(&tme)) s->mouseTracking = true;
         }
@@ -26926,13 +28180,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_MOUSEHOVER:
-        if (s && s->clickPolicy.singleClick && s->pointingDevice != PointingDevice::Touch &&
+        if (s && !s->pointerHoverSuppressed && s->clickPolicy.singleClick && s->pointingDevice != PointingDevice::Touch &&
             s->visible && !s->emptyNative && !s->optimisticStartedAt &&
             !PointerDragActive(*s) && !s->shellDragRunning && !s->rename.editor &&
             !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON)) && TabOwnsActiveView(*s)) {
             const int row = InsideListX(*s,GET_X_LPARAM(lParam)) ?
                 RowFromPoint(*s,GET_Y_LPARAM(lParam),GET_X_LPARAM(lParam)) : -1;
-            if (row >= 0 && row == s->hovered)
+            if (row >= 0 && row == s->hovered &&
+                SelectionCheckboxAt(*s,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)})==-1)
                 SelectWithModifiers(*s,row,(wParam & MK_CONTROL)!=0,(wParam & MK_SHIFT)!=0);
         }
         return 0;
@@ -26954,12 +28209,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         // The overlay HWND survives navigation. The UP after a double-click
         // may arrive when the *next* directory has already been painted.
-        if (!s || !s->mousePressActive ||
-            s->mousePressEpoch != s->mouseFolderEpoch) return 0;
+        if (!s) return 0;
+        if (!s->mousePressActive || s->mousePressEpoch != s->mouseFolderEpoch) {
+            ReleaseOrphanedMouseCapture(*s,(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))!=0);
+            return 0;
+        }
         // Only a previously selected item press can become an OLE drag.
         // The click (if no drag occurred) applies its modifiers on release.
         const bool pressControl = s->mousePressControl;
         const bool pressShift = s->mousePressShift;
+        const auto pressSource = s->mousePressSource;
         if (s->shellDragRow >= 0) {
             const int pressed = s->shellDragRow;
             const bool sameItem = s->mousePressRow == pressed &&
@@ -26985,6 +28244,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (sameItem && s->mouseFolderEpoch == epoch &&
                 !s->optimisticStartedAt) {
                 s->mouseClickRow = pressed;
+                s->mouseClickSource = pressSource;
                 s->mouseClickEpoch = epoch;
                 s->mouseClickTick = GetTickCount64();
                 if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,pressed);
@@ -27005,6 +28265,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool completedBackgroundClick = s->marqueePossible &&
             !s->marqueeActive && s->mousePressRow < 0 &&
             (!releaseInsideContent || releaseRow < 0);
+        const bool completedGestureBackground = completedBackgroundClick && s->mousePressBackground &&
+            EmptySpaceAt(*s,POINT{releaseX,releaseY});
         const int completedRow = s->mousePressRow;
         const ULONGLONG completedEpoch = s->mouseFolderEpoch;
         const bool completedMarquee = s->marqueePossible && s->marqueeActive;
@@ -27053,11 +28315,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (completedBackgroundClick &&
                 s->mouseFolderEpoch == completedEpoch && !s->optimisticStartedAt)
                 ClearSelectionForFolderMenu(*s);
+            if (completedGestureBackground && s->mouseFolderEpoch==completedEpoch && !s->optimisticStartedAt) {
+                s->mouseClickBackground = true;
+                s->mouseClickSource = pressSource;
+                s->mouseClickEpoch = completedEpoch;
+                s->mouseClickTick = GetTickCount64();
+            }
             if (completedRowClick && s->mouseFolderEpoch == completedEpoch &&
                 !s->optimisticStartedAt) {
                 SelectWithModifiers(*s, completedRow, pressControl, pressShift);
                 if (s->mouseFolderEpoch == completedEpoch) {
                     s->mouseClickRow = completedRow;
+                    s->mouseClickSource = pressSource;
                     s->mouseClickEpoch = completedEpoch;
                     s->mouseClickTick = GetTickCount64();
                     if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,completedRow);
@@ -27308,11 +28577,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const int row = y >= s->headerPx && InsideListX(*s, x) &&
                 !OnScrollbar(*s, x, y) && !OnHorizontalBar(*s, x, y)
                 ? RowFromPoint(*s, y, x) : -1;
+            const bool up = g_doubleClickUp.load(std::memory_order_relaxed) && !s->touch.replaying &&
+                !(wParam & (MK_CONTROL | MK_SHIFT)) && EmptySpaceAt(*s,POINT{x,y}) &&
+                s->mouseClickBackground && s->mouseClickEpoch==s->mouseFolderEpoch &&
+                s->mouseClickSource==CurrentClickSource(*s) &&
+                s->mouseClickTick && GetTickCount64()-s->mouseClickTick<=GetDoubleClickTime();
+            if (up) {
+                ResetMouseClickSequence(*s);
+                NavigateCurrentShellTab(*s,SBSP_PARENT | SBSP_SAMEBROWSER);
+                return 0;
+            }
             if (s->clickPolicy.singleClick && row >= 0) {
                 OverlayProc(hwnd,WM_LBUTTONDOWN,wParam,lParam);
                 return 0;
             }
             const bool sameFolderRow = row >= 0 && row == s->mouseClickRow &&
+                s->mouseClickSource==CurrentClickSource(*s) &&
                 s->mouseClickEpoch == s->mouseFolderEpoch &&
                 s->mouseClickTick &&
                 (s->touch.replaying || GetTickCount64() - s->mouseClickTick <= GetDoubleClickTime());
@@ -27355,6 +28635,17 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const bool background = OnScrollbar(*s, x, y) || OnHorizontalBar(*s, x, y) ||
                 !InsideListX(*s, x);
             const int row = background ? -1 : RowFromPoint(*s, y, x);
+            // A previous WinUI menu can still own its InputSiteWindow when
+            // the next mouse request arrives. Return focus before Select()
+            // publishes the new selection and enters reentrant Shell calls,
+            // just as a left press does. Otherwise that first model hides
+            // selection feedback until the new popup takes ownership.
+            if (background || y >= (s->columnsView ? ColumnHeaderHeight(*s) : s->headerPx)) {
+                const auto lifetime = s->lifetimeToken, token = s->token;
+                ReturnListInputFocus(*s, GetFocus());
+                if (State(hwnd) != s || s->lifetimeToken != lifetime || s->token != token)
+                    return 0;
+            }
             if (!background && s->columnsView && y < ColumnHeaderHeight(*s))
                 ExplorerColumnMenu(*s, screen);
             else if (row >= 0) ContextMenu(*s, row, screen);
@@ -27386,7 +28677,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
     case WM_KEYDOWN:
-        if (s) DiscardCompletedMouseClick(*s);
+        if (s) {
+            DiscardCompletedMouseClick(*s);
+            if (wParam != VK_CONTROL && wParam != VK_SHIFT && wParam != VK_MENU &&
+                wParam != VK_LWIN && wParam != VK_RWIN &&
+                !IsKeyboardMovementKey(static_cast<UINT>(wParam), s->gridView))
+                SuppressPointerHoverForKeyboard(*s);
+        }
         if (s && s->optimisticStartedAt) {
             // File operations wait until Explorer confirms the new IShellView.
             return 0;
@@ -27431,7 +28728,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     !(GetKeyState(VK_MENU) & 0x8000) &&
                     !(GetKeyState(VK_SHIFT) & 0x8000) &&
                     !(lParam & (1LL << 30)))
-                    NavigateCurrentShellTab(*s, true);
+                    NavigateCurrentShellTab(*s, SBSP_NAVIGATEBACK);
                 return 0;
             case VK_F2:
                 if (!control && !shift && !(lParam & (1LL << 30)))
@@ -27472,12 +28769,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // A new grouping policy invalidates any pending old-policy sort.
             // Do this on the owning STA, preserving the displayed selection and
             // viewport while the worker produces the replacement row order.
-            const FolderPlacement placement =
-                g_folderPlacement.load(std::memory_order_relaxed);
-            const bool placementChanged = s->sort.placement != placement;
-            s->sort.placement = placement;
+            const bool sortSettingsChanged=ReconcileSortSettings(*s);
             // Other settings retain their existing coalesced refresh behavior.
-            QueueDirectoryRefresh(*s, placementChanged, true);
+            QueueDirectoryRefresh(*s, sortSettingsChanged, true);
             // A settings change cancels animation; settle at the destination
             // instead of leaving the viewport frozen at an intermediate pixel.
             s->scrollNow = s->scrollTarget;
@@ -27793,6 +29087,7 @@ void PresentCachedTabSurface(ViewState& state) {
     // Present cached pixels first. The owner message then uses exactly the
     // F5/menu path; duplicate activation hints cannot restart provider work.
     QueueResumeRefresh(state);
+    QueueFeatureInitialization(state);
     if (trace)
         Wh_Log(L"[GPU tabs] PRESENT tick=%llu tab=%p gpu=%p native=%p was-visible=%d now-visible=%d loaded=%d rows=%d position=%llu ms show=%llu ms top=%llu ms total=%llu ms folder=%s",
             static_cast<unsigned long long>(started), state.activeTabHost, state.hwnd,
@@ -27928,6 +29223,18 @@ void SuppressAppearingNativeSurface(HWND changed, DWORD event) {
     if (!view) return;
     const HWND frame=GetAncestor(view,GA_ROOT);
     if (!IsExplorerFrame(frame)) return;
+    // A new background view is a frame sibling on modern Explorer. USER can
+    // place it above the current frame-owned GPU surface before discovery.
+    // Repair the current tab's HWND order synchronously; never borrow its
+    // suppression ownership for the new tab or query Shell from this callback.
+    if(auto* current=State(OverlayUnder(frame)); current && current->nativeHwnd!=view &&
+        current->visible && current->inScope && current->detailsViewActive && PresentationVisible(*current)) {
+        const HWND before=GetWindow(current->hwnd,GW_HWNDPREV);
+        EnsureOverlayStacking(*current);
+        if(before!=GetWindow(current->hwnd,GW_HWNDPREV))
+            PipelineEvent(*current->background,{.operation=L"tab.creation.preserve.surface",.a=event,
+                .b=reinterpret_cast<UINT_PTR>(view)});
+    }
     HWND overlay=OverlayForNative(view,frame);
     if (!overlay) overlay=OverlayUnder(frame);
     auto* owner=overlay ? State(overlay) : nullptr;
@@ -27967,6 +29274,21 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
     ReleaseSRWLockShared(&g_shellHookLock);
     if(!owns) return;
+    // USER reports a child z-order change on its parent. Explorer can select
+    // an already-visible tab this way, without a tab-host SHOW event.
+    if(event==EVENT_OBJECT_REORDER && !childId &&
+        (objectId==OBJID_WINDOW || objectId==OBJID_CLIENT)) {
+        wchar_t cls[64]{};
+        const bool tabHost=GetClassNameW(changed,cls,ARRAYSIZE(cls)) && !_wcsicmp(cls,L"ShellTabWindowClass");
+        if(changed==frame || tabHost) {
+            if(auto* selected=State(OverlayUnder(frame)); selected && selected->visible && selected->inScope && selected->detailsViewActive) {
+                if(PresentationVisible(*selected)) EnsureOverlayStacking(*selected);
+                else if(!selected->tabSurfaceWakeQueued)
+                    selected->tabSurfaceWakeQueued=PostMessageW(selected->hwnd,kMsgTabActivated,2,
+                        static_cast<LPARAM>(GetTickCount64()))!=FALSE;
+            }
+        }
+    }
     if(!GetPropW(changed,kViewToggleOwnerProperty) &&
         (event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_HIDE || event==EVENT_OBJECT_DESTROY ||
          (event==EVENT_OBJECT_LOCATIONCHANGE && objectId==OBJID_WINDOW))) {
@@ -28223,17 +29545,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.visibility = ReadShellVisibilityPolicy();
     state.clickPolicy = ReadShellClickPolicy();
     state.visibilitySelectionSyncPending = false;
-    // Fresh visits have no sorting preference in the GPU overlay. A previously
-    // visited folder may restore the explicit sort chosen there, along with
-    // its cached rows, but must not inherit the departing folder's sort.
-    state.sort = DefaultSort();
-    state.sortInitialized = false;
-    state.trackNativeSort = false;
-    SortSpec folderSort;
-    if (CachedFolderSort(state, path, folderSort, &state.grouping)) {
-        state.sort = folderSort;
-        state.sortInitialized = folderSort.explicitOrder;
-    }
+    InitializeFolderSort(state, path, cachedPreviewOnly);
     state.nativeSelectionImportPending = false;
     state.nativeSelectionAllPending = false;
     state.nativeSelectionAllCount = -1;
@@ -29079,7 +30391,7 @@ void BindTabPresentation(ViewState& state, HWND tabHost) {
 bool RefreshThisPcRows(ViewState& state, bool requestData) {
     TabTraceSlowScope trace(L"This PC row projection", state.hwnd);
     state.thisPcRowsDirty = false;
-    if (!state.thisPcGpu) return false;
+    if (!state.thisPcGpu || state.nativeSortPending) return false;
     if (state.nativeRowsNeedCapture && !state.nativeRowsPending) RequestNativeRows(state);
     if (state.nativeRows.empty() && !state.nativeRowsComplete) return false;
     if (state.loaded && state.nativeRowsPending) return false;
@@ -29192,19 +30504,22 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
         // Capacity/type values are already worker-resolved. Reuse the same
         // comparator without property-provider calls in this tiny projection.
         for (auto& entry : fresh) {
-            if (state.sort.kind == SortKind::Type || SameKey(state.sort.key,PKEY_ItemTypeText)) {
-                entry.sortText=entry.type; entry.sortValueKind=entry.type.empty() ? 0 : 1;
-            } else if (SameKey(state.sort.key,PKEY_Capacity) || SameKey(state.sort.key,PKEY_FreeSpace) ||
-                       SameKey(state.sort.key,PKEY_PercentFull)) {
-                entry.sortValueKind=(SameKey(state.sort.key,PKEY_PercentFull) ?
+            const auto seed=[&](const PROPERTYKEY& key,std::wstring& text,double& number,unsigned char& kind) {
+                if (SameKey(key,PKEY_ItemTypeText)) {
+                    text=entry.type; kind=entry.type.empty() ? 0 : 1;
+                } else if (SameKey(key,PKEY_Capacity) || SameKey(key,PKEY_FreeSpace) || SameKey(key,PKEY_PercentFull)) {
+                kind=(SameKey(key,PKEY_PercentFull) ?
                     entry.driveTotal || entry.driveUsedPercent>=0 : entry.driveTotal!=0) ? 2 : 0;
-                entry.sortNumber=SameKey(state.sort.key,PKEY_Capacity) ? static_cast<double>(entry.driveTotal) :
-                    SameKey(state.sort.key,PKEY_FreeSpace) ? static_cast<double>(entry.driveTotal-entry.driveUsed) :
+                number=SameKey(key,PKEY_Capacity) ? static_cast<double>(entry.driveTotal) :
+                    SameKey(key,PKEY_FreeSpace) ? static_cast<double>(entry.driveTotal-entry.driveUsed) :
                     entry.driveUsedPercent>=0 ? entry.driveUsedPercent :
                     entry.driveTotal ? 100.*entry.driveUsed/entry.driveTotal : 0.;
-            }
+                }
+            };
+            seed(state.sort.key,entry.sortText,entry.sortNumber,entry.sortValueKind);
+            for (auto& value : entry.secondarySortValues) seed(value.key,value.text,value.number,value.kind);
         }
-        std::sort(fresh.begin(),fresh.end(),[&](const Entry& a,const Entry& b) { return EntryPrecedes(a,b,state.sort); });
+        SortEntriesByIndex(fresh,[&](const Entry& a,const Entry& b) { return EntryPrecedes(a,b,state.sort); });
     }
     if (state.grouping.enabled) {
         const bool ascending = state.grouping.ascending != FALSE;
@@ -29235,6 +30550,7 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
                     a.driveTotal == b.driveTotal && a.driveUsed == b.driveUsed &&
                     a.driveUsedPercent == b.driveUsedPercent &&
                     a.sortValueKind == b.sortValueKind && a.sortNumber == b.sortNumber && a.sortText == b.sortText &&
+                    a.secondarySortValues == b.secondarySortValues &&
                     a.groupKey == b.groupKey && a.groupTitle == b.groupTitle &&
                     std::equal(a.cells.begin(), a.cells.end(), b.cells.begin(), b.cells.end(),
                         [](const ColumnCell& x, const ColumnCell& y) { return SameKey(x.key,y.key) && x.text==y.text; }) &&
@@ -29280,7 +30596,15 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
         CommitItemSnapshot(state, std::move(result), false,
             requestData && state.firstContentSubmittedAt != 0);
     }
-    if (complete) state.displayedSort = state.sort;
+    if (complete) {
+        state.displayedSort = state.sort;
+        // A tiny This PC projection can keep the same rows despite a new key.
+        // It still completes the header intent, without a structural commit.
+        if (state.instantInteractionSort && SameSort(*state.instantInteractionSort,state.sort)) {
+            StopRowTransition(state);
+            state.instantInteractionSort.reset();
+        }
+    }
     // Unchanged rows still need their deferred services after first content.
     if (state.firstContentSubmittedAt) {
         if (requestData) RequestVisibleIcons(state);
@@ -29414,7 +30738,7 @@ void RetryShellSubscriptions(ViewState& state, ULONGLONG now) {
 }
 
 void PrepareInitialOverlay(ViewState& state) {
-    if (!state.folderView || !state.visible || !TabOwnsActiveView(state) ||
+    if (!state.folderView || !state.visible || (!TabOwnsActiveView(state) && !state.preparingTab) ||
         state.overlayInitializing) return;
     GraphicsContinuation continuation(state);
     ScopedFlag initializing(state.overlayInitializing);
@@ -29433,8 +30757,17 @@ void PrepareInitialOverlay(ViewState& state) {
     state.initialModePending = false;
     ApplyViewLayout(state,{mode,state.nativeIconSize},false);
     if (!state.detailsViewActive) {
+        state.preparingTab=false;
         RestoreNativeContent(state);
         UnregisterAnimationWhenIdle(state);
+        return;
+    }
+    // Use the dedicated native content host even while preparing a hidden
+    // surface. A zero-sized/unfinished host is not a whole-frame viewport.
+    // Its real layout notifications and existing frame lane retry startup.
+    if(state.preparingTab && !PositionOverlayOverNative(state,false)) {
+        state.initialModePending=true;
+        RegisterViewAnimation(state);
         return;
     }
     state.visibility = ReadShellVisibilityPolicy();
@@ -29445,6 +30778,7 @@ void PrepareInitialOverlay(ViewState& state) {
     if(!StartPresentation(state)) {
         state.visible=false; RestoreNativeContent(state); return;
     }
+    InitializeFolderSort(state, state.folderPath);
     if (state.thisPcGpu) {
         RequestNativeRows(state); // Copy PIDLs; name providers run independently of GPU setup.
     } else {
@@ -29470,7 +30804,7 @@ void PrepareInitialOverlay(ViewState& state) {
 
 void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ComPtr<IShellFolder>& folder, ComPtr<IShellBrowser>& shellBrowser,
-                const std::wstring& path) {
+                const std::wstring& path, bool prepareTab = false) {
     if (g_unloading.load(std::memory_order_acquire) || !native || !IsWindow(native) ||
         !IsSupportedLocation(path) ||
         !BelongsToThisProcess(native)) return;
@@ -29480,8 +30814,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     if (!IsExplorerFrame(frame)) return;
     const HWND tabHost = BrowserTabHost(shellBrowser.Get(), native, frame);
     if (g_unloading.load(std::memory_order_acquire)) return;
-    if (!tabHost || tabHost != ActiveExplorerTab(frame) ||
-        !NativeViewAvailable(native)) return;
+    if (!tabHost || (!prepareTab && tabHost != ActiveExplorerTab(frame)) ||
+        !NativeViewAvailable(native,prepareTab ? tabHost : nullptr)) return;
     HWND overlay = OverlayForTab(tabHost);
     if (overlay && GetWindowThreadProcessId(overlay, nullptr) !=
                        GetCurrentThreadId()) return;
@@ -29570,9 +30904,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         if (s->firstContentSubmittedAt) AttachShellDestinationEvents(*s, shellBrowser.Get());
         s->inScope = true;
         const ULONGLONG rebindBegin = GetTickCount64();
-        // Do not consult the new Shell view's late-restored sorting preference
-        // here. The new folder owns an independent unsorted/cached policy.
-        // A sort chosen by the user may be tracked after it is committed.
+        // Capture the confirmed folder's native sort before names are queued.
+        // Subsequent Shell completion/command events reconcile late restoration.
         BindNativeViewInput(native, overlay);
         if (IsThisPcLocation(path)) {
             if (!s->thisPcGpu || changedPath || wasOutside) {
@@ -29605,9 +30938,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ++s->token;
                 ++s->iconToken;
                 s->directoryPending = false;
-                s->sort = DefaultSort();
-                s->sortInitialized = false;
-                s->trackNativeSort = false;
+                InitializeFolderSort(*s, path);
                 s->lastNativeModeProbe = 0;
                 ClearNavigationProbe(*s);
                 BeginDirectoryViewMode(*s,true);
@@ -29624,6 +30955,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 // contents. Keep the committed tiles, capacities and motion
                 // while the ordinary worker revalidates their identities.
                 s->folder=folder;
+                RefreshSortFromExplorer(*s, false, true);
                 ClearNavigationProbe(*s);
                 QueueNativeRows(*s);
             }
@@ -29644,6 +30976,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // The already-painted name snapshot belongs to this destination:
             // KEEP it. Resetting it here would recreate the 200ms blank wait.
             s->folder = folder;
+            RefreshSortFromExplorer(*s, false, true);
             s->directoryFolderIdentity.reset();
             WatchDirectory(*s);
             // Revalidate on the confirmed binding. Path-only announcements
@@ -29674,6 +31007,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             // to erase a breadcrumb-restored child after the first GPU paint.
             // A genuinely different tab can have an independent selection.
             s->folder = folder;
+            RefreshSortFromExplorer(*s, true, true);
             if (oldTabHost == newTabHost && !wasOutside) {
                 // The new native view might not have inherited the focused
                 // item yet. Reconcile a single selected item after paint;
@@ -29743,6 +31077,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     s->nativeHwnd = native;
     s->frameHwnd = frame;
     s->activeTabHost = tabHost;
+    s->preparingTab = prepareTab && tabHost != ActiveExplorerTab(frame);
     s->folderView = view;
     s->shellBrowser = shellBrowser;
     s->folder = folder;
@@ -29783,7 +31118,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     SetTimer(overlay, kTimerId, 250, nullptr);
 }
 
-void ScanShellWindow(HWND explorerFrame) {
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
     if (g_unloading.load() || !IsWindow(explorerFrame) ||
         GetPropW(explorerFrame, kShellScanProperty)) return;
     struct ScanGuard {
@@ -29791,11 +31126,14 @@ void ScanShellWindow(HWND explorerFrame) {
         ~ScanGuard() { if (IsWindow(frame)) RemovePropW(frame, kShellScanProperty); }
     } guard{explorerFrame};
     if (!SetPropW(explorerFrame, kShellScanProperty, reinterpret_cast<HANDLE>(1))) return;
-    SynchronizeTabSurfaces(explorerFrame);
+    const HWND targetTab=requestedTab ? requestedTab : ActiveExplorerTab(explorerFrame);
+    if (!IsWindow(targetTab) || (targetTab!=explorerFrame && GetAncestor(targetTab,GA_ROOT)!=explorerFrame)) return;
+    const bool preparing=requestedTab && targetTab!=ActiveExplorerTab(explorerFrame);
+    if (!preparing) SynchronizeTabSurfaces(explorerFrame);
     // The DispatchMessage hook, WinEvent and short navigation timer all run
     // on this STA. Never let them independently scan during one layout burst.
     // A genuinely NEW SHELLDLL_DefView resets this gate when first observed.
-    if (HWND overlay = OverlayUnder(explorerFrame)) {
+    if (HWND overlay = OverlayForTab(targetTab)) {
         if (ViewState* state = State(overlay)) {
             const ULONGLONG now = GetTickCount64();
             if (state->lastShellScanAt && now == state->lastShellScanAt)
@@ -29827,15 +31165,14 @@ void ScanShellWindow(HWND explorerFrame) {
             previous = now;
         }
     } stage(explorerFrame);
-    // A selected tab's browser can supply its own current view cheaply.
-    // Never consult an inactive tab's Shell browser for this frame; on tab
-    // activation without a matching overlay, use normal Shell discovery.
-    if (HWND overlay = OverlayUnder(explorerFrame)) {
+    // Use only the requested tab's browser. Ordinary discovery targets the
+    // selected tab; a cold request may explicitly prepare a background tab.
+    if (HWND overlay = OverlayForTab(targetTab)) {
         if (ViewState* s = State(overlay); s && s->shellBrowser) {
             ComPtr<IShellView> active;
             HWND native = nullptr;
             const bool matchingTab = BrowserTabHost(s->shellBrowser.Get(),
-                native, explorerFrame) == ActiveExplorerTab(explorerFrame);
+                native, explorerFrame) == targetTab;
             if (g_unloading.load(std::memory_order_acquire)) return;
             stage.Mark(L"cached browser resolve tab host");
             const HRESULT activeResult = matchingTab ?
@@ -29948,8 +31285,8 @@ void ScanShellWindow(HWND explorerFrame) {
         }
         stage.Mark(L"QueryService");
         // ShellWindows exposes one entry per Explorer tab but each entry's
-        // IWebBrowser2::HWND is the same frame. Reject inactive tab browsers
-        // *before* expensive view/property COM work.
+        // IWebBrowser2::HWND is the same frame. Reject other tab browsers
+        // before view/property COM work, including explicit cold preparation.
         HWND browserTab = nullptr;
         const HRESULT hostResult = shellBrowser->GetWindow(&browserTab);
         stage.Mark(L"IShellBrowser GetWindow");
@@ -29958,7 +31295,7 @@ void ScanShellWindow(HWND explorerFrame) {
         const bool qualifiedTab = browserTab &&
             GetClassNameW(browserTab, browserClass, ARRAYSIZE(browserClass)) &&
             _wcsicmp(browserClass, L"ShellTabWindowClass") == 0;
-        if (qualifiedTab && browserTab != ActiveExplorerTab(explorerFrame))
+        if (qualifiedTab && browserTab != targetTab)
             continue;
         ComPtr<IShellView> shellView;
         const HRESULT activeResult = shellBrowser->QueryActiveShellView(shellView.GetAddressOf());
@@ -29968,23 +31305,23 @@ void ScanShellWindow(HWND explorerFrame) {
         const HRESULT nativeResult = shellView->GetWindow(&native);
         stage.Mark(L"discovered IShellView GetWindow");
         if (FAILED(nativeResult) || !native ||
-            GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native) ||
+            GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native,preparing ? targetTab : nullptr) ||
             BrowserTabHost(shellBrowser.Get(), native, explorerFrame) !=
-                ActiveExplorerTab(explorerFrame))
+                targetTab)
             continue;
         ComPtr<IFolderView2> view;
         const HRESULT viewResult=shellView.As(&view);
         if (FAILED(viewResult) || !view) {
             if (viewResult!=E_NOINTERFACE) break; // Still unresolved, not proof of unsupported content.
-            SetPropW(explorerFrame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
-            if (HWND overlay = OverlayUnder(explorerFrame))
+            SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     DeactivateOutsideScope(*state);
             break;
         }
         ComPtr<IShellFolder> folder;
         std::wstring path;
-        if (HWND overlay=OverlayUnder(explorerFrame))
+        if (HWND overlay=OverlayForTab(targetTab))
             if (auto state=State(overlay); state && state->pendingShellView &&
                 IsWindow(state->pendingShellView) && native!=state->pendingShellView) continue;
         const bool pathResolved = GetFolderPath(view.Get(),path,folder);
@@ -29994,15 +31331,15 @@ void ScanShellWindow(HWND explorerFrame) {
             break;
         }
         if (!IsSupportedLocation(path))
-            SetPropW(explorerFrame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
         if (IsSupportedLocation(path)) {
-            AttachView(native,view,folder,shellBrowser,path);
+            AttachView(native,view,folder,shellBrowser,path,preparing);
             stage.Mark(L"AttachView discovered tab");
-            if (HWND overlay = OverlayUnder(explorerFrame))
+            if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     BindShellAutomation(*state, disp.Get());
             stage.Mark(L"AttachShellAutomationEvents/SelectionChanged");
-        } else if (HWND overlay = OverlayUnder(explorerFrame)) {
+        } else if (HWND overlay = OverlayForTab(targetTab)) {
             if (ViewState* state = State(overlay))
                 DeactivateOutsideScope(*state);
         }
@@ -30516,7 +31853,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     if (msg && g_bootstrapAttachMessage &&
         msg->message == g_bootstrapAttachMessage &&
         IsExplorerFrame(msg->hwnd)) {
-        HandleColdAttach(msg->hwnd);
+        HandleColdAttach(msg->hwnd,reinterpret_cast<HWND>(msg->wParam));
         return 0; // Do not forward the private registered message to Shell.
     }
     // Reuse the existing per-frame scan state for diagnostic input timestamps:

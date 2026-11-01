@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.316
+// @version         0.9.317
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -15813,6 +15813,10 @@ float SelectedFilenameWidth(ViewState& state, int index, float available) {
     return width;
 }
 
+float FilenameSelectionPadding(const ViewState& state) {
+    return 2.f * std::max(96, ViewDpi(state)) / 96.f;
+}
+
 // All normal and moving selection backgrounds use the SAME bounds and fill.
 // Interpolating this rectangle also handles filename-only pills with different
 // text widths, rather than jumping to the next filename's width.
@@ -15875,8 +15879,8 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         SelectionShape result;
         // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
         const float origin = state.rtlLayout ? state.paintWidth-
-            roundf(state.paintWidth-text.right)-(text.right-text.left) : roundf(text.left);
-        const float padding = 2.f * std::max(96,state.textFormatDpi) / 96.f;
+            roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
+        const float padding = FilenameSelectionPadding(state);
         for (unsigned i=0;i<cached.filenameSelection.count;++i) {
             auto rc=cached.filenameSelection.lines[i];
             rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
@@ -20767,10 +20771,39 @@ RECT RenameViewport(ViewState& state, bool frameCoordinates = true) {
     return viewport;
 }
 
+ItemGeometry RenameItemGeometry(ViewState& state, int index) {
+    return LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
+        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+}
+
 RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true) {
     const int dpi = ViewDpi(state);
-    const auto geometry = LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
-        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+    const auto geometry = RenameItemGeometry(state, index);
+    if (geometry.wrapped) {
+        // Enclose the label and its filename-only selection padding. Insetting
+        // this band exposed the old selection above the frame-child EDIT.
+        const RECT viewport = RenameViewport(state, false);
+        RECT client{}; ViewClientRect(state, &client);
+        const auto& text = geometry.text;
+        const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? client.right - text.right : text.left));
+        const LONG top = static_cast<LONG>(std::lround(text.top));
+        const LONG padding = ViewOptionEnabled(state, g_filenameOnly) ?
+            static_cast<LONG>(std::ceil(FilenameSelectionPadding(state))) : 0;
+        const LONG borderX = std::max<LONG>(padding, GetSystemMetricsForDpi(SM_CXBORDER, dpi));
+        const LONG borderY = std::max<LONG>(padding, GetSystemMetricsForDpi(SM_CYBORDER, dpi));
+        RECT rc{left - borderX, top - borderY,
+            left + static_cast<LONG>(std::ceil(text.right - text.left)) + borderX,
+            top + static_cast<LONG>(std::ceil(text.bottom - text.top)) + borderY};
+        rc.left = std::max(rc.left, static_cast<LONG>(std::floor(state.rtlLayout ? client.right - geometry.cell.right : geometry.cell.left)));
+        rc.right = std::min(rc.right, static_cast<LONG>(std::ceil(state.rtlLayout ? client.right - geometry.cell.left : geometry.cell.right)));
+        rc.top = std::max(rc.top, static_cast<LONG>(std::floor(geometry.cell.top)));
+        rc.bottom = std::min(rc.bottom, static_cast<LONG>(std::ceil(geometry.cell.bottom)));
+        rc.right = rc.left + std::max(1L, std::min(rc.right - rc.left, viewport.right - viewport.left));
+        rc.bottom = rc.top + std::max(1L, std::min(rc.bottom - rc.top, viewport.bottom - viewport.top));
+        if (frameCoordinates)
+            MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&rc), 2);
+        return rc;
+    }
     const float nameStart = geometry.text.left;
     // Use the whole Name column even when its current origin is offscreen.
     // Measuring against the clipped draw extent could collapse the EDIT to 1px.
@@ -20797,7 +20830,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
         }
     }
     const int limit = std::max(1, static_cast<int>(maxWidth));
-    const int width = geometry.wrapped ? limit : std::clamp(static_cast<int>(std::ceil(measured)) + Scale96(28, dpi),
+    const int width = std::clamp(static_cast<int>(std::ceil(measured)) + Scale96(28, dpi),
         std::min(Scale96(85, dpi), limit), limit);
     RECT client{}; ViewClientRect(state, &client);
     const int x = state.rtlLayout ?
@@ -20934,18 +20967,28 @@ int RenameLineHeight(HWND editor) {
     return height;
 }
 
-void CenterWrappedRenameText(HWND editor) {
+void AlignWrappedRenameText(ViewState& state) {
+    const HWND editor = state.rename.editor;
     if (!(GetWindowLongPtrW(editor, GWL_STYLE) & ES_MULTILINE)) return;
-    RECT client{}, format{};
+    RECT client{}, format{}, overlay{};
     GetClientRect(editor, &client);
     SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
-    const int line = RenameLineHeight(editor);
-    const int lines = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
-    const LONG top = std::max(0L, (client.bottom - line * lines) / 2);
-    if (format.top == top) return;
-    format.top = top;
-    format.bottom = client.bottom;
-    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&format));
+    ViewClientRect(state, &overlay);
+    const auto text = RenameItemGeometry(state, state.rename.index).text;
+    // Match Text()'s physical origin and wrapping width, independent of the
+    // selection's padding or a mirrored Explorer frame. Grid labels start at
+    // the top of this band; centering vertically made short names jump down.
+    const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? overlay.right - text.right : text.left));
+    RECT aligned{left, static_cast<LONG>(std::lround(text.top)),
+        left + static_cast<LONG>(std::lround(text.right - text.left)),
+        static_cast<LONG>(std::lround(text.bottom))};
+    MapWindowPoints(state.hwnd, editor, reinterpret_cast<POINT*>(&aligned), 2);
+    aligned.left = std::clamp(aligned.left, 0L, std::max(0L, client.right - 1));
+    aligned.right = std::clamp(aligned.right, aligned.left + 1, std::max(aligned.left + 1, client.right));
+    aligned.top = std::clamp(aligned.top, 0L, std::max(0L, client.bottom - 1));
+    aligned.bottom = client.bottom;
+    if (EqualRect(&format, &aligned)) return;
+    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
     InvalidateRect(editor, nullptr, FALSE);
 }
 
@@ -21036,7 +21079,7 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) CenterWrappedRenameText(hwnd);
+    if (current && (msg == WM_SIZE || msg == WM_SETFONT)) AlignWrappedRenameText(*state);
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
@@ -21081,9 +21124,10 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     const std::wstring name = state.entries[static_cast<size_t>(index)].name;
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
+    const bool wrapped = RenameItemGeometry(state, index).wrapped;
     const DWORD style = WS_CHILD | WS_CLIPSIBLINGS |
-        (state.gridView && state.cachedNativeMode != FVM_SMALLICON ? ES_MULTILINE | ES_AUTOVSCROLL : ES_AUTOHSCROLL) |
-        (state.rtlLayout ? ES_RIGHT : ES_LEFT);
+        (wrapped ? ES_MULTILINE | ES_AUTOVSCROLL | ES_CENTER :
+            ES_AUTOHSCROLL | (state.rtlLayout ? ES_RIGHT : ES_LEFT));
     HWND edit = CreateWindowExW(state.rtlLayout ? WS_EX_RTLREADING : 0,
         L"EDIT", name.c_str(), style, rc.left, rc.top,
         rc.right - rc.left, rc.bottom - rc.top, state.frameHwnd, nullptr,
@@ -21324,15 +21368,18 @@ void RepositionRenameEdit(ViewState& state) {
     OffsetRect(&local, std::clamp(local.left, overlayArea.left, std::max(overlayArea.left, overlayArea.right-width)) - local.left,
         std::clamp(local.top, overlayArea.top, std::max(overlayArea.top, overlayArea.bottom-height)) - local.top);
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
-    CenterWrappedRenameText(state.rename.editor);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
     if (EqualRect(&local, &state.rename.frameRect) && IsWindowVisible(state.rename.editor) &&
-        GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) return;
+        GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) {
+        AlignWrappedRenameText(state);
+        return;
+    }
     if (SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
         local.right - local.left, local.bottom - local.top,
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS | SWP_FRAMECHANGED))
         state.rename.frameRect = local;
+    AlignWrappedRenameText(state);
 }
 
 void FinishRename(ViewState& state, bool commit) {
