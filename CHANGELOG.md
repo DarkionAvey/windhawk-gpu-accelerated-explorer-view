@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.320
+
+- Keep the file view, rename editor and view button in one stable window order.
+  Ignore hidden siblings and apply necessary placement changes together.
+- Preserve rename-field pixels during layout updates and avoid redundant tab
+  activation repaints when the view button is correctly above the file view.
+
 ## 0.9.319
 
 - Use expanding, wrapping native rename fields in list views too, so narrow

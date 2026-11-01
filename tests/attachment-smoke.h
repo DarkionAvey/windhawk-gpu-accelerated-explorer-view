@@ -1224,6 +1224,8 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     std::cout << "PASS: production attachment, native/GPU toggles, read-only Recycle Bin scope/enumeration/Details/List/grid/PIDL menu, namespace-to-filesystem navigation and minimized dispose/reattach/restore\n";
 }
 
+#include "presentation-stack-smoke.h"
+
 static void TestBackgroundTabStartup(const std::wstring& fixture) {
     const auto root=std::filesystem::path(fixture)/L"background-tabs";
     const auto currentPath=root/L"current", incomingPath=root/L"incoming";
@@ -1286,6 +1288,7 @@ static void TestBackgroundTabStartup(const std::wstring& fixture) {
     auto* current=State(OverlayForTab(original));
     Check(current && Eventually([&] {pump();return current->loaded && current->firstContentSubmittedAt;}),"initial tab content");
     watched=current;
+    PresentationStackFixture::CheckStable(*current,false);
     for(bool hostVisible:{false,true}) {
         // Names can finish before the filesystem watch is installed. Watch
         // delivery intentionally starts a gap-closing scan; that scan belongs
@@ -1351,6 +1354,7 @@ static void TestBackgroundTabStartup(const std::wstring& fixture) {
         DestroyWindow(next->hwnd); DestroyWindow(tab); pump();
     }
     Check(!FocusFixture::sets,"background tab startup changed focus");
+    PresentationStackFixture::CheckStable(*current,true);
     watched=nullptr;
     DestroyWindow(frame); StopTabVisibilityObserver();
     std::vector<std::shared_ptr<TabBackground>> retiring;

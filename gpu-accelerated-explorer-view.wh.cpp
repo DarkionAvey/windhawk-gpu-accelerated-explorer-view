@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.319
+// @version         0.9.320
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -5426,36 +5426,86 @@ void ArmTabSwitchProbe(HWND frame, const wchar_t* reason);
 void TraceTabHostSnapshot(HWND frame, const wchar_t* source);
 void PresentCachedTabSurface(ViewState& state);
 
-HWND OverlayStackPredecessor(const ViewState& state) {
-    if(state.rename.editor && IsWindow(state.rename.editor) &&
-        GetParent(state.rename.editor)==state.frameHwnd && IsWindowVisible(state.rename.editor)) return state.rename.editor;
-    return IsWindowVisible(state.viewToggle) ? state.viewToggle : nullptr;
-}
-
 thread_local bool t_overlayStacking=false;
 
-HWND FirstVisibleFrameChild(HWND frame) {
-    HWND first=GetWindow(frame,GW_CHILD);
-    while(first && !IsWindowVisible(first)) first=GetWindow(first,GW_HWNDNEXT);
-    return first;
+HWND PreviousVisibleSibling(HWND hwnd) {
+    while((hwnd=GetWindow(hwnd,GW_HWNDPREV)) && !IsWindowVisible(hwnd)) {}
+    return hwnd;
 }
 
-bool OverlayStackingNeeded(const ViewState& state, HWND pinned) {
-    return FirstVisibleFrameChild(state.frameHwnd)!=(pinned ? pinned : state.hwnd) ||
-        (pinned && GetWindow(state.hwnd,GW_HWNDPREV)!=pinned);
+bool OverlayStackingNeeded(const ViewState& state) {
+    HWND previous=nullptr;
+    for(HWND child:{state.rename.editor,state.viewToggle,state.hwnd}) {
+        if(!child || GetParent(child)!=state.frameHwnd || (child!=state.hwnd && !IsWindowVisible(child))) continue;
+        if(PreviousVisibleSibling(child)!=previous) return true;
+        previous=child;
+    }
+    return false;
+}
+
+// Rename, chrome and GPU content share one order and one USER transaction.
+// Hidden frame children never require a repair. Position-only and Z-only work
+// retains valid pixels; ordinary layout must not discard/reframe the editor.
+bool PositionOverlayWindows(ViewState& state,const RECT* overlayBounds=nullptr,
+    const RECT* renameBounds=nullptr,const RECT* toggleBounds=nullptr) {
+    struct Placement { HWND hwnd; const RECT* bounds; UINT flags; };
+    std::array<Placement,3> windows{};
+    size_t count=0;
+    const auto append=[&](HWND hwnd,const RECT* bounds) {
+        if(!hwnd || GetParent(hwnd)!=state.frameHwnd ||
+            (hwnd!=state.hwnd && !bounds && !IsWindowVisible(hwnd))) return;
+        windows[count++]={hwnd,bounds,SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER};
+    };
+    append(state.rename.editor,renameBounds); append(state.viewToggle,toggleBounds); append(state.hwnd,overlayBounds);
+    if(!count) return false;
+    bool restack=false,changed=false;
+    HWND previous=nullptr;
+    for(size_t i=0;i<count;++i) {
+        auto& window=windows[i];
+        restack|=PreviousVisibleSibling(window.hwnd)!=previous;
+        previous=window.hwnd;
+        if(window.bounds) {
+            RECT current{}; GetWindowRect(window.hwnd,&current);
+            MapWindowPoints(HWND_DESKTOP,state.frameHwnd,reinterpret_cast<POINT*>(&current),2);
+            if(current.left!=window.bounds->left || current.top!=window.bounds->top) window.flags&=~SWP_NOMOVE;
+            if(current.right-current.left!=window.bounds->right-window.bounds->left ||
+                current.bottom-current.top!=window.bounds->bottom-window.bounds->top) window.flags&=~SWP_NOSIZE;
+            if(window.hwnd!=state.hwnd && !IsWindowVisible(window.hwnd)) window.flags|=SWP_SHOWWINDOW;
+        }
+        changed|=(window.flags&(SWP_NOMOVE|SWP_NOSIZE))!=(SWP_NOMOVE|SWP_NOSIZE) || (window.flags&SWP_SHOWWINDOW);
+    }
+    restack&=!t_overlayStacking;
+    if(!changed && !restack) return true;
+    ScopedFlag repair(t_overlayStacking);
+    HDWP batch=BeginDeferWindowPos(static_cast<int>(count));
+    if(!batch) return false;
+    previous=HWND_TOP;
+    for(size_t i=0;i<count;++i) {
+        auto& window=windows[i];
+        if(restack) window.flags&=~SWP_NOZORDER;
+        if((window.flags&(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER))==(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER) &&
+            !(window.flags&SWP_SHOWWINDOW)) {previous=window.hwnd; continue;}
+        const RECT rect=window.bounds ? *window.bounds : RECT{};
+        PipelineEvent(*state.background,{.operation=L"ui.window.position[x,y,width,height]",
+            .a=reinterpret_cast<UINT_PTR>(window.hwnd),.b=window.flags,
+            .v={double(rect.left),double(rect.top),double(rect.right-rect.left),double(rect.bottom-rect.top)}},true);
+        batch=DeferWindowPos(batch,window.hwnd,previous,rect.left,rect.top,
+            rect.right-rect.left,rect.bottom-rect.top,window.flags);
+        if(!batch) return false;
+        previous=window.hwnd;
+    }
+    const bool applied=EndDeferWindowPos(batch)!=FALSE;
+    PipelineEvent(*state.background,{.operation=L"ui.window.batch[count,restack,geometry,success]",
+        .a=reinterpret_cast<UINT_PTR>(state.hwnd),.v={double(count),double(restack),double(changed),double(applied)}},true);
+    return applied;
 }
 
 void EnsureOverlayStacking(ViewState& state) {
     if(t_overlayStacking) return;
-    const HWND pinned=OverlayStackPredecessor(state);
-    if(!OverlayStackingNeeded(state,pinned)) return;
-    ScopedFlag repair(t_overlayStacking);
-    // An adjacent editor/button can itself be below a newly created native
-    // sibling. Raise the pinned control as well, retaining both rectangles.
-    if(pinned && FirstVisibleFrameChild(state.frameHwnd)!=pinned)
-        SetWindowPos(pinned,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-    SetWindowPos(state.hwnd,pinned ? pinned : HWND_TOP,0,0,0,0,
-        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    if(!PositionOverlayWindows(state)) {
+        state.nativePresentationPending=true;
+        RegisterViewAnimation(state);
+    }
 }
 
 bool PositionOverlayOverNative(ViewState& state, bool top = true) {
@@ -5506,15 +5556,12 @@ bool PositionOverlayOverNative(ViewState& state, bool top = true) {
         current.bottom - current.top != height;
     // A rename editor is a FRAME sibling, not a composited child of the
     // overlay. Keep it above the GPU HWND throughout position/top repairs.
-    const HWND pinned = OverlayStackPredecessor(state);
-    const bool behind = OverlayStackingNeeded(state,pinned);
+    const bool behind = OverlayStackingNeeded(state);
     if (moved || (top && behind)) {
-        ScopedFlag repair(t_overlayStacking,t_overlayStacking || top);
-        if(top && pinned && FirstVisibleFrameChild(owner)!=pinned)
-            SetWindowPos(pinned,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        SetWindowPos(state.hwnd, top ? (pinned ? pinned : HWND_TOP) : nullptr,
-            rect.left, rect.top, width, height,
-            SWP_NOACTIVATE | (top ? 0 : SWP_NOZORDER));
+        if(top) {
+            if(!PositionOverlayWindows(state,&rect)) return pending(L"presentation.pending.position[kept,rows]");
+        } else if(!SetWindowPos(state.hwnd,nullptr,rect.left,rect.top,width,height,
+            SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER)) return pending(L"presentation.pending.position[kept,rows]");
     }
     state.nativePresentationPending = false;
     return true;
@@ -21112,7 +21159,7 @@ void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) 
         RECT current{}; GetWindowRect(edit, &current);
         if (current.right - current.left != width)
             SetWindowPos(edit, nullptr, 0, 0, width, current.bottom - current.top,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         AlignWrappedRenameText(state);
         return static_cast<LONG>(SendMessageW(edit, EM_GETLINECOUNT, 0, 0)) *
             std::max(1, RenameLineHeight(edit)) + padding.cy * 2;
@@ -21334,11 +21381,9 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     SendMessageW(edit, EM_SETSEL, end, 0);
     RepositionRenameEdit(state);
     if (r.editor != edit || !IsWindowVisible(edit)) return;
-    // Two FRAME siblings: keep GPU list immediately below the editor, not
-    // above it. DWM will composite EDIT text/caret on top of the DComp list.
+    // Keep the editor and chrome above the GPU sibling in the shared order.
     PositionOverlayOverNative(state);
-    SetWindowPos(edit, HWND_TOP, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    EnsureOverlayStacking(state);
     SetFocus(edit);
     SendMessageW(edit, EM_SCROLLCARET, 0, 0);
     if (GetFocus() != edit && !createdItem) {
@@ -21541,12 +21586,13 @@ void RepositionRenameEdit(ViewState& state) {
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
-    if ((!EqualRect(&local, &state.rename.frameRect) || !IsWindowVisible(state.rename.editor) ||
-        GetWindow(state.frameHwnd, GW_CHILD) != state.rename.editor) &&
-        SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
-        local.right - local.left, local.bottom - local.top,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS | SWP_FRAMECHANGED))
+    if (PositionOverlayWindows(state,nullptr,&local))
         state.rename.frameRect = local;
+    else {
+        state.nativePresentationPending=true;
+        RegisterViewAnimation(state);
+        return; // Keep zoom suspension/focus intent until placement succeeds.
+    }
     AlignWrappedRenameText(state);
     if (std::exchange(rename.zoomHidden, false)) {
         if (std::exchange(rename.restoreZoomFocus, false) && ExplorerFrameHasForeground(state.frameHwnd))
@@ -27546,7 +27592,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     static_cast<unsigned long long>(GetTickCount64()),
                     s->frameHwnd, s->activeTabHost, hwnd,
                     IsWindowVisible(hwnd) != FALSE,
-                    GetWindow(s->frameHwnd, GW_CHILD) == hwnd);
+                    !OverlayStackingNeeded(*s));
             // Only unresolved/new views get a native Shell scan. A known
             // cached tab is reactivated using its own HWND/State exclusively.
             if (wParam != 2 && (wParam == 1 || !OverlayUnder(s->frameHwnd))) {
@@ -29587,10 +29633,10 @@ void CALLBACK ShellViewEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed
                 if (event == EVENT_OBJECT_REORDER) {
                     const HWND selected = ActiveExplorerTab(frame);
                     if (HWND owner = OverlayForTab(selected)) {
-                        if (!IsWindowVisible(owner) ||
-                            GetWindow(frame, GW_CHILD) != owner)
-                            PostMessageW(owner, kMsgTabActivated, 2,
-                                static_cast<LPARAM>(GetTickCount64()));
+                        if(auto* state=State(owner); state && !state->tabSurfaceWakeQueued &&
+                            (!IsWindowVisible(owner) || OverlayStackingNeeded(*state)))
+                            state->tabSurfaceWakeQueued=PostMessageW(owner,kMsgTabActivated,2,
+                                static_cast<LPARAM>(GetTickCount64()))!=FALSE;
                     }
                 } else if (event == EVENT_OBJECT_SHOW) {
                     SynchronizeTabSurfaces(frame, true);
@@ -32852,13 +32898,14 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
         }
         RECT previous{}; GetWindowRect(state->viewToggle, &previous);
         MapWindowPoints(HWND_DESKTOP, frame, reinterpret_cast<POINT*>(&previous), 2);
-        if (!IsWindowVisible(state->viewToggle) || GetWindow(frame, GW_CHILD) != state->viewToggle ||
-            previous.left != x || previous.top != y || previous.right - previous.left != width ||
-            previous.bottom - previous.top != height)
+        const RECT placement{x,y,x+width,y+height};
+        const bool repaint=!IsWindowVisible(state->viewToggle) || !EqualRect(&previous,&placement);
+        if (repaint || OverlayStackingNeeded(*state))
         {
-            SetWindowPos(state->viewToggle, HWND_TOP, x, y, width, height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-            InvalidateRect(state->viewToggle, nullptr, FALSE);
+            if(!PositionOverlayWindows(*state,nullptr,nullptr,&placement)) {
+                RetryStatusButtonGeometry(*state); continue;
+            }
+            if(repaint) InvalidateRect(state->viewToggle, nullptr, FALSE);
             if(g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU status] layout source=%s root=%p neighbor=%p x=%d y=%d w=%d h=%d gap=%d pending=%d",
                     fromNative ? (state->viewToggleGeometry.accessible ? L"accessibility" : L"HWND") : L"fallback",
