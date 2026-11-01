@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.319
+
+- Use expanding, wrapping native rename fields in list views too, so narrow
+  Name columns show the beginning while preserving the selected basename.
+- Avoid repeated native reformatting and shrink/expand measurements when a
+  rename field's text, font and available space have not changed.
+- Add drag-selection, repaint, focus and placement records to UI transition
+  diagnostics for investigating the remaining live rename-field blinking.
+
+## 0.9.318
+
+- Expand grid rename fields to show long names, using more window width when
+  needed. Preserve native editing and selection while resizing.
+- Hide rename fields during wheel and pinch zoom, then restore them with the
+  current font size when the gesture and zoom animation finish.
+- Follow the chosen text smoothing policy and remove layout work from rename
+  painting. Narrow-name scrolling and drag-selection blinking persisted in
+  live Explorer testing.
+
 ## 0.9.317
 
 - Center grid rename text on the label and preserve its wrapping position.

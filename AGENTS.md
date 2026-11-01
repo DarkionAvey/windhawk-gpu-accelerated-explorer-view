@@ -36,6 +36,11 @@
 - Only intentional read-only OS/Shell integration probes may use real system
   resources; discover those locations through Windows APIs. Synthetic drive
   strings used as identities must not become filesystem assumptions.
+- When implementing a new feature, think of how existing mod features could
+  or should play with the new feature, like for example if the user asks for 
+  copy/cut icon animations, think should the animation be played when renaming
+  a file, ctrl+wheel zooming, change of dir contents, etc. So it is not just 
+  implementing the feature, but actually fitting it in the grand design of the mod.
 
 ## Source and release workflow
 

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.317
+// @version         0.9.319
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -3145,6 +3145,7 @@ struct ViewState {
     struct RenameSession {
         HWND editor = nullptr;
         HFONT font = nullptr;
+        unsigned fontRenderingRevision = 0;
         HBRUSH background = nullptr;
         COLORREF backgroundColor = CLR_INVALID;
         int index = -1;
@@ -3154,6 +3155,13 @@ struct ViewState {
         UINT_PTR epoch = 0;
         bool finishing = false;
         bool positioning = false;
+        unsigned nativeDispatchDepth = 0;
+        bool textLayoutDirty = false;
+        RECT requestedTextRect{};
+        bool requestedTextRectValid = false;
+        SIZE layoutPreferred{}, layoutAvailable{}, layoutPadding{}, layoutSize{};
+        bool layoutValid = false;
+        bool zoomHidden = false, zoomRetargeting = false, restoreZoomFocus = false;
         bool parentSubclassInstalled = false;
         HWND notificationHost = nullptr;
         bool creationSticky = false; // Ignore non-pointer Shell focus transitions.
@@ -4523,6 +4531,7 @@ void CancelTouchMarquee(ViewState& state);
 void UpdateTouchScrollbars(ViewState& state);
 void ClearSwipeFeedback(ViewState& state);
 void RetargetSwipeFeedback(ViewState& state,bool released,bool committed);
+void RepositionRenameEdit(ViewState& state);
 void StopTouch(ViewState& state) {
     const bool control = state.touch.control;
     const bool owned = state.touch.active || state.touch.primary;
@@ -4553,6 +4562,7 @@ void StopTouch(ViewState& state) {
         if (GetCapture() == state.hwnd) ReleaseCapture();
     }
     UpdateTouchScrollbars(state);
+    RepositionRenameEdit(state);
     if (feedback) Redraw(state); // Retire the preview on the independent render owner too.
 }
 void ResetMouseGestureForNavigation(ViewState& state) {
@@ -4777,6 +4787,7 @@ static void StopTouchpad(ViewState& state, bool releaseResources = true) {
     MSG pending{};
     while (PeekMessageW(&pending, state.hwnd, kMsgManipulationPan,
                         kMsgManipulationNavigate, PM_REMOVE)) {}
+    RepositionRenameEdit(state);
     if (!releaseResources) return;
     if (state.manipulationViewport) {
         if (state.manipulationCookie) {
@@ -6680,8 +6691,11 @@ ViewInputOwner InputFocusOwner(const ViewState& state) {
     if (!state.visible || !state.inScope || !state.detailsViewActive ||
         !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd)) return ViewInputOwner::None;
     const HWND focus = GetFocus();
-    if (!focus) return ViewInputOwner::None;
+    if (!focus) return state.rename.zoomHidden && state.rename.restoreZoomFocus ?
+        ViewInputOwner::RenameEditor : ViewInputOwner::None;
     if (focus == state.rename.editor) return ViewInputOwner::RenameEditor;
+    if (state.rename.zoomHidden && state.rename.restoreZoomFocus &&
+        (focus == state.hwnd || focus == state.frameHwnd)) return ViewInputOwner::RenameEditor;
     if (focus == state.hwnd) return ViewInputOwner::GpuList;
     if (focus == state.frameHwnd) return ViewInputOwner::Frame;
     if (NativeRenameEditor(state, focus)) return ViewInputOwner::NativeEditor;
@@ -20731,6 +20745,28 @@ ViewState* State(HWND hwnd);
 
 void FinishRename(ViewState& state, bool commit);
 
+// Keep this on the existing bounded asynchronous trace lane. In particular,
+// observing a drag must not invalidate, reformat, or acquire a drawing DC.
+void TraceRenameEvent(ViewState& state, UINT message, WPARAM parameter, unsigned phase) {
+    if ((!g_uiTransitionLogging.load(std::memory_order_relaxed) &&
+         !g_pipelineTracing.load(std::memory_order_relaxed)) || !state.rename.editor) return;
+    const HWND edit = state.rename.editor;
+    DWORD first=0,last=0;
+    SendMessageW(edit,EM_GETSEL,reinterpret_cast<WPARAM>(&first),reinterpret_cast<LPARAM>(&last));
+    const LRESULT origin=SendMessageW(edit,EM_POSFROMCHAR,0,0);
+    PipelineEvent(*state.background,{.operation=L"ui.rename.message[phase,depth,focus,capture]",
+        .a=message,.b=parameter,.v={double(phase),double(state.rename.nativeDispatchDepth),
+            GetFocus()==edit ? 1. : 0.,GetCapture()==edit ? 1. : 0.}},true);
+    PipelineEvent(*state.background,{.operation=L"ui.rename.selection[x,y,firstVisible,lines]",
+        .a=first,.b=last,.v={double(static_cast<short>(LOWORD(origin))),double(static_cast<short>(HIWORD(origin))),
+            double(SendMessageW(edit,EM_GETFIRSTVISIBLELINE,0,0)),double(SendMessageW(edit,EM_GETLINECOUNT,0,0))}},true);
+    RECT rect{}; GetWindowRect(edit,&rect);
+    PipelineEvent(*state.background,{.operation=L"ui.rename.window[left,top,right,bottom]",
+        .a=static_cast<unsigned long long>(GetWindowLongPtrW(edit,GWL_STYLE)),
+        .b=reinterpret_cast<UINT_PTR>(GetWindow(edit,GW_HWNDPREV)),
+        .v={double(rect.left),double(rect.top),double(rect.right),double(rect.bottom)}},true);
+}
+
 LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                      UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
@@ -20739,6 +20775,7 @@ LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         reinterpret_cast<HWND>(lp) == reinterpret_cast<HWND>(id)) {
         ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
         if (state && state->rename.editor == reinterpret_cast<HWND>(lp) && state->rename.background) {
+            TraceRenameEvent(*state,msg,0,2);
             const HDC dc = reinterpret_cast<HDC>(wp);
             SetTextColor(dc, state->nativeEditForeground);
             SetBkColor(dc, state->nativeEditBackground);
@@ -20748,8 +20785,15 @@ LRESULT CALLBACK RenameParentSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (msg == WM_COMMAND && HIWORD(wp) == EN_CHANGE &&
         reinterpret_cast<HWND>(lp) == reinterpret_cast<HWND>(id)) {
         ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
-        if (state && state->rename.editor == reinterpret_cast<HWND>(lp))
-            RepositionRenameEdit(*state);
+        if (state && state->rename.editor == reinterpret_cast<HWND>(lp)) {
+            TraceRenameEvent(*state,msg,HIWORD(wp),2);
+            state->rename.layoutValid = false;
+            state->rename.textLayoutDirty = true;
+            if (!state->rename.nativeDispatchDepth) {
+                state->rename.textLayoutDirty = false;
+                RepositionRenameEdit(*state);
+            }
+        }
     }
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameParentSubclass, id);
     return DefSubclassProc(hwnd, msg, wp, lp);
@@ -20776,6 +20820,14 @@ ItemGeometry RenameItemGeometry(ViewState& state, int index) {
         DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
 }
 
+SIZE RenameTextPadding(const ViewState& state) {
+    const int dpi = ViewDpi(state);
+    const LONG selection = ViewOptionEnabled(state, g_filenameOnly) ?
+        static_cast<LONG>(std::ceil(FilenameSelectionPadding(state))) : 0;
+    return {std::max<LONG>(selection, GetSystemMetricsForDpi(SM_CXBORDER, dpi)),
+        std::max<LONG>(selection, GetSystemMetricsForDpi(SM_CYBORDER, dpi))};
+}
+
 RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true) {
     const int dpi = ViewDpi(state);
     const auto geometry = RenameItemGeometry(state, index);
@@ -20787,10 +20839,8 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
         const auto& text = geometry.text;
         const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? client.right - text.right : text.left));
         const LONG top = static_cast<LONG>(std::lround(text.top));
-        const LONG padding = ViewOptionEnabled(state, g_filenameOnly) ?
-            static_cast<LONG>(std::ceil(FilenameSelectionPadding(state))) : 0;
-        const LONG borderX = std::max<LONG>(padding, GetSystemMetricsForDpi(SM_CXBORDER, dpi));
-        const LONG borderY = std::max<LONG>(padding, GetSystemMetricsForDpi(SM_CYBORDER, dpi));
+        const auto padding = RenameTextPadding(state);
+        const LONG borderX = padding.cx, borderY = padding.cy;
         RECT rc{left - borderX, top - borderY,
             left + static_cast<LONG>(std::ceil(text.right - text.left)) + borderX,
             top + static_cast<LONG>(std::ceil(text.bottom - text.top)) + borderY};
@@ -20881,6 +20931,10 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.folder.clear();
     r.tab = r.native = nullptr;
     r.finishing = false;
+    r.textLayoutDirty = false;
+    r.requestedTextRectValid = false;
+    r.layoutValid = false;
+    r.zoomHidden = r.zoomRetargeting = r.restoreZoomFocus = false;
     r.creationSticky = false;
     r.refocusQueued = false;
     r.startedAt = 0;
@@ -20970,26 +21024,112 @@ int RenameLineHeight(HWND editor) {
 void AlignWrappedRenameText(ViewState& state) {
     const HWND editor = state.rename.editor;
     if (!(GetWindowLongPtrW(editor, GWL_STYLE) & ES_MULTILINE)) return;
-    RECT client{}, format{}, overlay{};
+    RECT client{};
     GetClientRect(editor, &client);
-    SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
-    ViewClientRect(state, &overlay);
-    const auto text = RenameItemGeometry(state, state.rename.index).text;
-    // Match Text()'s physical origin and wrapping width, independent of the
-    // selection's padding or a mirrored Explorer frame. Grid labels start at
-    // the top of this band; centering vertically made short names jump down.
-    const LONG left = static_cast<LONG>(std::lround(state.rtlLayout ? overlay.right - text.right : text.left));
-    RECT aligned{left, static_cast<LONG>(std::lround(text.top)),
-        left + static_cast<LONG>(std::lround(text.right - text.left)),
-        static_cast<LONG>(std::lround(text.bottom))};
-    MapWindowPoints(state.hwnd, editor, reinterpret_cast<POINT*>(&aligned), 2);
-    aligned.left = std::clamp(aligned.left, 0L, std::max(0L, client.right - 1));
-    aligned.right = std::clamp(aligned.right, aligned.left + 1, std::max(aligned.left + 1, client.right));
-    aligned.top = std::clamp(aligned.top, 0L, std::max(0L, client.bottom - 1));
-    aligned.bottom = client.bottom;
-    if (EqualRect(&format, &aligned)) return;
-    SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
-    InvalidateRect(editor, nullptr, FALSE);
+    const auto padding = RenameTextPadding(state);
+    const LONG x = std::min(std::max(0L, padding.cx - GetSystemMetricsForDpi(SM_CXBORDER, ViewDpi(state))),
+        std::max(0L, (client.right - 1) / 2));
+    const LONG y = std::min(std::max(0L, padding.cy - GetSystemMetricsForDpi(SM_CYBORDER, ViewDpi(state))),
+        std::max(0L, (client.bottom - 1) / 2));
+    // Padding belongs to this independent editor, so growing or moving it
+    // above a bottom-edge label never leaves an empty band above its text.
+    RECT aligned{x, y, std::max(x + 1, client.right - x), std::max(y + 1, client.bottom - y)};
+    // EDIT normalizes formatting heights to its own line metrics (and can
+    // retain a minimum height in tiny viewports). Comparing EM_GETRECT with
+    // the request repeatedly reformats/invalidates an otherwise settled field.
+    auto& rename=state.rename;
+    if (!rename.requestedTextRectValid || !EqualRect(&rename.requestedTextRect, &aligned)) {
+        SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
+        rename.requestedTextRect=aligned;
+        rename.requestedTextRectValid=true;
+        InvalidateRect(editor, nullptr, FALSE);
+    }
+    const int first = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+    if (first > 0 && SendMessageW(editor, EM_GETLINECOUNT, 0, 0) * RenameLineHeight(editor) <= aligned.bottom - aligned.top)
+        SendMessageW(editor, EM_LINESCROLL, 0, -first);
+}
+
+BYTE RenameFontQuality() {
+    const auto mode = g_textAntialiasing.load(std::memory_order_relaxed);
+    if (mode == TextAntialiasing::Aliased) return NONANTIALIASED_QUALITY;
+    if (mode == TextAntialiasing::Smooth) return ANTIALIASED_QUALITY;
+    BOOL smoothing = TRUE;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0)) return DEFAULT_QUALITY;
+    if (!smoothing) return NONANTIALIASED_QUALITY;
+    UINT type = 0;
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE, 0, &type, 0)) return DEFAULT_QUALITY;
+    return type == FE_FONTSMOOTHINGCLEARTYPE ? CLEARTYPE_QUALITY : ANTIALIASED_QUALITY;
+}
+
+LOGFONTW RenameFontDescription(ViewState& state) {
+    LOGFONTW font = NativeHeaderFont(state);
+    const ResolvedManualFont chosen = ResolveManualFont(ConfiguredFontFamily());
+    if (!chosen.family.empty()) {
+        const auto& face = chosen.gdiFamily.empty() ? chosen.family : chosen.gdiFamily;
+        const size_t count = std::min(face.size(), static_cast<size_t>(LF_FACESIZE - 1));
+        std::copy_n(face.c_str(), count, font.lfFaceName); font.lfFaceName[count] = L'\0';
+    }
+    font.lfHeight = -static_cast<LONG>(std::lround(state.fontPx));
+    font.lfWeight = chosen.exactFace ? static_cast<LONG>(chosen.weight) : FW_NORMAL;
+    if (chosen.exactFace) font.lfItalic = chosen.style != DWRITE_FONT_STYLE_NORMAL;
+    font.lfQuality = RenameFontQuality();
+    return font;
+}
+
+void RefreshRenameFont(ViewState& state) {
+    auto& r = state.rename;
+    LOGFONTW font{};
+    if (!r.font || !GetObjectW(r.font, sizeof(font), &font)) return;
+    const unsigned revision = g_textRenderingRevision.load(std::memory_order_relaxed);
+    const LONG height = -static_cast<LONG>(std::lround(state.fontPx));
+    if (r.fontRenderingRevision != revision) font = RenameFontDescription(state);
+    else if (font.lfHeight == height) return;
+    font.lfHeight = height;
+    const HFONT replacement = CreateFontIndirectW(&font);
+    if (!replacement) return;
+    const HFONT previous = std::exchange(r.font, replacement);
+    r.fontRenderingRevision = revision;
+    SendMessageW(r.editor, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), TRUE);
+    DeleteObject(previous); // The native EDIT has selected its replacement.
+}
+
+void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) {
+    const HWND edit = state.rename.editor;
+    if (!(GetWindowLongPtrW(edit, GWL_STYLE) & ES_MULTILINE)) return;
+    auto& rename=state.rename;
+    const auto padding = RenameTextPadding(state);
+    const SIZE preferred{rect.right-rect.left,rect.bottom-rect.top};
+    const SIZE available{viewport.right-viewport.left,viewport.bottom-viewport.top};
+    const auto same=[](SIZE a,SIZE b) {return a.cx==b.cx && a.cy==b.cy;};
+    if (rename.layoutValid && same(preferred,rename.layoutPreferred) &&
+        same(available,rename.layoutAvailable) && same(padding,rename.layoutPadding)) {
+        if (rename.layoutSize.cx!=preferred.cx) rect.left=viewport.left;
+        rect.right=rect.left+rename.layoutSize.cx;
+        rect.bottom=rect.top+rename.layoutSize.cy;
+        return;
+    }
+    const auto measure = [&](LONG width) {
+        RECT current{}; GetWindowRect(edit, &current);
+        if (current.right - current.left != width)
+            SetWindowPos(edit, nullptr, 0, 0, width, current.bottom - current.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        AlignWrappedRenameText(state);
+        return static_cast<LONG>(SendMessageW(edit, EM_GETLINECOUNT, 0, 0)) *
+            std::max(1, RenameLineHeight(edit)) + padding.cy * 2;
+    };
+    LONG height = std::max(rect.bottom - rect.top, measure(rect.right - rect.left));
+    if (height > viewport.bottom - viewport.top && rect.right - rect.left < viewport.right - viewport.left) {
+        // At a window edge, use the available width before resorting to the
+        // native editor's scrolling. No filename line-count or row-height cap.
+        rect.left = viewport.left; rect.right = viewport.right;
+        height = std::max(rect.bottom - rect.top, measure(rect.right - rect.left));
+    }
+    rect.bottom = rect.top + std::max(1L, std::min(height, viewport.bottom - viewport.top));
+    // Text/font changes invalidate this measurement. Geometry/padding are
+    // keyed above: moving a settled field must not shrink it to measure its
+    // old narrow width and immediately expand it again on every owner update.
+    rename.layoutPreferred=preferred; rename.layoutAvailable=available; rename.layoutPadding=padding;
+    rename.layoutSize={rect.right-rect.left,rect.bottom-rect.top}; rename.layoutValid=true;
 }
 
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
@@ -21000,24 +21140,24 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // Its session stays alive until this procedure's final native NCDESTROY.
     const HWND overlay=state ? state->hwnd : nullptr;
     const bool current = state && state->rename.editor == hwnd;
+    const bool trace = current && (msg==WM_PAINT || msg==WM_ERASEBKGND || msg==WM_NCPAINT ||
+        msg==WM_SETFOCUS || msg==WM_KILLFOCUS || msg==WM_CAPTURECHANGED ||
+        msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP || (msg==WM_MOUSEMOVE && GetCapture()==hwnd) ||
+        msg==WM_WINDOWPOSCHANGING || msg==WM_WINDOWPOSCHANGED || msg==WM_SETFONT ||
+        msg==WM_SETTEXT || msg==WM_TIMER || msg==EM_SETSEL || msg==EM_SCROLLCARET || msg==EM_SETRECTNP);
+    const WPARAM traceParameter=(msg==WM_WINDOWPOSCHANGING || msg==WM_WINDOWPOSCHANGED) && lp ?
+        reinterpret_cast<const WINDOWPOS*>(lp)->flags : wp;
+    if (trace) TraceRenameEvent(*state,msg,traceParameter,0);
     // Own the border outside the EDIT's client area: native multiline borders
-    // inset every EM_SETRECT again. Single-line EDITs ignore EM_SETRECT, so
-    // center their client band using the selected HFONT's actual line metrics.
+    // inset every EM_SETRECT again.
     if (msg == WM_NCCALCSIZE && current) {
         const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
         auto& client = wp ? reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] :
             *reinterpret_cast<RECT*>(lp);
-        const auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
         const int dpi = DpiOf(hwnd);
         const LONG borderX = std::min<LONG>(GetSystemMetricsForDpi(SM_CXBORDER, dpi), (client.right-client.left)/2);
         const LONG borderY = std::min<LONG>(GetSystemMetricsForDpi(SM_CYBORDER, dpi), (client.bottom-client.top)/2);
         InflateRect(&client, -borderX, -borderY);
-        const int line = (style & ES_MULTILINE) ? 0 : RenameLineHeight(hwnd);
-        if (line > 0) {
-            const LONG padding = std::max(0L, (client.bottom - client.top - line) / 2);
-            client.top += padding;
-            client.bottom -= padding;
-        }
         return result;
     }
     if (msg == WM_NCPAINT && current && state->rename.background) {
@@ -21035,12 +21175,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         }
         return 0;
     }
-    // Notifications cover text mutations; paint also follows font/geometry
-    // changes without enumerating each editor mutation message here.
-    if (msg == WM_PAINT && current && !state->rename.finishing) {
-        RepositionRenameEdit(*state);
-        if (state->rename.editor != hwnd || !IsWindow(hwnd)) return 0;
-    }
+    // Painting/drag selection must never resize or reformat the native EDIT.
+    // EN_CHANGE, font, viewport and animation events own those operations.
     if (msg == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE)) {
         if (current && !state->rename.finishing)
             PostMessageW(overlay, kMsgRenameDecision, wp == VK_RETURN ? 1 : 0,
@@ -21048,7 +21184,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         return 0;
     }
     if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;
-    if (msg == WM_KILLFOCUS && current && !state->rename.finishing) {
+    if (msg == WM_KILLFOCUS && current && !state->rename.finishing &&
+        !(state->rename.zoomHidden && state->rename.positioning)) {
         if (state->rename.creationSticky) {
             // Shell's hidden native editor can transiently steal focus after
             // New Folder. Don't cancel the user's GPU editing session for it.
@@ -21074,12 +21211,26 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // Always call the genuine EDIT window procedure through WM_NCDESTROY.
     // The session (and its font) are released only AFTER it has completed.
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, RenameEditProc, id);
+    if (current && (msg==WM_SIZE || msg==WM_SETFONT || msg==EM_SETRECT || msg==EM_SETRECTNP))
+        state->rename.requestedTextRectValid=false;
+    if (current && (msg==WM_SETFONT || msg==WM_SETTEXT)) state->rename.layoutValid=false;
+    if (current) ++state->rename.nativeDispatchDepth;
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+    if (current) --state->rename.nativeDispatchDepth;
+    if (trace && state->rename.editor==hwnd) TraceRenameEvent(*state,msg,traceParameter,1);
     if (current && msg == WM_SETFONT) {
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
     if (current && (msg == WM_SIZE || msg == WM_SETFONT)) AlignWrappedRenameText(*state);
+    if (state && state->rename.editor == hwnd && !state->rename.nativeDispatchDepth && !state->rename.finishing &&
+        (msg == WM_SETFONT || msg == WM_SETTEXT || state->rename.textLayoutDirty)) {
+        // EN_CHANGE is synchronous inside the native editor's mutation. Let
+        // it finish its own word-wrap/scroll bookkeeping before resizing.
+        // Multiline WM_SETTEXT does not send EN_CHANGE at all.
+        state->rename.textLayoutDirty = false;
+        RepositionRenameEdit(*state);
+    }
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
@@ -21125,9 +21276,12 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
     const bool wrapped = RenameItemGeometry(state, index).wrapped;
-    const DWORD style = WS_CHILD | WS_CLIPSIBLINGS |
-        (wrapped ? ES_MULTILINE | ES_AUTOVSCROLL | ES_CENTER :
-            ES_AUTOHSCROLL | (state.rtlLayout ? ES_RIGHT : ES_LEFT));
+    // The single-line EDIT normalizes reversed selections to the trailing
+    // caret even though EM_SETSEL documents an active ending parameter.
+    // Use the same native wrapping/expansion path in every view; it honors the
+    // leading caret and keeps long names accessible in narrow columns and RTL.
+    const DWORD style = WS_CHILD | WS_CLIPSIBLINGS | ES_MULTILINE | ES_AUTOVSCROLL |
+        (wrapped ? ES_CENTER : state.rtlLayout ? ES_RIGHT : ES_LEFT);
     HWND edit = CreateWindowExW(state.rtlLayout ? WS_EX_RTLREADING : 0,
         L"EDIT", name.c_str(), style, rc.left, rc.top,
         rc.right - rc.left, rc.bottom - rc.top, state.frameHwnd, nullptr,
@@ -21152,6 +21306,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     r.tab = state.activeTabHost;
     r.native = state.nativeHwnd;
     r.frameRect = rc;
+    EnsurePipelineTrace(state);
     RefreshRenamePalette(state);
     // Creation, input and overlay retirement run on this EDIT's owner thread.
     if (!SetWindowSubclass(edit, RenameEditProc,
@@ -21160,31 +21315,23 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
         Wh_Log(L"[GPU rename] EDIT subclass failed");
         return;
     }
-    LOGFONTW editFont = NativeHeaderFont(state);
-    const ResolvedManualFont chosen = ResolveManualFont(ConfiguredFontFamily());
-    if (!chosen.family.empty()) {
-        const std::wstring& face = chosen.gdiFamily.empty() ?
-            chosen.family : chosen.gdiFamily;
-        const size_t count = std::min(face.size(),
-                                     static_cast<size_t>(LF_FACESIZE - 1));
-        std::copy_n(face.c_str(), count, editFont.lfFaceName);
-        editFont.lfFaceName[count] = L'\0';
-    }
-    editFont.lfHeight = -static_cast<LONG>(std::lround(state.fontPx));
-    editFont.lfWeight = chosen.exactFace ?
-        static_cast<LONG>(chosen.weight) : FW_NORMAL;
-    if (chosen.exactFace)
-        editFont.lfItalic = chosen.style != DWRITE_FONT_STYLE_NORMAL;
+    LOGFONTW editFont = RenameFontDescription(state);
     r.font = CreateFontIndirectW(&editFont);
-    SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(r.font ? r.font :
-        static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
+    r.fontRenderingRevision = g_textRenderingRevision.load(std::memory_order_relaxed);
+    {
+        ScopedFlag initializing(r.positioning);
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(r.font ? r.font :
+            static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
+    }
     int end = static_cast<int>(name.size());
     if (!state.entries[static_cast<size_t>(index)].folder) {
         const size_t dot = name.find_last_of(L'.');
         if (dot != std::wstring::npos && dot > 0)
             end = static_cast<int>(dot);
     }
-    SendMessageW(edit, EM_SETSEL, 0, end);
+    // Keep the full basename selected, with its active end at character zero.
+    // Focusing a narrow single-line EDIT otherwise scrolls to the suffix.
+    SendMessageW(edit, EM_SETSEL, end, 0);
     RepositionRenameEdit(state);
     if (r.editor != edit || !IsWindowVisible(edit)) return;
     // Two FRAME siblings: keep GPU list immediately below the editor, not
@@ -21193,6 +21340,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     SetWindowPos(edit, HWND_TOP, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SetFocus(edit);
+    SendMessageW(edit, EM_SCROLLCARET, 0, 0);
     if (GetFocus() != edit && !createdItem) {
         CancelRename(state);
         return;
@@ -21222,7 +21370,7 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
     // subsequently focuses its duplicate. Cancel only the duplicate session.
     if (state.rename.editor) {
         SendMessageW(editor, WM_KEYDOWN, VK_ESCAPE, 0);
-        if (current()) { RepositionRenameEdit(state); SetFocus(state.rename.editor); }
+        if (current()) { RepositionRenameEdit(state); if (!state.rename.zoomHidden) SetFocus(state.rename.editor); }
         return current() && state.rename.editor;
     }
     const auto view = state.folderView;
@@ -21263,7 +21411,8 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
     BeginRename(state, row, true);
     if (!state.rename.editor) return false;
     SetWindowTextW(state.rename.editor, text.c_str());
-    SendMessageW(state.rename.editor, EM_SETSEL, first, last);
+    SendMessageW(state.rename.editor, EM_SETSEL, first == 0 ? last : first, first == 0 ? first : last);
+    SendMessageW(state.rename.editor, EM_SCROLLCARET, 0, 0);
     ClearInteractiveCreation(state);
     if (g_perf.load(std::memory_order_relaxed))
         Wh_Log(L"[GPU rename] NATIVE_EDIT_HANDOFF native-edit=%p gpu-edit=%p row=%d path=%s",
@@ -21333,6 +21482,24 @@ void RepositionRenameEdit(ViewState& state) {
     if (!state.rename.editor || state.rename.positioning) return;
     ScopedFlag positioning(state.rename.positioning);
     if (!RenameSessionValid(state)) { CancelRename(state); return; }
+    auto& rename = state.rename;
+    const bool zooming = state.zoomAnimating || rename.zoomRetargeting ||
+        (state.touchpadPinching && (state.manipulationFrameActive || (state.touch.active && !state.swipeReleased)));
+    if (zooming) {
+        if (!rename.zoomHidden) {
+            rename.zoomHidden = true;
+            rename.restoreZoomFocus = GetFocus() == rename.editor;
+            SetPresentationVisibility(rename.editor, false);
+            Redraw(state);
+        }
+        return; // No native sizing/font/painting work during compositor zoom.
+    }
+    if (rename.zoomHidden && g_unloading.load(std::memory_order_acquire)) return;
+    const HWND focus = GetFocus();
+    if (rename.zoomHidden && rename.restoreZoomFocus && focus && focus != rename.editor &&
+        focus != state.hwnd && focus != state.frameHwnd) { CancelRename(state); return; }
+    RefreshRenameFont(state);
+    if (!RenameSessionValid(state)) { CancelRename(state); return; }
     if (!state.rename.parentSubclassInstalled) {
         state.rename.notificationHost = state.frameHwnd;
         state.rename.parentSubclassInstalled = SetWindowSubclass(state.rename.notificationHost,
@@ -21348,6 +21515,8 @@ void RepositionRenameEdit(ViewState& state) {
         return;
     }
     RECT local = RenameEditorRect(state, state.rename.index, false);
+    // Reveal the original Name-column anchor before an expanded editor can
+    // borrow the whole viewport width and replace that offscreen rectangle.
     const LONG dx = local.left < overlayArea.left ? local.left - overlayArea.left :
         std::max(0L, local.right - overlayArea.right);
     if (dx && ColumnsPresented(state)) {
@@ -21355,12 +21524,14 @@ void RepositionRenameEdit(ViewState& state) {
         overlayArea = RenameViewport(state, false);
         local = RenameEditorRect(state, state.rename.index, false);
     }
+    FitWrappedRenameEditor(state, local, overlayArea);
     const LONG dy = local.top < overlayArea.top ? local.top - overlayArea.top :
         std::max(0L, local.bottom - overlayArea.bottom);
     if (dy) {
         SetScrollImmediate(state, state.scrollNow + dy);
         overlayArea = RenameViewport(state, false);
         local = RenameEditorRect(state, state.rename.index, false);
+        FitWrappedRenameEditor(state, local, overlayArea);
     }
     // If an icon/indent alone exceeds a tiny viewport, keep the EDIT usable
     // inside that viewport after exhausting the real scroll range.
@@ -21370,16 +21541,18 @@ void RepositionRenameEdit(ViewState& state) {
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
-    if (EqualRect(&local, &state.rename.frameRect) && IsWindowVisible(state.rename.editor) &&
-        GetWindow(state.frameHwnd, GW_CHILD) == state.rename.editor) {
-        AlignWrappedRenameText(state);
-        return;
-    }
-    if (SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
+    if ((!EqualRect(&local, &state.rename.frameRect) || !IsWindowVisible(state.rename.editor) ||
+        GetWindow(state.frameHwnd, GW_CHILD) != state.rename.editor) &&
+        SetWindowPos(state.rename.editor, HWND_TOP, local.left, local.top,
         local.right - local.left, local.bottom - local.top,
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS | SWP_FRAMECHANGED))
         state.rename.frameRect = local;
     AlignWrappedRenameText(state);
+    if (std::exchange(rename.zoomHidden, false)) {
+        if (std::exchange(rename.restoreZoomFocus, false) && ExplorerFrameHasForeground(state.frameHwnd))
+            SetFocus(rename.editor);
+        Redraw(state);
+    }
 }
 
 void FinishRename(ViewState& state, bool commit) {
@@ -22506,6 +22679,22 @@ bool AdvanceRowHeight(ViewState& state, bool finish) {
 // limits as wheel input without losing sub-pixel changes. Grid has no visual
 // upper limit; only the integer preference's representable range bounds it.
 int RowFromPoint(ViewState& state, int y, int x);
+class RenameZoomUpdate {
+    ViewState& state;
+    bool previous;
+    UINT_PTR epoch;
+public:
+    explicit RenameZoomUpdate(ViewState& owner) : state(owner), previous(std::exchange(owner.rename.zoomRetargeting, true)), epoch(owner.rename.epoch) {
+        RepositionRenameEdit(state);
+    }
+    ~RenameZoomUpdate() {
+        // Completion is the gesture state/compositor acknowledgement, never
+        // an extra quiet-period timer on the native editor.
+        if (state.rename.epoch == epoch) state.rename.zoomRetargeting = previous;
+        RepositionRenameEdit(state);
+    }
+};
+
 double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact = nullptr) {
     const int current = state.rowHeight96[state.gridView] ?
         state.rowHeight96[state.gridView] : g_row96.load();
@@ -22513,6 +22702,11 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
     const double bounded96 = std::clamp(requested96, 24.,
         state.gridView ? static_cast<double>(std::numeric_limits<int>::max()) : 96.);
     const int height96 = static_cast<int>(std::llround(bounded96));
+    if (!contact && height96 == current) {
+        ScheduleZoomAutoRefit(state, false);
+        return bounded96;
+    }
+    RenameZoomUpdate renameZoom(state);
     if (contact) {
         // Direct touch follows each physical scale sample. Preserve the item
         // and fractional row under the midpoint through grid/group reflow;
@@ -22544,10 +22738,6 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         QueueVisibleDataFrame(state);
         ScheduleZoomAutoRefit(state, true);
         Redraw(state);
-        return bounded96;
-    }
-    if (height96 == current) {
-        ScheduleZoomAutoRefit(state, false);
         return bounded96;
     }
     state.preciseRowHeight96[state.gridView] = 0.;
@@ -22760,7 +22950,7 @@ void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
             UnregisterAnimationWhenIdle(state);
         }
     }
-
+    RepositionRenameEdit(state);
 }
 
 void ApplyManipulationPan(ViewState& state, float physicalX, float dy) {
@@ -22861,6 +23051,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
             state.preciseRowHeight96[state.gridView] > 0. ? state.preciseRowHeight96[state.gridView] :
             state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
     }
+    RepositionRenameEdit(state);
     if (!logDelta) return;
     state.lastManipulationActivity = GetTickCount64();
     state.touchpadPinchHeight96 = ApplyRowHeight(state,
@@ -24930,7 +25121,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
         state.presentationFont=NativeHeaderFont(state); state.presentationDpi=model->dpi;
     }
     model->font=state.presentationFont;
-    model->renameEditor=state.rename.editor; model->renameIndex=state.rename.index;
+    model->renameEditor=state.rename.zoomHidden ? nullptr : state.rename.editor; model->renameIndex=state.rename.index;
     model->observerId=state.presentObserverId; model->observerQpc=state.presentObserverQpc;
     model->observerCommitQpc=state.observerCommitQpc;
     model->documentHeight=DocumentHeight(state); model->clipboard=state.clipboardPaths;
@@ -25615,7 +25806,13 @@ void ConsumePresentation(ViewState& state) {
         state.iconPx=receipt->iconSize; state.headerPx=receipt->headerHeight;
         state.itemWidth=receipt->itemWidth; state.itemsPerRow=receipt->itemsPerRow;
         state.scrollNow=state.scrollTarget=receipt->scroll; geometry=true;
-        if(state.textFormat && state.textFormat->GetFontSize()!=state.fontPx) MakeTextFormats(state,true);
+        if(state.textFormat && state.textFormat->GetFontSize()!=state.fontPx) {
+            const auto style = state.presentationStyleRevision;
+            MakeTextFormats(state,true);
+            // A cold/invalidated owner format can resolve its face here.
+            // Publish that new style before requiring it on the next receipt.
+            if (style != state.presentationStyleRevision) Redraw(state);
+        }
         if(!state.zoomAnimating && state.zoomLayoutTransition) StopRowTransition(state);
     }
     if(state.presentationGroupIntents==receipt->groupIntents && receipt->groupFrame.QuadPart)
@@ -26936,6 +27133,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ++g_textRenderingRevision;
                 StopKeyboardSelectionAnimation(*s);
                 if (s->target || s->presenter) MakeTextFormats(*s);
+                RepositionRenameEdit(*s);
             }
             if (changes & kStyleInput) {
                 s->checkboxHeaderActionPending=false; s->checkboxHeaderActionSelection.clear();
@@ -27518,7 +27716,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // changes. Restore keyboard input without dismissing or recreating
             // the field. Never steal focus from another Explorer/application.
             AdoptNativeRenameEditor(*s, GetFocus());
-            if (s->rename.editor && s->rename.creationSticky &&
+            if (s->rename.editor && !s->rename.zoomHidden && s->rename.creationSticky &&
                 GetFocus() != s->rename.editor &&
                 ExplorerFrameHasForeground(s->frameHwnd) &&
                 !(GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
@@ -28470,7 +28668,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             AdoptNativeRenameEditor(*s, reinterpret_cast<HWND>(wParam));
         return 0;
     case kMsgCreationRefocus:
-        if (s && s->rename.editor && s->rename.creationSticky &&
+        if (s && s->rename.editor && !s->rename.zoomHidden && s->rename.creationSticky &&
             s->rename.epoch == static_cast<UINT_PTR>(lParam)) {
             s->rename.refocusQueued = false;
             const ULONGLONG now = GetTickCount64();
