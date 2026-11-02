@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.337
+// @version         0.9.338
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -36,6 +36,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
 - **Shell Size Text** — The Size column uses Shell formatting and can pick up folder sizes from [Better file sizes in Explorer details](https://windhawk.net/mods/explorer-details-better-file-sizes). Refresh after changing that mod's settings. Size sorting and grouping use the overlay's own rules.
+- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags. On by default.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
@@ -125,6 +126,9 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $description: Higher = more visible drag rectangle; lower = fainter.
   $name: Selection
 - Hover:
+    - detailedTooltips: true
+      $name: Detailed tooltips
+      $description: Add populated file properties such as dimensions, bitrate, comments and tags to item tooltips. Extra details are limited to the available screen space.
     - animateHover: true
       $name: Animate hover highlight
     - hoverOpacity: 50
@@ -567,6 +571,7 @@ std::atomic<ViewOption> g_filenameOnly{ViewOption::GridOnly};
 std::atomic<ViewOption> g_middleEllipsis{ViewOption::GridOnly};
 std::atomic<bool> g_listThumbnails{false};
 std::atomic<bool> g_animateHover{true};
+std::atomic<bool> g_detailedItemTips{true};
 // Internal until exposed as "animated item interactions". Header sorting is
 // deliberate input; native context-menu sorting keeps its layout animation.
 std::atomic<bool> g_animateItemInteractions{false};
@@ -1767,10 +1772,12 @@ struct ColumnCatalogJob {
     ColumnChoices known; // Only value snapshots; never an apartment-owned IColumnManager.
 };
 
-// Latest-wins hover metadata the row snapshot lacks: a type name not yet
-// formatted for this view, or a namespace item's size/dates. Plain values only.
+struct ItemTipRow { std::wstring label, value; PROPERTYKEY key{}; bool date = false; };
+// Latest-wins hover metadata. Cached column strings (including empty cells)
+// are authoritative; provider interfaces never cross the owning apartment.
 struct ItemTipJob {
     unsigned long long token = 0;
+    unsigned long long listing = 0; // Size-binding lifetime; token is per hover.
     SharedPidl identity;
     std::wstring path;
     bool folder = false, namespaceItem = false;
@@ -1778,6 +1785,11 @@ struct ItemTipJob {
     ULONGLONG size = 0;
     bool sizeKnown = false;
     FILETIME created{}, modified{};
+    std::vector<ColumnCell> cells;
+    ColumnChoices labels;
+    std::vector<ItemTipRow> rows;
+    size_t rowLimit = 0;
+    bool detailed = false;
 };
 
 struct StatusButtonQuery {
@@ -2233,6 +2245,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::optional<StatusButtonSnapshot> statusButtonJob,statusButtonResult;
     std::optional<ItemTipJob> itemTipJob, itemTipResult;
     std::atomic<unsigned long long> itemTipGeneration{0};
+    // Listing whose parent-folder Size binding the Columns lane may keep.
+    std::atomic<unsigned long long> itemTipListing{0};
     std::deque<DirectoryWatchJob> watchJobs;
     std::deque<DirectoryResult> directoryResults;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
@@ -2761,7 +2775,6 @@ struct PresentationRowCache {
 };
 // Hovered-item tooltip: one popup per tab, painted with that tab's DirectWrite
 // face and palette through standard Win32, Direct2D and DWM calls only.
-struct ItemTipRow { std::wstring label, value; };
 struct ItemTip {
     HWND hwnd = nullptr;
     std::wstring item;       // Displayed or pending item identity.
@@ -2782,6 +2795,8 @@ struct ItemTip {
     std::vector<float> rowTops;
     float padX = 0.f, padY = 0.f, nameHeight = 0.f, labelX = 0.f, valueX = 0.f;
     SIZE size{};
+    size_t rowCapacity = 0;
+    DragTextStyle textStyle; // Shared monitor-aware rendering policy, independent popup target.
     void Release() {
         if (IsWindow(hwnd) && GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId() &&
             GetWindowLongPtrW(hwnd, GWLP_USERDATA) == reinterpret_cast<LONG_PTR>(this)) {
@@ -2793,7 +2808,7 @@ struct ItemTip {
         nameFormat.Reset(); labelFormat.Reset(); valueFormat.Reset();
         nameLayout.Reset(); rowLayouts.clear(); rowTops.clear();
         item.clear(); suppressed.clear(); name.clear(); rows.clear();
-        token = 0; formatSerial = 0;
+        token = 0; formatSerial = 0; textStyle = {};
     }
     ~ItemTip() { Release(); }
 };
@@ -6241,6 +6256,7 @@ void LoadSettings() {
     g_middleEllipsis.store(viewOption(L"Appearance.middleEllipsis"));
     g_listThumbnails.store(Wh_GetIntSetting(L"Appearance.listThumbnails") != 0);
     g_animateHover.store(Wh_GetIntSetting(L"Hover.animateHover") != 0);
+    g_detailedItemTips.store(Wh_GetIntSetting(L"Hover.detailedTooltips") != 0);
     g_selectionAlpha.store(std::clamp(Wh_GetIntSetting(L"Selection.selectionOpacity"), 0, 100));
     g_hoverAlpha.store(std::clamp(Wh_GetIntSetting(L"Hover.hoverOpacity"), 0, 100));
     g_bothAlpha.store(std::clamp(Wh_GetIntSetting(L"Hover.hoverSelectedOpacity"), 0, 100));
@@ -7831,6 +7847,150 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
+std::wstring ItemTipDate(REFPROPERTYKEY key, const FILETIME& time) {
+    std::wstring text = FormatFileTime(time);
+    if (text.empty()) return text;
+    PROPVARIANT value{}; value.vt = VT_FILETIME; value.filetime = time;
+    PWSTR relative = nullptr, absolute = nullptr;
+    const auto flags = static_cast<PROPDESC_FORMAT_FLAGS>(PDFF_HIDETIME | PDFF_SHORTDATE);
+    PSFormatForDisplayAlloc(key, value, flags, &absolute);
+    PSFormatForDisplayAlloc(key, value,
+        static_cast<PROPDESC_FORMAT_FLAGS>(flags | PDFF_RELATIVEDATE), &relative);
+    // Windows supplies friendly dates such as Yesterday where supported.
+    // Never invent English age phrases or duplicate an ordinary calendar date.
+    if (relative && *relative && absolute && wcscmp(relative, absolute) != 0)
+        text += L" \x00B7 " + std::wstring(relative);
+    CoTaskMemFree(relative); CoTaskMemFree(absolute);
+    return text;
+}
+
+std::wstring ItemTipComparison(std::wstring value, bool date) {
+    if (date) {
+        const auto suffix = value.find(L" \x00B7 ");
+        if (suffix != std::wstring::npos) value.resize(suffix);
+    }
+    std::erase_if(value, [](wchar_t ch) { return ch == 0x200e || ch == 0x200f || (ch >= 0x202a && ch <= 0x202e); });
+    return value;
+}
+
+template<class Current>
+void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
+                    std::map<std::wstring, std::wstring>& typeNames, Current&& current) {
+    ComPtr<IPropertyStore> store;
+    bool storeAttempted = false;
+    std::vector<PROPERTYKEY> visited;
+    std::vector<std::wstring> displayedValues;
+    const auto cached = [&](REFPROPERTYKEY key) -> const std::wstring* {
+        for (const auto& cell : job.cells) if (SameKey(cell.key, key)) return &cell.text;
+        return nullptr;
+    };
+    const auto add = [&](REFPROPERTYKEY key, std::wstring value, bool requireViewable) {
+        if (value.find_first_not_of(L" \t\r\n") == std::wstring::npos || job.rows.size() >= job.rowLimit) return;
+        ComPtr<IPropertyDescription> description;
+        std::wstring label;
+        if (SUCCEEDED(PSGetPropertyDescription(key, IID_PPV_ARGS(&description)))) {
+            PROPDESC_TYPE_FLAGS flags{};
+            if (requireViewable && (FAILED(description->GetTypeFlags(PDTF_ISVIEWABLE, &flags)) ||
+                !(flags & PDTF_ISVIEWABLE))) return;
+            PWSTR text = nullptr;
+            if (SUCCEEDED(description->GetDisplayName(&text)) && text) label = text;
+            CoTaskMemFree(text);
+        } else if (requireViewable) return;
+        if (label.empty()) for (const auto& known : job.labels)
+            if (SameKey(known.first, key)) { label = known.second; break; }
+        if (label.empty()) return; // No canonical names or hardcoded English fallback.
+        for (auto& ch : value) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+        VARTYPE type = VT_EMPTY;
+        const bool date = description && SUCCEEDED(description->GetPropertyType(&type)) && type == VT_FILETIME;
+        // Cached date columns lack our optional Windows-friendly suffix.
+        auto comparison = ItemTipComparison(value, date);
+        if (std::find(displayedValues.begin(), displayedValues.end(), comparison) != displayedValues.end()) return;
+        displayedValues.push_back(std::move(comparison));
+        job.rows.push_back({std::move(label), std::move(value), key, date});
+    };
+    const auto first = [&](REFPROPERTYKEY key) {
+        if (!current() || job.rows.size() >= job.rowLimit || ClassifySort(key) == SortKind::Name ||
+            std::any_of(visited.begin(), visited.end(), [&](const auto& seen) { return SameKey(seen, key); })) return false;
+        visited.push_back(key);
+        return true;
+    };
+    const auto openStore = [&] {
+        if (!storeAttempted && current() && job.rows.size() < job.rowLimit) {
+            storeAttempted = true;
+            EntryPropertyStore(job.path, job.identity.get(), GPS_DEFAULT, store.GetAddressOf());
+        }
+    };
+    job.rows.clear();
+    for (const auto& key : {PKEY_Size, PKEY_ItemTypeText, PKEY_DateCreated, PKEY_DateModified}) {
+        if (!first(key)) continue;
+        std::wstring text;
+        bool resolved = cached(key) != nullptr;
+        if (const auto* value = cached(key)) text = *value;
+        else if (SameKey(key, PKEY_Size)) {
+            resolved = ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding, job.listing);
+            if (!resolved && job.sizeKnown) { text = FormatSize(job.size); resolved = true; }
+            // Filesystem directory allocation is not its contents' size.
+            // Only cached/column-provider text can supply a folder size.
+            if (!resolved && job.folder && !job.namespaceItem) resolved = true;
+        } else if (SameKey(key, PKEY_ItemTypeText)) text = !job.type.empty() ? job.type :
+            !job.namespaceItem ? GetTypeName(typeNames, job.path, job.folder) : L"";
+        else text = ItemTipDate(key, SameKey(key, PKEY_DateCreated) ? job.created : job.modified);
+        if (text.empty() && !resolved) {
+            openStore();
+            PROPVARIANT value{};
+            if (store && SUCCEEDED(store->GetValue(key, &value))) {
+                text = value.vt == VT_FILETIME ? ItemTipDate(key, value.filetime) : FormatShellDetail(nullptr, key, &value);
+            }
+            PropVariantClear(&value);
+            if (text.empty() && SameKey(key, PKEY_ItemTypeText)) text = GetTypeName(typeNames, job.path, job.folder);
+        }
+        add(key, std::move(text), false);
+    }
+    if (!job.detailed || job.folder || job.namespaceItem || !current() || job.rows.size() >= job.rowLimit) return;
+    // A folder's column catalog includes volume capacity, free space, paths,
+    // and other inherited context. Extra rows must belong to the file itself.
+    // Enumerate its handler's keys before reusing cached optional columns, so
+    // an enabled disk-space column cannot leak back into this popup.
+    ComPtr<IPropertyStore> fileStore;
+    if (FAILED(EntryPropertyStore(job.path, job.identity.get(), GPS_HANDLERPROPERTIESONLY,
+        fileStore.GetAddressOf())) || !fileStore) return;
+    DWORD properties = 0;
+    std::vector<PROPERTYKEY> fileKeys;
+    if (FAILED(fileStore->GetCount(&properties))) return;
+    for (DWORD i = 0; i < properties && current(); ++i) {
+        PROPERTYKEY key{};
+        if (SUCCEEDED(fileStore->GetAt(i, &key))) fileKeys.push_back(key);
+    }
+    const auto read = [&](REFPROPERTYKEY key, bool requireViewable) {
+        if (!first(key) || std::none_of(fileKeys.begin(), fileKeys.end(),
+            [&](const auto& present) { return SameKey(present, key); })) return;
+        if (const auto* value = cached(key)) { add(key, *value, false); return; }
+        PROPVARIANT value{};
+        if (SUCCEEDED(fileStore->GetValue(key, &value)))
+            add(key, value.vt == VT_FILETIME ? ItemTipDate(key, value.filetime) :
+                FormatShellDetail(nullptr, key, &value), requireViewable);
+        PropVariantClear(&value);
+    };
+    // The item's FullDetails list orders relevant image/audio/document fields
+    // ahead of generic filesystem properties. It is not a metadata whitelist.
+    ComPtr<IShellItem2> item;
+    if (current() && job.rows.size() < job.rowLimit) {
+        if (job.identity) SHCreateItemFromIDList(job.identity.get(), IID_PPV_ARGS(&item));
+        else SHCreateItemFromParsingName(job.path.c_str(), nullptr, IID_PPV_ARGS(&item));
+    }
+    ComPtr<IPropertyDescriptionList> list;
+    UINT count = 0;
+    if (item && SUCCEEDED(item->GetPropertyDescriptionList(PKEY_PropList_FullDetails, IID_PPV_ARGS(&list))) &&
+        SUCCEEDED(list->GetCount(&count))) for (UINT i = 0; i < count && current() && job.rows.size() < job.rowLimit; ++i) {
+        ComPtr<IPropertyDescription> description; PROPERTYKEY key{};
+        if (SUCCEEDED(list->GetAt(i, IID_PPV_ARGS(&description))) && SUCCEEDED(description->GetPropertyKey(&key))) read(key, true);
+    }
+    for (const auto& key : fileKeys) {
+        if (!current() || job.rows.size() >= job.rowLimit) break;
+        read(key, true);
+    }
+}
+
 // Device-independent storage metadata. Shell storage providers expose either
 // System.Capacity/System.FreeSpace or System.Devices.Storage* properties.
 // Everything here executes on the tab-owned directory worker. Never invoke
@@ -8691,25 +8851,16 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         }
         // An idle detail lane keeps no provider folder alive between demands.
         if (detailsLane && !haveDetail) sizeBinding.Reset();
+        // Hover tips in one listing share its parent binding; a new or forgotten
+        // listing releases it as soon as the lane next runs or idles.
+        if (columnsLane && !itemTip) {
+            const auto listing = work.itemTipListing.load(std::memory_order_acquire);
+            if (!listing || sizeBinding.token != listing) sizeBinding.Reset();
+        }
         if(itemTip) {
             const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
                 work.itemTipGeneration.load(std::memory_order_acquire)==itemTip->token;};
-            if(current() && itemTip->namespaceItem) {
-                ComPtr<IPropertyStore> store;
-                if(SUCCEEDED(EntryPropertyStore(itemTip->path,itemTip->identity.get(),GPS_DEFAULT,store.GetAddressOf())) && store) {
-                    itemTip->type=FormatShellDetail(store.Get(),PKEY_ItemTypeText);
-                    for(const PROPERTYKEY& key:{PKEY_Size,PKEY_DateCreated,PKEY_DateModified}) {
-                        PROPVARIANT value{}; PropVariantInit(&value);
-                        if(SUCCEEDED(store->GetValue(key,&value))) {
-                            if(SameKey(key,PKEY_Size) && value.vt==VT_UI8) {
-                                itemTip->size=value.uhVal.QuadPart; itemTip->sizeKnown=true;
-                            } else if(value.vt==VT_FILETIME)
-                                (SameKey(key,PKEY_DateCreated) ? itemTip->created : itemTip->modified)=value.filetime;
-                        }
-                        PropVariantClear(&value);
-                    }
-                }
-            } else if(current()) itemTip->type=GetTypeName(typeNames,itemTip->path,itemTip->folder);
+            if(current()) ResolveItemTip(*itemTip,sizeBinding,typeNames,current);
             if(current()) {
                 {ExclusiveSrwLock lock(work.directoryLock);
                     if(current()) work.itemTipResult=std::move(itemTip);}
@@ -9351,6 +9502,9 @@ void ForgetDirectory(ViewState& state) {
     state.zebraExtentAnimating = false;
     auto& work = *state.background;
     work.directoryGeneration.store(0, std::memory_order_release);
+    // Navigation must not keep the old folder bound on an idle Columns lane.
+    work.itemTipListing.store(0, std::memory_order_release);
+    if (work.columns.thread) SetEvent(work.columns.wake);
     work.capacityGeneration.store(0, std::memory_order_release);
     state.capacityToken = 0;
     state.driveSpaceRefreshPending = false;
@@ -25015,9 +25169,8 @@ void ClearPointerHover(ViewState& state, bool animate) {
 
 // ---- Hovered-item tooltip ---------------------------------------------------
 // A resting mouse/pen pointer (WM_MOUSEHOVER, the system hover time) shows the
-// item's full name, size, type and dates. Names, sizes and filesystem dates
-// come from the row snapshot; only missing type text or a namespace item's
-// properties are resolved on the tab's Columns lane, never on this thread.
+// item's full name and populated Shell properties. The tab's existing Columns
+// lane reuses cached values and prepares one complete popup before it appears.
 bool ItemTipEligible(const ViewState& state, int row) {
     return row >= 0 && static_cast<size_t>(row) < state.entries.size() && state.clickPolicy.itemTips &&
         state.visible && state.inScope && state.pointerInside && state.pointingDevice != PointingDevice::Touch &&
@@ -25044,40 +25197,6 @@ void ItemTipHoverMoved(ViewState& state, int row) {
         &state.entries[static_cast<size_t>(row)].path : nullptr;
     if (!tip.item.empty() && (!item || *item != tip.item)) HideItemTip(state);
     if (!tip.suppressed.empty() && (!item || *item != tip.suppressed)) tip.suppressed.clear();
-}
-
-std::wstring RelativeAge(const FILETIME& then, const FILETIME& now) {
-    const ULONGLONG from = (ULONGLONG(then.dwHighDateTime) << 32) | then.dwLowDateTime;
-    const ULONGLONG to = (ULONGLONG(now.dwHighDateTime) << 32) | now.dwLowDateTime;
-    if (!from) return {};
-    // Timestamps from a slightly fast clock (another machine, a share) are
-    // "just now"; anything further in the future gets no age at all.
-    if (to < from) return from - to < 600000000ull ? L"just now" : L"";
-    const ULONGLONG minutes = (to - from) / 600000000ull;
-    const auto ago = [](ULONGLONG count, const wchar_t* unit) {
-        return std::to_wstring(count) + L" " + unit + (count == 1 ? L"" : L"s") + L" ago";
-    };
-    if (minutes < 1) return L"just now";
-    if (minutes < 60) return ago(minutes, L"minute");
-    const ULONGLONG hours = minutes / 60, days = hours / 24;
-    if (hours < 24) return ago(hours, L"hour");
-    if (days < 7) return ago(days, L"day");
-    if (days < 30) return ago(days / 7, L"week");
-    if (days < 365) return ago(std::clamp<ULONGLONG>(days / 30, 1, 11), L"month");
-    return ago(days / 365, L"year");
-}
-
-std::vector<ItemTipRow> ItemTipRows(const ItemTipJob& facts, const FILETIME& now) {
-    std::vector<ItemTipRow> rows;
-    if (facts.sizeKnown) rows.push_back({L"Size", FormatSize(facts.size)});
-    if (!facts.type.empty()) rows.push_back({L"Type", facts.type});
-    for (const auto& [label, time] : {std::pair{L"Created", facts.created}, std::pair{L"Modified", facts.modified}}) {
-        std::wstring value = FormatFileTime(time);
-        if (value.empty()) continue;
-        if (const auto age = RelativeAge(time, now); !age.empty()) value += L" \x00B7 " + age; // Middle dot
-        rows.push_back({label, std::move(value)});
-    }
-    return rows;
 }
 
 void RefreshItemTipPalette(ViewState& state, bool highContrast) {
@@ -25121,6 +25240,21 @@ bool EnsureItemTipWindow(ViewState& state) {
     return true;
 }
 
+RECT ItemTipCursorBounds(const ViewState& state, POINT anchor) {
+    int height = GetSystemMetricsForDpi(SM_CYCURSOR, UINT(DpiOf(state.hwnd))), hotspot = 0;
+    CURSORINFO cursor{sizeof(cursor)};
+    ICONINFO info{};
+    if (GetCursorInfo(&cursor) && cursor.hCursor && GetIconInfo(cursor.hCursor, &info)) {
+        BITMAP bitmap{};
+        if (GetObjectW(info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bitmap), &bitmap))
+            height = info.hbmColor ? bitmap.bmHeight : bitmap.bmHeight / 2;
+        hotspot = int(info.yHotspot);
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+    }
+    return RECT{anchor.x, anchor.y - hotspot, anchor.x, anchor.y - hotspot + height};
+}
+
 bool LayoutItemTip(ViewState& state, const RECT& work) {
     auto& tip = state.itemTip;
     if (!g_writeFactory || (!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat) return false;
@@ -25152,10 +25286,18 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
     tip.padX = float(Scale96(10, dpi)); tip.padY = float(Scale96(7, dpi));
     const float columnGap = float(Scale96(16, dpi)), nameGap = float(Scale96(5, dpi));
     const float available = std::max(1.f, float(work.right - work.left) - 2.f * tip.padX);
+    const RECT cursor = ItemTipCursorBounds(state, tip.anchor);
+    const float maxHeight = std::max(1.f, float(std::min(work.bottom - work.top,
+        std::max(cursor.top - work.top, work.bottom - cursor.bottom))));
+    ComPtr<IDWriteInlineObject> ellipsis;
+    g_writeFactory->CreateEllipsisTrimmingSign(tip.valueFormat.Get(), &ellipsis);
+    const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
     const auto layout = [&](const std::wstring& text, IDWriteTextFormat* format, float width,
                             ComPtr<IDWriteTextLayout>& out, DWRITE_TEXT_METRICS& metrics) {
-        return SUCCEEDED(g_writeFactory->CreateTextLayout(text.c_str(), UINT32(text.size()), format,
-            width, 1e6f, &out)) && SUCCEEDED(out->GetMetrics(&metrics));
+        if (FAILED(g_writeFactory->CreateTextLayout(text.c_str(), UINT32(text.size()), format,
+            width, 1e6f, &out))) return false;
+        if (ellipsis) out->SetTrimming(&trimming, ellipsis.Get());
+        return SUCCEEDED(out->GetMetrics(&metrics));
     };
     // Tab-stop alignment: one label column sized by its widest label, so
     // every value starts on the same edge.
@@ -25165,14 +25307,17 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
     for (const auto& row : tip.rows) {
         ComPtr<IDWriteTextLayout> label, value;
         DWRITE_TEXT_METRICS labelMetrics{}, valueMetrics{};
-        if (!layout(row.label, tip.labelFormat.Get(), available, label, labelMetrics) ||
-            !layout(row.value, tip.valueFormat.Get(), available, value, valueMetrics)) return false;
+        const auto bounded = [](const std::wstring& text) {
+            return text.size() > kColumnFitTextLimit ? text.substr(0, kColumnFitTextLimit) + L"\x2026" : text;
+        };
+        if (!layout(bounded(row.label), tip.labelFormat.Get(), available, label, labelMetrics) ||
+            !layout(bounded(row.value), tip.valueFormat.Get(), available, value, valueMetrics)) return false;
         labelWidth = std::max(labelWidth, labelMetrics.widthIncludingTrailingWhitespace);
         valueWidth = std::max(valueWidth, valueMetrics.widthIncludingTrailingWhitespace);
         heights.push_back(std::max(labelMetrics.height, valueMetrics.height));
         tip.rowLayouts.emplace_back(std::move(label), std::move(value));
     }
-    labelWidth = std::ceil(labelWidth);
+    labelWidth = std::min(std::ceil(labelWidth), std::max(1.f, (available - columnGap) * .45f));
     const float tableWidth = tip.rows.empty() ? 0.f : std::min(available, labelWidth + columnGap + std::ceil(valueWidth));
     // Long names wrap within the details' width, or a third of the monitor.
     const float nameLimit = std::min(available, std::max(tableWidth, float(work.right - work.left) / 3.f));
@@ -25180,38 +25325,37 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
     if (!layout(tip.name, tip.nameFormat.Get(), nameLimit, tip.nameLayout, nameMetrics)) return false;
     const float content = std::ceil(std::max(tableWidth, nameMetrics.widthIncludingTrailingWhitespace));
     tip.nameLayout->SetMaxWidth(content);
-    tip.nameHeight = nameMetrics.height;
-    float y = tip.padY + nameMetrics.height + (tip.rows.empty() ? 0.f : nameGap);
+    tip.nameHeight = std::min(nameMetrics.height, std::max(1.f, maxHeight - 2.f * tip.padY));
+    tip.nameLayout->SetMaxHeight(tip.nameHeight);
+    float y = tip.padY + tip.nameHeight + nameGap;
+    ComPtr<IDWriteTextLayout> line; DWRITE_TEXT_METRICS lineMetrics{};
+    if (!layout(L" ", tip.valueFormat.Get(), available, line, lineMetrics)) return false;
+    tip.rowCapacity = size_t(std::max(0.f, std::floor((maxHeight - y - tip.padY) / std::max(1.f, lineMetrics.height))));
     const float valueBox = std::max(1.f, content - labelWidth - columnGap);
     for (size_t i = 0; i < tip.rowLayouts.size(); ++i) {
+        if (y + heights[i] + tip.padY > maxHeight) { tip.rowLayouts.resize(i); break; }
         tip.rowLayouts[i].first->SetMaxWidth(std::max(1.f, labelWidth));
+        tip.rowLayouts[i].first->SetMaxHeight(heights[i]);
         tip.rowLayouts[i].second->SetMaxWidth(valueBox);
+        tip.rowLayouts[i].second->SetMaxHeight(heights[i]);
         tip.rowTops.push_back(y);
         y += heights[i];
     }
     // Leading alignment inside each column box mirrors with the reading order.
     tip.labelX = state.rtlLayout ? tip.padX + content - labelWidth : tip.padX;
     tip.valueX = state.rtlLayout ? tip.padX : tip.padX + labelWidth + columnGap;
-    tip.size = SIZE{LONG(std::ceil(content + 2.f * tip.padX)), LONG(std::ceil(y + tip.padY))};
+    if (tip.rowLayouts.empty()) y = tip.padY + tip.nameHeight;
+    tip.size = SIZE{std::min(work.right - work.left, LONG(std::ceil(content + 2.f * tip.padX))),
+        std::min(LONG(maxHeight), LONG(std::ceil(y + tip.padY)))};
     return true;
 }
 
 // Below the cursor image (its real hotspot and height), flipped above it at
 // the monitor's working-area edge, mirrored for right-to-left Explorer.
 POINT ItemTipPosition(const ViewState& state, POINT anchor, SIZE size, const RECT& work) {
-    int below = GetSystemMetricsForDpi(SM_CYCURSOR, UINT(DpiOf(state.hwnd))), hotspot = 0;
-    CURSORINFO cursor{sizeof(cursor)};
-    ICONINFO info{};
-    if (GetCursorInfo(&cursor) && cursor.hCursor && GetIconInfo(cursor.hCursor, &info)) {
-        BITMAP bitmap{};
-        if (GetObjectW(info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bitmap), &bitmap))
-            below = info.hbmColor ? bitmap.bmHeight : bitmap.bmHeight / 2;
-        hotspot = int(info.yHotspot);
-        if (info.hbmColor) DeleteObject(info.hbmColor);
-        if (info.hbmMask) DeleteObject(info.hbmMask);
-    }
-    POINT at{state.rtlLayout ? anchor.x - size.cx : anchor.x, anchor.y - hotspot + below};
-    if (at.y + size.cy > work.bottom) at.y = anchor.y - hotspot - size.cy;
+    const RECT cursor = ItemTipCursorBounds(state, anchor);
+    POINT at{state.rtlLayout ? anchor.x - size.cx : anchor.x, cursor.bottom};
+    if (at.y + size.cy > work.bottom) at.y = cursor.top - size.cy;
     at.x = std::clamp<LONG>(at.x, work.left, std::max(work.left, work.right - size.cx));
     at.y = std::clamp<LONG>(at.y, work.top, std::max(work.top, work.bottom - size.cy));
     return at;
@@ -25219,10 +25363,7 @@ POINT ItemTipPosition(const ViewState& state, POINT anchor, SIZE size, const REC
 
 void PresentItemTip(ViewState& state, const ItemTipJob& facts) {
     auto& tip = state.itemTip;
-    tip.token = 0;
-    FILETIME now{};
-    GetSystemTimePreciseAsFileTime(&now); // File times are finer than the tick clock.
-    tip.rows = ItemTipRows(facts, now);
+    tip.rows = facts.rows;
     if (!ValidRgb(tip.background) || !ValidRgb(tip.foreground)) RefreshNativePalette(state);
     MONITORINFO monitor{sizeof(monitor)};
     if (!GetMonitorInfoW(MonitorFromPoint(tip.anchor, MONITOR_DEFAULTTONEAREST), &monitor) ||
@@ -25233,12 +25374,22 @@ void PresentItemTip(ViewState& state, const ItemTipJob& facts) {
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
 }
 
+void CaptureItemTipCells(const Entry& entry, ItemTipJob& facts) {
+    facts.cells = entry.cells;
+    for (const auto& [key, text] : {std::pair{PKEY_Size, &entry.size}, std::pair{PKEY_ItemTypeText, &entry.type},
+            std::pair{PKEY_DateModified, &entry.date}}) {
+        if (!text->empty() && std::none_of(facts.cells.begin(), facts.cells.end(),
+            [&](const auto& cell) { return SameKey(cell.key, key); })) facts.cells.push_back({key, *text});
+    }
+}
+
 void ShowItemTip(ViewState& state, POINT client) {
     const int row = state.hovered;
     if (!ItemTipEligible(state, row)) return;
     auto& tip = state.itemTip;
-    const Entry& entry = state.entries[static_cast<size_t>(row)];
+    Entry& entry = state.entries[static_cast<size_t>(row)];
     if (entry.path.empty() || entry.path == tip.suppressed || entry.path == tip.item) return;
+    CacheRowDetails(state, entry, false); // Includes properties cached in another view mode.
     HideItemTip(state);
     tip.item = entry.path;
     tip.name = entry.name;
@@ -25250,22 +25401,34 @@ void ShowItemTip(ViewState& state, POINT client) {
     facts.folder = entry.folder;
     facts.namespaceItem = entry.shellIdentity && entry.path.starts_with(L"windhawk:pidl:");
     facts.type = entry.type;
+    facts.detailed = g_detailedItemTips.load(std::memory_order_relaxed);
+    CaptureItemTipCells(entry, facts);
+    for (const auto& column : state.columns) if (!column.title.empty()) facts.labels.emplace_back(column.key, column.title);
     if (!facts.namespaceItem) {
         facts.created = entry.created;
         facts.modified = entry.lastWrite;
         facts.size = entry.byteSize;
         facts.sizeKnown = !entry.folder && !state.thisPcGpu;
     }
-    if (!facts.namespaceItem && !facts.type.empty()) { PresentItemTip(state, facts); return; }
+    // No Shell/COM calls here. Measure the available row budget without showing
+    // a partial popup: the worker returns one completed result for this mode.
+    MONITORINFO monitor{sizeof(monitor)};
+    tip.rows.clear();
+    if (!GetMonitorInfoW(MonitorFromPoint(tip.anchor, MONITOR_DEFAULTTONEAREST), &monitor) ||
+        !LayoutItemTip(state, monitor.rcWork)) { HideItemTip(state); return; }
+    facts.rowLimit = tip.rowCapacity;
+    if (!facts.rowLimit) { PresentItemTip(state, facts); return; }
     auto& work = *state.background;
     if (!work.hwnd) work.hwnd = state.hwnd;
     const HWND hwnd = state.hwnd;
     if (!StartTabWorker(state.background, work.columns, DirectoryWorkerProc, THREAD_PRIORITY_BELOW_NORMAL) ||
-        State(hwnd) != &state) { PresentItemTip(state, facts); return; }
+        State(hwnd) != &state) { HideItemTip(state); return; }
     facts.token = tip.token = g_nextToken.fetch_add(1);
+    facts.listing = state.directoryToken;
     {
         ExclusiveSrwLock lock(work.directoryLock);
         work.itemTipGeneration.store(facts.token, std::memory_order_release);
+        work.itemTipListing.store(facts.listing, std::memory_order_release);
         work.itemTipJob = std::move(facts);
     }
     SetEvent(work.columns.wake);
@@ -25283,6 +25446,21 @@ void ConsumeItemTip(ViewState& state) {
     // The pointer may have rested elsewhere, pressed or left meanwhile.
     if (!ItemTipEligible(state, state.hovered) ||
         state.entries[static_cast<size_t>(state.hovered)].path != tip.item) { HideItemTip(state); return; }
+    // Detail jobs can finish after hover started. Prefer their newer strings
+    // as well, especially folder-size text supplied by another mod.
+    CaptureItemTipCells(state.entries[static_cast<size_t>(state.hovered)], *result);
+    for (auto& row : result->rows) for (const auto& cell : result->cells)
+        if (SameKey(row.key, cell.key)) {
+            row.value = cell.text;
+            for (auto& ch : row.value) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+            break;
+        }
+    std::unordered_set<std::wstring> values;
+    std::erase_if(result->rows, [&](const auto& row) {
+        return row.value.find_first_not_of(L" \t\r\n") == std::wstring::npos ||
+            !values.insert(ItemTipComparison(row.value, row.date)).second;
+    });
+    tip.token = 0;
     PresentItemTip(state, *result);
 }
 
@@ -25301,6 +25479,9 @@ void PaintItemTip(ItemTip& tip, HWND hwnd) {
         return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f);
     };
     if (dc && tip.target && tip.nameLayout && SUCCEEDED(tip.target->BindDC(dc, &client))) {
+        RefreshTextRenderingForWindow(tip.textStyle, hwnd, true);
+        ConfigureTextTarget(tip.textStyle, tip.target.Get());
+        tip.target->SetTextAntialiasMode(tip.textStyle.opaqueTextAntialiasMode);
         tip.target->BeginDraw();
         tip.target->Clear(color(tip.background));
         ComPtr<ID2D1SolidColorBrush> text, label;
@@ -25314,10 +25495,10 @@ void PaintItemTip(ItemTip& tip, HWND hwnd) {
                 tip.target->DrawRectangle(D2D1::RectF(.5f, .5f, client.right - .5f, client.bottom - .5f), border.Get());
         }
         if (text && label) {
-            tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.padY), tip.nameLayout.Get(), text.Get());
+            tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.padY), tip.nameLayout.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             for (size_t i = 0; i < tip.rowLayouts.size() && i < tip.rowTops.size(); ++i) {
-                tip.target->DrawTextLayout(D2D1::Point2F(tip.labelX, tip.rowTops[i]), tip.rowLayouts[i].first.Get(), label.Get());
-                tip.target->DrawTextLayout(D2D1::Point2F(tip.valueX, tip.rowTops[i]), tip.rowLayouts[i].second.Get(), text.Get());
+                tip.target->DrawTextLayout(D2D1::Point2F(tip.labelX, tip.rowTops[i]), tip.rowLayouts[i].first.Get(), label.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                tip.target->DrawTextLayout(D2D1::Point2F(tip.valueX, tip.rowTops[i]), tip.rowLayouts[i].second.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
         }
         if (tip.target->EndDraw() == D2DERR_RECREATE_TARGET) tip.target.Reset();
@@ -30664,6 +30845,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         break;
     case kMsgSettings:
         if (s) {
+            HideItemTip(*s); // Cancel old detail policy and text presentation immediately.
             RefreshViewToggleForFrame(s->frameHwnd);
             s->columnFitPendingEpoch = 0;
             CancelRename(*s);

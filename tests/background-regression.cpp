@@ -2074,6 +2074,8 @@ int wmain(int argc,wchar_t** argv) {
             Check(found,"unknown regression suite");
         } else if (argc>1 && wcscmp(argv[1],L"--shell-size")==0) {
             TestShellSizeDetails(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--item-tips")==0) {
+            TestItemTips(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--icon-sizing")==0) {
             TestNativeIconSizing(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--icon-alpha")==0) {

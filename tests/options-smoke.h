@@ -125,6 +125,7 @@ static void TestUserOptions() {
         {L"Appearance.zebraStripes",true,&g_zebra},
         {L"Appearance.showEmptyRows",false,&g_emptyRows},
         {L"Hover.animateHover",true,&g_animateHover},
+        {L"Hover.detailedTooltips",true,&g_detailedItemTips},
         {L"Navigation.smoothScrolling",true,&g_smooth},
         {L"Gestures.doubleClickUp",true,&g_doubleClickUp},
         {L"Gestures.middleClickNewTab",true,&g_middleClickNewTab},

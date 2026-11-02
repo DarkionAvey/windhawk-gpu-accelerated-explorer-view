@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.338
+
+- Localize tooltip labels and friendly dates through Windows, use system date
+  and time formats, and reuse cached Details column values, including folder sizes.
+- Add **Detailed tooltips** under **Mouse hover**, on by default, to show
+  properties carried by the file such as dimensions, bitrate, comments and tags.
+  Extra rows fit the screen space around the pointer; long values are shortened.
+- Omit duplicate tooltip values, including repeated dates under different properties.
+- Show the tooltip once its selected details are ready, avoiding jumps as data arrives.
+- Reuse the folder binding across tooltips in the same folder, so tooltips no
+  longer rebind the folder on every hover and appear with consistent timing.
+- Apply the selected text antialiasing mode to tooltip text, including Windows
+  subpixel rendering on the opaque popup.
+
 ## 0.9.337
 
 - Show one larger, transparent drag preview instead of both Shell and GPU images.
