@@ -1918,6 +1918,7 @@ static void TestPreviewInput() {
 #include "additional-gestures-smoke.h"
 #include "checkbox-smoke.h"
 #include "rename-appearance-smoke.h"
+#include "rename-vertical-alignment-smoke.h"
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
 #include "item-tip-smoke.h"

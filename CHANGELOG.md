@@ -2,6 +2,8 @@
 
 ## 0.9.341 (working candidate)
 
+- Center rename text vertically in list rows, including wrapped names and
+  changes to row/font size.
 - Start held touch drags from Windows' promoted mouse input so the operation
   does not immediately end with its button still reported as released.
 - Remove the ineffective touch-drag movement workaround. Keep bounded Windhawk

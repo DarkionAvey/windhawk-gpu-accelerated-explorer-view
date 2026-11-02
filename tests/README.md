@@ -168,6 +168,12 @@ contain spaces or Unicode. Relative source paths are rooted at the repository.
 
 ## Focused or historical tests
 
+`--test rename-vertical-alignment` checks native EDIT character positions
+against the client and row centers in Details/List/Small icons at 96/144/192
+DPI and LTR/RTL, including wrapping, edits, undo and font/row-size changes.
+Private offscreen windows and substituted focus keep this independent of
+desktop input; it does not establish live Explorer presentation behavior.
+
 `--graphics` includes private offscreen pixel comparisons for Details metadata
 and captions during real window resizing and horizontal scroll reversals in
 LTR/RTL. Visible glyphs must match the fully exposed column; the window edge

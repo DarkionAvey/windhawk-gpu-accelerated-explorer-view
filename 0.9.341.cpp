@@ -22781,21 +22781,31 @@ void AlignWrappedRenameText(ViewState& state) {
         std::max(0L, (client.right - 1) / 2));
     const LONG y = std::min(std::max(0L, padding.cy - GetSystemMetricsForDpi(SM_CYBORDER, ViewDpi(state))),
         std::max(0L, (client.bottom - 1) / 2));
-    // Padding belongs to this independent editor, so growing or moving it
-    // above a bottom-edge label never leaves an empty band above its text.
+    // Grid captions start at the label's top; list captions center their whole
+    // native text block in the row, including any wrapped filename lines.
     RECT aligned{x, y, std::max(x + 1, client.right - x), std::max(y + 1, client.bottom - y)};
     // EDIT normalizes formatting heights to its own line metrics (and can
     // retain a minimum height in tiny viewports). Comparing EM_GETRECT with
     // the request repeatedly reformats/invalidates an otherwise settled field.
     auto& rename=state.rename;
-    if (!rename.requestedTextRectValid || !EqualRect(&rename.requestedTextRect, &aligned)) {
-        SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
-        rename.requestedTextRect=aligned;
-        rename.requestedTextRectValid=true;
-        InvalidateRect(editor, nullptr, FALSE);
+    const bool wrapped = RenameItemGeometry(state, rename.index).wrapped;
+    const int lineHeight = RenameLineHeight(editor);
+    // A changed formatting width can rewrap the native EDIT. Apply that width
+    // first, then settle the vertical origin using its resulting line count.
+    for (int pass = 0; pass < 2; ++pass) {
+        const LRESULT lines = SendMessageW(editor, EM_GETLINECOUNT, 0, 0);
+        if (!wrapped && lineHeight > 0)
+            aligned.top = std::max<LONG>(y, (client.bottom - lines * lineHeight) / 2);
+        if (!rename.requestedTextRectValid || !EqualRect(&rename.requestedTextRect, &aligned)) {
+            SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
+            rename.requestedTextRect=aligned;
+            rename.requestedTextRectValid=true;
+            InvalidateRect(editor, nullptr, FALSE);
+        }
+        if (SendMessageW(editor, EM_GETLINECOUNT, 0, 0) == lines) break;
     }
     const int first = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
-    if (first > 0 && SendMessageW(editor, EM_GETLINECOUNT, 0, 0) * RenameLineHeight(editor) <= aligned.bottom - aligned.top)
+    if (first > 0 && SendMessageW(editor, EM_GETLINECOUNT, 0, 0) * lineHeight <= aligned.bottom - aligned.top)
         SendMessageW(editor, EM_LINESCROLL, 0, -first);
 }
 
