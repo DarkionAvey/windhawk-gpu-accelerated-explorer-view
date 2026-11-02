@@ -70,4 +70,34 @@ if (!$branches.Count -or $branches[0][4] -eq 0 -or $branches[0][5] -eq 0) {
 }
 $missed = Get-Content -LiteralPath (Join-Path $coverage.Directory 'uncovered-lines.json') -Raw | ConvertFrom-Json
 if ($missed -notcontains 6) { throw 'Coverage omitted the uncovered return line' }
-Write-Output 'PASS: compiler coverage, both branch outcomes, uncovered function/line, source definition aggregation across binary variants, parallel profiles, DLL unload and paths with spaces/brackets'
+
+# Publication moves the numbered source. Regeneration must read the verified
+# snapshot, and still produce a working index plus real source/count markup.
+Move-Item -LiteralPath $source -Destination (Join-Path $fixture 'archived-covered.c')
+Write-RegressionCoverage $coverage @($dll,$unusedDll) (Join-Path $fixture 'regression-results.csv') $true
+$htmlDirectory = Join-Path $coverage.Directory 'html'
+$indexPath = Join-Path $htmlDirectory 'index.html'
+$index = [IO.File]::ReadAllText($indexPath)
+foreach ($expected in @('(2/3)','(5/8)','(7/9)','(3/4)')) {
+    if (!$index.Contains($expected)) { throw "HTML omitted independent fixture expectation $expected" }
+}
+$page = Assert-CoverageHtml $htmlDirectory $report.data[0].files[0].summary
+$sourceHtml = [IO.File]::ReadAllText($page)
+if ($sourceHtml -notmatch "name='L2'.*?</td><td class='covered-line'><pre>2</pre>" -or
+    $sourceHtml -notmatch "name='L6'.*?</td><td class='uncovered-line'><pre>0</pre>" -or
+    !$sourceHtml.Contains('return 99;')) { throw 'HTML omitted actual source or covered/uncovered line counts' }
+try {
+    [IO.File]::WriteAllText($indexPath, [regex]::Replace($index,'\(\d+/\d+\)','(0/0)'))
+    $rejected = $false
+    try { $null = Assert-CoverageHtml $htmlDirectory $report.data[0].files[0].summary }
+    catch { $rejected = $true }
+    if (!$rejected) { throw 'Coverage accepted an empty HTML report' }
+} finally { [IO.File]::WriteAllText($indexPath,$index) }
+try {
+    Remove-Item -LiteralPath $page
+    $rejected = $false
+    try { $null = Assert-CoverageHtml $htmlDirectory $report.data[0].files[0].summary }
+    catch { $rejected = $true }
+    if (!$rejected) { throw 'Coverage accepted a broken source-page link' }
+} finally { [IO.File]::WriteAllText($page,$sourceHtml) }
+Write-Output 'PASS: compiler coverage, branch/line/function expectations, binary variant aggregation, parallel profiles, DLL unload, actual HTML totals and annotations, rejected empty/broken HTML, and regeneration after source archival'

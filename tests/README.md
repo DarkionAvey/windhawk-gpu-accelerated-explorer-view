@@ -102,6 +102,9 @@ source hash, binaries, test outcomes and whether the run passed. Reports and
 instrumented test binaries are retained even after failure. Profiles are unique
 per process and binary; shared worker counters use atomic updates.
 `source.cpp` preserves the measured source after publication archives it.
+HTML generation uses that verified snapshot. The gate checks actual index
+totals against LLVM's measurements and follows the annotated source link;
+empty reports and missing source pages fail even if LLVM exits successfully.
 Uncovered functions combine all binary/template variants of each source
 definition; an unused variant cannot mark an executed definition uncovered.
 The line list identifies physical source lines with zero LCOV execution counts.
