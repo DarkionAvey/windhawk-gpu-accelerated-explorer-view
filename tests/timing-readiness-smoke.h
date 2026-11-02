@@ -125,7 +125,7 @@ static void TestTimingReadiness(const std::wstring& directory) {
     };
     resetRows(3); UpdateMetrics(state); UpdateRefreshRate(state);
     Check(EnsureTarget(state),"timing target");
-    const HWND actualFocus=GetFocus(),actualForeground=GetForegroundWindow();
+    const auto actualActivation=Regression::Activation::Capture();
     {
         FocusFixture::Session focus(frame,state.hwnd);
         const auto pumpFit=[&] {
@@ -396,15 +396,13 @@ static void TestTimingReadiness(const std::wstring& directory) {
         state.shellAutomationBrowser.Reset(); state.navigationEventSource.Reset();
         state.explorerNavigationSource.Reset();
     }
-    const HWND finalFocus=GetFocus(),finalForeground=GetForegroundWindow();
-    if(finalFocus!=actualFocus || finalForeground!=actualForeground) {
-        DWORD beforeProcess=0,afterProcess=0;
-        GetWindowThreadProcessId(actualForeground,&beforeProcess); GetWindowThreadProcessId(finalForeground,&afterProcess);
-        std::cout<<"TIMING FOCUS before="<<actualFocus<<" after="<<finalFocus
-            <<" foreground-before="<<actualForeground<<" foreground-after="<<finalForeground
-            <<" process-before="<<beforeProcess<<" process-after="<<afterProcess<<" fixture-process="<<GetCurrentProcessId()<<std::endl;
-    }
-    Check(finalFocus==actualFocus && finalForeground==actualForeground,"timing tests changed user focus");
+    const auto finalActivation=Regression::Activation::Capture();
+    if(!(finalActivation==actualActivation))
+        std::cout<<"TIMING FOCUS before="<<actualActivation.focus<<" after="<<finalActivation.focus
+            <<" active-before="<<actualActivation.active<<" active-after="<<finalActivation.active
+            <<" owned-foreground-before="<<actualActivation.ownsForeground
+            <<" owned-foreground-after="<<finalActivation.ownsForeground<<std::endl;
+    Check(finalActivation==actualActivation,"timing tests changed user focus");
     CancelRename(state); CancelAutoRefit(state); Stop(state.background); DropTarget(state);
     UnregisterAnimationWindow(state.hwnd);
     SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(original));

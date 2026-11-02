@@ -14,6 +14,15 @@ struct TouchCalibration {
     UINT32 beforeCount=0,afterCount=0;
     void Failed(const char* api) {prerequisite=api; error=GetLastError(); device=nullptr;}
     TouchCalibration() {
+        // The device list is session-wide. Concurrent test processes would
+        // otherwise each see the other's new digitizer in their before/after
+        // difference and could adopt a device that its owner then destroys.
+        // Only creation and identification are serialized, never the test.
+        struct Discovery {
+            HANDLE mutex=CreateMutexW(nullptr,FALSE,L"Local\\gpu-overlay-regression-digitizer-discovery");
+            Discovery() {if(mutex) WaitForSingleObject(mutex,INFINITE);}
+            ~Discovery() {if(mutex) {ReleaseMutex(mutex); CloseHandle(mutex);}}
+        } discovery;
         UINT32 count=0;
         if(!GetPointerDevices(&count,nullptr)) {Failed(prerequisite); return;}
         std::vector<POINTER_DEVICE_INFO> before(count);

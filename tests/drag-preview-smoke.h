@@ -175,15 +175,24 @@ static void TestDragPreview(const std::wstring& fixture) {
                 if(glyph.data[size_t(y)*glyph.stride+x*4+3]>16) {
                     left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
                 }
-            Check(right>left && bottom>top && std::abs(float(left+right)*.5f-200.f)<=1.f &&
-                std::abs(float(top+bottom)*.5f-200.f)<=1.f,"operation emoji ink is not centered in both axes");
-            // Fractional edge coverage can occupy one extra texel on either
-            // side of the common continuous width; integer cases stay +/-1.
-            const bool commonWidth=right-left>=UINT(std::floor(symbolSize)-1) && right-left<=UINT(std::ceil(symbolSize)+1);
+            const bool centered=right>left && bottom>top && std::abs(float(left+right)*.5f-200.f)<=1.f &&
+                std::abs(float(top+bottom)*.5f-200.f)<=1.f;
+            if(!centered) std::cerr<<"EMOJI CENTER utf16="<<unsigned(emoji[0])<<","<<unsigned(emoji[1])<<" size="<<symbolSize
+                <<" bounds="<<left<<","<<top<<","<<right<<","<<bottom<<" ink="<<cached.bounds.left<<","<<cached.bounds.top
+                <<","<<cached.bounds.right<<","<<cached.bounds.bottom<<"\n";
+            Check(centered,"operation emoji ink is not centered in both axes");
+            // Visible width is the half-coverage extent of the shape; the faint
+            // antialiasing tail (alpha>16) extends past the outline by up to a
+            // texel per side. Fractional edges still allow +/-1 texel.
+            UINT halfLeft=glyph.width,halfRight=0;
+            for(UINT y=0;y<glyph.height;++y) for(UINT x=0;x<glyph.width;++x)
+                if(glyph.data[size_t(y)*glyph.stride+x*4+3]>128) {halfLeft=std::min(halfLeft,x); halfRight=std::max(halfRight,x+1);}
+            const bool commonWidth=halfRight>halfLeft && halfRight-halfLeft>=UINT(std::floor(symbolSize)-1) &&
+                halfRight-halfLeft<=UINT(std::ceil(symbolSize)+1);
             if(!commonWidth) {
                 float dpiX=0,dpiY=0; state.target->GetDpi(&dpiX,&dpiY);
                 std::cerr<<"EMOJI WIDTH utf16="<<unsigned(emoji[0])<<","<<unsigned(emoji[1])
-                    <<" size="<<symbolSize<<" bounds="<<left<<","<<top<<","<<right<<","<<bottom
+                    <<" size="<<symbolSize<<" bounds="<<left<<","<<top<<","<<right<<","<<bottom<<" half="<<halfLeft<<".."<<halfRight
                     <<" command-bounds="<<cached.bounds.left<<","<<cached.bounds.top<<","<<cached.bounds.right<<","<<cached.bounds.bottom
                     <<" dpi="<<dpiX<<","<<dpiY<<" mactype="<<bool(GetModuleHandleW(L"MacType64.dll") || GetModuleHandleW(L"MacType64.Core.dll"))<<"\n";
             }
@@ -210,7 +219,14 @@ static void TestDragPreview(const std::wstring& fixture) {
             Check(SUCCEEDED(state.target->EndDraw()),"direct native emoji draw");
             const auto native=IconAlphaFixture::Read(state,surface.Get());
             size_t changed=0;
-            for(size_t i=0;i<glyph.data.size();++i) changed+=std::abs(int(glyph.data[i])-int(native.data[i]))>1;
+            int largest=0;
+            for(size_t i=0;i<glyph.data.size();++i) {
+                const int difference=std::abs(int(glyph.data[i])-int(native.data[i]));
+                changed+=difference>1; largest=std::max(largest,difference);
+            }
+            if(changed && emoji[0]==L'\xD83D' && emoji[1]==L'\xDEAB')
+                std::cerr<<"EMOJI NATIVE size="<<symbolSize<<" changed="<<changed<<" largest="<<largest<<" bounds="<<cached.bounds.left
+                    <<","<<cached.bounds.top<<","<<cached.bounds.right<<","<<cached.bounds.bottom<<"\n";
             if(!commonWidth) {
                 for(BYTE threshold:{BYTE(0),BYTE(1),BYTE(16),BYTE(128)}) {
                     UINT l=native.width,r=0,t=native.height,bottomEdge=0;

@@ -97,76 +97,99 @@ static void TestOptionConsumers(Set set) {
     ShutDownFrames(); g_frameStopping=false; g_writeFactory=factory;
 }
 
-// Independent expected contract: a newly exposed/renamed/removed option fails
-// until this table and its tests are deliberately updated. Read the selected
-// source, including historical negative controls, rather than latest.cpp.
-static void TestUserOptions() {
-    struct Integer {
-        const wchar_t* key; int initial,minimum,maximum; std::atomic<int>* setting;
-    };
-    const Integer integers[]={
-        {L"Appearance.rowHeight",32,24,96,&g_row96},
-        {L"Appearance.fontSizePercent",52,20,80,&g_fontPercent},
-        {L"Appearance.gridFontSizePercent",42,20,80,&g_gridFontPercent},
-        {L"Appearance.secondaryTextOpacity",45,0,100,&g_secondaryOpacity},
-        {L"Appearance.zebraOpacity",4,0,100,&g_zebraOpacity},
-        {L"Appearance.edgeMargin",10,0,400,&g_edgeMargin96},
-        {L"Selection.selectionOpacity",60,0,100,&g_selectionAlpha},
-        {L"Selection.selectionRadius",8,-1,4096,&g_selectionRadius},
-        {L"Selection.gridSelectionRadius",16,-1,4096,&g_gridSelectionRadius},
-        {L"Selection.marqueeOpacity",30,0,100,&g_marqueeAlpha},
-        {L"Hover.hoverOpacity",50,0,100,&g_hoverAlpha},
-        {L"Hover.hoverSelectedOpacity",100,0,100,&g_bothAlpha},
-    };
-    struct Boolean {const wchar_t* key; bool initial; std::atomic<bool>* setting;};
-    const Boolean booleans[]={
-        {L"Appearance.dimDotFiles",true,&g_dimDotFiles},
-        {L"Appearance.listThumbnails",false,&g_listThumbnails},
-        {L"Appearance.zebraStripes",true,&g_zebra},
-        {L"Appearance.showEmptyRows",false,&g_emptyRows},
-        {L"Hover.animateHover",true,&g_animateHover},
-        {L"Hover.detailedTooltips",true,&g_detailedItemTips},
-        {L"Navigation.smoothScrolling",true,&g_smooth},
-        {L"Gestures.doubleClickUp",true,&g_doubleClickUp},
-        {L"Gestures.middleClickNewTab",true,&g_middleClickNewTab},
-        {L"Gestures.twoFingerContextMenu",true,&g_twoFingerContextMenu},
-        {L"Navigation.showNativeViewToggleButton",true,&g_showNativeViewToggleButton},
-        {L"Navigation.touchpadDirectManipulation",true,&g_touchpadDirectManipulation},
-        {L"Navigation.touchpadSwipeNavigation",false,&g_touchpadSwipeNavigation},
-        {L"Navigation.showScrollbar",true,&g_scrollbar},
-        {L"Navigation.instantScrollbarScrub",false,&g_instantScrub},
-        {L"Columns.autoRefitColumns",true,&g_autoRefitColumns},
-        {L"Columns.preSort",true,&g_preSort},
-        {L"enableLogging",false,&g_perf},
-    };
-    std::map<std::wstring,std::wstring> expected;
-    for(const auto& option:integers) expected[option.key]=std::to_wstring(option.initial);
-    for(const auto& option:booleans) expected[option.key]=option.initial ? L"true" : L"false";
-    expected.insert({{L"Appearance.fontFamily",L""},{L"Appearance.textAntialiasing",L"system"},{L"Appearance.middleEllipsis",L"gridOnly"},
-        {L"Selection.filenameOnlySelection",L"gridOnly"},{L"Selection.selectionColor",L"accent"},
-        {L"Columns.folderPlacement",L"explorerDefault"}});
-    std::map<std::wstring,std::wstring> schema;
+// Shared option catalog. Independent expected contract: a newly exposed,
+// renamed or removed option fails TestUserOptions, the option-effect tests and
+// the live option sweep until these tables are deliberately updated. Read the
+// selected source, including historical negative controls, not latest.cpp.
+namespace OptionCatalog {
+struct Integer {
+    const wchar_t* key; int initial,minimum,maximum; std::atomic<int>* setting;
+};
+inline const Integer integers[]={
+    {L"Appearance.rowHeight",32,24,96,&g_row96},
+    {L"Appearance.fontSizePercent",52,20,80,&g_fontPercent},
+    {L"Appearance.gridFontSizePercent",42,20,80,&g_gridFontPercent},
+    {L"Appearance.secondaryTextOpacity",45,0,100,&g_secondaryOpacity},
+    {L"Appearance.zebraOpacity",4,0,100,&g_zebraOpacity},
+    {L"Appearance.edgeMargin",10,0,400,&g_edgeMargin96},
+    {L"Selection.selectionOpacity",60,0,100,&g_selectionAlpha},
+    {L"Selection.selectionRadius",8,-1,4096,&g_selectionRadius},
+    {L"Selection.gridSelectionRadius",16,-1,4096,&g_gridSelectionRadius},
+    {L"Selection.marqueeOpacity",30,0,100,&g_marqueeAlpha},
+    {L"Hover.hoverOpacity",50,0,100,&g_hoverAlpha},
+    {L"Hover.hoverSelectedOpacity",100,0,100,&g_bothAlpha},
+};
+struct Boolean {const wchar_t* key; bool initial; std::atomic<bool>* setting;};
+inline const Boolean booleans[]={
+    {L"Appearance.dimDotFiles",true,&g_dimDotFiles},
+    {L"Appearance.listThumbnails",false,&g_listThumbnails},
+    {L"Appearance.zebraStripes",true,&g_zebra},
+    {L"Appearance.showEmptyRows",false,&g_emptyRows},
+    {L"Hover.animateHover",true,&g_animateHover},
+    {L"Hover.detailedTooltips",true,&g_detailedItemTips},
+    {L"Navigation.smoothScrolling",true,&g_smooth},
+    {L"Gestures.doubleClickUp",true,&g_doubleClickUp},
+    {L"Gestures.middleClickNewTab",true,&g_middleClickNewTab},
+    {L"Gestures.twoFingerContextMenu",true,&g_twoFingerContextMenu},
+    {L"Navigation.showNativeViewToggleButton",true,&g_showNativeViewToggleButton},
+    {L"Navigation.touchpadDirectManipulation",true,&g_touchpadDirectManipulation},
+    {L"Navigation.touchpadSwipeNavigation",false,&g_touchpadSwipeNavigation},
+    {L"Navigation.showScrollbar",true,&g_scrollbar},
+    {L"Navigation.instantScrollbarScrub",false,&g_instantScrub},
+    {L"Columns.autoRefitColumns",true,&g_autoRefitColumns},
+    {L"Columns.preSort",true,&g_preSort},
+    {L"enableLogging",false,&g_perf},
+};
+// Free-form and choice options with their defaults.
+inline const std::pair<const wchar_t*,const wchar_t*> strings[]={
+    {L"Appearance.fontFamily",L""},{L"Appearance.textAntialiasing",L"system"},{L"Appearance.middleEllipsis",L"gridOnly"},
+    {L"Selection.filenameOnlySelection",L"gridOnly"},{L"Selection.selectionColor",L"accent"},
+    {L"Columns.folderPlacement",L"explorerDefault"},
+};
+// Every option as written in the settings block: key, default and, for
+// $options lists, each choice in schema order.
+struct Option { std::wstring key, initial; std::vector<std::wstring> choices; };
+inline std::vector<Option> Schema() {
+    std::vector<Option> options;
     std::wifstream source{std::filesystem::path(GPU_OVERLAY_SOURCE)};
     Check(source.is_open(),"selected settings source unavailable");
-    bool settings=false; std::wstring line,group;
+    bool settings=false, listing=false; std::wstring line,group;
     const std::wregex category(LR"(^- ([A-Za-z][A-Za-z0-9]*):\s*$)"),
         option(LR"(^    - ([A-Za-z][A-Za-z0-9]*): (.*?)\s*$)"),
-        rootOption(LR"(^- ([A-Za-z][A-Za-z0-9]*): (.*?)\s*$)");
+        rootOption(LR"(^- ([A-Za-z][A-Za-z0-9]*): (.*?)\s*$)"),
+        choice(LR"(^        - ([A-Za-z][A-Za-z0-9]*):.*$)");
     while(std::getline(source,line)) {
+        if(!line.empty() && line.back()==L'\r') line.pop_back();
         if(line.find(L"// ==WindhawkModSettings==")!=std::wstring::npos) {settings=true; continue;}
         if(line.find(L"// ==/WindhawkModSettings==")!=std::wstring::npos) break;
         if(!settings) continue;
         std::wsmatch match;
         if(std::regex_match(line,match,rootOption)) {
-            Check(schema.emplace(match[1].str(),match[2].str()).second,"duplicate root user option");
-            group.clear();
-        } else if(std::regex_match(line,match,category)) group=match[1];
+            options.push_back({match[1].str(),match[2].str(),{}}); group.clear(); listing=false;
+        } else if(std::regex_match(line,match,category)) {group=match[1]; listing=false;}
         else if(std::regex_match(line,match,option)) {
             std::wstring value=match[2];
             if(value.size()>=2 && value.front()==L'"' && value.back()==L'"') value=value.substr(1,value.size()-2);
-            Check(schema.emplace(group+L"."+match[1].str(),value).second,"duplicate user option");
-        }
+            options.push_back({group+L"."+match[1].str(),value,{}}); listing=false;
+        } else if(line.find(L"$options:")!=std::wstring::npos) listing=true;
+        else if(listing && std::regex_match(line,match,choice)) options.back().choices.push_back(match[1]);
     }
+    return options;
+}
+inline std::map<std::wstring,std::wstring> Defaults() {
+    std::map<std::wstring,std::wstring> values;
+    for(const auto& option:Schema()) Check(values.emplace(option.key,option.initial).second,"duplicate user option");
+    return values;
+}
+}
+
+static void TestUserOptions() {
+    using OptionCatalog::integers; using OptionCatalog::booleans;
+    std::map<std::wstring,std::wstring> expected;
+    for(const auto& option:integers) expected[option.key]=std::to_wstring(option.initial);
+    for(const auto& option:booleans) expected[option.key]=option.initial ? L"true" : L"false";
+    for(const auto& [key,value]:OptionCatalog::strings) expected[key]=value;
+    const auto schema=OptionCatalog::Defaults();
     Check(schema==expected,"exposed options/defaults changed without updating regression coverage");
     auto values=schema;
     std::vector<std::function<void()>> restore;

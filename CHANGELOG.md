@@ -14,7 +14,21 @@
   the configured mod font family and resolved face.
 - Publish cached native-row identities for selection imports, so held drags
   in This PC can proceed when provider name resolution fails.
-
+- Fix the Name header checkbox sometimes clearing every selection instead of
+  selecting all when Explorer was busy: a late selection event no longer
+  turns a correct Select All into a selection reset.
+- Grid filename highlights: Small icons keep equal padding on both sides of
+  the name, and two-line captions no longer leave descenders uncovered or a
+  faint line between the lines.
+- Fix two diagnostic log lines that passed 64-bit values to 32-bit format
+  specifiers when **Enable logging** is on.
+- Drag preview operation symbols (prohibited, copy, link, move) are drawn at
+  their intended size and centred, also without a font customizer such as
+  MacType (they were about 9% too small).
+- Text no longer changes weight or shifts slightly between its first frame and
+  later frames: dark text (light themes), right-aligned and centred values, and
+  translucent text such as column headers, Date/type/size and dimmed items now
+  render identically whether freshly drawn or cached.
 ## 0.9.340
 
 - Show the contents of cloud and virtual drives (such as the Google Drive root)

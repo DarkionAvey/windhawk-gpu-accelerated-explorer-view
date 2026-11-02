@@ -2,10 +2,19 @@ param(
     [string]$WindhawkDirectory,
     [string]$SourceFile = 'latest.cpp',
     [string[]]$TestArguments = @(),
+    # Manifest names (background-regression.exe --list-tests) and/or 'unload'.
+    # Selected tests keep their Parallel/Serial scheduling.
+    [string[]]$Tests = @(),
     [string]$MinifiedSourceFile,
     [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
+    [ValidateRange(1,86400)][int]$TestTimeoutSeconds = 900,
     [switch]$KeepArtifacts
 )
+if ($Tests.Count -and $TestArguments.Count) { throw 'Use either -Tests or -TestArguments' }
+# Comma-separated names arrive as one string through powershell -File.
+$Tests = @($Tests | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$compileUnload = (!$Tests.Count -and !$TestArguments.Count) -or $TestArguments -contains '--unload' -or $Tests -contains 'unload'
+$compilePipeline = $TestArguments -notcontains '--unload' -and !($Tests.Count -and !@($Tests | Where-Object { $_ -ne 'unload' }).Count)
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
 . (Join-Path $PSScriptRoot 'parallel-runner.ps1')
@@ -54,7 +63,7 @@ if (-not $hostLibrary) { throw 'Installed Windhawk x64 host import library not f
 Write-Output "Windhawk host library: $hostLibrary"
 $modFlags = $flags | Where-Object { $_ -notin @('-DWH_EDITING', '-static', '-municode') }
 $modFlags += '-fstack-usage'
-$compileTasks = @([pscustomobject]@{Name='compile-mod'; FilePath=$compiler; Exclusive=$false
+$compileTasks = @([pscustomobject]@{Name='compile-mod'; FilePath=$compiler; Serial=$false
     Arguments=@($modFlags)+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$modDll,$hostLibrary)+$libraries})
 if ($MinifiedSourceFile) {
     if (![IO.Path]::IsPathRooted($MinifiedSourceFile)) {
@@ -68,16 +77,16 @@ if ($MinifiedSourceFile) {
         [Text.UTF8Encoding]::new($false))
     $minifiedFlags = @($modFlags | ForEach-Object { if ($_ -eq $configuration) { $minifiedConfiguration } else { $_ } })
     $minifiedDll = Join-Path $outputDirectory 'minified-mod-build.dll'
-    $compileTasks += [pscustomobject]@{Name='compile-minified'; FilePath=$compiler; Exclusive=$false
+    $compileTasks += [pscustomobject]@{Name='compile-minified'; FilePath=$compiler; Serial=$false
         Arguments=@($minifiedFlags)+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$minifiedDll,$hostLibrary)+$libraries}
 }
-if ($TestArguments -contains '--unload' -or !$TestArguments.Count) {
+if ($compileUnload) {
     $unloadDll = Join-Path $outputDirectory 'unload-mod.dll'
     $unloadExe = Join-Path $outputDirectory 'unload-regression.exe'
     $unloadFlags = $flags | Where-Object { $_ -notin @('-static', '-municode') }
-    $compileTasks += [pscustomobject]@{Name='compile-unload-mod'; FilePath=$compiler; Exclusive=$false
+    $compileTasks += [pscustomobject]@{Name='compile-unload-mod'; FilePath=$compiler; Serial=$false
         Arguments=@($unloadFlags)+@('-shared',(Join-Path $testDirectory 'unload-mod.cpp'),'-o',$unloadDll)+$libraries}
-    $compileTasks += [pscustomobject]@{Name='compile-unload-host'; FilePath=$compiler; Exclusive=$false
+    $compileTasks += [pscustomobject]@{Name='compile-unload-host'; FilePath=$compiler; Serial=$false
         Arguments=@('-std=c++23','-target','x86_64-w64-mingw32','-O2','-municode',
             (Join-Path $testDirectory 'unload-regression.cpp'),'-o',$unloadExe,'-lole32')}
     # Windhawk's import libraries name the private runtimes .whl. The isolated
@@ -85,8 +94,8 @@ if ($TestArguments -contains '--unload' -or !$TestArguments.Count) {
     Copy-Item -LiteralPath (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin\libc++.dll') -Destination (Join-Path $outputDirectory 'libc++.whl')
     Copy-Item -LiteralPath (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin\libunwind.dll') -Destination (Join-Path $outputDirectory 'libunwind.whl')
 }
-if ($TestArguments -notcontains '--unload') {
-    $compileTasks += [pscustomobject]@{Name='compile-pipeline'; FilePath=$compiler; Exclusive=$false
+if ($compilePipeline) {
+    $compileTasks += [pscustomobject]@{Name='compile-pipeline'; FilePath=$compiler; Serial=$false
         Arguments=@($flags)+@((Join-Path $testDirectory 'background-regression.cpp'),'-o',$executable)+$libraries}
 }
 # The large translation units are memory intensive; cap concurrent compilers
@@ -117,26 +126,33 @@ try {
         (Join-Path $compilerDirectory 'bin') + ';' + $previousPath
     $testTasks = @()
     if ($unloadExe) { $testTasks += [pscustomobject]@{
-        Name='unload'; FilePath=$unloadExe; Arguments=@($unloadDll); Exclusive=$false} }
-    if ($TestArguments -notcontains '--unload') {
+        Name='unload'; FilePath=$unloadExe; Arguments=@($unloadDll); Serial=$false} }
+    if ($compilePipeline) {
         if ($TestArguments.Count) {
             $testTasks += [pscustomobject]@{Name='pipeline'; FilePath=$executable
-                Arguments=$TestArguments; Exclusive=$false}
+                Arguments=$TestArguments; Serial=$false}
         } else {
-            $manifest = @(& $executable --list-suites)
-            if ($LASTEXITCODE -ne 0 -or !$manifest.Count) { throw 'Cannot read full-suite manifest' }
+            # One process per manifest entry. Parallel entries run first, then
+            # each Serial entry alone (see tests/README.md "Writing a regression").
+            $manifest = @(& $executable --list-tests)
+            if ($LASTEXITCODE -ne 0 -or !$manifest.Count) { throw 'Cannot read the regression manifest' }
+            $known = @{}
             foreach ($line in $manifest) {
-                if ($line -notmatch '^([a-z0-9-]+)\t(shared|exclusive)$') { throw "Invalid suite manifest: $line" }
-                $testTasks += [pscustomobject]@{Name=$Matches[1]; FilePath=$executable
-                    Arguments=@('--suite',$Matches[1]); Exclusive=($Matches[2] -eq 'exclusive')}
+                if ($line -notmatch '^([a-z0-9-]+)\t(parallel|serial)\t(release|focused)\t([a-z,-]*)$') {
+                    throw "Invalid regression manifest line: $line"
+                }
+                $known[$Matches[1]] = $true
+                $selected = if ($Tests.Count) { $Tests -contains $Matches[1] } else { $Matches[3] -eq 'release' }
+                if ($selected) {
+                    $testTasks += [pscustomobject]@{Name=$Matches[1]; FilePath=$executable
+                        Arguments=@('--test',$Matches[1]); Serial=($Matches[2] -eq 'serial')}
+                }
             }
-            # Run shared suites first so an exclusive measurement does not
-            # leave other slots idle while earlier children finish.
-            $testTasks = @($testTasks | Where-Object { !$_.Exclusive }) +
-                @($testTasks | Where-Object Exclusive)
+            $unknown = @($Tests | Where-Object { $_ -ne 'unload' -and !$known.ContainsKey($_) })
+            if ($unknown.Count) { throw "Unknown regression(s): $($unknown -join ', ')" }
         }
     }
-    Invoke-RegressionTasks -Tasks $testTasks -OutputDirectory $outputDirectory -Jobs $Jobs -Phase regression
+    Invoke-RegressionTasks -Tasks $testTasks -OutputDirectory $outputDirectory -Jobs $Jobs -Phase regression -TimeoutSeconds $TestTimeoutSeconds
     $testsPassed = $true
     Write-Output ('PASS: complete regression gate in {0:N2}s (compile and execution)' -f $totalClock.Elapsed.TotalSeconds)
     if ($KeepArtifacts) { Write-Output "Artifacts retained at $outputDirectory" }

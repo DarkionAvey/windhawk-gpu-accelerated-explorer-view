@@ -125,7 +125,10 @@ static void TestColumnViewTransition(HWND frame) {
                 if(error>8)
                     std::cout<<"HEADER: plane="<<bool(plane)<<" rtl="<<rtl<<" h="<<state.headerPx
                         <<" xy="<<(p/4%640)<<","<<(p/4/640)<<" alpha="<<unsigned(pixels[p+3])
-                        <<" expected="<<unsigned(settledHeader[offset+p+3])<<"\n";
+                        <<" expected="<<unsigned(settledHeader[offset+p+3])<<" bgra="<<unsigned(pixels[p])<<","<<unsigned(pixels[p+1])
+                        <<","<<unsigned(pixels[p+2])<<","<<unsigned(pixels[p+3])<<" settled="<<unsigned(settledHeader[offset+p])<<","
+                        <<unsigned(settledHeader[offset+p+1])<<","<<unsigned(settledHeader[offset+p+2])<<","<<unsigned(settledHeader[offset+p+3])
+                        <<" visibility="<<alpha<<" shift="<<shift<<" error="<<error<<std::endl;
                 Check(error<=8,
                     "header container did not share the fixed-DIP vertical slide and fade");
             }
@@ -634,6 +637,9 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         Check(state.rowTransitionActive, "no-op viewport update cancelled deletion movement");
         ModifierFixture::Session modifiers;
         if constexpr (requires { state.framePaintPending; }) {
+            // These pacing checks take real time; the deletion must still be
+            // in flight for the wheel check below however long they took.
+            AnimationClockFixture::Freeze deletionInFlight;
             FrameInputFixture::Session inputQueue;
             const bool perf = g_perf.exchange(true);
             const int paints = state.paintCalls;
@@ -712,8 +718,14 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         Check(state.scrollNow > beforeScroll && fabsf(LayoutRowVisual(state, row, progress).top -
             top + state.scrollNow-beforeScroll) < .01f,
             "collapse attenuated the viewport delta instead of scrolling at full speed");
-        Check(Eventually([&] { frame(); return state.rowTransitionStartedQpc.QuadPart != 0; }),
-              "retargeted frame did not submit");
+        const bool retargeted=Eventually([&] { frame(); return state.rowTransitionStartedQpc.QuadPart != 0; });
+        if (!retargeted)
+            std::cout << "RETARGET transition=" << state.rowTransitionActive << " directory=" << state.directoryPending
+                      << " watch=" << state.watchedChangePending << " total=" << state.total
+                      << " framePending=" << state.framePaintPending << " visible=" << state.visible
+                      << " standby=" << state.graphicsStandby << " animation=" << state.animationActive
+                      << " paints=" << state.paintCalls << std::endl;
+        Check(retargeted, "retargeted frame did not submit");
         state.rowTransitionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.2);
         Check(Eventually([&] { frame(); return !state.rowTransitionActive; }),
               "settled submitted frame retained structural animation");

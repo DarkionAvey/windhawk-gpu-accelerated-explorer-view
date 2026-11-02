@@ -22,6 +22,7 @@ if($Mode -eq 'pipes') {
     [Console]::Out.Write([string]::new([char]'O',131072))
     [Console]::Error.Write([string]::new([char]'E',131072))
 }
+if($Mode -eq 'hang') { $null=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$Identity+'-never').WaitOne() }
 $record=@{Start=$start; End=[Diagnostics.Stopwatch]::GetTimestamp(); Value=$Value}
 [IO.File]::WriteAllText((Join-Path $Root ($Mode+'.json')),($record | ConvertTo-Json))
 if($Mode -eq 'failure') { exit 7 }
@@ -31,20 +32,21 @@ if($Mode -eq 'failure') { exit 7 }
     if (!(Test-Path -LiteralPath $shell)) { $shell = Join-Path $PSHOME 'pwsh.exe' }
     $identity = 'gpu-parallel-'+[guid]::NewGuid().ToString('N')
     $value = 'spaces "quotes" slash-before-quote \" trailing-slash\ ; $() ` '+[char]0x062A
-    function Task([string]$Mode,[bool]$Exclusive=$false) {
-        [pscustomobject]@{Name=$Mode; FilePath=$shell; Exclusive=$Exclusive
+    function Task([string]$Mode,[bool]$Serial=$false) {
+        [pscustomobject]@{Name=$Mode; FilePath=$shell; Serial=$Serial
             Arguments=@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$program,$Mode,$fixture,$identity,$value)}
     }
-    $tasks = @((Task 'peer-a'),(Task 'peer-b'),(Task 'exclusive' $true),(Task 'after'),(Task 'pipes'))
+    function Record([string]$Mode) { [IO.File]::ReadAllText((Join-Path $fixture ($Mode+'.json'))) | ConvertFrom-Json }
+    # Serial tasks are listed among parallel ones; the runner must still finish
+    # every parallel task first and then run each serial task alone.
+    $tasks = @((Task 'peer-a'),(Task 'serial-one' $true),(Task 'peer-b'),(Task 'serial-two' $true),(Task 'after'),(Task 'pipes'))
     # Suppress the intentionally large pipe output, while retaining the logs.
     Invoke-RegressionTasks -Tasks $tasks -OutputDirectory $fixture -Jobs 2 *> $null
-    $a = [IO.File]::ReadAllText((Join-Path $fixture 'peer-a.json')) | ConvertFrom-Json
-    $b = [IO.File]::ReadAllText((Join-Path $fixture 'peer-b.json')) | ConvertFrom-Json
-    $exclusive = [IO.File]::ReadAllText((Join-Path $fixture 'exclusive.json')) | ConvertFrom-Json
-    $after = [IO.File]::ReadAllText((Join-Path $fixture 'after.json')) | ConvertFrom-Json
-    if ($exclusive.Start -lt [Math]::Max($a.End,$b.End) -or $after.Start -lt $exclusive.End) {
-        throw 'Exclusive task overlapped another child'
-    }
+    $parallelEnd = (@('peer-a','peer-b','after','pipes') | ForEach-Object { (Record $_).End } | Measure-Object -Maximum).Maximum
+    $one = Record 'serial-one'; $two = Record 'serial-two'
+    if ($one.Start -lt $parallelEnd -or $two.Start -lt $parallelEnd) { throw 'Serial task started before the parallel phase drained' }
+    if ($two.Start -lt $one.End -and $one.Start -lt $two.End) { throw 'Serial tasks overlapped each other' }
+    $a = Record 'peer-a'; $b = Record 'peer-b'
     if ($a.Value -cne $value -or $b.Value -cne $value) { throw 'Native argument quoting changed the payload' }
     foreach ($stream in @('stdout','stderr')) {
         if ((Get-Item -LiteralPath (Join-Path $fixture ('pipes.'+$stream+'.log'))).Length -lt 131072) {
@@ -53,18 +55,26 @@ if($Mode -eq 'failure') { exit 7 }
     }
     $rejected=$false
     try {
-        Invoke-RegressionTasks -Tasks @((Task 'failure'),(Task 'survivor')) -OutputDirectory $fixture -Jobs 2 *> $null
+        Invoke-RegressionTasks -Tasks @((Task 'failure'),(Task 'survivor'),(Task 'late-serial' $true)) -OutputDirectory $fixture -Jobs 2 *> $null
     } catch { $rejected=$_.Exception.Message -like '*failure (exit 7)*' }
-    if (!$rejected -or !(Test-Path -LiteralPath (Join-Path $fixture 'survivor.json'))) {
-        throw 'Failed child did not fail the gate and drain its peer'
+    if (!$rejected -or !(Test-Path -LiteralPath (Join-Path $fixture 'survivor.json')) -or
+        !(Test-Path -LiteralPath (Join-Path $fixture 'late-serial.json'))) {
+        throw 'Failed child did not fail the gate after running its peers and the serial phase'
     }
     $results = @(Import-Csv -LiteralPath (Join-Path $fixture 'tasks-results.csv'))
-    if ($results.Count -ne 2 -or ($results | Where-Object Name -eq 'failure').ExitCode -ne 7 -or
+    if ($results.Count -ne 3 -or ($results | Where-Object Name -eq 'failure').ExitCode -ne 7 -or
         !(Test-Path -LiteralPath (Join-Path $fixture 'failure.stderr.log'))) {
         throw 'Failure diagnostics were not retained'
     }
     $rejected=$false
-    $missing=[pscustomobject]@{Name='missing'; FilePath=(Join-Path $fixture 'missing.exe'); Arguments=@(); Exclusive=$false}
+    try {
+        Invoke-RegressionTasks -Tasks @((Task 'hang'),(Task 'beside-hang')) -OutputDirectory $fixture -Jobs 2 -TimeoutSeconds 5 *> $null
+    } catch { $rejected=$_.Exception.Message -like '*hang (timeout)*' }
+    if (!$rejected -or !(Test-Path -LiteralPath (Join-Path $fixture 'beside-hang.json'))) {
+        throw 'A hung child did not time out as a failure while its peer completed'
+    }
+    $rejected=$false
+    $missing=[pscustomobject]@{Name='missing'; FilePath=(Join-Path $fixture 'missing.exe'); Arguments=@(); Serial=$false}
     try {
         Invoke-RegressionTasks -Tasks @((Task 'drained'),$missing) -OutputDirectory $fixture -Jobs 2 *> $null
     } catch { $rejected=$true }
@@ -73,10 +83,9 @@ if($Mode -eq 'failure') { exit 7 }
         throw 'Process startup failure did not drain and log its running peer'
     }
     Invoke-RegressionTasks -Tasks @((Task 'serial-a'),(Task 'serial-b')) -OutputDirectory $fixture -Jobs 1 *> $null
-    $a = [IO.File]::ReadAllText((Join-Path $fixture 'serial-a.json')) | ConvertFrom-Json
-    $b = [IO.File]::ReadAllText((Join-Path $fixture 'serial-b.json')) | ConvertFrom-Json
+    $a = Record 'serial-a'; $b = Record 'serial-b'
     if ($b.Start -lt $a.End) { throw '-Jobs 1 overlapped children' }
-    Write-Output 'PASS: parallel process rendezvous, exclusive barriers, serial limit, Windows argument quoting, stdout/stderr draining, failure propagation and peer cleanup'
+    Write-Output 'PASS: parallel rendezvous, parallel-before-serial phases, isolated serial tasks, -Jobs 1, timeouts, Windows argument quoting, stdout/stderr draining, failure propagation and peer cleanup'
 } finally {
     $resolved=[IO.Path]::GetFullPath($fixture)
     if ((Split-Path -Parent $resolved) -ne $temporary -or (Split-Path -Leaf $resolved) -notlike 'gpu-parallel-runner-*') {

@@ -49,24 +49,105 @@ testing.
 
 ## Parallel execution
 
-Full runs use up to four test processes by default (bounded by the logical CPU
-count), and up to two concurrent compiler processes. Each suite owns its mod
-globals, COM apartments, workers and PID-specific temporary fixtures. The C++
-suite manifest drives both parallel and serial runs in isolated processes,
-so neither mode drops tests or inherits another suite's globals or fixture files.
-Preprocessing benchmarks, native/GPU resource
-checks, and the UI/presentation groups with native column/EDIT paint assertions
-run alone, after the parallel groups finish. Missing prerequisites and assertion
-failures retain diagnostics and fail the release gate. No assertion is relaxed
-or automatically retried.
+Every regression is one entry in `tests/regression-manifest.h` and runs in its
+own process, with its own mod globals, COM apartments, window classes, workers
+and private fixture directory. No test can depend on another test's state.
+The runner starts all Parallel entries first (up to `-Jobs` processes; default
+four, bounded by the logical CPU count), then each Serial entry alone. It
+reports every failure together, names crash codes (access violation, fail-fast,
+stack overflow...), prints the crashing test with its option/view context, and
+fails a test that exceeds `-TestTimeoutSeconds` (default 900) instead of
+blocking the gate. Up to two compiler processes run concurrently.
 
-Use `build.bat -Jobs 1` or `tests/run-regressions.ps1 -SourceFile <source> -Jobs 1`
-for serial compilation and one suite process at a time. `-Jobs N` changes the
-test-process limit; focused `-TestArguments` still run only the requested probe.
-The runner prints phase and task durations and reports all failed groups after
-draining started processes. Failure preserves binaries, per-task stdout/stderr
-logs, and compile/regression timing CSVs in the printed artifact directory.
-`-KeepArtifacts` on either command retains these after success too.
+```powershell
+tests/run-regressions.ps1 -SourceFile 0.9.341.cpp                     # release gate
+tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Jobs 16            # wider
+tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Tests option-effects-list,touch-input
+background-regression.exe --list-tests                                # name, concurrency, gate, resources
+background-regression.exe --test option-live-sweep-details            # one test, this process
+```
+
+`-Jobs 1` runs everything sequentially. Historical focused flags (`--touch`,
+`--options`, ...) still select the matching manifest entries. Failure
+preserves binaries, per-test stdout/stderr logs, timing CSVs and any pixel
+evidence (`*.bmp`) in the printed artifact directory; `-KeepArtifacts`
+retains them after success too. No assertion is relaxed or retried.
+
+## Writing a regression
+
+1. Write `static void TestSomething(const std::wstring& fixture)` in a
+   `tests/*-smoke.h` header included by `background-regression.cpp`.
+2. Add one line to `tests/regression-manifest.h`:
+   `REGRESSION("something", PARALLEL, TestSomething(fixture)),`
+   `tests/repository-regression.ps1` fails if a `Test*` function is not
+   reachable from the manifest.
+3. Run it alone (`--test something`) and beside the suite
+   (`-Jobs 16`); both must pass.
+
+**Parallel is the expected declaration.** Isolation comes with the process:
+- Create files only under `fixture`; never use user folders or fixed paths.
+- Use the existing substitutes: `FocusFixture` (focus/foreground/visibility),
+  `ClipboardFixture`, `PointerFixture`/`ModifierFixture` (cursor/keys),
+  `StyleFixture` (DPI, theme, Shell settings), `UiLocaleFixture` (UI
+  language), `AnimationClockFixture` (time).
+- Observe only this process: `Regression::Activation::Capture()` instead of
+  comparing the desktop's foreground window, private desktops for real
+  popups, `SHCNF_FLUSH`/explicit Shell refresh rather than assuming the
+  machine-wide Shell notification broker delivered an event.
+- Wait for completion signals (receipts, accepted sequences, pending flags)
+  with `Eventually`; deadlines are failure bounds, not sleeps.
+- Assertions never depend on elapsed time; print timings as `PROFILE`.
+
+**Serial is only for machine-wide state no process can isolate**, declared as
+`SERIAL(Regression::Resource)`: `InputDesktop` (real foreground, SendInput,
+cursor), `Clipboard` (real clipboard), `SystemSettings` (SPI_SET*, broadcasts,
+HKCU writes), `QuietCpu` (benchmarks whose output is an uncontended timing).
+This is enforced, not advisory. In test code these APIs claim their resource
+(`tests/regression-guards.h`); fixtures call `Regression::Claim`. A Parallel
+test that claims fails with `CONCURRENCY: ... is not declared Serial(...)`,
+and a Serial test that never claims its declared resource fails with
+`CONCURRENCY: declared Serial(...) but never used it`. If a test fails only
+in parallel, find the shared state and isolate it; do not declare Serial.
+
+Add `Regression::Scope scope("view=List dpi=144")` around loops: the text is
+attached to assertion failures and printed with crashes.
+
+## User option tests
+
+Option coverage is complete by construction:
+- `OptionCatalog` (`tests/options-smoke.h`) lists every option with its
+  default (and integer limits). `user-options` checks exact schema, defaults,
+  limits, choices and bindings.
+- `OptionEffects::kCoverage` (`tests/option-effects-smoke.h`) names, for each
+  option, the release test that asserts its visible effect.
+  `option-coverage` fails when an option lacks either.
+
+`option-effects-list`, `-grid`, `-zoom` and `-appearance` use a real private
+folder in an offscreen ExplorerBrowser, deliver each value through the
+production settings handler and read back the GPU frame. Expected results are
+independent of the renderer: row pitch and text size from DPI arithmetic,
+capital height and filename width from a separate DirectWrite measurement of
+the configured font, highlights checked to cover every glyph pixel with the
+configured padding. They cover row height, list/grid text size, filename-only
+and whole-item highlights, Ctrl+wheel and touchpad pinch, side margins, corner
+rounding, colours and opacities, stripes, marquee, secondary text, dotfiles,
+antialiasing (when no font customizer such as MacType is injected, only the
+requested renderer mode is asserted), font family and middle ellipsis,
+in Details/List/Small/Medium/Large icons at 96/144 DPI and LTR/RTL.
+
+`option-live-sweep-details`, `-list` and `-icons` attach the production
+overlay to a genuine DefView with images, a shortcut, an archive and
+hidden/system files, then apply every value of every option through
+`Wh_ModSettingsChanged` on a separate thread (as Windhawk does) while idle,
+zooming, renaming, hovering/scrolling, pinching and dragging the scrollbar.
+After each change they visit every item and check metrics, the renderer model,
+the view toggle and folder placement; the details/icons sweeps also start a
+view with each non-default value already configured. Values come from the
+schema, so new options are swept without test changes.
+
+To cover a new option: add it to `OptionCatalog`, assert its result in an
+option-effects test (compare against an independent expectation, not the mod's
+helpers) and name that test in `kCoverage`.
 
 Prerequisites fail explicitly: touch probes require a discoverable private
 digitizer with nonempty Windows calibration (API/error/count diagnostics are

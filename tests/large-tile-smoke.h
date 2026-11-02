@@ -40,10 +40,20 @@ static void TestLargeTileBackpressure() {
             "ready GPU did not resume the latest large tile frame");
         Check(ResizeTarget(state,1920,1080),"waitable swap chain resize lost its creation flags");
         const HANDLE handle=state.frameLatencyWaitable;
+        // Handle values are recycled: another thread may receive the same
+        // value at once. Compare the kernel object, not the number.
+        HANDLE probe=nullptr;
+        Check(DuplicateHandle(GetCurrentProcess(),handle,GetCurrentProcess(),&probe,0,FALSE,DUPLICATE_SAME_ACCESS),
+            "frame latency handle probe");
         DropTarget(state);
         DWORD flags=0;
-        Check(!state.frameLatencyWaitable && !GetHandleInformation(handle,&flags),
-            "device teardown leaked the frame latency handle");
+        // Windows 10 API, absent from the MinGW import library.
+        const auto compare=reinterpret_cast<BOOL(WINAPI*)(HANDLE,HANDLE)>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"kernelbase.dll"),"CompareObjectHandles")));
+        Check(compare!=nullptr,"CompareObjectHandles");
+        const bool leaked=GetHandleInformation(handle,&flags) && compare(probe,handle);
+        CloseHandle(probe);
+        Check(!state.frameLatencyWaitable && !leaked,"device teardown leaked the frame latency handle");
     }
     g_writeFactory.Reset();
     const HANDLE abandoned=CreateEventW(nullptr,FALSE,FALSE,nullptr);

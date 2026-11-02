@@ -183,3 +183,32 @@ try {
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
+
+# Every regression function is reachable from the manifest (directly or from
+# another test), and every manifest entry declares its concurrency with a
+# known resource. A new test cannot be silently left out of the suite.
+$testsDirectory = $PSScriptRoot
+$sources = @(Get-ChildItem -LiteralPath $testsDirectory -File | Where-Object { $_.Extension -in '.h', '.cpp' -and $_.Name -notlike '*.wh.cpp' })
+$text = @{}
+foreach ($source in $sources) { $text[$source.Name] = [IO.File]::ReadAllText($source.FullName) }
+$defined = foreach ($source in $sources) {
+    foreach ($match in [regex]::Matches($text[$source.Name], '(?m)^static void (Test[A-Za-z0-9]+)\(')) {
+        [pscustomobject]@{ Name = $match.Groups[1].Value; File = $source.Name }
+    }
+}
+$all = ($text.Values -join "`n")
+$unreferenced = @($defined | Where-Object {
+    [regex]::Matches($all, '\b' + [regex]::Escape($_.Name) + '\s*(<[^>]*>)?\(').Count -lt 2
+})
+Assert (!$unreferenced.Count) ("regression functions not registered in tests/regression-manifest.h or called by a test: " +
+    (($unreferenced | ForEach-Object { "$($_.Name) ($($_.File))" }) -join ', '))
+$manifest = $text['regression-manifest.h']
+$entries = [regex]::Matches($manifest, '(?m)^\s*(REGRESSION|FOCUSED)\("([^"]+)",\s*([^,]+?),')
+Assert ($entries.Count -gt 50) 'regression manifest entries were not found'
+foreach ($entry in $entries) {
+    $declaration = $entry.Groups[3].Value.Trim()
+    Assert ($declaration -eq 'PARALLEL' -or $declaration -match '^SERIAL\(Regression::(InputDesktop|Clipboard|SystemSettings|QuietCpu)( \| Regression::(InputDesktop|Clipboard|SystemSettings|QuietCpu))*\)$') `
+        "regression $($entry.Groups[2].Value) has an invalid concurrency declaration: $declaration"
+}
+Write-Output ("PASS: all {0} regression functions are reachable from {1} manifest entries with valid concurrency declarations" -f
+    @($defined).Count, $entries.Count)

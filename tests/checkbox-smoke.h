@@ -56,8 +56,12 @@ void Selection(const std::wstring& fixture) {
     };
     const auto pump=[&] {
         MSG message{};
-        while(PeekMessageW(&message,state.hwnd,kMsgAdoptNativeSelectAll,kMsgAdoptNativeSelectAll,PM_REMOVE))
-            OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
+        // The real overlay receives every selection notification; dropping
+        // these left a native selection change unimported whenever the
+        // faster path lost a race under load.
+        for(UINT selectionMessage:{kMsgAdoptNativeSelectAll,kMsgNativeSelectionChanged,kMsgShellSelectionEvent})
+            while(PeekMessageW(&message,state.hwnd,selectionMessage,selectionMessage,PM_REMOVE))
+                OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
         browser.Pump();
         ReceiveDirectoryResults(state);
         ConsumePresentation(state);
@@ -102,6 +106,14 @@ void Selection(const std::wstring& fixture) {
     input.Next(); input.Send(state,{input.Packet(state,input.primary,marqueeEnd,TouchInputTest::up)});
     Check(Eventually([&] {pump(); return count()==6 && std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==6;}),
         "marquee selection did not check the selected items");
+    // Capture the mod's unconditional selection decisions (no extra logging or
+    // native sampling is enabled) and print them only if Select All is lost.
+    std::vector<std::wstring> selectionLog;
+    SelectionLogFixture::Session selectionCapture(selectionLog);
+    struct AllSelection {
+        bool previous=std::exchange(SelectionLogFixture::allSelection,true);
+        ~AllSelection() {SelectionLogFixture::allSelection=previous;}
+    } allSelection;
     StopTouch(state); ClearSelectionForFolderMenu(state); Tap(input,state,rowPoint(1));
     const auto header=Center(state,HeaderSelectionCheckbox(state));
     Check(SelectionCheckboxAt(state,header)==-2,"Name header checkbox hit");
@@ -120,6 +132,10 @@ void Selection(const std::wstring& fixture) {
     Tap(input,state,header);
     Check(state.checkboxHeaderActionPending && count()==1 && HeaderSelectionCheckboxState(state)==-3,
         "header scanned or waited on the UI while its checker was withheld");
+    // Diagnostics hold no SelectionFlags copy: an extra reference would make
+    // the copy-on-write store clone and change the identity under test.
+    const auto requestedToken=state.token;
+    const auto requestedEpoch=state.mouseFolderEpoch; const int requestedTotal=state.total;
     checkerHold.Release();
     const bool selectedAll=Eventually([&] {pump(); return count()==6 &&
         std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==6;});
@@ -127,7 +143,14 @@ void Selection(const std::wstring& fixture) {
         <<std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)<<" pending="<<state.checkboxHeaderActionPending
         <<" header="<<HeaderSelectionCheckboxState(state)<<" total="<<state.total<<" policy="<<state.clickPolicy.checkSelect
         <<" visible="<<state.visible<<" failure="<<std::hex<<state.graphicsFailure<<std::dec
-        <<" sequence="<<state.presentationSequence<<" accepted="<<state.presentationAcceptedSequence<<std::endl;
+        <<" sequence="<<state.presentationSequence<<" accepted="<<state.presentationAcceptedSequence
+        <<" receipt-current="<<state.checkboxSelection.SharesStorage(state.selectedFlags)<<" token-changed="<<(state.token!=requestedToken)
+        <<" epoch-changed="<<(state.mouseFolderEpoch!=requestedEpoch)<<" total-changed="<<(state.total!=requestedTotal)
+        <<" optimistic="<<state.optimisticStartedAt<<" loaded="<<state.loaded<<" tab-owner="<<TabOwnsActiveView(state)
+        <<" native-view-current="<<[&] {ComPtr<IShellView> view; HWND actual=nullptr;
+            return state.shellBrowser && SUCCEEDED(state.shellBrowser->QueryActiveShellView(&view)) && view &&
+                SUCCEEDED(view->GetWindow(&actual)) && actual==state.nativeHwnd;}()<<std::endl;
+    if(!selectedAll) for(const auto& line:selectionLog) std::wcout<<L"CHECKBOX LOG "<<line<<L'\n';
     Check(selectedAll,
         "real Shell Select All command did not select every item");
     Tap(input,state,header);
@@ -181,10 +204,31 @@ void Selection(const std::wstring& fixture) {
     };
     Tap(input,state,header); awaitRows(6,1);
     RemoveFile(browser.frame,folder/L"item5.txt");
-    // Shell's delete operation clears its selection in this private control.
-    // The header must reflect that rather than retaining its last clicked state.
-    awaitRows(5,0);
+    // DefView learns of the deletion through the machine-wide Shell broker,
+    // which coalesces events and can deliver it late. Refresh (Explorer's own
+    // recovery) makes native membership deterministic. Whether the delete
+    // cleared Explorer's selection or not, the header must mirror the
+    // selection Explorer ends with, never retain its last clicked state.
     refreshNative(5);
+    const bool mirrored=Eventually([&] {
+        pump(); int nativeTotal=-1; state.folderView->ItemCount(SVGIO_ALLVIEW,&nativeTotal);
+        return nativeTotal==5 && state.total==5 && !state.directoryPending && !state.watchedChangePending &&
+            HeaderSelectionCheckboxState(state)==(count()==5 ? 1 : 0) &&
+            std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==count();
+    },30000);
+    if(!mirrored) {
+        int nativeTotal=-1; state.folderView->ItemCount(SVGIO_ALLVIEW,&nativeTotal);
+        std::cout<<"CHECKBOX deletion mirror native-total="<<nativeTotal<<" native-selected="<<count()
+            <<" gpu-total="<<state.total<<" gpu-selected="<<std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)
+            <<" header="<<HeaderSelectionCheckboxState(state)<<" summary="<<state.checkboxSummaryTotal<<"/"<<state.checkboxSummaryState
+            <<" directory="<<state.directoryPending<<" watch="<<state.watchedChangePending
+            <<" recovery="<<state.nativeSelectionRecoveryPending<<" unsafe="<<state.nativeSelectionUnsafe
+            <<" dirty="<<state.nativeSelectionDirty<<" import="<<state.nativeSelectionImportPending
+            <<" prepared="<<state.pendingNativeSelection<<std::endl;
+        for(const auto& line:selectionLog) std::wcout<<L"CHECKBOX LOG "<<line<<L'\n';
+    }
+    Check(mirrored,"checkbox header did not mirror Explorer's selection after a deletion");
+    if(count()) {Tap(input,state,header); awaitRows(5,0);}
     Tap(input,state,header); awaitRows(5,1);
     const auto inserted=folder/L"inserted.txt";
     HANDLE newFile=CreateFileW(inserted.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);

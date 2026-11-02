@@ -78,7 +78,7 @@ static void TestPasteFocus(const std::wstring& fixture) {
     const auto archive = root / L"source.zip";
     auto sourceData = ArchiveData(archive);
     Consume(sourceData.Get());
-    const auto foreground = GetForegroundWindow(), focus = GetFocus();
+    const auto activation = Regression::Activation::Capture();
     const auto sequence = testClipboard.sequence;
     const auto empties = testClipboard.empties;
     struct Restore {
@@ -273,7 +273,7 @@ static void TestPasteFocus(const std::wstring& fixture) {
         DestroyWindow(edit);
     }
     sourceData.Reset(); StopTabVisibilityObserver();
-    Check(GetForegroundWindow() == foreground && GetFocus() == focus && testClipboard.sequence == sequence && testClipboard.empties == empties,
+    Check(Regression::Activation::Capture() == activation && testClipboard.sequence == sequence && testClipboard.empties == empties,
         "paste test changed user focus or the clipboard");
     Check(std::filesystem::weakly_canonical(root).parent_path() == std::filesystem::weakly_canonical(fixture), "paste cleanup escaped private fixture");
     Check(Eventually([&] { std::error_code error; std::filesystem::remove_all(root, error); return !error; }), "paste fixture cleanup");

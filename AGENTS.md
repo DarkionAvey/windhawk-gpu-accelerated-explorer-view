@@ -42,6 +42,25 @@
   a file, ctrl+wheel zooming, change of dir contents, etc. So it is not just 
   implementing the feature, but actually fitting it in the grand design of the mod.
 
+## Regression tests
+
+- Read `tests/README.md` "Writing a regression" before adding a test. Every
+  test is one line in `tests/regression-manifest.h` and runs in its own
+  process; tests never rely on another test's state or order.
+- Declare `PARALLEL`. `SERIAL(Regression::...)` is only for machine-wide state
+  (input desktop, real clipboard, system settings, uncontended benchmarks)
+  and is verified at run time: an unclaimed or undeclared resource fails the
+  test. If a test fails only in parallel, find and isolate the shared state
+  (private fixture, substituted API, per-process observation); never declare
+  Serial to hide it, and never relax or retry an assertion.
+- Before reporting, run the new test alone (`--test name`) and with the suite
+  at `-Jobs 16`.
+- A new or changed user option needs an `OptionCatalog` entry, an effect
+  assertion against an independent expectation (pixels, DPI arithmetic,
+  DirectWrite measurement; not the mod's own helpers) and a
+  `OptionEffects::kCoverage` entry. The live sweep derives its values from the
+  schema automatically.
+
 ## Source and release workflow
 
 - `latest.cpp` is the current published Windhawk source. Read its `@version`

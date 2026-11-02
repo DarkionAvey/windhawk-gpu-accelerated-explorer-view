@@ -67,6 +67,39 @@ static void TestRenderQuality() {
             return raster.rendering==state.textRenderingSerial;
         }),"raster cache did not include the rendering revision");
     }
+    // The cached-mask and direct DirectWrite paths draw the same pixels at the
+    // same place for any alignment, colour and opacity: a value's first (cold)
+    // frame must not shift or re-weight when its mask takes over.
+    {
+        g_textAntialiasing=TextAntialiasing::System; RefreshTextRendering(state,true);
+        int serial=0;
+        for(auto alignment:{DWRITE_TEXT_ALIGNMENT_LEADING,DWRITE_TEXT_ALIGNMENT_CENTER,DWRITE_TEXT_ALIGNMENT_TRAILING})
+        for(int kind=0;kind<3;++kind)  // body, header, sorted (bold) header
+        for(unsigned color:{0xFFFFFFu,0x000000u,0x808080u}) for(float opacity:{1.f,.5625f}) {
+            for(auto* format:{state.textFormat.Get(),state.headerFormat.Get(),state.sortedHeaderFormat.Get()})
+                Check(format && SUCCEEDED(format->SetTextAlignment(alignment)),"quality text alignment");
+            const std::wstring probe=L"Type Ag "+std::to_wstring(++serial);
+            std::vector<DWORD> paths[2];
+            // Direct first, as a cold frame draws a freshly shaped value before
+            // its mask exists; the mask is built and drawn afterwards.
+            for(int direct=1;direct>=0;--direct) {
+                state.textRasterUnavailable=direct!=0;
+                for(int warm=0;warm<2;++warm) {
+                    state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
+                    Text(state,probe,12.3f,15.f,348.f,70.f,color,kind>0,opacity,kind==2); paths[direct]=read();
+                }
+            }
+            state.textRasterUnavailable=false;
+            int largest=0;
+            for(size_t i=0;i<paths[0].size();++i) for(int shift=0;shift<32;shift+=8)
+                largest=std::max(largest,std::abs(int((paths[0][i]>>shift)&255)-int((paths[1][i]>>shift)&255)));
+            if(largest>1) std::cout<<"DIRECT/CACHED kind="<<kind<<" alignment="<<alignment<<" color="<<std::hex<<color<<std::dec
+                <<" opacity="<<opacity<<" largest="<<largest<<std::endl;
+            Check(largest<=1,"direct and cached text differ in position or coverage");
+        }
+        for(auto* format:{state.textFormat.Get(),state.headerFormat.Get(),state.sortedHeaderFormat.Get()})
+            format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
     if(!customizerOverrides) Check(samples.size()==3 && samples[1]!=samples[2],"text choices did not change real glyph pixels");
     else std::cout<<"PROFILE: active MacType overrides native text choices; direct/cache effective policies and pixels remain consistent\n";
     g_textAntialiasing=TextAntialiasing::System; RefreshTextRendering(state,true);

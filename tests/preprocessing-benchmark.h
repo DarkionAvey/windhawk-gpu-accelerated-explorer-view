@@ -28,6 +28,8 @@ static void TestMixedDirectoryIndex(const std::wstring& fixture, const std::vect
 static void TestPreprocessingBenchmarks(const std::wstring& fixture, bool extended=false) {
     const bool tracing=g_pipelineTracing.exchange(true);
     struct Restore {bool trace; ~Restore() {g_pipelineTracing=trace;}} restore{tracing};
+    // The published phase timings are only meaningful on an otherwise idle CPU.
+    Regression::Claim(Regression::QuietCpu,"uncontended preprocessing phase timings");
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
     std::cout<<"PREPROCESS_HEADER,items,sort,run,bind_ms,enumerate_ms,sort_ms,baseline_ms,snapshot_ms,ready_ms\n";
     for (const int count : extended ? std::vector<int>{1000,10000,50000} : std::vector<int>{1000,10000}) {

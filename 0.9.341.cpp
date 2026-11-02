@@ -1038,6 +1038,9 @@ struct TextLayoutCache {
         size_t bytes = 0;
         unsigned long long painted = 0;
         bool underline = false;
+        // Grayscale text alpha correction depends on the brush luminance: a mask
+        // rasterized for white text is not the coverage DirectWrite gives dark text.
+        unsigned color = 0xFFFFFF;
     };
     struct Layout {
         ComPtr<IDWriteTextLayout> text;
@@ -1368,7 +1371,7 @@ struct DragGlyph {
     std::wstring text;
     float size=0.f;
     COLORREF foreground=CLR_INVALID;
-    ComPtr<ID2D1CommandList> image;
+    ComPtr<IDWriteTextLayout> layout;  // Shaped once per symbol/size; drawn directly.
     D2D1_RECT_F bounds{};
 };
 struct DragShadow {
@@ -15464,6 +15467,31 @@ HRESULT ReserveGlyphSlot(ViewState& state, UINT width, UINT height,
     return S_OK;
 }
 
+// An untrimmed line's glyphs do not change when its cell grows or moves.
+// Canonicalize to intrinsic width (snapped to a whole pixel when drawn)
+// instead of missing the raster cache for every intermediate auto-fit width.
+// Wrapped/trimmed text keeps exact bounds. Direct drawing uses the same box,
+// so right-aligned/centered values never shift when their mask takes over.
+bool IntrinsicTextBox(ViewState& state, const std::wstring& text, IDWriteTextLayout* layout,
+                      float& x, float& width, float height, bool header, bool sorted, bool wrapped, bool filename) {
+    if (wrapped) return false;
+    auto& shaped = state.textLayouts[!header ? 0 : sorted ? 2 : 1].layouts.at(text);
+    const float cellWidth=width;
+    if (shaped.naturalWidth < 0.f) {
+        float natural=0.f;
+        ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename);
+        ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename);
+    }
+    const float glyphWidth=ceilf(shaped.naturalWidth)+1.f;
+    if (shaped.naturalWidth < 0.f || glyphWidth > cellWidth) return false;
+    const auto alignment=layout->GetTextAlignment();
+    const bool rtl=layout->GetReadingDirection()==DWRITE_READING_DIRECTION_RIGHT_TO_LEFT;
+    x += (cellWidth-glyphWidth)*(alignment==DWRITE_TEXT_ALIGNMENT_CENTER ? .5f :
+        ((alignment==DWRITE_TEXT_ALIGNMENT_LEADING)==rtl ? 1.f : 0.f));
+    width=glyphWidth;
+    return true;
+}
+
 // Cache the expensive DWrite-to-D2D traversal, not just shaped layouts. Command
 // lists only move this cost to EndDraw. A8 coverage masks bypass that traversal
 // while FillOpacityMask applies text gamma, live color and live opacity. A
@@ -15480,27 +15508,8 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     // must never erase text already drawn, including through the direct path.
     deferCold = deferCold && !shaped.displayed;
     auto& p = state.frameProfile;
-    // An untrimmed line's glyphs do not change when its cell grows or moves.
-    // Canonicalize to intrinsic width instead of missing the raster cache for
-    // every intermediate auto-fit width. Wrapped/trimmed text keeps exact bounds.
-    bool intrinsic=false;
     const float cellWidth=width;
-    if (!wrapped) {
-        if (shaped.naturalWidth < 0.f) {
-            float natural=0.f;
-            ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename);
-            ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename);
-        }
-        const float glyphWidth=ceilf(shaped.naturalWidth)+1.f;
-        if (shaped.naturalWidth >= 0.f && glyphWidth <= cellWidth) {
-            const auto alignment=layout->GetTextAlignment();
-            const bool rtl=layout->GetReadingDirection()==DWRITE_READING_DIRECTION_RIGHT_TO_LEFT;
-            x += (cellWidth-glyphWidth)*(alignment==DWRITE_TEXT_ALIGNMENT_CENTER ? .5f :
-                ((alignment==DWRITE_TEXT_ALIGNMENT_LEADING)==rtl ? 1.f : 0.f));
-            width=glyphWidth;
-            intrinsic=true;
-        }
-    }
+    const bool intrinsic=IntrinsicTextBox(state,text,layout,x,width,height,header,sorted,wrapped,filename);
     const auto draw = [&](const TextLayoutCache::Raster& raster) {
         shaped.displayed = true;
         ID2D1Bitmap1* bitmap=raster.bitmap.Get();
@@ -15527,7 +15536,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     };
     for (auto& raster : shaped.rasters) {
         if (raster.width != width || raster.height != height || raster.rendering!=state.textRenderingSerial ||
-            raster.underline != bool(underline)) continue;
+            raster.underline != bool(underline) || raster.color != (color & 0xFFFFFF)) continue;
         raster.used = ++state.textRasterTick;
         raster.painted = state.graphicsPaintSerial;
         draw(raster);
@@ -15607,6 +15616,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     if (FAILED(layout->GetFontSize(0,&raster.fontSize))) raster.fontSize=0.f;
     raster.rendering=state.textRenderingSerial;
     raster.underline = underline != FALSE;
+    raster.color = color & 0xFFFFFF;
     raster.used=++state.textRasterTick; raster.bytes=bytes;
     raster.painted=state.graphicsPaintSerial;
     HRESULT hr = S_OK;
@@ -15664,7 +15674,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
                 D2D1_ANTIALIAS_MODE_ALIASED);
         } else state.textRasterTarget->SetTarget(raster.bitmap.Get());
         state.textRasterTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
-        state.textRasterBrush->SetColor(Packed(0xFFFFFF));
+        state.textRasterBrush->SetColor(Packed(raster.color));
         state.textRasterTarget->DrawTextLayout(D2D1::Point2F(),layout,
             state.textRasterBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
         if (raster.slot) state.textRasterTarget->PopAxisAlignedClip();
@@ -15718,7 +15728,8 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
     TextLayoutCache::Raster* raster = nullptr;
     for (auto& candidate : shaped.rasters)
         if (candidate.fontSize > 0.f && candidate.bitmap && candidate.rendering == state.textRenderingSerial &&
-            candidate.underline == underline && (!raster || candidate.used > raster->used)) raster = &candidate;
+            candidate.underline == underline && candidate.color == (color & 0xFFFFFF) &&
+            (!raster || candidate.used > raster->used)) raster = &candidate;
     if (!raster) return false;
     const float scale = format->GetFontSize() / raster->fontSize;
     ID2D1Bitmap1* bitmap = raster->bitmap.Get();
@@ -15831,8 +15842,27 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             state.brush->SetColor(Packed(hex, opacity));
         }
         if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename)) {
-            state.target->DrawTextLayout(D2D1::Point2F(l,t), layout, state.brush.Get(),
-                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            // Same canonical box and whole-pixel origin as the cached mask.
+            float boxLeft=l, boxWidth=r-l;
+            const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename);
+            const auto origin=intrinsic ? SnapDrawPoint(state.target.Get(),D2D1::Point2F(boxLeft,t)) : D2D1::Point2F(l,t);
+            if (intrinsic) layout->SetMaxWidth(boxWidth);
+            // A translucent brush changes Direct2D's grayscale text alpha
+            // correction; masks scale opaque coverage instead. Draw translucent
+            // text opaque in a bounded layer so both paths match (muted headers,
+            // secondary text, dimmed items, fades).
+            const bool translucent=opacity<1.f;
+            if (translucent) {
+                state.brush->SetColor(Packed(hex,1.f));
+                state.target->PushLayer(D2D1::LayerParameters1(D2D1::RectF(origin.x,t,origin.x+boxWidth,b),nullptr,
+                    D2D1_ANTIALIAS_MODE_ALIASED,D2D1::IdentityMatrix(),opacity),nullptr);
+            }
+            state.target->DrawTextLayout(origin, layout, state.brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            if (translucent) {
+                state.target->PopLayer();
+                state.brush->SetColor(Packed(hex,opacity));
+            }
+            if (intrinsic) layout->SetMaxWidth(r-l);
             if (state.uiTraceDrawItem && filename)
                 PipelineEvent(*state.background,{.operation=L"ui.text.direct[opacity,width,height,color]",
                     .a=state.uiTraceItem,.b=state.token,.v={opacity,r-l,b-t,double(hex)}},true);
@@ -16998,7 +17028,12 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
                     }
                     position += line.length;
                     if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-                    rc.left=std::max(0.f,rc.left-pad); rc.right=std::min(cached.width,rc.right+pad);
+                    // Pad symmetrically within the layout box (a rename EDIT
+                    // covers exactly that box). Clamping each side separately
+                    // removed only the leading inset when the caption starts
+                    // at the box edge (Small icons), leaving a lopsided pill.
+                    const float inset=std::clamp(std::min(rc.left,cached.width-rc.right),0.f,pad);
+                    rc.left-=inset; rc.right+=inset;
                     rc.top=std::max(0.f,rc.top); rc.bottom=std::min(cached.height,rc.bottom);
                     // DirectWrite describes physical glyph positions. Fill
                     // mirrors logical rectangles, so convert the shaped run.
@@ -17022,11 +17057,15 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
             rc.top=std::max(geometry.cell.top,rc.top+roundf(text.top)-padding);
             rc.bottom=std::min(geometry.cell.bottom,rc.bottom+roundf(text.top)+padding);
             if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-            // Wrapped lines share their interior padding. Split the overlap
-            // so translucent selection/hover never acquire a darker seam.
+            // Wrapped lines overlap in their interior padding. Give the overlap
+            // to the wider line (its descenders/ascenders extend past the
+            // narrower line), so the union is unchanged but translucent fills
+            // never double up. Meet on a whole pixel: two antialiased edges at
+            // a fractional row would leave a faint line through the highlight.
             if (result.count && rc.top<result.lines[result.count-1].bottom) {
                 auto& previous=result.lines[result.count-1];
-                previous.bottom=rc.top=(previous.bottom+rc.top)*.5f;
+                const bool previousWider=previous.right-previous.left>=rc.right-rc.left;
+                previous.bottom=rc.top=roundf(previousWider ? previous.bottom : rc.top);
             }
             if (!result.count) result.bounds=rc;
             else {
@@ -18261,20 +18300,126 @@ POINT PositionDragPreview(const DragPreview& preview,POINT cursor,const RECT& wo
         std::clamp(y,top,std::max(top,LONG(std::floor(work.bottom-visible.bottom))))};
 }
 
+// Exact ink of a layout: the union of its glyph outlines, using each color
+// font layer's own glyphs (a layer can be narrower than the base glyph). Image
+// bounds of recorded text are conservative glyph boxes; with no font
+// customizer they made normalized emoji ~9% too small. CPU geometry only.
+class InkBoundsRenderer final : public IDWriteTextRenderer {
+public:
+    explicit InkBoundsRenderer(ID2D1Factory* factory) : factory(factory) {}
+    D2D1_RECT_F bounds{FLT_MAX,FLT_MAX,-FLT_MAX,-FLT_MAX};
+    HRESULT failure=S_OK;
+    bool Valid() const { return SUCCEEDED(failure) && bounds.right>bounds.left && bounds.bottom>bounds.top; }
+    // Stack-owned for one synchronous IDWriteTextLayout::Draw call.
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+        if(iid==__uuidof(IUnknown) || iid==__uuidof(IDWritePixelSnapping) || iid==__uuidof(IDWriteTextRenderer)) {
+            *out=this; return S_OK;
+        }
+        *out=nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE IsPixelSnappingDisabled(void*,BOOL* disabled) override { *disabled=TRUE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetCurrentTransform(void*,DWRITE_MATRIX* transform) override {
+        *transform={1.f,0.f,0.f,1.f,0.f,0.f}; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPixelsPerDip(void*,FLOAT* pixels) override { *pixels=1.f; return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawGlyphRun(void*,FLOAT x,FLOAT y,DWRITE_MEASURING_MODE mode,
+        const DWRITE_GLYPH_RUN* run,const DWRITE_GLYPH_RUN_DESCRIPTION* description,IUnknown*) override {
+        ComPtr<IDWriteFactory2> colors; ComPtr<IDWriteColorGlyphRunEnumerator> layers;
+        if(SUCCEEDED(g_writeFactory.As(&colors)) &&
+            SUCCEEDED(colors->TranslateColorGlyphRun(x,y,run,description,mode,nullptr,0,&layers))) {
+            BOOL more=FALSE;
+            while(SUCCEEDED(layers->MoveNext(&more)) && more) {
+                const DWRITE_COLOR_GLYPH_RUN* layer=nullptr;
+                if(SUCCEEDED(layers->GetCurrentRun(&layer)) && layer)
+                    Add(layer->baselineOriginX,layer->baselineOriginY,layer->glyphRun);
+            }
+        } else Add(x,y,*run);  // DWRITE_E_NOCOLOR: an ordinary outline glyph run.
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawUnderline(void*,FLOAT,FLOAT,const DWRITE_UNDERLINE*,IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawStrikethrough(void*,FLOAT,FLOAT,const DWRITE_STRIKETHROUGH*,IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawInlineObject(void*,FLOAT,FLOAT,IDWriteInlineObject*,BOOL,BOOL,IUnknown*) override { return S_OK; }
+private:
+    ID2D1Factory* factory;
+    void Add(float x,float y,const DWRITE_GLYPH_RUN& run) {
+        ComPtr<ID2D1PathGeometry> path; ComPtr<ID2D1GeometrySink> sink;
+        HRESULT hr=factory->CreatePathGeometry(&path);
+        if(SUCCEEDED(hr)) hr=path->Open(&sink);
+        if(SUCCEEDED(hr)) hr=run.fontFace->GetGlyphRunOutline(run.fontEmSize,run.glyphIndices,run.glyphAdvances,
+            run.glyphOffsets,run.glyphCount,run.isSideways,run.bidiLevel&1,sink.Get());
+        if(SUCCEEDED(hr)) hr=sink->Close();
+        D2D1_RECT_F outline{};
+        if(SUCCEEDED(hr)) hr=path->GetBounds(D2D1::Matrix3x2F::Translation(x,y),&outline);
+        if(FAILED(hr)) { failure=hr; return; }
+        if(outline.right<=outline.left || outline.bottom<=outline.top) return;  // Blank glyphs.
+        bounds={std::min(bounds.left,outline.left),std::min(bounds.top,outline.top),
+            std::max(bounds.right,outline.right),std::max(bounds.bottom,outline.bottom)};
+    }
+};
+
+D2D1_MATRIX_3X2_F CenteredDragLabelTransform(const D2D1_RECT_F& ink,float size,const D2D1_RECT_F& rect) {
+    const float scale=size/(ink.right-ink.left);
+    return D2D1::Matrix3x2F::Scale(scale,scale)*D2D1::Matrix3x2F::Translation(
+        (rect.left+rect.right)*.5f-(ink.left+ink.right)*.5f*scale,
+        (rect.top+rect.bottom)*.5f-(ink.top+ink.bottom)*.5f*scale);
+}
+
+// Hinting and color-font rendering can place visible ink a pixel or more away
+// from the glyph outlines. Rasterize once on the CPU (software D2D into a DIB:
+// no GPU readback or COM) at the transform the outlines suggest, and return
+// the half-coverage ink in layout coordinates, so the cached transform makes
+// the drawn symbol exactly `size` wide and centered.
+bool RenderedDragInk(ID2D1Factory* factory,IDWriteTextLayout* layout,COLORREF foreground,
+                     const D2D1_RECT_F& estimate,float size,D2D1_RECT_F& ink) {
+    const int side=static_cast<int>(std::ceil(size*2.f))+8;
+    const auto area=D2D1::RectF(0.f,0.f,float(side),float(side));
+    const auto transform=CenteredDragLabelTransform(estimate,size,area);
+    BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(info.bmiHeader); info.bmiHeader.biWidth=side;
+    info.bmiHeader.biHeight=-side; info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32;
+    void* bits=nullptr;
+    HDC dc=CreateCompatibleDC(nullptr);
+    HBITMAP dib=dc ? CreateDIBSection(dc,&info,DIB_RGB_COLORS,&bits,nullptr,0) : nullptr;
+    struct Release { HDC dc; HBITMAP dib; HGDIOBJ old;
+        ~Release() { if(old) SelectObject(dc,old); if(dib) DeleteObject(dib); if(dc) DeleteDC(dc); } }
+        release{dc,dib,dib ? SelectObject(dc,dib) : nullptr};
+    if(!bits) return false;
+    const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1DCRenderTarget> software; ComPtr<ID2D1DeviceContext> context; ComPtr<ID2D1SolidColorBrush> brush;
+    const RECT bounds{0,0,side,side};
+    if(FAILED(factory->CreateDCRenderTarget(&properties,&software)) || FAILED(software->BindDC(dc,&bounds)) ||
+        FAILED(software.As(&context)) || FAILED(context->CreateSolidColorBrush(D2D1::ColorF(
+            GetRValue(foreground)/255.f,GetGValue(foreground)/255.f,GetBValue(foreground)/255.f),&brush))) return false;
+    context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    context->BeginDraw(); context->Clear(D2D1::ColorF(0,0.f)); context->SetTransform(transform);
+    context->DrawTextLayout(D2D1::Point2F(),layout,brush.Get(),D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    if(FAILED(context->EndDraw())) return false;
+    int left=side,top=side,right=-1,bottom=-1;
+    const auto* pixels=static_cast<const BYTE*>(bits);
+    for(int y=0;y<side;++y) for(int x=0;x<side;++x) if(pixels[(size_t(y)*side+x)*4+3]>=128) {
+        left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
+    }
+    if(right<=left || bottom<=top) return false;
+    // Map the measured device box back through the transform.
+    const float scale=transform._11;
+    ink={(left-transform._31)/scale,(top-transform._32)/scale,(right-transform._31)/scale,(bottom-transform._32)/scale};
+    return true;
+}
+
 void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brush,
     const std::wstring& text,const wchar_t* family,float size,D2D1_RECT_F rect,COLORREF foreground,
     bool normalizeWidth=false,DragGlyph* cached=nullptr,IDWriteTextFormat* preferredFormat=nullptr) {
     DragGlyph local;
     auto& glyph=cached ? *cached:local;
     const auto color=D2D1::ColorF(GetRValue(foreground)/255.f,GetGValue(foreground)/255.f,GetBValue(foreground)/255.f);
-    if(normalizeWidth && glyph.image && glyph.text==text && glyph.size==size && glyph.foreground==foreground) {
-        const auto& b=glyph.bounds;
-        const float scale=size/(b.right-b.left);
+    if(normalizeWidth && glyph.layout && glyph.text==text && glyph.size==size && glyph.foreground==foreground) {
         D2D1_MATRIX_3X2_F previous{}; target->GetTransform(&previous);
-        target->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale)*D2D1::Matrix3x2F::Translation(
-            (rect.left+rect.right)*.5f-(b.left+b.right)*.5f*scale,
-            (rect.top+rect.bottom)*.5f-(b.top+b.bottom)*.5f*scale)*previous);
-        target->DrawImage(glyph.image.Get()); target->SetTransform(previous); return;
+        target->SetTransform(CenteredDragLabelTransform(glyph.bounds,size,rect)*previous);
+        brush->SetColor(color);
+        target->DrawTextLayout(D2D1::Point2F(),glyph.layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        target->SetTransform(previous); return;
     }
     ComPtr<IDWriteTextFormat> format;
     // Segoe UI Emoji has regular color artwork. Asking for semibold invokes
@@ -18297,21 +18442,14 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
     }
     if(normalizeWidth) {
         // Color layers can have narrower ink than the font's base glyph (for
-        // example the clipboard). Measure the actual recorded color drawing,
-        // once per symbol/size, without readback or another GPU device.
-        ComPtr<ID2D1Device> device; target->GetDevice(&device);
-        ComPtr<ID2D1DeviceContext> recording;
-        ComPtr<ID2D1CommandList> image;
-        if(!device || FAILED(device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,&recording)) ||
-            FAILED(recording->CreateCommandList(&image))) return;
-        recording->SetTarget(image.Get()); recording->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        brush->SetColor(color); recording->BeginDraw();
-        recording->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-        const HRESULT draw=recording->EndDraw(); recording->SetTarget(nullptr);
-        D2D1_RECT_F bounds{};
-        if(FAILED(draw) || FAILED(image->Close()) || FAILED(recording->GetImageLocalBounds(image.Get(),&bounds)) ||
-            bounds.right<=bounds.left || bounds.bottom<=bounds.top) return;
-        glyph={text,size,foreground,std::move(image),bounds};
+        // example the clipboard). Estimate from the layered outlines, then
+        // measure the rendered ink once per symbol/size (CPU only).
+        ComPtr<ID2D1Factory> factory; target->GetFactory(&factory);
+        InkBoundsRenderer ink(factory.Get());
+        if(!factory || FAILED(layout->Draw(nullptr,&ink,0.f,0.f)) || !ink.Valid()) return;
+        D2D1_RECT_F rendered{};
+        glyph={text,size,foreground,layout,
+            RenderedDragInk(factory.Get(),layout.Get(),foreground,ink.bounds,size,rendered) ? rendered : ink.bounds};
         DrawCenteredDragLabel(target,brush,text,family,size,rect,foreground,true,&glyph); return;
     }
     DWRITE_OVERHANG_METRICS ink{};
@@ -19847,7 +19985,7 @@ void Paint(ViewState& state) {
                     g_frameTimeLogging.load(std::memory_order_relaxed)))
                     Wh_Log(L"[GPU composition] %s tab=%p origin=%lld header=%.2f->%.2f duration=%u ms columns=%zu grid=%d kind=%s (DWM clock; frame summaries measure CPU submissions)",
                         compositionFrame.Rows() ? L"ROWS" : L"COLUMNS",state.activeTabHost,state.modeComposition.started.QuadPart,state.columnHeaderFrom,
-                        state.columnHeaderTo,kUiTransitionDurationMs,state.columns.size(),state.gridView,
+                        state.columnHeaderTo,static_cast<unsigned>(kUiTransitionDurationMs),state.columns.size(),state.gridView,
                     compositionFrame.Rows() ? L"rows" : state.modeComposition.widths ? L"fit" : L"mode");
                 state.modeComposition.published=true;
             }
@@ -29639,8 +29777,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     CapturedSelectionStillCurrent(*s,*prepared);
                 if (!IsWindow(hwnd) || State(hwnd)!=s) return 0;
                 if (s->pendingNativeSelection!=prepared->generation) return 0;
+                // Rows republished since capture (e.g. a refresh queued by a
+                // late Shell event) make this import stale, not a failed commit.
                 if (FAILED(hr) || FAILED(prepared->result) || count!=prepared->expectedCount ||
                     !identitiesCurrent || s->folderView.Get()!=view.Get() ||
+                    s->directoryToken!=prepared->directoryToken ||
                     s->namespaceIdentities!=prepared->namespaceIdentities ||
                     s->nativeSelectionDirty || prepared->entries.size()!=prepared->children.size()) {
                     PipelineEvent(*s->background,{.operation=L"selection.import.retry",.a=prepared->generation,.b=static_cast<unsigned>(count),
@@ -34175,7 +34316,7 @@ bool HandleNativeFileKey(const MSG& msg, ViewState* owner) {
         if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
             live->nativeHwnd!=target) return true;
         const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
-        if (FAILED(hr)) Wh_Log(L"[GPU selection] file shortcut failed key=0x%X hr=0x%08X",key.key,static_cast<unsigned>(hr));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] file shortcut failed key=0x%X hr=0x%08X",static_cast<unsigned>(key.key),static_cast<unsigned>(hr));
         return true;
     };
     if (owner) return handle(*owner,true);

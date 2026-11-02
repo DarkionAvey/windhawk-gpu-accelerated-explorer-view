@@ -81,6 +81,7 @@
 #undef GetClipboardData
 #undef IsClipboardFormatAvailable
 #undef EmptyClipboard
+#include "regression-guards.h"
 #include <filesystem>
 #include <stdexcept>
 #include <iostream>
@@ -90,7 +91,11 @@ static HANDLE providerGate = nullptr;
 static std::atomic<unsigned> blockedProviders{0};
 
 static void Check(bool value, const char* message) {
-    if (!value) throw std::runtime_error(message);
+    // Attach the active Regression::Scope (option, view, DPI...) before unwinding.
+    if (!value) {
+        const auto context = Regression::ContextText();
+        throw std::runtime_error(context.empty() ? std::string(message) : std::string(message) + " [" + context + "]");
+    }
 }
 
 template<class Predicate>
@@ -479,12 +484,12 @@ static void TestNativeSuppression() {
     Check(SuppressNativeContent(state), "minimized suppression setup");
     ShowWindow(frame, SW_SHOWMINNOACTIVE);
     Check(IsIconic(frame), "minimize fixture did not become iconic");
-    const HWND foreground = GetForegroundWindow(), focus = GetFocus();
+    const auto activation = Regression::Activation::Capture();
     NativeShowWindowHook(host, SW_HIDE); // Shell layout while minimized.
     RestoreNativeContent(state);
     Check(!hidden() && IsIconic(frame) && IsWindowEnabled(frame),
           "unload while minimized stranded the selected native host hidden");
-    Check(GetForegroundWindow() == foreground && GetFocus() == focus,
+    Check(Regression::Activation::Capture() == activation,
           "minimized native restoration changed activation/focus");
     // Recover an older version's orphaned host without accepting a genuinely
     // hidden view, tab or frame as a live Shell view.
@@ -1917,140 +1922,116 @@ static void TestPreviewInput() {
 #include "native-menu-smoke.h"
 #include "item-tip-smoke.h"
 
-// One manifest owns full-suite coverage in both serial and parallel runs.
-// Keep related workflows together; each child gets a private PID fixture and
-// performs the same callback/COM/worker shutdown checks as the serial run.
-struct RegressionSuite {
-    const wchar_t* name;
-    bool exclusive;
-    void (*run)(const std::wstring&);
-};
-static const RegressionSuite kRegressionSuites[] = {
-    {L"foundation", false, [](const std::wstring&) {
-        TestLlmReport(); TestRenderQuality(); TestToggleRepaint();
-        TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
-        TestStatusButtonLayout();
-        TestUserOptions();
-    }},
-    {L"touch", false, [](const std::wstring& fixture) {
-        TestTouchInput(fixture);
-    }},
-    {L"drag-preview", false, [](const std::wstring& fixture) {
-        TestDragPreview(fixture);
-    }},
-    {L"gestures", false, [](const std::wstring& fixture) {
-        TestAdditionalGestures(fixture);
-    }},
-    // Native column/EDIT probes observe USER painting and asynchronous Shell
-    // acknowledgements. Keep them exclusive; assertions still fail normally.
-    {L"ui-input", true, [](const std::wstring& fixture) {
-        TestSelectionCheckboxes(fixture);
-        TestResolvedStyles();
-        TestStyleEvents(fixture);
-        TestPeriodicCapacityRefresh();
-        TestTabResumeRefresh(fixture); TestWindowResumeRefresh(); TestUnchangedRefreshPresentation();
-        TestClippingPreflight();
-        TestResizeAutoRefit();
-        TestColumnMinimumWidths();
-        TestOfficeLockFiltering(fixture);
-        TestEmptySnapshotReconciliation(fixture);
-        TestNamespaceItemMutations(fixture);
-        TestNativeSuppression();
-        TestExplorerColumnBridge(fixture);
-    }},
-    {L"workers", false, [](const std::wstring& fixture) {
-        TestPublicationAndEpochs();
-        TestWorkerApartment();
-        TestWorkerStartupIsolation();
-        TestThirtyIndependentTabs(fixture);
-        TestColdColumnCatalog(fixture);
-        TestDeferredColumnCapture(fixture);
-        TestSnapshotSelectionRestoration(fixture);
-        ProfileExecutableIcons();
-        TestIconQueueIsolation();
-        TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
-        TestFrameBudgets();
-        TestLargeTileBackpressure(); TestLargeTileSampling();
-        TestDenseGridDrawing();
-        TestIconAlphaQuality(fixture);
-        TestNativeIconSizing(fixture);
-        TestPipelineTrace();
-        TestPropertyPoolIsolation(fixture);
-        TestDriveSpaceRefresh();
-        TestPreviewAndLayout(fixture);
-    }},
-    {L"preprocessing", true, [](const std::wstring& fixture) {
-        TestPreprocessingBenchmarks(fixture);
-    }},
-    {L"shell", false, [](const std::wstring& fixture) {
-        TestLayoutWatchAndCache(fixture);
-        TestFilesystemMutationDelivery(fixture);
-        TestShellProviderContents(fixture);
-        TestProviderSelection(fixture);
-        TestInitialSorting(fixture);
-        TestNativeMenuInteraction();
-        TestSelectionUiWork(fixture);
-        TestProviderNavigation(fixture);
-        TestPasteFocus(fixture);
-        TestBurstRowContinuity(fixture);
-        TestSortDetails(fixture);
-        TestShellSizeDetails(fixture);
-        TestItemTips(fixture);
-    }},
-    {L"graphics", true, [](const std::wstring& fixture) {
-        TestRealNativeViewport(fixture);
-        TestNativeSuppression();
-        TestNativeUiaBatch();
-        TestRealNativeUiaPressure(fixture);
-        TestGraphicsIsolation(fixture);
-        TestGraphicsResourceLifecycle();
-    }},
-    {L"presentation", true, [](const std::wstring& fixture) {
-        TestPresentationOwners();
-        TestTimingReadiness(fixture);
-        TestMirroredWindowCoordinates(fixture);
-        TestRenameSizing();
-        TestRenameAppearance(fixture);
-        TestRenameHandoff(fixture);
-        TestEditorSelectionOwnership(fixture);
-        TestRenameReorderReadiness(fixture);
-        TestUnexpectedInputs(fixture);
-    }},
-    {L"navigation-selection", false, [](const std::wstring& fixture) {
-        TestEscapeClipboard();
-        TestPreviewInput();
-        TestNativeStartupPipeline(fixture);
-        TestColdAttachWake();
-        TestBackgroundTabStartup(fixture);
-        TestAttachedLifecycle(fixture);
-        TestTypeSearchPrefix();
-        TestUiFeedbackAudit(fixture);
-        TestMarqueeSelection(fixture);
-    }},
-};
+#include "option-effects-smoke.h"
+#include "regression-manifest.h"
+#include <set>
+
+// Prerequisites every process provides, independent of which test runs.
+// Window classes stand in for Explorer's native hosts; no test may rely on
+// another test having registered them first.
+static void PrepareRegressionProcess() {
+    g_perf = false;
+    Check(RegisterFrameHookReleaseMessage(),"registered frame lifecycle message");
+    WNDCLASSW cls{};
+    cls.hInstance = GetModuleHandleW(nullptr);
+    cls.lpfnWndProc = DefWindowProcW;
+    for (const auto* name : {L"SHELLDLL_DefView", L"CtrlNotifySink"}) {
+        cls.lpszClassName = name;
+        Check(RegisterClassW(&cls) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS, "native host fixture class");
+    }
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
+    Check(InitCommonControlsEx(&controls), "header control initialization");
+}
+
+static std::string CrashLocation(const void* address) {
+    HMODULE module = nullptr; wchar_t path[MAX_PATH]{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCWSTR>(address), &module) || !GetModuleFileNameW(module, path, MAX_PATH))
+        return "unknown module";
+    return Regression::Narrow(std::filesystem::path(path).filename().wstring()) + "+0x" + [&] {
+        char offset[24];
+        std::snprintf(offset, sizeof(offset), "%llx", static_cast<unsigned long long>(
+            static_cast<const BYTE*>(address) - reinterpret_cast<const BYTE*>(module)));
+        return std::string(offset);
+    }();
+}
+
+// A crash in a test process is a test failure with a name and context, not an
+// anonymous exit code. Report, then continue the default crash path.
+static void ReportCrash(const char* kind, const std::string& detail) {
+    std::fprintf(stderr, "CRASH: %s in %s%s%s\n", kind,
+        Regression::current ? Regression::Narrow(Regression::current->name).c_str() : "process setup",
+        detail.empty() ? "" : ": ", detail.c_str());
+    const auto context = Regression::ContextText();
+    if (!context.empty()) std::fprintf(stderr, "CRASH CONTEXT: %s\n", context.c_str());
+    std::fflush(stderr); std::fflush(stdout);
+}
+static LONG WINAPI UnhandledCrash(EXCEPTION_POINTERS* exception) {
+    char detail[64];
+    std::snprintf(detail, sizeof(detail), "exception 0x%08lX thread %lu",
+        exception->ExceptionRecord->ExceptionCode, GetCurrentThreadId());
+    ReportCrash("unhandled exception", std::string(detail) + " at " +
+        CrashLocation(exception->ExceptionRecord->ExceptionAddress));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static const Regression::Test* FindRegression(const wchar_t* name) {
+    for (const auto& test : kRegressions) if (!wcscmp(name, test.name)) return &test;
+    return nullptr;
+}
 
 int wmain(int argc,wchar_t** argv) {
-    if(argc==2 && wcscmp(argv[1],L"--list-suites")==0) {
-        for (const auto& suite : kRegressionSuites)
-            std::wcout << suite.name << L'\t' << (suite.exclusive ? L"exclusive" : L"shared") << L'\n';
+    SetUnhandledExceptionFilter(UnhandledCrash);
+    std::set_terminate([] {
+        std::string detail = "std::terminate";
+        if (const auto error = std::current_exception()) {
+            try { std::rethrow_exception(error); }
+            catch (const std::exception& e) { detail += std::string(" (uncaught ") + e.what() + ")"; }
+            catch (...) { detail += " (uncaught non-standard exception)"; }
+        }
+        ReportCrash("abort", detail);
+        std::abort();
+    });
+    if(argc==2 && wcscmp(argv[1],L"--list-tests")==0) {
+        // name, concurrency, gate, resources: consumed by run-regressions.ps1.
+        std::set<std::wstring> names;
+        for (const auto& test : kRegressions) {
+            if (!names.insert(test.name).second) { std::wcerr << L"FAIL: duplicate regression " << test.name << L'\n'; return 1; }
+            std::wcout << test.name << L'\t' << (test.serial ? L"serial" : L"parallel") << L'\t'
+                       << (test.gate == Regression::Gate::Release ? L"release" : L"focused") << L'\t'
+                       << Regression::ResourceNames(test.serial).c_str() << L'\n';
+        }
         return 0;
     }
     if(argc>1 && wcscmp(argv[1],L"--trace-selection")==0)
         return TraceLiveSelection(argc>2 ? std::clamp(_wtoi(argv[2]),1,180) : 90);
+    std::vector<const Regression::Test*> selected;
+    bool menuChild=false;
+    for (int i=1; i<argc; ++i) {
+        if (!wcscmp(argv[i],L"--native-context-menu-child")) { menuChild=true; continue; }
+        if (!wcscmp(argv[i],L"--test") && i+1<argc) {
+            const auto* test=FindRegression(argv[++i]);
+            if (!test) { std::wcerr << L"FAIL: unknown regression " << argv[i] << L'\n'; return 2; }
+            selected.push_back(test); continue;
+        }
+        bool aliased=false;
+        for (const auto& alias : kRegressionAliases) if (!wcscmp(argv[i],alias.flag)) {
+            for (const auto* name : alias.tests) selected.push_back(FindRegression(name));
+            aliased=true;
+        }
+        if (!aliased) {
+            std::wcerr << L"FAIL: unknown argument " << argv[i] << L". Use --list-tests and --test <name>.\n";
+            return 2;
+        }
+    }
+    if (!menuChild && selected.empty()) {
+        std::wcerr << L"Usage: --list-tests | --test <name> [--test <name>...]\n"
+                      L"Full runs use tests/run-regressions.ps1, one process per test.\n";
+        return 2;
+    }
     WorkerComApartment mainApartment; // Keep the test process's main STA alive through worker shutdown.
     try {
-        g_perf = false;
-        Check(RegisterFrameHookReleaseMessage(),"registered frame lifecycle message");
-        {
-            // These are identities only; no real volume/share is accessed.
-            Check(IsTargetPath(L"Q:\\") && IsTargetPath(L"q:/ordinary/folder") &&
-                  IsTargetPath(L"Q:\\Windows.old") && IsTargetPath(L"\\\\scope-fixture\\share\\folder") &&
-                  !IsTargetPath(L"Q:relative") && !IsTargetPath(L"relative\\folder") &&
-                  !IsTargetPath(L"shell:unsupported") && !IsTargetPath(L""),
-                  "all-folder filesystem scope rejected a drive/share or accepted a non-filesystem identity");
-            Check(IsSupportedLocation(kThisPcLocation) && IsSupportedLocation(kRecycleBinLocation) &&
-                  !IsSupportedLocation(kUnsupportedShellLocation),"filesystem scope changed supported namespace fallbacks");
-        }
+        PrepareRegressionProcess();
         wchar_t temporary[MAX_PATH]{};
         Check(GetTempPathW(MAX_PATH, temporary) != 0, "temp directory");
         GUID fixtureId{}; wchar_t fixtureName[40]{};
@@ -2068,187 +2049,11 @@ int wmain(int argc,wchar_t** argv) {
             Check(file != INVALID_HANDLE_VALUE, "fixture creation");
             CloseHandle(file);
         }
-        const bool navigationOnly=argc>1 && wcscmp(argv[1],L"--navigation")==0;
-        if (argc>1 && wcscmp(argv[1],L"--suite")==0) {
-            Check(argc==3,"--suite needs one manifest name");
-            bool found=false;
-            for (const auto& suite : kRegressionSuites) if (!wcscmp(argv[2],suite.name)) {
-                TestNativeSuppression(); // Register the private native-control prerequisites in each child.
-                suite.run(fixture.wstring()); found=true; break;
-            }
-            Check(found,"unknown regression suite");
-        } else if (argc>1 && wcscmp(argv[1],L"--shell-size")==0) {
-            TestShellSizeDetails(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--item-tips")==0) {
-            TestItemTips(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--icon-sizing")==0) {
-            TestNativeIconSizing(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--icon-alpha")==0) {
-            TestIconAlphaQuality(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--animation-continuity")==0) {
-            Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
-                reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"continuity fonts");
-            HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private continuity frame",
-                WS_POPUP,-32000,-32000,800,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
-            Check(frame!=nullptr,"continuity frame");
-            TestColumnViewTransition(frame); TestIconGrid(frame,fixture.wstring());
-            DestroyWindow(frame); g_writeFactory.Reset();
-        } else if (argc>1 && wcscmp(argv[1],L"--drive-bars")==0) {
-            Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
-                reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"drive bar fonts");
-            HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private drive bar frame",
-                WS_POPUP,-32000,-32000,1000,600,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
-            Check(frame!=nullptr,"drive bar frame"); TestInlineDriveBars(frame);
-            DestroyWindow(frame); g_writeFactory.Reset();
-        } else if (argc>1 && wcscmp(argv[1],L"--dense-rows")==0) {
-            TestDenseRowPublication();
-        } else if (argc>1 && wcscmp(argv[1],L"--dense-grid")==0) {
-            TestDenseGridDrawing();
-        } else if (argc>1 && wcscmp(argv[1],L"--large-tiles")==0) {
-            TestLargeTileBackpressure(); TestLargeTileSampling();
-        } else if (argc>1 && wcscmp(argv[1],L"--adaptive-images")==0) {
-            TestAdaptiveImageDemand(); TestAdaptiveImagePipeline();
-        } else if (argc>1 && wcscmp(argv[1],L"--unexpected-inputs")==0) {
-            TestUnexpectedInputs(fixture.wstring(),argc>2 ? argv[2] : L"all");
-        } else if (argc>1 && wcscmp(argv[1],L"--llm-report")==0) {
-            TestLlmReport(); TestFilesystemMutationDelivery(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--render-quality")==0) {
-            TestRenderQuality(); TestToggleRepaint();
-        } else if (argc>1 && wcscmp(argv[1],L"--pipeline-trace")==0) {
-            TestPipelineTrace();
-        } else if (argc>1 && wcscmp(argv[1],L"--frame-report")==0) {
-            TestFrameHookRelease(); TestDispatchStateRetirement(); TestRenameHandoff(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--lifetime")==0) {
-            TestLifetimeRaces(); TestDispatchStateRetirement(); TestFrameHookRelease();
-        } else if (argc>1 && wcscmp(argv[1],L"--namespace-mutations")==0) {
-            TestNamespaceItemMutations(fixture.wstring());
-            TestNativeStartupPipeline(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--office-locks")==0) {
-            TestOfficeLockFiltering(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--empty-snapshot")==0) {
-            TestEmptySnapshotReconciliation(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--status-buttons")==0) {
-            TestStatusButtonLayout();
-        } else if (argc>1 && wcscmp(argv[1],L"--drive-refresh")==0) {
-            TestDriveSpaceRefresh();
-        } else if (argc>1 && wcscmp(argv[1],L"--smart-refresh")==0) {
-            TestTabResumeRefresh(fixture.wstring()); TestWindowResumeRefresh(); TestUnchangedRefreshPresentation();
-            TestSortDetails(fixture.wstring()); TestDriveSpaceRefresh();
-        } else if (argc>1 && wcscmp(argv[1],L"--column-minimum")==0) {
-            TestColumnMinimumWidths();
-        } else if (argc>1 && wcscmp(argv[1],L"--column-bridge")==0) {
-            TestNativeSuppression();
-            TestExplorerColumnBridge(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--options")==0) {
-            TestUserOptions();
-            TestClippingPreflight();
-            TestResizeAutoRefit();
-        } else if (argc>1 && wcscmp(argv[1],L"--styles")==0) {
-            TestResolvedStyles();
-            TestStyleEvents(fixture.wstring());
-            TestPeriodicCapacityRefresh();
-        } else if (argc>1 && wcscmp(argv[1],L"--live-sort")==0) {
-            HWND frame=CreateWindowExW(0,L"STATIC",L"hidden-live-sort-frame",0,
-                0,0,640,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
-            Check(frame!=nullptr,"live sort frame");
-            TestLiveSorting(frame,fixture.wstring());
-            DestroyWindow(frame);
-        } else if (argc>1 && wcscmp(argv[1],L"--selection-ui")==0) {
-            TestSelectionUiWork(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--selection-ui-mode")==0) {
-            TestSelectionUiModeReads();
-        } else if (argc>1 && wcscmp(argv[1],L"--selection-ui-navigation")==0) {
-            TestSelectionUiWork(fixture.wstring());
-            TestProviderNavigation(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--selection")==0) {
-            TestNativeSuppression();
-            WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
-            cls.lpszClassName=L"CabinetWClass"; RegisterClassW(&cls);
-            TestMarqueeSelection(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--rtl-windows")==0) {
-            TestNativeSuppression();
-            TestMirroredWindowCoordinates(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--gpu-memory")==0) {
-            TestGraphicsMemoryProbe();
-        } else if (argc>1 && wcscmp(argv[1],L"--gpu-lifecycle")==0) {
-            if(argc>2 && wcscmp(argv[2],L"--after-graphics")==0) {
-                TestNativeSuppression(); TestGraphicsIsolation(fixture.wstring());
-            }
-            TestGraphicsResourceLifecycle();
-        } else if (argc>1 && wcscmp(argv[1],L"--trace-cpu")==0) {
-            TestIdleTraceCpu();
-        } else if (argc>1 && wcscmp(argv[1],L"--native-uia")==0) {
-            TestNativeSuppression();
-            TestNativeUiaBatch();
-            TestRealNativeUiaPressure(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--native-viewport")==0) {
-            TestRealNativeViewport(fixture.wstring());
-            TestNativeSuppression();
-            TestNativeUiaBatch();
-            TestRealNativeUiaPressure(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--profile-identity-probe")==0) {
-            TestProfileIdentityProbe();
-        } else if (argc>1 && wcscmp(argv[1],L"--native-context-menu-child")==0) {
-            NativeMenuFixture::Child(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--native-context-menu")==0) {
-            TestNativeMenuInteraction();
-        } else if (argc>1 && wcscmp(argv[1],L"--preprocessing")==0) {
-            TestPreprocessingBenchmarks(fixture.wstring(),true);
-        } else if (argc>1 && wcscmp(argv[1],L"--initial-sort")==0) {
-            TestInitialSorting(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--provider-selection")==0) {
-            TestProviderSelection(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--provider-navigation")==0) {
-            TestProviderNavigation(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--paste-focus")==0) {
-            TestPasteFocus(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--shell-provider")==0) {
-            TestShellProviderContents(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--filesystem")==0) {
-            TestShellProviderContents(fixture.wstring());
-            TestFilesystemMutationDelivery(fixture.wstring());
-            TestBurstRowContinuity(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--timing")==0) {
-            TestTimingReadiness(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--presentation")==0) {
-            TestPresentationOwners();
-        } else if (argc>1 && wcscmp(argv[1],L"--row-composition")==0) {
-            WorkerComApartment apartment;
-            Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
-                reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"row compositor fonts");
-            HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private row fixture",
-                WS_POPUP|WS_VISIBLE,-32000,-32000,800,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
-            Check(frame!=nullptr,"row compositor frame");
-            TestRowComposition<ViewState>(frame); DestroyWindow(frame); g_writeFactory.Reset();
-        } else if (argc>1 && wcscmp(argv[1],L"--rename")==0) {
-            TestRenameSizing();
-            TestRenameAppearance(fixture.wstring());
-            TestRenameHandoff(fixture.wstring());
-            TestEditorSelectionOwnership(fixture.wstring());
-            TestRenameReorderReadiness(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--scrollbar-input")==0) {
-            TestScrollbarPressRouting();
-        } else if (argc>1 && wcscmp(argv[1],L"--swipe-compositor")==0) {
-            TestSwipeCompositor();
-        } else if (argc>1 && wcscmp(argv[1],L"--touch")==0) {
-            TestTouchInput(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--additional-gestures")==0) {
-            TestAdditionalGestures(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--new-tabs")==0) {
-            TestBackgroundTabStartup(fixture.wstring()); TestColdAttachWake();
-        } else if (argc>1 && wcscmp(argv[1],L"--checkboxes")==0) {
-            TestSelectionCheckboxes(fixture.wstring());
-        } else if (argc>1 && wcscmp(argv[1],L"--graphics")==0) {
-            TestNativeSuppression();
-            TestGraphicsIsolation(fixture.wstring());
-            TestTimingReadiness(fixture.wstring());
-        } else if (navigationOnly) {
-            TestNativeSuppression();
-            TestAttachedLifecycle(fixture.wstring());
-            TestUiFeedbackAudit(fixture.wstring());
-        } else {
-            Check(argc==1, "unknown test argument");
-            for (const auto& suite : kRegressionSuites) suite.run(fixture.wstring());
+        if (menuChild) NativeMenuFixture::Child(fixture.wstring());
+        for (const auto* test : selected) {
+            Regression::current = test; Regression::claimed = 0;
+            test->run(fixture.wstring());
+            Regression::CheckDeclaredResources();
         }
         Check(g_windowCallbacks.load() == 0, "window callbacks were not drained");
         Check(g_shellViewHooks.empty(), "frame lifecycle/creation hooks outlived their overlays");
@@ -2260,20 +2065,33 @@ int wmain(int argc,wchar_t** argv) {
               std::filesystem::weakly_canonical(std::filesystem::path(temporary)),
               "fixture deletion escaped its temporary directory");
         // Shell releases of a nested bound folder can finish after its files
-        // are deleted. Retry only this verified private fixture's cleanup.
-        Check(Eventually([&] {
-            std::error_code error;
-            std::filesystem::remove_all(fixture,error);
-            return !error;
-        }), "private fixture cleanup did not settle");
-        std::cout << (navigationOnly ? "Navigation regressions passed. " : "All pipeline regressions passed. ") <<
-            "Explorer visual/ETW validation is separate.\n";
+        // are deleted, later still on a loaded machine. Retry only this
+        // verified private fixture's cleanup; the deadline is a failure bound.
+        std::error_code cleanupError;
+        const bool cleaned=Eventually([&] {
+            cleanupError.clear();
+            std::filesystem::remove_all(fixture,cleanupError);
+            return !cleanupError;
+        },60000);
+        if (!cleaned) {
+            // Non-throwing walk: a held or pending-delete entry denies access.
+            std::error_code walk;
+            for (std::filesystem::recursive_directory_iterator entry(fixture,
+                     std::filesystem::directory_options::skip_permission_denied,walk), end;
+                 !walk && entry != end; entry.increment(walk))
+                std::wcout << L"FIXTURE still held: " << entry->path().wstring() << L'\n';
+            std::cout << "FIXTURE cleanup error: " << cleanupError.message() << '\n';
+        }
+        Check(cleaned, "private fixture cleanup did not settle");
+        if (!menuChild) std::cout << "All selected regressions passed. Explorer visual/ETW validation is separate.\n";
         return 0;
     } catch (const std::exception& error) {
         if (providerGate) SetEvent(providerGate);
         ShutDownFrames();
         ShutDownBackgroundWorkers();
         std::cerr << "FAIL: " << error.what() << '\n';
+        const auto context = Regression::ContextText();
+        if (!context.empty()) std::cerr << "CONTEXT: " << context << '\n';
         return 1;
     }
 }

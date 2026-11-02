@@ -44,6 +44,23 @@ static void TestInitialSorting(const std::wstring& fixture) {
         }
         return paths;
     };
+    // DefView applies SetSortColumns asynchronously; under load its rows can
+    // still be in the previous order after one pump. The GPU order is final,
+    // so wait (bounded) for the native oracle to converge to it.
+    const auto awaitNativeOrder=[&](const char* message,const PROPERTYKEY* key=nullptr,int direction=0) {
+        std::vector<std::wstring> paths;
+        const bool converged=Eventually([&] {
+            host.Pump(); paths=nativeOrder();
+            if(int(paths.size())!=state.total) return false;
+            for(int i=0;i<state.total;++i) if(_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str())) return false;
+            return true;
+        },30000);
+        if(!converged) for(int i=0;i<std::min<int>(state.total,int(paths.size()));++i)
+            if(_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str()))
+                std::wcout<<L"SORT MISMATCH key="<<(key ? key->pid : 0)<<L" direction="<<direction
+                    <<L" row="<<i<<L" native="<<paths[i]<<L" GPU="<<state.entries[i].path<<std::endl;
+        Check(converged,message);
+    };
     // Turning off pre-sorting also rejects an automatically sorted cache,
     // rather than silently preserving the former default on the next visit.
     g_preSort=false;
@@ -62,13 +79,7 @@ static void TestInitialSorting(const std::wstring& fixture) {
             auto folder=state.folder;
             ResetForNewDirectory(state,root.wstring(),folder,false,state.activeTabHost);
             settle();
-            const auto paths=nativeOrder();
-            for (int i=0;i<state.total;++i) {
-                if (_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str()))
-                    std::wcout<<L"SORT MISMATCH key="<<key.pid<<L" direction="<<int(direction)
-                        <<L" row="<<i<<L" native="<<paths[i]<<L" GPU="<<state.entries[i].path<<std::endl;
-                Check(_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str())==0,"saved sort differs from native view order");
-            }
+            awaitNativeOrder("saved sort differs from native view order",&key,int(direction));
         }
     // Native changes made while the overlay is off must replace its cache.
     SetActive(state.hwnd,false);
@@ -93,9 +104,7 @@ static void TestInitialSorting(const std::wstring& fixture) {
     settle(false);
     Check(!state.rowTransitionActive && state.rowMotion.empty() && !state.instantInteractionSort,
         "replacement refresh animated a deliberate header sort");
-    auto order=nativeOrder();
-    for (int i=0;i<state.total;++i)
-        Check(_wcsicmp(order[i].c_str(),state.entries[i].path.c_str())==0,"instant header order differs from native");
+    awaitNativeOrder("instant header order differs from native");
     // Keep the internal switch functional before it becomes a user option.
     g_animateItemInteractions=true;
     SortByHeader(state,0); settle(false);
@@ -120,9 +129,7 @@ static void TestInitialSorting(const std::wstring& fixture) {
     Check(SUCCEEDED(state.folderView->SetSortColumns(multiple,2)),"native secondary sort choice"); host.Pump();
     RefreshSortFromExplorer(state,true,true); settle();
     Check(state.sort.secondary.size()==1 && SameSort(state.sort,state.displayedSort),"secondary native key was dropped");
-    const auto paths=nativeOrder();
-    for (int i=0;i<state.total;++i)
-        Check(_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str())==0,"secondary sort differs from native order");
+    awaitNativeOrder("secondary sort differs from native order");
     g_preSort=false;
     state.folderCache.folders.clear();
     InitializeFolderSort(state,root.wstring());
