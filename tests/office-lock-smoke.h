@@ -12,12 +12,13 @@ static void ProfileOfficeNameFilter(Predicate predicate) {
     for(size_t i=0;i<count;++i) {
         auto& record=records[i];
         const bool owner=i%997==0,folder=i%13==0;
-        const bool system=i%31==0;
+        const bool hidden=i%17==0,system=i%31==0;
         record.dwFileAttributes=(folder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE) |
-            (i%17==0 ? FILE_ATTRIBUTE_HIDDEN : 0) | (system ? FILE_ATTRIBUTE_SYSTEM : 0);
+            (hidden ? FILE_ATTRIBUTE_HIDDEN : 0) | (system ? FILE_ATTRIBUTE_SYSTEM : 0);
         const auto name=std::wstring(owner ? L"~$document-" : L"document-")+std::to_wstring(i)+L".docx";
         wcscpy_s(record.cFileName,name.c_str());
-        expectedBase+=!system; expectedFiltered+=!system && !(owner && !folder);
+        const bool protectedItem=hidden && system; // SYSTEM alone is listed by CFSFolder.
+        expectedBase+=!protectedItem; expectedFiltered+=!protectedItem && !(owner && !folder);
     }
     std::vector<double> baseline,filtered;
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);

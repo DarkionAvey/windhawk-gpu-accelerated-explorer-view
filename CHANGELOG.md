@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.340
+
+- Show the contents of cloud and virtual drives (such as the Google Drive root)
+  that previously appeared as "This folder is empty": when the fast file listing
+  finds nothing, the folder is confirmed with Windows' own Shell listing.
+- If Explorer still shows items in a folder the GPU view sees as empty, hand that
+  folder back to Explorer's own view instead of reporting it as empty, and leave
+  Explorer's selection untouched.
+- Show items marked only as "system" (for example customized folders), as
+  Explorer does; hidden protected system files still follow Explorer's options.
+
 ## 0.9.339
 
 - Keep Ctrl+wheel and touchpad zoom smooth on large displays: visible labels

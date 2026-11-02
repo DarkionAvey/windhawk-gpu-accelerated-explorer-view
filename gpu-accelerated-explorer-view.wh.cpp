@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.339
+// @version         0.9.340
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -442,6 +442,7 @@ constexpr UINT kMsgStyleChanged = WM_APP + 75;
 constexpr UINT kMsgTabResumeRefresh = WM_APP + 76;
 // Hovered-item tooltip metadata resolved on the tab's Columns lane.
 constexpr UINT kMsgItemTipReady = WM_APP + 78;
+constexpr UINT kMsgReconcileEmptySnapshot = WM_APP + 79;
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
@@ -1124,6 +1125,8 @@ ShellClickPolicy ReadShellClickPolicy() {
 // Exclude protected HIDDEN+SYSTEM entries even when ordinary hidden items
 // are displayed; this includes Explorer's normally suppressed desktop.ini.
 // A protected-file override does not implicitly turn on ordinary hidden items.
+// SYSTEM alone is not protected: CFSFolder lists it (customized folders and
+// cloud drive roots commonly carry READONLY|SYSTEM).
 bool ShellItemVisible(DWORD attributes, const ShellVisibilityPolicy& policy,
                       const wchar_t* name) {
     // Office owner/lock files are implementation details, not selectable
@@ -1137,8 +1140,15 @@ bool ShellItemVisible(DWORD attributes, const ShellVisibilityPolicy& policy,
     // Explorer's protected-files option and ordinary hidden-files option
     // are independent: both must permit an item marked HIDDEN | SYSTEM.
     if (hidden && !policy.showHidden) return false;
-    if (system && !policy.showProtected) return false;
+    if (hidden && system && !policy.showProtected) return false;
     return true;
+}
+
+SHCONTF ShellEnumerationFlags(const ShellVisibilityPolicy& policy) {
+    SHCONTF flags = SHCONTF_FOLDERS | SHCONTF_NONFOLDERS;
+    if (policy.showHidden) flags |= SHCONTF_INCLUDEHIDDEN;
+    if (policy.showProtected) flags |= SHCONTF_INCLUDESUPERHIDDEN;
+    return flags;
 }
 
 // One RAM-only per-tab directory cache, indexed by filesystem path. A snapshot
@@ -1668,6 +1678,8 @@ struct DirectoryJob {
     SharedPidl folderIdentity; // Native binding, including filesystem-addressed providers.
     SharedPidl namespaceFolder; // Immutable; rebound only by the names worker.
     std::shared_ptr<const NamespaceIdentities> verifyIdentities;
+    SharedPidl nativeWitness; // Explorer item contradicting an empty snapshot.
+    bool nativeWitnessExists = false;
     std::shared_ptr<std::atomic<size_t>> capacityRemaining;
     HWND hwnd = nullptr;
     unsigned long long token = 0;
@@ -1828,6 +1840,7 @@ struct DirectoryResult {
     int sortRevealIndex = -1;
     std::shared_ptr<const NamespaceIdentities> namespaceIdentities;
     bool namespaceChanged = false;
+    bool nativeWitnessExists = false;
     bool IsEnrichment() const { return kind == Details || kind == DriveSpace; }
     ColumnChoices columnChoices;
     bool nativeRowsComplete = false;
@@ -3407,6 +3420,12 @@ struct ViewState {
     std::shared_ptr<DirectoryJob> nativeCatalogJob;
     HWND nativeCatalogView = nullptr;
     int nativeCatalogCount = -1;
+    // Explorer listed items for a folder whose GPU snapshot was empty: the
+    // revalidation generation, and the folder then returned to Explorer.
+    unsigned long long emptySnapshotRecheckToken = 0;
+    SharedPidl emptySnapshotWitness; // Explorer item handed to that generation.
+    bool emptySnapshotWitnessed = false; // The completed generation validated it.
+    std::wstring nativeFallbackFolder;
     bool pendingSelectionContextMenu = false;
     bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
@@ -8177,6 +8196,7 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
     result.token = directory.token;
     result.entries = std::move(names);
     result.error = error;
+    result.nativeWitnessExists = directory.nativeWitnessExists;
     return result;
 }
 
@@ -8450,6 +8470,30 @@ bool PlainFilesystemProvider(IShellFolder* folder, const std::wstring& path) {
         _wcsicmp(DirectoryProviderPath(folder, {}).c_str(), path.c_str()) == 0;
 }
 
+// An empty FindFirstFileEx listing is not proof of an empty folder. Virtual
+// filesystems (cloud drive roots, user-mode filesystem drivers) can answer
+// Win32 directory queries differently from CFSFolder, whose enumeration is
+// what Explorer displays. A provider child that the Win32 rules would show
+// proves the Win32 listing incomplete.
+template<class Current>
+bool ProviderListsVisibleChild(IShellFolder* folder, const ShellVisibilityPolicy& visibility,
+                               Current&& current) {
+    ComPtr<IEnumIDList> children;
+    if (!folder || folder->EnumObjects(nullptr, ShellEnumerationFlags(visibility), &children) != S_OK ||
+        !children) return false;
+    while (current()) {
+        PITEMID_CHILD raw = nullptr;
+        ULONG fetched = 0;
+        const HRESULT hr = children->Next(1, &raw, &fetched);
+        OwnedPidl child(hr == S_OK && fetched ? raw : nullptr);
+        if (!child) return false;
+        WIN32_FIND_DATAW data{};
+        if (FAILED(SHGetDataFromIDListW(folder, child.get(), SHGDFIL_FINDDATA, &data, sizeof(data))) ||
+            ShellItemVisible(data.dwFileAttributes, visibility, data.cFileName)) return true;
+    }
+    return false;
+}
+
 void EnumerateNativeRowsJob(TabBackground& work, NativeRowsJob& job,
                            IShellFolder* boundFolder = nullptr, bool preferFilesystemIdentity = false) {
     const ULONGLONG began = GetTickCount64();
@@ -8465,10 +8509,7 @@ void EnumerateNativeRowsJob(TabBackground& work, NativeRowsJob& job,
         if (SUCCEEDED(hr)) hr = item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder));
     }
     ComPtr<IEnumIDList> enumeration;
-    SHCONTF flags = SHCONTF_FOLDERS | SHCONTF_NONFOLDERS;
-    if (job.visibility.showHidden) flags |= SHCONTF_INCLUDEHIDDEN;
-    if (job.visibility.showProtected) flags |= SHCONTF_INCLUDESUPERHIDDEN;
-    if (SUCCEEDED(hr)) hr = folder->EnumObjects(nullptr, flags, &enumeration);
+    if (SUCCEEDED(hr)) hr = folder->EnumObjects(nullptr, ShellEnumerationFlags(job.visibility), &enumeration);
     const auto resolve = [&](const NativeRowIdentity& identity, Entry& entry) {
         return ResolveNativeRowIdentity(identity, entry, folder.Get(), preferFilesystemIdentity);
     };
@@ -9169,8 +9210,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     if (value != INVALID_HANDLE_VALUE) FindClose(value);
                 };
                 std::unique_ptr<void, decltype(closeFind)> enumeration(find, closeFind);
+                DWORD findError = ERROR_SUCCESS;
                 if (find == INVALID_HANDLE_VALUE) {
-                    error = GetLastError();
+                    error = findError = GetLastError();
                     if (error == ERROR_FILE_NOT_FOUND || error == ERROR_NO_MORE_FILES) {
                         const DWORD attributes = GetFileAttributesW(directory.path.c_str());
                         if (attributes != INVALID_FILE_ATTRIBUTES &&
@@ -9228,6 +9270,38 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         enumerationError != ERROR_NO_MORE_FILES) error = enumerationError;
                 }
                 if (!DirectoryJobCurrent(work, directory.token)) continue;
+                PIDLIST_ABSOLUTE root = nullptr;
+                if (error == ERROR_SUCCESS && names.empty() && provider &&
+                    ProviderListsVisibleChild(provider.Get(), directory.visibility,
+                        [&] { return DirectoryJobCurrent(work, directory.token); }) &&
+                    SUCCEEDED(SHGetIDListFromObject(provider.Get(), &root)) && root) {
+                    // List this generation through the provider, as Explorer
+                    // does. The provider enumerates on this worker; a native
+                    // view that is still populating cannot supply the rows.
+                    if (g_perf.load(std::memory_order_relaxed))
+                        Wh_Log(L"[GPU names] WIN32_INCOMPLETE token=%llu folder=%s find-error=%lu entries=%zu; listing through Shell provider",
+                            directory.token, directory.path.c_str(), findError, visited);
+                    directory.namespaceFolder = SharedPidl(root, TaskMemDeleter{});
+                    directory.captureNativeCatalog = false;
+                    ExclusiveSrwLock lock(work.directoryLock);
+                    if (DirectoryJobCurrent(work, directory.token)) {
+                        work.directoryJobs.push_back(std::move(directory));
+                        SetEvent(work.directory.wake);
+                    }
+                    continue;
+                }
+                CoTaskMemFree(root);
+                if (error == ERROR_SUCCESS && names.empty() && provider && directory.nativeWitness) {
+                    // Validation fails for an item Explorer still holds after
+                    // its deletion; filtered names (Office owners) stay hidden.
+                    PCUITEMID_CHILD child = directory.nativeWitness.get();
+                    SFGAOF attributes = SFGAO_VALIDATE;
+                    WIN32_FIND_DATAW data{};
+                    directory.nativeWitnessExists =
+                        SUCCEEDED(provider->GetAttributesOf(1, &child, &attributes)) &&
+                        (FAILED(SHGetDataFromIDListW(provider.Get(), child, SHGDFIL_FINDDATA, &data, sizeof(data))) ||
+                         ShellItemVisible(data.dwFileAttributes, directory.visibility, data.cFileName));
+                }
             }
             // Win32 already supplies names, dates and sizes. Keep those sorts
             // independent of an old folder's blocked type/property provider.
@@ -10271,6 +10345,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     newJob.path = state.folderPath;
     newJob.folderIdentity = state.directoryFolderIdentity;
     newJob.captureNativeCatalog=state.folderView && IsWindow(state.nativeHwnd);
+    newJob.nativeWitness=state.emptySnapshotWitness;
     newJob.previousOrderHash=state.displayedOrderHash;
     newJob.previousMetadataHash=state.displayedMetadataHash;
     newJob.sortRevealPath=std::move(state.sortRevealPath);
@@ -11665,6 +11740,8 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 RetireCachedEntries(state, result.namespaceIdentities);
                 continue;
             }
+            if (result.kind == DirectoryResult::Complete)
+                state.emptySnapshotWitnessed = result.nativeWitnessExists;
             if (result.kind == DirectoryResult::Complete && result.error == ERROR_SUCCESS) {
                 RetireCachedEntries(state, state.namespaceIdentities);
                 state.namespaceIdentities = std::move(result.namespaceIdentities);
@@ -11706,6 +11783,10 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
     // An identical snapshot advances cancellation, not pixels. Acknowledge
     // the submitted model's new generation without repainting its contents.
     if(completedNames && !contentChanged) SynchronizePresentationGeneration(state);
+    // Compare a completed empty snapshot with Explorer's view on the owner
+    // queue, outside this commit and its callers' presentation updates.
+    if (completedNames && state.loaded && !state.directoryPending && !state.total && !state.thisPcGpu)
+        PostMessageW(state.hwnd, kMsgReconcileEmptySnapshot, static_cast<WPARAM>(state.directoryToken), 0);
     // One viewport scan/refit per delivered burst, rather than one for every
     // single-row property completion in that burst. No timer/debounce delay.
     if (detailsChanged) {
@@ -20567,7 +20648,24 @@ void ApplyImportedNativeSelection(ViewState& state,
     Redraw(state);
 }
 
+// Explorer's view lists items while the completed GPU snapshot is empty.
+bool EmptySnapshotContradicted(const ViewState& state, int* nativeCount = nullptr) {
+    if (!state.loaded || state.namesPreview || state.directoryPending || state.total ||
+        state.thisPcGpu || state.enumerationError != ERROR_SUCCESS ||
+        state.optimisticStartedAt || !state.folderView) return false;
+    int count = -1;
+    if (FAILED(state.folderView->ItemCount(SVGIO_ALLVIEW, &count)) || count <= 0) return false;
+    if (nativeCount) *nativeCount = count;
+    return true;
+}
+
 bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool commitFailure = false) {
+    // A contradicted empty model can neither verify Explorer's selection nor
+    // reset it; ReconcileEmptySnapshot revalidates or hands the folder back.
+    if (EmptySnapshotContradicted(state)) {
+        PostMessageW(state.hwnd, kMsgReconcileEmptySnapshot, static_cast<WPARAM>(state.directoryToken), 0);
+        return true;
+    }
     if (NativeSelectionRestorePending(state) && !state.nativeSelectionCommitting && !state.nativeFileCommandDepth) {
         TrySyncLastFolderSelection(state);
         if (NativeSelectionRestorePending(state)) {
@@ -23092,6 +23190,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
                           bool cachedPreviewOnly = false,
                           const SharedPidl& destinationIdentity = {});
 void DeactivateOutsideScope(ViewState& state);
+bool ReconcileEmptySnapshot(ViewState& state);
 
 // Defined after ResetForNewDirectory; only invokes the existing directory
 // cache/worker, and never navigates or calls into Shell COM.
@@ -29176,7 +29275,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->visible && s->inScope && s->detailsViewActive && !s->optimisticStartedAt &&
                 !PresentationMinimized(*s) && TabOwnsActiveView(*s)) {
                 RefreshSortFromExplorer(*s, false, true);
-                ForceRefresh(*s);
+                if (!ReconcileEmptySnapshot(*s)) ForceRefresh(*s);
             }
             if (s->folderView && s->inScope && TabOwnsActiveView(*s))
                 QueueNativeSelectionHint(*s);
@@ -30975,6 +31074,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case kMsgItemTipReady:
         if (s && wParam==WPARAM(s->lifetimeToken)) ConsumeItemTip(*s);
         return 0;
+    case kMsgReconcileEmptySnapshot:
+        if (s && static_cast<unsigned long long>(wParam)==s->directoryToken) ReconcileEmptySnapshot(*s);
+        return 0;
     case kMsgViewToggleLayout:
         if (s && (!wParam || wParam==WPARAM(s->lifetimeToken))) {
             s->viewToggleLayoutQueued = false;
@@ -32530,6 +32632,34 @@ void DeactivateOutsideScope(ViewState& state) {
     CloseDirectoryWatch(state);
 }
 
+// Explorer's own view decides whether a folder has contents. A completed
+// empty GPU snapshot contradicted by Explorer's item count is revalidated
+// once, carrying one of Explorer's items as a witness: an item can appear
+// between the two enumerations, and a deleted item can remain in Explorer's
+// change queue. If the fresh generation is still empty while the witness
+// exists, the GPU cannot represent this provider: return the folder to
+// Explorer until the tab navigates elsewhere.
+bool ReconcileEmptySnapshot(ViewState& state) {
+    int count = -1;
+    if (!state.visible || !state.inScope || !state.detailsViewActive ||
+        !TabOwnsActiveView(state) || !EmptySnapshotContradicted(state, &count)) return false;
+    if (state.emptySnapshotRecheckToken != state.directoryToken) {
+        PITEMID_CHILD witness = nullptr;
+        if (FAILED(state.folderView->Item(0, &witness)) || !witness) return false;
+        state.emptySnapshotWitness = SharedPidl(witness, TaskMemDeleter{});
+        QueueDirectoryRefresh(state, true, true);
+        state.emptySnapshotWitness.reset(); // Consumed by the queued generation.
+        if (state.directoryPending) state.emptySnapshotRecheckToken = state.directoryToken;
+        return state.directoryPending;
+    }
+    if (!state.emptySnapshotWitnessed) return false;
+    Wh_Log(L"[GPU overlay] native fallback: Explorer lists %d item(s) where the GPU snapshot is empty: %s",
+        count, state.folderPath.c_str());
+    state.nativeFallbackFolder = state.folderPath;
+    DeactivateOutsideScope(state);
+    return true;
+}
+
 // Per-view column/zoom persistence. A tab now has its own ViewState and this
 // code only runs when the Shell actually replaces the host (legacy fallback).
 void BindTabPresentation(ViewState& state, HWND tabHost) {
@@ -33018,6 +33148,10 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
         const bool changedView = s->nativeHwnd != native;
         const bool changedPath = _wcsicmp(s->folderPath.c_str(), path.c_str()) != 0;
         const bool wasOutside = !s->inScope;
+        // A Shell rebind of the folder handed back by ReconcileEmptySnapshot
+        // stays native; navigating anywhere else attaches normally.
+        if (changedPath) s->nativeFallbackFolder.clear();
+        else if (wasOutside && !s->nativeFallbackFolder.empty()) return;
         const bool optimistic = s->optimisticStartedAt != 0;
         bool changedBinding = false;
         if ((changedView || optimistic) && !changedPath && s->directoryFolderIdentity) {

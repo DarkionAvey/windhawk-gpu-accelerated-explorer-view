@@ -1866,6 +1866,7 @@ static void TestPreviewInput() {
 #include "attachment-smoke.h"
 #include "selection-smoke.h"
 #include "office-lock-smoke.h"
+#include "empty-snapshot-smoke.h"
 #include "ui-work-smoke.h"
 #include "ui-feedback-smoke.h"
 #include "frame-budget-smoke.h"
@@ -1949,6 +1950,7 @@ static const RegressionSuite kRegressionSuites[] = {
         TestResizeAutoRefit();
         TestColumnMinimumWidths();
         TestOfficeLockFiltering(fixture);
+        TestEmptySnapshotReconciliation(fixture);
         TestNamespaceItemMutations(fixture);
         TestNativeSuppression();
         TestExplorerColumnBridge(fixture);
@@ -2120,6 +2122,8 @@ int wmain(int argc,wchar_t** argv) {
             TestNativeStartupPipeline(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--office-locks")==0) {
             TestOfficeLockFiltering(fixture.wstring());
+        } else if (argc>1 && wcscmp(argv[1],L"--empty-snapshot")==0) {
+            TestEmptySnapshotReconciliation(fixture.wstring());
         } else if (argc>1 && wcscmp(argv[1],L"--status-buttons")==0) {
             TestStatusButtonLayout();
         } else if (argc>1 && wcscmp(argv[1],L"--drive-refresh")==0) {
