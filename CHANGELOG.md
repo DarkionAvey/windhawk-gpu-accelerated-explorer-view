@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.339
+
+- Keep Ctrl+wheel and touchpad zoom smooth on large displays: visible labels
+  scale their already drawn text during the animation instead of re-laying out
+  every filename on each frame, then settle to crisp text at the final size.
+
 ## 0.9.338
 
 - Localize tooltip labels and friendly dates through Windows, use system date

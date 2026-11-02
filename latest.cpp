@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.338
+// @version         0.9.339
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1029,6 +1029,7 @@ struct TextLayoutCache {
         }
         unsigned long long rendering = 0;
         float width = 0.f, height = 0.f;
+        float fontSize = 0.f; // Shaped size; zoom frames scale the mask from it.
         unsigned long long used = 0;
         size_t bytes = 0;
         unsigned long long painted = 0;
@@ -15397,7 +15398,9 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     }
     // Moving stable glyphs can use/create their ordinary mask during layout
     // animation too. Only changing font/trim/wrap/height requires direct drawing.
-    if (state.zoomAnimating ||
+    // A zoom draws existing masks scaled; a value exposed by the zoom gets
+    // one mask, which the remaining zoom frames scale instead of reshaping.
+    if ((state.zoomAnimating && !shaped.rasters.empty()) ||
         (!intrinsic && ((state.columnTransitionActive && !state.modeComposition.painting) || state.dragDivider >= 0)) ||
         ((state.groupAnimating || state.rowTransitionActive) && !header &&
             (state.gridView || fabsf(height-state.rowPx)>.01f)) ||
@@ -15456,6 +15459,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     }
     TextLayoutCache::Raster raster;
     raster.width=width; raster.height=height;
+    if (FAILED(layout->GetFontSize(0,&raster.fontSize))) raster.fontSize=0.f;
     raster.rendering=state.textRenderingSerial;
     raster.underline = underline != FALSE;
     raster.used=++state.textRasterTick; raster.bytes=bytes;
@@ -15547,6 +15551,73 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     return true;
 }
 
+// Zoom changes the body size on every frame. Reshaping and directly drawing
+// each visible value then cost a full-viewport text pass per frame on large
+// displays. Draw a value's existing mask scaled about its aligned box instead,
+// without touching its shaped layout. The settled frame reshapes as before.
+bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, float t,
+                          float r, float b, unsigned color, float opacity, bool wrapped,
+                          bool filename, bool underline) {
+    IDWriteTextFormat* format = state.textFormat.Get();
+    if (!format || state.textRasterUnavailable) return false;
+    auto& cache = state.textLayouts[wrapped ? 3 : 0];
+    const auto found = cache.layouts.find(text);
+    if (found == cache.layouts.end()) return false;
+    auto& shaped = found->second;
+    // Only a size change can be scaled. Face, direction, alignment and trim
+    // changes still reshape exactly as ResolveTextLayout would.
+    const bool sameFace = cache.format.Get() == format ||
+        (cache.faceSerial == state.textFaceSerial && cache.alignment == format->GetTextAlignment());
+    if (!sameFace || shaped.generation != cache.generation || !shaped.text ||
+        shaped.middleTrim != (filename && ViewOptionEnabled(state,g_middleEllipsis))) return false;
+    TextLayoutCache::Raster* raster = nullptr;
+    for (auto& candidate : shaped.rasters)
+        if (candidate.fontSize > 0.f && candidate.bitmap && candidate.rendering == state.textRenderingSerial &&
+            candidate.underline == underline && (!raster || candidate.used > raster->used)) raster = &candidate;
+    if (!raster) return false;
+    const float scale = format->GetFontSize() / raster->fontSize;
+    ID2D1Bitmap1* bitmap = raster->bitmap.Get();
+    const auto pixels = raster->slot ? raster->slot.Size() : bitmap->GetPixelSize();
+    const auto source = raster->slot ? raster->slot.Source() :
+        D2D1::RectF(0.f,0.f,float(pixels.width),float(pixels.height));
+    const float width = pixels.width*scale, height = pixels.height*scale;
+    // Place the mask box as its layout placed the text: the same alignment
+    // factors DrawTextRaster uses for intrinsic glyphs, plus paragraph alignment.
+    const auto alignment = shaped.text->GetTextAlignment();
+    const bool rtl = shaped.text->GetReadingDirection() == DWRITE_READING_DIRECTION_RIGHT_TO_LEFT;
+    const float horizontal = alignment == DWRITE_TEXT_ALIGNMENT_CENTER ? .5f :
+        (alignment == DWRITE_TEXT_ALIGNMENT_TRAILING) != rtl ? 1.f : 0.f;
+    const auto paragraph = shaped.text->GetParagraphAlignment();
+    const float vertical = paragraph == DWRITE_PARAGRAPH_ALIGNMENT_CENTER ? .5f :
+        paragraph == DWRITE_PARAGRAPH_ALIGNMENT_FAR ? 1.f : 0.f;
+    const auto origin = SnapDrawPoint(state.target.Get(),
+        D2D1::Point2F(l+(r-l-width)*horizontal, t+(b-t-height)*vertical));
+    // Clip to the value's box like the layout's own clip; map source equally.
+    const auto destination = D2D1::RectF(std::max(origin.x,l), std::max(origin.y,t),
+        std::min(origin.x+width,r), std::min(origin.y+height,b));
+    if (destination.right > destination.left && destination.bottom > destination.top) {
+        const auto from = D2D1::RectF(source.left+(destination.left-origin.x)/scale,
+            source.top+(destination.top-origin.y)/scale, source.left+(destination.right-origin.x)/scale,
+            source.top+(destination.bottom-origin.y)/scale);
+        const auto antialias = state.target->GetAntialiasMode();
+        state.target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+        state.brush->SetColor(Packed(color,opacity));
+        static_cast<ID2D1RenderTarget*>(state.target.Get())->FillOpacityMask(bitmap,
+            state.brush.Get(),D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL,&destination,&from);
+        state.target->SetAntialiasMode(antialias);
+    }
+    raster->used = ++state.textRasterTick;
+    raster->painted = shaped.painted = state.graphicsPaintSerial;
+    shaped.used = ++state.textLayoutTick;
+    shaped.displayed = true;
+    cache.recent.splice(cache.recent.begin(), cache.recent, shaped.recent);
+    if (state.frameProfile.recording) ++state.frameProfile.textHits;
+    if (state.uiTraceDrawItem && filename)
+        PipelineEvent(*state.background,{.operation=L"ui.text.scaled[opacity,width,height,scale]",
+            .a=state.uiTraceItem,.b=reinterpret_cast<ULONG_PTR>(bitmap),.v={opacity,width,height,scale}},true);
+    return true;
+}
+
 void Text(ViewState& state, const std::wstring& text, float l, float t,
           float r, float b, unsigned hex, bool header=false, float opacity=1.f,
           bool sortedHeader=false, bool wrapped=false, UINT32 highlight=0, bool deferCold=false,
@@ -15572,6 +15643,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         (sortedHeader && state.sortedHeaderFormat ?
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
     if (!fmt) return;
+    if (!header && !highlight && state.zoomAnimating &&
+        DrawScaledTextRaster(state,text,l,t,r,b,hex,opacity,wrapped,filename,underline)) return;
     // Changes to font/trimming geometry retain immediate drawing during their
     // animation. With stable geometry, don't even shape a new deferred value
     // after its frame's enrichment budget has already been consumed.
