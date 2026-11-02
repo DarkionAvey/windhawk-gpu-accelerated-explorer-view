@@ -9,7 +9,7 @@ struct Device : TouchCalibration {
     LARGE_INTEGER frequency{},startQpc{},frameQpc{};
     bool realTime=false,performance=true;
     Device() {
-        Check(device!=nullptr,"private recognizer digitizer calibration");
+        Check(Ready(),"PRECONDITION: private recognizer digitizer calibration unavailable");
         QueryPerformanceFrequency(&frequency); ResetTime();
     }
     void ResetTime(bool real=false) {
@@ -1347,18 +1347,35 @@ static void TestTouchInput(const std::wstring& fixture) {
     const auto holdWait=state.touch.holdDeadline-GetTickCount64();
     Sleep(DWORD(holdWait)+USER_TIMER_MINIMUM);
     WaitForPreparedSelection(state);
-    const auto expectedDraggedPath=state.entries[size_t(state.touch.row)].path;
     const float beforeDrag=state.scrollNow;
-    POINT moved=point; moved.y-=GetSystemMetricsForDpi(SM_CYDRAG,ViewDpi(state));
-    input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,move)});
+    POINT moved=point;
+    const int step=std::max(1,GetSystemMetricsForDpi(SM_CYDRAG,ViewDpi(state)));
+    // Ninput owns manipulation slop; SM_CYDRAG alone does not promise a
+    // manipulation BEGIN. Move within the real viewport until it recognizes
+    // the held movement, without reinstating the removed threshold override.
+    while(!state.touch.dragPending && moved.y-step>ColumnHeaderHeight(state)) {
+        moved.y-=step;
+        input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,move)});
+        Check(state.scrollNow==beforeDrag && TouchFixture::drags==0,
+            "held movement scrolled or entered OLE inside the recognizer callback");
+    }
     Check(state.touch.dragPending && state.scrollNow==beforeDrag && TouchFixture::drags==0,
         "held movement scrolled or entered OLE inside the recognizer callback");
     Pump(state);
-    Check(TouchFixture::promotions==1 && TouchFixture::drags==1 && !state.shellDragRunning && !state.touch.active,
-        "held movement failed native primary-contact promotion/Shell drag or retained its state");
-    Check(TouchFixture::dragPaths==std::vector<std::wstring>{expectedDraggedPath},
-        "touch OLE data object did not contain the actually selected held item");
+    Check(TouchFixture::promotions==1 && TouchFixture::drags==0 && !state.shellDragRunning &&
+        state.touch.active && state.touch.dragPending && state.touch.dragPromoted,
+        "promotion entered OLE before native held mouse delivery or lost the pending handoff");
+    Pump(state);
+    Check(TouchFixture::promotions==1 && TouchFixture::drags==0,
+        "idle continuation repeated promotion or entered OLE without native mouse delivery");
+    // This API-boundary fixture does not inject desktop input. Windows has
+    // delivered no mouse DOWN/MOVE, so it must not claim an end-to-end OLE drag.
+    // Releasing the native contact must revoke the pending handoff instead.
     input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,up)});
+    Check(!state.touch.active && !state.touch.dragPending && TouchFixture::drags==0,
+        "released contact retained an unstarted native mouse handoff");
+    StopTouch(state); // Same cancellation used by the native pointer-message boundary.
+    Check(!state.touch.dragPromoted,"native handoff cancellation retained promotion ownership");
     input.performance=true;
     Check(MenuFixture::calls==1 && commands->calls.size()==6,"drag release became a click or context menu");
 
@@ -1821,11 +1838,11 @@ static void TestTouchInput(const std::wstring& fixture) {
         input.Next(); input.Send(waiting,{input.Packet(waiting,input.primary,point,down)});
         Held(waiting);
         moved=point; moved.y-=70; input.Next(); input.Send(waiting,{input.Packet(waiting,input.primary,moved,move)});
-        Check(waiting.touch.dragPending && waiting.pendingNativeSelection && TouchFixture::drags==1,
+        Check(waiting.touch.dragPending && waiting.pendingNativeSelection && TouchFixture::drags==0,
             "held drag bypassed the pending selection lane");
         input.Next(); input.Send(waiting,{input.Packet(waiting,input.primary,moved,up)});
         held.Release(); WaitForPreparedSelection(waiting); Pump(waiting);
-        Check(TouchFixture::drags==1 && !waiting.touch.dragPending,"released contact started OLE after selection completion");
+        Check(TouchFixture::drags==0 && !waiting.touch.dragPending,"released contact started OLE after selection completion");
         StopTouchpad(waiting); SetWindowLongPtrW(waiting.hwnd,GWLP_USERDATA,0);
     }
     Reset(state,input,true); input.Next(); input.Send(state,{input.Packet(state,input.primary,point,down)});
@@ -1834,7 +1851,7 @@ static void TestTouchInput(const std::wstring& fixture) {
     input.Send(state,{input.Packet(state,input.primary,point,move),input.Packet(state,input.primary+1,second,down)});
     point.y-=80; second.y-=80; input.Next();
     input.Send(state,{input.Packet(state,input.primary,point,move),input.Packet(state,input.primary+1,second,move)});
-    Pump(state); Check(TouchFixture::drags==1,"second contact did not cancel held drag eligibility");
+    Pump(state); Check(TouchFixture::drags==0,"second contact did not cancel held drag eligibility");
     StopTouch(state);
 
     ScrollbarInteractions(input,fixture);
@@ -1956,5 +1973,5 @@ static void TestTouchInput(const std::wstring& fixture) {
     }
     Check(TouchFixture::bindings.empty(),"native callback binding survived context destruction");
     g_touchpadSwipeNavigation=swipe; g_smooth=smooth; g_scrollbar=bars; g_writeFactory=savedWrite;
-    std::cout<<"PASS: real Windows recognizer -> marquee GPU pixels before list focus and straight drags; no metric/pixel jump at pinch recognition, proportional post-threshold span scaling; six double-tap cycles, hold/Shell drag, 1/2/3/5-finger vertical pan, staggered swipes, contact replacement, fitting-directory marquee, capture/contact changes, two-finger column/history edges, grouped LTR/RTL pinch at 3 DPIs, coalesced frames, inertia and animated scrollbars; independent contexts\n";
+    std::cout<<"PASS: real Windows recognizer -> marquee GPU pixels before list focus and straight drags; no metric/pixel jump at pinch recognition, proportional post-threshold span scaling; six double-tap cycles, held native promotion waits for mouse delivery and cancels safely (OLE handoff requires hardware), 1/2/3/5-finger vertical pan, staggered swipes, contact replacement, fitting-directory marquee, capture/contact changes, two-finger column/history edges, grouped LTR/RTL pinch at 3 DPIs, coalesced frames, inertia and animated scrollbars; independent contexts\n";
 }

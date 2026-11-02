@@ -160,6 +160,7 @@ static void TestDragPreview(const std::wstring& fixture) {
         ComPtr<ID2D1SolidColorBrush> glyphBrush;
         Check(SUCCEEDED(state.target->CreateSolidColorBrush(D2D1::ColorF(1,1,1),&glyphBrush)),"drag glyph brush");
         state.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE); // Compare emoji artwork, independently of opaque text.
+        state.target->SetTextRenderingParams(nullptr); // Match the recording context's native emoji policy, not the preceding caption's policy.
         for(float symbolSize:{48.f,128.f*.58f*.82f,192.f*.58f*.82f,256.f*.58f*.82f})
         for(const auto* emoji:{L"\U0001F6AB",L"\U0001F4CB",L"\u27A1\uFE0F",L"\u2B05\uFE0F",L"\U0001F517"}) {
             DragGlyph cached;
@@ -179,10 +180,13 @@ static void TestDragPreview(const std::wstring& fixture) {
             // Fractional edge coverage can occupy one extra texel on either
             // side of the common continuous width; integer cases stay +/-1.
             const bool commonWidth=right-left>=UINT(std::floor(symbolSize)-1) && right-left<=UINT(std::ceil(symbolSize)+1);
-            if(!commonWidth)
+            if(!commonWidth) {
+                float dpiX=0,dpiY=0; state.target->GetDpi(&dpiX,&dpiY);
                 std::cerr<<"EMOJI WIDTH utf16="<<unsigned(emoji[0])<<","<<unsigned(emoji[1])
-                    <<" bounds="<<left<<","<<top<<","<<right<<","<<bottom<<"\n";
-            Check(commonWidth,"operation emoji did not use the shared visible width");
+                    <<" size="<<symbolSize<<" bounds="<<left<<","<<top<<","<<right<<","<<bottom
+                    <<" command-bounds="<<cached.bounds.left<<","<<cached.bounds.top<<","<<cached.bounds.right<<","<<cached.bounds.bottom
+                    <<" dpi="<<dpiX<<","<<dpiY<<" mactype="<<bool(GetModuleHandleW(L"MacType64.dll") || GetModuleHandleW(L"MacType64.Core.dll"))<<"\n";
+            }
             // Compare against the font's original regular color artwork.
             // Semibold synthesizes bold and visibly flattens the 🚫 edge,
             // including when using Windows' direct text drawing path.
@@ -190,6 +194,14 @@ static void TestDragPreview(const std::wstring& fixture) {
             Check(SUCCEEDED(g_writeFactory->CreateTextFormat(L"Segoe UI Emoji",nullptr,DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,symbolSize,L"",&directFormat)) &&
                 SUCCEEDED(g_writeFactory->CreateTextLayout(emoji,UINT32(wcslen(emoji)),directFormat.Get(),64,64,&direct)),"native emoji reference");
+            direct->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            if(!commonWidth) {
+                DWRITE_OVERHANG_METRICS ink{}; DWRITE_TEXT_METRICS metrics{};
+                direct->GetOverhangMetrics(&ink); direct->GetMetrics(&metrics);
+                std::cerr<<"EMOJI FONT size="<<directFormat->GetFontSize()<<" weight="<<directFormat->GetFontWeight()
+                    <<" ink="<<ink.left<<","<<ink.top<<","<<ink.right<<","<<ink.bottom
+                    <<" metrics="<<metrics.left<<","<<metrics.top<<","<<metrics.width<<","<<metrics.height<<"\n";
+            }
             const auto& b=cached.bounds; const float scale=symbolSize/(b.right-b.left);
             state.target->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale)*D2D1::Matrix3x2F::Translation(
                 200.f-(b.left+b.right)*.5f*scale,200.f-(b.top+b.bottom)*.5f*scale));
@@ -199,6 +211,18 @@ static void TestDragPreview(const std::wstring& fixture) {
             const auto native=IconAlphaFixture::Read(state,surface.Get());
             size_t changed=0;
             for(size_t i=0;i<glyph.data.size();++i) changed+=std::abs(int(glyph.data[i])-int(native.data[i]))>1;
+            if(!commonWidth) {
+                for(BYTE threshold:{BYTE(0),BYTE(1),BYTE(16),BYTE(128)}) {
+                    UINT l=native.width,r=0,t=native.height,bottomEdge=0;
+                    for(UINT y=0;y<native.height;++y) for(UINT x=0;x<native.width;++x)
+                        if(native.data[size_t(y)*native.stride+x*4+3]>threshold) {
+                            l=std::min(l,x); r=std::max(r,x+1); t=std::min(t,y); bottomEdge=std::max(bottomEdge,y+1);
+                        }
+                    std::cerr<<"EMOJI REFERENCE alpha>"<<unsigned(threshold)<<" bounds="<<l<<","<<t<<","<<r<<","<<bottomEdge
+                        <<" changed="<<changed<<"\n";
+                }
+            }
+            Check(commonWidth,"operation emoji did not use the shared visible width");
             Check(emoji[0]!=L'\xD83D' || emoji[1]!=L'\xDEAB' || !changed,
                 "prohibition emoji differed from the unclipped native font rendering");
         }
@@ -230,6 +254,8 @@ static void TestDragPreview(const std::wstring& fixture) {
             DragTextStyle style;
             DragPreview preview; preview.side=128; preview.dpi=96; preview.count=6;
             preview.background=RGB(24,24,24); preview.foreground=RGB(240,240,240); preview.accent=RGB(40,40,40);
+            preview.badgePalette=static_cast<unsigned long long>(preview.accent) |
+                (static_cast<unsigned long long>(preview.foreground)<<24) | (255ULL<<48);
             preview.pixels.width=preview.pixels.height=32; preview.pixels.stride=128; preview.pixels.data.assign(4096,0);
             UpdateDragCaption(state,preview,shellText,260.f);
             const auto geometry=LayoutDragPreview(preview);
@@ -251,7 +277,7 @@ static void TestDragPreview(const std::wstring& fixture) {
                 Check(listSerial==state.textRenderingSerial && style.textAntialiasing==mode,
                     "drag text ignored shared policy or invalidated the tab glyph cache");
                 const auto pixels=IconAlphaFixture::Read(state,surface.Get());
-                const float height=preview.side*.38f;
+                const float height=preview.side*.38f*preview.dragBadgeScaling;
                 const auto count=D2D1::RectF(geometry.artwork.left+height*.25f,geometry.artwork.top+height*.25f,
                     geometry.artwork.left+height*.75f,geometry.artwork.top+height*.75f);
                 auto caption=geometry.caption; caption.left+=geometry.edge; caption.top+=geometry.edge;

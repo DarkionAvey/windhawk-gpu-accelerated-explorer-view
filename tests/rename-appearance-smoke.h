@@ -219,7 +219,14 @@ struct PaintColors {
     HWND editor;
     COLORREF text=CLR_INVALID, background=CLR_INVALID, brush=CLR_INVALID;
     unsigned calls=0, onscreen=0; // Paint requests against a window rather than an off-screen DC.
+    unsigned paints=0;
+    bool invalid=false;
 };
+LRESULT CALLBACK ObserveEditorPaint(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
+    auto& colors=*reinterpret_cast<PaintColors*>(data);
+    if(msg==WM_PAINT) {++colors.paints; colors.invalid=GetUpdateRect(hwnd,nullptr,FALSE)!=FALSE;}
+    return DefSubclassProc(hwnd,msg,wp,lp);
+}
 LRESULT CALLBACK ObserveColors(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     auto& colors=*reinterpret_cast<PaintColors*>(data);
     const LRESULT result=DefSubclassProc(hwnd,msg,wp,lp);
@@ -239,8 +246,20 @@ void Palette(ViewState& state) {
     // Let the real EDIT request colors while USER paints it. PrintWindow is
     // not supported for these offscreen EDITs; no paint messages are fabricated.
     PaintColors colors{state.rename.editor};
+    RECT client{},window{};
+    Check(IsWindowVisible(colors.editor) && GetClientRect(colors.editor,&client) && client.right>0 && client.bottom>0,
+        "PRECONDITION: native EDIT palette probe needs a visible nonempty client");
+    GetWindowRect(colors.editor,&window);
+    Check(GetParent(colors.editor)==state.frameHwnd && GetPropW(colors.editor,kRenameEditorProperty) && state.rename.background,
+        "PRECONDITION: native EDIT palette probe needs its live rename session");
+    Check(SetWindowSubclass(colors.editor,ObserveEditorPaint,2,reinterpret_cast<DWORD_PTR>(&colors)),"rename native paint observer");
     Check(SetWindowSubclass(state.frameHwnd,ObserveColors,1,reinterpret_cast<DWORD_PTR>(&colors)),"rename paint observer");
-    RedrawWindow(colors.editor,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_FRAME);
+    // Establish the client update region before asking USER to dispatch its
+    // paint. Border/erase-only work is not evidence of an EDIT client repaint.
+    const BOOL invalidated=InvalidateRect(colors.editor,nullptr,FALSE);
+    RECT update{}; const BOOL pending=GetUpdateRect(colors.editor,&update,FALSE);
+    const BOOL redrawn=UpdateWindow(colors.editor);
+    RemoveWindowSubclass(colors.editor,ObserveEditorPaint,2);
     RemoveWindowSubclass(state.frameHwnd,ObserveColors,1);
     if(!colors.calls || colors.text!=state.nativeEditForeground || colors.background!=state.nativeEditBackground ||
         colors.brush!=state.nativeEditBackground)
@@ -248,7 +267,13 @@ void Palette(ViewState& state) {
             <<" background="<<colors.background<<"/"<<state.nativeEditBackground<<" brush="<<colors.brush
             <<" editor-visible="<<IsWindowVisible(colors.editor)<<" hidden="<<state.rename.zoomHidden
             <<" dpi="<<StyleFixture::dpi<<" rtl="<<state.rtlLayout<<" grid="<<state.gridView
-            <<" high-contrast="<<StyleFixture::highContrast<<std::endl;
+            <<" high-contrast="<<StyleFixture::highContrast<<" redraw="<<redrawn
+            <<" invalidated="<<invalidated<<" pending="<<pending<<" update="<<update.left<<","<<update.top<<","<<update.right<<","<<update.bottom
+            <<" paints="<<colors.paints<<" invalid="<<colors.invalid
+            <<" client="<<client.right<<","<<client.bottom<<" window="<<window.left<<","<<window.top<<","<<window.right<<","<<window.bottom
+            <<" parent="<<GetParent(colors.editor)<<" frame="<<state.frameHwnd<<" enabled="<<IsWindowEnabled(colors.editor)<<std::endl;
+    Check(invalidated && pending && redrawn && colors.paints,
+        "PRECONDITION: native EDIT palette probe requires a real client update region and Windows paint delivery");
     Check(colors.calls && colors.text==state.nativeEditForeground &&
         colors.background==state.nativeEditBackground && colors.brush==state.nativeEditBackground,
         "native EDIT paint did not use the cached theme background/text/brush");

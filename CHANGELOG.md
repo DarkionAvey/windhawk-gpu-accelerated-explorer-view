@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.341 (working candidate)
+
+- Start held touch drags from Windows' promoted mouse input so the operation
+  does not immediately end with its button still reported as released.
+- Remove the ineffective touch-drag movement workaround. Keep bounded Windhawk
+  diagnostics for troubleshooting native input handoff.
+- Keep drag captions above the icon pile for mouse and touch, with stable
+  positioning when captions change. Remove scale pulses on operation changes
+  and add cached soft shadows to separate stacked icons.
+- Use the navigation bubble's accent/foreground palette for drag item counts
+  and size them through an internal `dragBadgeScaling=0.75f` factor. Counts use
+  the configured mod font family and resolved face.
+- Publish cached native-row identities for selection imports, so held drags
+  in This PC can proceed when provider name resolution fails.
+
 ## 0.9.340
 
 - Show the contents of cloud and virtual drives (such as the Google Drive root)

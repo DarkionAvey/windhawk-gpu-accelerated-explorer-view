@@ -119,7 +119,7 @@ try {
     if ($unloadExe) { $testTasks += [pscustomobject]@{
         Name='unload'; FilePath=$unloadExe; Arguments=@($unloadDll); Exclusive=$false} }
     if ($TestArguments -notcontains '--unload') {
-        if ($TestArguments.Count -or $Jobs -eq 1) {
+        if ($TestArguments.Count) {
             $testTasks += [pscustomobject]@{Name='pipeline'; FilePath=$executable
                 Arguments=$TestArguments; Exclusive=$false}
         } else {

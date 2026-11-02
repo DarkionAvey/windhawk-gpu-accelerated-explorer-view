@@ -52,20 +52,29 @@ testing.
 Full runs use up to four test processes by default (bounded by the logical CPU
 count), and up to two concurrent compiler processes. Each suite owns its mod
 globals, COM apartments, workers and PID-specific temporary fixtures. The C++
-suite manifest drives both the parallel gate and the original combined serial
-run, so neither mode drops tests. Preprocessing benchmarks, native/GPU resource
+suite manifest drives both parallel and serial runs in isolated processes,
+so neither mode drops tests or inherits another suite's globals or fixture files.
+Preprocessing benchmarks, native/GPU resource
 checks, and the UI/presentation groups with native column/EDIT paint assertions
-run alone, after the parallel groups finish. These native probes can also fail
-intermittently in isolated runs; failures retain diagnostics and still fail the
-release gate. No assertion is relaxed or automatically retried.
+run alone, after the parallel groups finish. Missing prerequisites and assertion
+failures retain diagnostics and fail the release gate. No assertion is relaxed
+or automatically retried.
 
 Use `build.bat -Jobs 1` or `tests/run-regressions.ps1 -SourceFile <source> -Jobs 1`
-for serial compilation and the combined pipeline suite. `-Jobs N` changes the
+for serial compilation and one suite process at a time. `-Jobs N` changes the
 test-process limit; focused `-TestArguments` still run only the requested probe.
 The runner prints phase and task durations and reports all failed groups after
 draining started processes. Failure preserves binaries, per-task stdout/stderr
 logs, and compile/regression timing CSVs in the printed artifact directory.
 `-KeepArtifacts` on either command retains these after success too.
+
+Prerequisites fail explicitly: touch probes require a discoverable private
+digitizer with nonempty Windows calibration (API/error/count diagnostics are
+printed on failure), graphics probes require usable D3D/D2D/DComp targets, and
+native rename color checks require a live visible editor, a nonempty client
+update region and actual Windows paint delivery through `UpdateWindow`.
+Native-key deferral uses scoped private modifiers/focus
+instead of retrying against the user's input state or skipping rejection.
 
 ## Toolchain discovery
 
@@ -131,7 +140,8 @@ supplies calibration; it never injects input into the desktop. No gesture
 outputs or Windows input messages are manufactured. Coverage includes taps,
 six double-tap activation cycles (varied system-relative intervals, positions,
 press durations and delayed owner dispatch), timed and delayed-delivery holds,
-Shell drag identities, bulk-selection release races, vertical pan with
+native drag promotion waiting for actual mouse delivery, cancellation before
+that delivery, bulk-selection release races, vertical pan with
 1/2/3/5 contacts, one-finger marquee commit/rollback and contact changes,
 two-finger column scrolling followed by edge-only history navigation through
 the owning Shell browser, reversal before release, staggered/unequal two-finger
@@ -141,7 +151,7 @@ separations and orientations, exclusive
 pinch anchoring across layouts/DPIs/RTL, contact replacement/rotation rejection,
 unequal and drifting pinches (including gradual movement below the per-packet
 system slop), late second fingers after one-contact scrolling and same-pair
-pan-to-pinch transitions without replaying recognition distance or pan feedback,
+pan locking without replaying recognition distance or retaining stale feedback,
 long same-direction swipes with converging/diverging finger spacing, within-view
 Back/Forward arming, reversal and exact owning-Shell routing without inertial repeats,
 vertical marquee in fitting directories, release-velocity flings, coalesced frames, capture

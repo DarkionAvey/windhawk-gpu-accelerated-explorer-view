@@ -88,6 +88,8 @@ extern "C" __declspec(dllexport) BOOL FailedInitialization() {
 }
 static bool editDestroyed=false;
 extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
+    TouchCalibration digitizer;
+    if(!digitizer.Ready()) return FALSE; // Assert the OS input prerequisite before starting the lifecycle probe.
     g_unloading=false; g_backgroundShutdown=false;
     WNDCLASSW type{}; type.hInstance=GetModuleHandleW(nullptr); type.lpfnWndProc=DefWindowProcW;
     for(const auto name : {L"CabinetWClass",L"CtrlNotifySink",L"SHELLDLL_DefView",L"DirectUIHWND"}) {
@@ -158,8 +160,7 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
 #endif
     // Own a real Ninput callback and an armed system-threshold hold deadline
     // when the DLL is disabled. The private digitizer never injects desktop IO.
-    TouchCalibration digitizer;
-    if(!digitizer.device || !StartTouchRecognizer(*state)) {
+    if(!StartTouchRecognizer(*state)) {
         printf("BARRIER DLL touch startup failed digitizer=%d\n",bool(digitizer.device)); return FALSE;
     }
     POINT screen{100,100};

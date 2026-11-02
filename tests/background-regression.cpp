@@ -1368,7 +1368,12 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
         1000.0 * (profileFirst.QuadPart - profileStart.QuadPart) / profileFrequency.QuadPart <<
         " ms next-tab=" << 1000.0 * (profileSecond.QuadPart - profileFirst.QuadPart) /
         profileFrequency.QuadPart << " ms (standalone process)\n";
-    if (firstReady && secondReady) {
+    if(!firstReady || !secondReady)
+        std::cerr<<"GRAPHICS PRECONDITION first=0x"<<std::hex<<static_cast<unsigned>(a.graphicsFailure)
+            <<" stage="<<a.graphicsFailureStage<<" second=0x"<<static_cast<unsigned>(b.graphicsFailure)
+            <<" stage="<<b.graphicsFailureStage<<std::dec<<"\n";
+    Check(firstReady && secondReady,"PRECONDITION: graphics suite requires two usable D3D/D2D/DComp targets");
+    {
         Check(a.d3d.Get() != b.d3d.Get() && a.d2dDevice.Get() != b.d2dDevice.Get() &&
               a.composition.Get() != b.composition.Get(), "graphics devices shared between overlays");
         const auto deviceB = b.d3d.Get();
@@ -1433,8 +1438,6 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
         TestIconUploadBatches();
         TestColdScrollDelivery();
         TestSampledPointer();
-    } else {
-        std::cout << "SKIP: graphics runtime unavailable in this session; Explorer graphics validation required\n";
     }
     DropTarget(a);
     DropTarget(b);
