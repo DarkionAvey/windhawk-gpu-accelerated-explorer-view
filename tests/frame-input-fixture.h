@@ -1,6 +1,7 @@
 // Model queued hardware input without injecting keys/mouse events into the
 // user's desktop. Low word stays zero: input already examined is still pending.
 #include <windows.h>
+#include <stdexcept>
 namespace FrameInputFixture {
 inline thread_local bool enabled=false;
 inline thread_local UINT pending=0;
@@ -25,6 +26,15 @@ inline SHORT WINAPI Key(int key) {
     if(!active || key<0 || key>=256) return ::GetKeyState(key);
     return SHORT((active[key]&0x80 ? 0x8000 : 0) | (active[key]&1));
 }
+inline BOOL WINAPI Translate(const MSG* message) {
+    if(!active) return ::TranslateMessage(message);
+    BYTE saved[256]{};
+    if(!GetKeyboardState(saved) || !SetKeyboardState(active))
+        throw std::runtime_error("private keyboard translation state");
+    const BOOL result=::TranslateMessage(message);
+    if(!SetKeyboardState(saved)) throw std::runtime_error("restore keyboard translation state");
+    return result;
+}
 struct Session {
     BYTE keys[256]{};
     BYTE* previous=active;
@@ -33,3 +43,4 @@ struct Session {
 };
 }
 #define GetKeyState ModifierFixture::Key
+#define TranslateMessage ModifierFixture::Translate

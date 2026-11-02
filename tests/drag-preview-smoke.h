@@ -92,12 +92,12 @@ static void TestDragPreview(const std::wstring& fixture) {
         Check(captionPreview.caption && captionPreview.captionSize.width>0.f && captionPreview.captionSize.height>0.f &&
             !UpdateDragCaption(state,captionPreview,shellText,600.f),"drag caption layout was absent or rebuilt unchanged feedback");
         const auto captionGeometry=LayoutDragPreview(captionPreview);
-        const RECT captionWork{0,0,1920,1080}; const POINT captionCursor{960,540};
-        const auto captionPosition=PositionDragPreview(captionPreview,captionCursor,captionWork,false);
+        const POINT captionCursor{960,540};
+        const auto captionPosition=PositionDragPreview(captionPreview,captionCursor,false);
         for(const auto& text:shellTexts) {
             UpdateDragCaption(state,captionPreview,text,600.f);
             const auto geometry=LayoutDragPreview(captionPreview);
-            const auto position=PositionDragPreview(captionPreview,captionCursor,captionWork,false);
+            const auto position=PositionDragPreview(captionPreview,captionCursor,false);
             Check(geometry.artwork.left==captionGeometry.artwork.left && geometry.artwork.top==captionGeometry.artwork.top &&
                 position.x==captionPosition.x && position.y==captionPosition.y,
                 "native description width changes moved the icon canvas or pointer anchor");
@@ -353,22 +353,25 @@ static void TestDragPreview(const std::wstring& fixture) {
                 "drag preview/badge did not follow system DPI geometry");
             const RECT work{-1920,-1080,0,0};
             const POINT cursor{-960,-540};
-            const auto position=PositionDragPreview(preview,cursor,work,false);
+            const auto position=PositionDragPreview(preview,cursor,false);
             Check(std::abs(position.x+(geometry.artwork.left+geometry.artwork.right)*.5f-cursor.x)<=.5f &&
                 std::abs(position.y+geometry.artwork.bottom-cursor.y)<=.5f,
                 "drag artwork hotspot included transparent padding or badge offset");
-            const auto touch=PositionDragPreview(preview,cursor,work,true);
+            const auto touch=PositionDragPreview(preview,cursor,true);
             Check(touch.y+LONG(extent.height)==cursor.y,"touch preview overlaps the promoted contact point");
             auto portrait=preview;
             std::swap(portrait.pixels.thumbnailWidth,portrait.pixels.thumbnailHeight);
-            const auto replacement=PositionDragPreview(portrait,cursor,work,false);
+            const auto replacement=PositionDragPreview(portrait,cursor,false);
             Check(position.x==replacement.x && position.y==replacement.y,
                 "background thumbnail aspect changes moved the stationary drag hotspot");
-            for(POINT edge: {POINT{work.left,work.top},POINT{work.right,work.bottom}}) {
-                const auto bounded=PositionDragPreview(preview,edge,work,false);
-                Check(bounded.x>=work.left && bounded.y>=work.top &&
-                    bounded.x+LONG(extent.width)<=work.right && bounded.y+LONG(extent.height)<=work.bottom,
-                    "drag preview escaped the monitor work area");
+            // Translation must stay continuous beyond screen and work-area edges.
+            // This expectation is independent of the layout hotspot arithmetic.
+            for(bool promoted:{false,true}) for(POINT edge:{POINT{work.left,work.top},
+                POINT{work.right,work.bottom},POINT{work.left-500,work.top-500},POINT{500,500}}) {
+                const auto origin=PositionDragPreview(preview,cursor,promoted);
+                const auto moved=PositionDragPreview(preview,edge,promoted);
+                Check(moved.x-origin.x==edge.x-cursor.x && moved.y-origin.y==edge.y-cursor.y,
+                    "drag preview stopped following the pointer at a screen boundary");
             }
         }
         state.target->SetTarget(previous.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());

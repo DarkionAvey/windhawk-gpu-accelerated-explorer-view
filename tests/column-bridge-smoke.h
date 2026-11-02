@@ -68,7 +68,7 @@ inline void Pump() {
 struct Receipts {
     HWND hwnd;
     std::shared_ptr<const PresentationReceipt> latest;
-    unsigned long long modelSequence=0,directory=0;
+    unsigned long long modelSequence=0,navigation=0;
     unsigned deferredOverflow=0;
     bool admitted=false,premature=false;
     static LRESULT CALLBACK Capture(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR context) {
@@ -83,7 +83,9 @@ struct Receipts {
             {std::lock_guard lock(state->presenter->mutex); model=state->presenter->pending;}
             if(model && model->sequence>self.modelSequence) {
                 self.modelSequence=model->sequence;
-                if(self.directory!=model->directoryToken) {self.directory=model->directoryToken; self.admitted=false;}
+                // A revalidation scan preserves already-visible chrome. Only
+                // a real navigation starts another first-admission contract.
+                if(self.navigation!=model->token) {self.navigation=model->token; self.admitted=false;}
                 if(!model->horizontalScrollbarAdmitted && model->columnContentWidth>model->client.right) ++self.deferredOverflow;
                 if(!self.admitted && model->horizontalScrollbarAdmitted && !state->horizontalScroll &&
                     (state->nativeColumnsDirty || state->deferColumnProviders || state->autoRefitPending ||

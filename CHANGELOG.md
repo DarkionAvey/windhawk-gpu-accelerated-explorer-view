@@ -1,7 +1,18 @@
 # Changelog
 
-## 0.9.341 (working candidate)
+## 0.9.341
 
+- Keep GPU drag previews moving across frame and screen edges, with Windows'
+  forbidden cursor for rejected drops.
+- Yield the GPU preview to Windows' WinUI drag visual while it is visible,
+  then restore it at the current pointer position.
+- Resume deferred native selection and view updates when GPU animations finish.
+- Preserve native-view suppression if Windows rejects the visibility observer.
+- Finish rename zooms when the editor covers the GPU surface and a font refresh
+  needs another compositor frame.
+- Retire pending animation wakes while the GPU window is hidden, and resume
+  them when it is shown.
+- Add optional source coverage reports for regression runs.
 - Center rename text vertically in list rows, including wrapped names and
   changes to row/font size.
 - Start held touch drags from Windows' promoted mouse input so the operation

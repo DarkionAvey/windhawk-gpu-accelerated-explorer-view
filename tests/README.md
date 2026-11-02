@@ -73,6 +73,47 @@ preserves binaries, per-test stdout/stderr logs, timing CSVs and any pixel
 evidence (`*.bmp`) in the printed artifact directory; `-KeepArtifacts`
 retains them after success too. No assertion is relaxed or retried.
 
+Native popup coverage runs filesystem, archive and delegated providers in
+separate processes/private desktops. Each keeps its own failure deadline and
+checks the same Details/List/grid menus and selection states.
+Rename painting uses the same process-owned private desktop, with in-bounds
+windows so USER delivers actual client paints. Child exit releases native
+worker desktop attachments before the parent checks desktop cleanup.
+
+## Code coverage
+
+`build.bat -Coverage -Jobs 16` runs the full gate with compiler-measured line,
+function, region and branch coverage. Focused runs also support `-Coverage`:
+
+```powershell
+tests/run-regressions.ps1 -SourceFile latest.cpp -Tests drag-preview -Coverage
+```
+
+Install `llvm-cov` and `llvm-profdata` matching Windhawk Clang's major version.
+Discovery checks Windhawk, `LLVM_HOME`, PATH and the standard LLVM installation;
+`-LlvmToolsDirectory` selects another directory. No additional tools are needed
+for ordinary builds. The coverage selftest verifies parallel profiles, branch
+outcomes, uncovered lines/functions and profile writing on actual DLL unload.
+
+The printed `coverage/html/index.html` highlights executed and missed code.
+`summary.txt`, `coverage.json`, `coverage.lcov`, `uncovered-functions.json` and
+`uncovered-lines.json` support review and automation. `run.json` records the
+source hash, binaries, test outcomes and whether the run passed. Reports and
+instrumented test binaries are retained even after failure. Profiles are unique
+per process and binary; shared worker counters use atomic updates.
+`source.cpp` preserves the measured source after publication archives it.
+Uncovered functions combine all binary/template variants of each source
+definition; an unused variant cannot mark an executed definition uncovered.
+The line list identifies physical source lines with zero LCOV execution counts.
+
+Only the selected mod source is instrumented, in the standalone suite and
+unload DLL. Release DLLs stay uninstrumented. Results describe the compiled
+test configurations, not live Explorer, hardware input, excluded preprocessor
+branches, or displayed frames. Executing a line does not prove its behavior was
+asserted; crashed or terminated processes may leave no profile. A partial run
+is not a full-suite coverage baseline. The implementation uses LLVM's
+[source-based coverage](https://clang.llvm.org/docs/SourceBasedCodeCoverage.html).
+
 ## Writing a regression
 
 1. Write `static void TestSomething(const std::wstring& fixture)` in a

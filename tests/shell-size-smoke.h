@@ -56,6 +56,10 @@ static void TestShellSizeDetails(const std::wstring& directory) {
                 SUCCEEDED(StrRetToStrW(&native.str, child, &text)), "native Shell size text");
             expected.emplace_back(text ? text : L"");
             CoTaskMemFree(text);
+            if(entry.folder ? !expected.back().empty() : expected.back().empty())
+                std::wcout << L"SIZE native name=" << entry.name << L" folder=" << entry.folder
+                    << L" bytes=" << entry.byteSize << L" attributes=" << GetFileAttributesW(entry.path.c_str())
+                    << L" text=[" << expected.back() << L"] column=" << sizeColumn << std::endl;
             Check(entry.folder ? expected.back().empty() : !expected.back().empty(),
                 "native size must distinguish folders from zero-byte files");
             DetailRequest request;

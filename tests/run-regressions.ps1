@@ -8,7 +8,9 @@ param(
     [string]$MinifiedSourceFile,
     [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
     [ValidateRange(1,86400)][int]$TestTimeoutSeconds = 900,
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+    [switch]$Coverage,
+    [string]$LlvmToolsDirectory
 )
 if ($Tests.Count -and $TestArguments.Count) { throw 'Use either -Tests or -TestArguments' }
 # Comma-separated names arrive as one string through powershell -File.
@@ -18,10 +20,12 @@ $compilePipeline = $TestArguments -notcontains '--unload' -and !($Tests.Count -a
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
 . (Join-Path $PSScriptRoot 'parallel-runner.ps1')
+. (Join-Path $PSScriptRoot 'coverage.ps1')
 $totalClock = [Diagnostics.Stopwatch]::StartNew()
 $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
 $compilerDirectory = Join-Path $WindhawkDirectory 'Compiler'
 $compiler = Join-Path $compilerDirectory 'bin\clang++.exe'
+$coverageTools = if ($Coverage) { Resolve-CoverageTools $compiler $LlvmToolsDirectory } else { $null }
 $testDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (![IO.Path]::IsPathRooted($SourceFile)) { $SourceFile = Join-Path (Split-Path -Parent $testDirectory) $SourceFile }
 $sourcePath = (Resolve-Path -LiteralPath $SourceFile).ProviderPath
@@ -63,6 +67,12 @@ if (-not $hostLibrary) { throw 'Installed Windhawk x64 host import library not f
 Write-Output "Windhawk host library: $hostLibrary"
 $modFlags = $flags | Where-Object { $_ -notin @('-DWH_EDITING', '-static', '-municode') }
 $modFlags += '-fstack-usage'
+$coverageRun = if ($Coverage) { New-RegressionCoverage $sourcePath $outputDirectory $coverageTools } else { $null }
+if ($Coverage) {
+    & (Join-Path $testDirectory 'coverage-regression.ps1') -Compiler $compiler `
+        -LlvmToolsDirectory (Split-Path -Parent $coverageTools.Cov) -OutputDirectory $outputDirectory
+}
+$testFlags = if ($Coverage) { @($flags)+$coverageRun.Flags } else { $flags }
 $compileTasks = @([pscustomobject]@{Name='compile-mod'; FilePath=$compiler; Serial=$false
     Arguments=@($modFlags)+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$modDll,$hostLibrary)+$libraries})
 if ($MinifiedSourceFile) {
@@ -83,7 +93,7 @@ if ($MinifiedSourceFile) {
 if ($compileUnload) {
     $unloadDll = Join-Path $outputDirectory 'unload-mod.dll'
     $unloadExe = Join-Path $outputDirectory 'unload-regression.exe'
-    $unloadFlags = $flags | Where-Object { $_ -notin @('-static', '-municode') }
+    $unloadFlags = $testFlags | Where-Object { $_ -notin @('-static', '-municode') }
     $compileTasks += [pscustomobject]@{Name='compile-unload-mod'; FilePath=$compiler; Serial=$false
         Arguments=@($unloadFlags)+@('-shared',(Join-Path $testDirectory 'unload-mod.cpp'),'-o',$unloadDll)+$libraries}
     $compileTasks += [pscustomobject]@{Name='compile-unload-host'; FilePath=$compiler; Serial=$false
@@ -96,7 +106,7 @@ if ($compileUnload) {
 }
 if ($compilePipeline) {
     $compileTasks += [pscustomobject]@{Name='compile-pipeline'; FilePath=$compiler; Serial=$false
-        Arguments=@($flags)+@((Join-Path $testDirectory 'background-regression.cpp'),'-o',$executable)+$libraries}
+        Arguments=@($testFlags)+@((Join-Path $testDirectory 'background-regression.cpp'),'-o',$executable)+$libraries}
 }
 # The large translation units are memory intensive; cap concurrent compilers
 # at two while allowing the separately isolated test suites to use -Jobs.
@@ -120,8 +130,10 @@ if ($oversized.Count) { $oversized | Format-Table -AutoSize; throw 'Message/COM 
 Write-Output ('PASS: compiled message/COM callback stack frames stay within 8 KiB (maximum ' +
     ($callbackStacks | Measure-Object Bytes -Maximum).Maximum + ' bytes)')
 $previousPath = $env:PATH
+$previousProfile = $env:LLVM_PROFILE_FILE
 $testsPassed = $false
 try {
+    if ($Coverage) { $env:LLVM_PROFILE_FILE = $coverageRun.Pattern }
     $env:PATH = (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin') + ';' +
         (Join-Path $compilerDirectory 'bin') + ';' + $previousPath
     $testTasks = @()
@@ -157,9 +169,21 @@ try {
     Write-Output ('PASS: complete regression gate in {0:N2}s (compile and execution)' -f $totalClock.Elapsed.TotalSeconds)
     if ($KeepArtifacts) { Write-Output "Artifacts retained at $outputDirectory" }
 } finally {
-    $env:PATH = $previousPath
+    $env:LLVM_PROFILE_FILE = $previousProfile
+    try {
+        if ($Coverage) {
+            $objects = @()
+            if ($compilePipeline) { $objects += $executable }
+            if ($compileUnload) { $objects += $unloadDll }
+            try { Write-RegressionCoverage $coverageRun $objects (Join-Path $outputDirectory 'regression-results.csv') $testsPassed }
+            catch {
+                if ($testsPassed) { throw }
+                Write-Warning "Coverage report failed after test failure: $_"
+            }
+        }
+    } finally { $env:PATH = $previousPath }
     # Delete only this script's known generated binary; no recursive deletion.
-    if ($testsPassed -and !$KeepArtifacts) {
+    if ($testsPassed -and !$KeepArtifacts -and !$Coverage) {
         if (Test-Path -LiteralPath $executable) { Remove-Item -LiteralPath $executable -Force }
         if (Test-Path -LiteralPath $modDll) { Remove-Item -LiteralPath $modDll -Force }
         if ($minifiedDll) { Remove-Item -LiteralPath $minifiedDll, $minifiedConfiguration -Force }

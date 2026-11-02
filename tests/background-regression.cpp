@@ -61,6 +61,7 @@
 #undef DCompositionCreateDevice
 #undef GetQueueStatus
 #undef GetKeyState
+#undef TranslateMessage
 #undef GetFocus
 #undef GetForegroundWindow
 #undef IsWindowVisible
@@ -1917,6 +1918,7 @@ static void TestPreviewInput() {
 #include "drag-preview-smoke.h"
 #include "additional-gestures-smoke.h"
 #include "checkbox-smoke.h"
+#include "private-desktop-fixture.h"
 #include "rename-appearance-smoke.h"
 #include "rename-vertical-alignment-smoke.h"
 #include "swipe-compositor-smoke.h"
@@ -2008,8 +2010,11 @@ int wmain(int argc,wchar_t** argv) {
         return TraceLiveSelection(argc>2 ? std::clamp(_wtoi(argv[2]),1,180) : 90);
     std::vector<const Regression::Test*> selected;
     bool menuChild=false;
+    std::wstring menuProvider;
     for (int i=1; i<argc; ++i) {
-        if (!wcscmp(argv[i],L"--native-context-menu-child")) { menuChild=true; continue; }
+        if (!wcscmp(argv[i],L"--native-context-menu-child") && i+1<argc) {
+            menuChild=true; menuProvider=argv[++i]; continue;
+        }
         if (!wcscmp(argv[i],L"--test") && i+1<argc) {
             const auto* test=FindRegression(argv[++i]);
             if (!test) { std::wcerr << L"FAIL: unknown regression " << argv[i] << L'\n'; return 2; }
@@ -2050,7 +2055,7 @@ int wmain(int argc,wchar_t** argv) {
             Check(file != INVALID_HANDLE_VALUE, "fixture creation");
             CloseHandle(file);
         }
-        if (menuChild) NativeMenuFixture::Child(fixture.wstring());
+        if (menuChild) NativeMenuFixture::Child(fixture.wstring(),menuProvider);
         for (const auto* test : selected) {
             Regression::current = test; Regression::claimed = 0;
             test->run(fixture.wstring());

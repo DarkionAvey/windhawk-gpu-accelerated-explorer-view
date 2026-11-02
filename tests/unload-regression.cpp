@@ -145,9 +145,9 @@ int wmain(int argc,wchar_t** argv) {
             Check(DestroyWindow(frame)!=FALSE && !IsWindow(editor),"detached EDIT destruction after unload");
             std::cout<<"PASS: surviving rename EDIT has no mod subclass, uses a stock font and handles text/destruction after verified DLL unmapping\n";
         }
-        {
+        for(BOOL failRegistration:{FALSE,TRUE}) {
             HMODULE barrier=Load(argv[1]);
-            Check(Export<BOOL(*)()>(barrier,"NativeBarrierRetirement")(),"native creation barrier did not suppress/retire with its owning overlay");
+            Check(Export<BOOL(*)(BOOL)>(barrier,"NativeBarrierRetirement")(failRegistration),"native creation barrier did not suppress/retire with its owning overlay");
             Export<void(*)()>(barrier,"Before")();
             unload();
             Check(FreeLibrary(barrier)!=FALSE,"native barrier DLL release");

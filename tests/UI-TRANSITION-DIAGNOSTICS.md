@@ -8,9 +8,8 @@ are independent of the high-volume tracing options below.
 
 The diagnostics added in 0.9.177 remain available. Version 0.9.178 repairs the
 confirmed highlight layering problem: temporary composition siblings were
-inserted in reverse order, placing background fills over item content. See
-[layering findings](LAYERING-0.9.178.md). This option remains useful for other
-appearance problems and interrupted transitions.
+inserted in reverse order, placing background fills over item content. This
+option remains useful for other appearance problems and interrupted transitions.
 
 1. Install `latest.cpp` and enable **UI transition diagnostics** in Windhawk.
 2. Start capturing Windhawk/DebugView output before entering the child folder.

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.340
+// @version         0.9.341
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -215,6 +215,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <d2d1.h>
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
+#include <d2d1effects.h>
 #include <d2d1helper.h>
 #include <d3d11.h>
 #include <dxgi1_4.h>
@@ -727,6 +728,8 @@ struct TouchInput {
     bool active = false, consumed = false, control = false, replaying = false;
     bool panningFeedback = false, holding = false, inertia = false, down = false;
     bool dragPending = false, dragPosted = false, dragPromoted = false, controlDouble = false;
+    bool dragMotionTraced = false; // Diagnostics only: one movement record per contact.
+    const wchar_t* dragBlockTraced = nullptr;
     bool scrollbarMenuEligible = false, multiTapDelivered = false;
     unsigned long long epoch = 0;
     unsigned long long generation = 0;
@@ -1035,6 +1038,9 @@ struct TextLayoutCache {
         size_t bytes = 0;
         unsigned long long painted = 0;
         bool underline = false;
+        // Grayscale text alpha correction depends on the brush luminance: a mask
+        // rasterized for white text is not the coverage DirectWrite gives dark text.
+        unsigned color = 0xFFFFFF;
     };
     struct Layout {
         ComPtr<IDWriteTextLayout> text;
@@ -1345,7 +1351,9 @@ struct DragPreview : DragPreviewImage {
     const DragPreviewImage& Image(size_t index) const {return index ? behind[index-1]:*this;}
     std::wstring description;
     ComPtr<IDWriteTextLayout> caption;
+    ComPtr<IDWriteTextFormat> captionFormat;
     D2D1_SIZE_F captionSize{};
+    float captionMaxHeight=0.f; // Three measured text lines, reserved even without a caption.
     unsigned long long captionFace=0;
     int captionDpi=0;
     float captionAvailable=0.f;
@@ -1354,6 +1362,8 @@ struct DragPreview : DragPreviewImage {
     int dpi=96,count=1;
     DWORD effect=DROPEFFECT_NONE;
     COLORREF background=0,foreground=0,accent=0;
+    unsigned long long badgePalette=g_swipePalette.load(std::memory_order_relaxed);
+    float dragBadgeScaling=0.75f; // Item-count diameter, padding and font scale together.
     bool rtl=false,animate=true;
     std::shared_ptr<std::atomic<bool>> rendered=std::make_shared<std::atomic<bool>>(false);
 };
@@ -1361,8 +1371,13 @@ struct DragGlyph {
     std::wstring text;
     float size=0.f;
     COLORREF foreground=CLR_INVALID;
-    ComPtr<ID2D1CommandList> image;
+    ComPtr<IDWriteTextLayout> layout;  // Shaped once per symbol/size; drawn directly.
     D2D1_RECT_F bounds{};
+};
+struct DragShadow {
+    ComPtr<ID2D1Bitmap1> bitmap;
+    const void* identity=nullptr;
+    float side=0.f;
 };
 // Same policy calculation as list text, with an independent monitor cache so
 // a drag on another display never invalidates the tab's existing glyph masks.
@@ -3715,6 +3730,7 @@ struct ViewState {
         ComPtr<IDCompositionAnimation> curve;
         std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages> artwork;
         std::array<const void*,kDragPreviewImages> artworkIdentity{};
+        std::array<DragShadow,kDragPreviewImages> shadows;
         DragGlyph glyph;
         DragTextStyle textStyle;
         std::shared_ptr<const DragPreview> snapshot;
@@ -4871,7 +4887,38 @@ void UpdateTouchScrollbars(ViewState& state);
 void ClearSwipeFeedback(ViewState& state);
 void RetargetSwipeFeedback(ViewState& state,bool released,bool committed);
 void RepositionRenameEdit(ViewState& state);
+// Debug logging only: capture the owner stack at contact transitions, never
+// resolve symbols or download PDBs on the input thread. Module build identities
+// and native offsets can be analyzed from the Windhawk log offline.
+void TraceTouchDrag(const ViewState& state, PCWSTR stage, bool stack = false) {
+    if (!g_perf.load(std::memory_order_relaxed)) return;
+    const DWORD error = GetLastError();
+    const auto& t = state.touch;
+    Wh_Log(L"[GPU touch drag] %s hwnd=%p tid=%lu generation=%llu pointer=%u active=%d down=%d hold=%d pending=%d posted=%d promoted=%d consumed=%d control=%d checkbox=%d row=%d contacts=%u gesture=%u delta=(%ld,%ld) selection=(%llu,%d,%d,%d) epoch=(%llu,%llu)",
+        stage,state.hwnd,GetCurrentThreadId(),t.generation,t.primary,t.active,t.down,t.holding,t.dragPending,t.dragPosted,
+        t.dragPromoted,t.consumed,t.control,t.checkbox,t.row,t.contacts,unsigned(t.gesture),t.last.x-t.start.x,t.last.y-t.start.y,
+        static_cast<unsigned long long>(state.pendingNativeSelection),state.nativeSelectionUnsafe,
+        state.nativeSelectionImportPending,state.nativeSelectionAwaitingRefresh,t.epoch,state.mouseFolderEpoch);
+    if (stack) {
+        void* frames[20]{};
+        const USHORT count = CaptureStackBackTrace(1,ARRAYSIZE(frames),frames,nullptr);
+        for (USHORT i=0;i<count;++i) {
+            HMODULE module=nullptr; wchar_t path[MAX_PATH]{};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(frames[i]),&module) && GetModuleFileNameW(module,path,ARRAYSIZE(path))) {
+                const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+                const auto* pe=reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const BYTE*>(module)+dos->e_lfanew);
+                Wh_Log(L"[GPU touch drag] stack[%u] address=%p base=%p rva=0x%llX stamp=%08lX size=%08lX module=%s",
+                    i,frames[i],module,static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(frames[i])-
+                    reinterpret_cast<ULONG_PTR>(module)),pe->FileHeader.TimeDateStamp,pe->OptionalHeader.SizeOfImage,path);
+            } else Wh_Log(L"[GPU touch drag] stack[%u] address=%p",i,frames[i]);
+        }
+    }
+    SetLastError(error);
+}
+
 void StopTouch(ViewState& state) {
+    if (state.touch.active) TraceTouchDrag(state,L"stop",true);
     const bool control = state.touch.control;
     const bool owned = state.touch.active || state.touch.primary;
     const bool feedback = state.swipeFeedbackActive || state.swipeFeedbackFading || state.swipeOutgoingIndicator.moving;
@@ -8389,6 +8436,22 @@ void PublishNativeRows(TabBackground& work, const NativeRowsJob& job,
     result.token = job.token;
     result.entries = rows;
     result.nativeRowsComplete = complete;
+    if(complete && error==ERROR_SUCCESS) {
+        // Native row projections already own canonical children, just like
+        // namespace directory snapshots. Retain that index for selection
+        // imports instead of requiring another provider name translation.
+        auto identities=std::make_shared<NamespaceIdentities>();
+        identities->reserve(rows.size());
+        for(const auto& entry:rows) {
+            if(!DirectoryJobCurrent(work,job.token,true)) return;
+            auto child=entry.shellChild;
+            if(!child && entry.shellIdentity)
+                child=SharedPidl(ILClone(ILFindLastID(entry.shellIdentity.get())),TaskMemDeleter{});
+            if(entry.path.empty() || !child) {identities.reset(); break;}
+            identities->emplace(entry.path,std::move(child));
+        }
+        result.namespaceIdentities=std::move(identities);
+    }
     result.nativeRowsRequestedAt = job.requestedAt;
     result.nativeRowsPublishedAt = GetTickCount64();
     result.error = error;
@@ -11584,6 +11647,10 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
             if (!state.thisPcGpu || result.token != state.nativeRowsToken ||
                 state.nativeRowsViewToken != state.token) continue;
             const bool refreshAfterCompletion = result.nativeRowsComplete && state.nativeRowsNeedCapture;
+            if(result.nativeRowsComplete && result.error==ERROR_SUCCESS) {
+                RetireCachedEntries(state,state.namespaceIdentities);
+                state.namespaceIdentities=std::move(result.namespaceIdentities);
+            }
             // These rows own immutable Shell PIDLs. Native list readiness and
             // native row ordering are not prerequisites for publishing them.
             if (result.nativeRowsRequestedAt && g_perf.load(std::memory_order_relaxed))
@@ -15400,6 +15467,31 @@ HRESULT ReserveGlyphSlot(ViewState& state, UINT width, UINT height,
     return S_OK;
 }
 
+// An untrimmed line's glyphs do not change when its cell grows or moves.
+// Canonicalize to intrinsic width (snapped to a whole pixel when drawn)
+// instead of missing the raster cache for every intermediate auto-fit width.
+// Wrapped/trimmed text keeps exact bounds. Direct drawing uses the same box,
+// so right-aligned/centered values never shift when their mask takes over.
+bool IntrinsicTextBox(ViewState& state, const std::wstring& text, IDWriteTextLayout* layout,
+                      float& x, float& width, float height, bool header, bool sorted, bool wrapped, bool filename) {
+    if (wrapped) return false;
+    auto& shaped = state.textLayouts[!header ? 0 : sorted ? 2 : 1].layouts.at(text);
+    const float cellWidth=width;
+    if (shaped.naturalWidth < 0.f) {
+        float natural=0.f;
+        ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename);
+        ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename);
+    }
+    const float glyphWidth=ceilf(shaped.naturalWidth)+1.f;
+    if (shaped.naturalWidth < 0.f || glyphWidth > cellWidth) return false;
+    const auto alignment=layout->GetTextAlignment();
+    const bool rtl=layout->GetReadingDirection()==DWRITE_READING_DIRECTION_RIGHT_TO_LEFT;
+    x += (cellWidth-glyphWidth)*(alignment==DWRITE_TEXT_ALIGNMENT_CENTER ? .5f :
+        ((alignment==DWRITE_TEXT_ALIGNMENT_LEADING)==rtl ? 1.f : 0.f));
+    width=glyphWidth;
+    return true;
+}
+
 // Cache the expensive DWrite-to-D2D traversal, not just shaped layouts. Command
 // lists only move this cost to EndDraw. A8 coverage masks bypass that traversal
 // while FillOpacityMask applies text gamma, live color and live opacity. A
@@ -15416,27 +15508,8 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     // must never erase text already drawn, including through the direct path.
     deferCold = deferCold && !shaped.displayed;
     auto& p = state.frameProfile;
-    // An untrimmed line's glyphs do not change when its cell grows or moves.
-    // Canonicalize to intrinsic width instead of missing the raster cache for
-    // every intermediate auto-fit width. Wrapped/trimmed text keeps exact bounds.
-    bool intrinsic=false;
     const float cellWidth=width;
-    if (!wrapped) {
-        if (shaped.naturalWidth < 0.f) {
-            float natural=0.f;
-            ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename);
-            ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename);
-        }
-        const float glyphWidth=ceilf(shaped.naturalWidth)+1.f;
-        if (shaped.naturalWidth >= 0.f && glyphWidth <= cellWidth) {
-            const auto alignment=layout->GetTextAlignment();
-            const bool rtl=layout->GetReadingDirection()==DWRITE_READING_DIRECTION_RIGHT_TO_LEFT;
-            x += (cellWidth-glyphWidth)*(alignment==DWRITE_TEXT_ALIGNMENT_CENTER ? .5f :
-                ((alignment==DWRITE_TEXT_ALIGNMENT_LEADING)==rtl ? 1.f : 0.f));
-            width=glyphWidth;
-            intrinsic=true;
-        }
-    }
+    const bool intrinsic=IntrinsicTextBox(state,text,layout,x,width,height,header,sorted,wrapped,filename);
     const auto draw = [&](const TextLayoutCache::Raster& raster) {
         shaped.displayed = true;
         ID2D1Bitmap1* bitmap=raster.bitmap.Get();
@@ -15463,7 +15536,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     };
     for (auto& raster : shaped.rasters) {
         if (raster.width != width || raster.height != height || raster.rendering!=state.textRenderingSerial ||
-            raster.underline != bool(underline)) continue;
+            raster.underline != bool(underline) || raster.color != (color & 0xFFFFFF)) continue;
         raster.used = ++state.textRasterTick;
         raster.painted = state.graphicsPaintSerial;
         draw(raster);
@@ -15543,6 +15616,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     if (FAILED(layout->GetFontSize(0,&raster.fontSize))) raster.fontSize=0.f;
     raster.rendering=state.textRenderingSerial;
     raster.underline = underline != FALSE;
+    raster.color = color & 0xFFFFFF;
     raster.used=++state.textRasterTick; raster.bytes=bytes;
     raster.painted=state.graphicsPaintSerial;
     HRESULT hr = S_OK;
@@ -15600,7 +15674,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
                 D2D1_ANTIALIAS_MODE_ALIASED);
         } else state.textRasterTarget->SetTarget(raster.bitmap.Get());
         state.textRasterTarget->Clear(D2D1::ColorF(0.f,0.f,0.f,0.f));
-        state.textRasterBrush->SetColor(Packed(0xFFFFFF));
+        state.textRasterBrush->SetColor(Packed(raster.color));
         state.textRasterTarget->DrawTextLayout(D2D1::Point2F(),layout,
             state.textRasterBrush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
         if (raster.slot) state.textRasterTarget->PopAxisAlignedClip();
@@ -15654,7 +15728,8 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
     TextLayoutCache::Raster* raster = nullptr;
     for (auto& candidate : shaped.rasters)
         if (candidate.fontSize > 0.f && candidate.bitmap && candidate.rendering == state.textRenderingSerial &&
-            candidate.underline == underline && (!raster || candidate.used > raster->used)) raster = &candidate;
+            candidate.underline == underline && candidate.color == (color & 0xFFFFFF) &&
+            (!raster || candidate.used > raster->used)) raster = &candidate;
     if (!raster) return false;
     const float scale = format->GetFontSize() / raster->fontSize;
     ID2D1Bitmap1* bitmap = raster->bitmap.Get();
@@ -15767,8 +15842,27 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             state.brush->SetColor(Packed(hex, opacity));
         }
         if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename)) {
-            state.target->DrawTextLayout(D2D1::Point2F(l,t), layout, state.brush.Get(),
-                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            // Same canonical box and whole-pixel origin as the cached mask.
+            float boxLeft=l, boxWidth=r-l;
+            const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename);
+            const auto origin=intrinsic ? SnapDrawPoint(state.target.Get(),D2D1::Point2F(boxLeft,t)) : D2D1::Point2F(l,t);
+            if (intrinsic) layout->SetMaxWidth(boxWidth);
+            // A translucent brush changes Direct2D's grayscale text alpha
+            // correction; masks scale opaque coverage instead. Draw translucent
+            // text opaque in a bounded layer so both paths match (muted headers,
+            // secondary text, dimmed items, fades).
+            const bool translucent=opacity<1.f;
+            if (translucent) {
+                state.brush->SetColor(Packed(hex,1.f));
+                state.target->PushLayer(D2D1::LayerParameters1(D2D1::RectF(origin.x,t,origin.x+boxWidth,b),nullptr,
+                    D2D1_ANTIALIAS_MODE_ALIASED,D2D1::IdentityMatrix(),opacity),nullptr);
+            }
+            state.target->DrawTextLayout(origin, layout, state.brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            if (translucent) {
+                state.target->PopLayer();
+                state.brush->SetColor(Packed(hex,opacity));
+            }
+            if (intrinsic) layout->SetMaxWidth(r-l);
             if (state.uiTraceDrawItem && filename)
                 PipelineEvent(*state.background,{.operation=L"ui.text.direct[opacity,width,height,color]",
                     .a=state.uiTraceItem,.b=state.token,.v={opacity,r-l,b-t,double(hex)}},true);
@@ -16934,7 +17028,12 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
                     }
                     position += line.length;
                     if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-                    rc.left=std::max(0.f,rc.left-pad); rc.right=std::min(cached.width,rc.right+pad);
+                    // Pad symmetrically within the layout box (a rename EDIT
+                    // covers exactly that box). Clamping each side separately
+                    // removed only the leading inset when the caption starts
+                    // at the box edge (Small icons), leaving a lopsided pill.
+                    const float inset=std::clamp(std::min(rc.left,cached.width-rc.right),0.f,pad);
+                    rc.left-=inset; rc.right+=inset;
                     rc.top=std::max(0.f,rc.top); rc.bottom=std::min(cached.height,rc.bottom);
                     // DirectWrite describes physical glyph positions. Fill
                     // mirrors logical rectangles, so convert the shaped run.
@@ -16958,11 +17057,15 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
             rc.top=std::max(geometry.cell.top,rc.top+roundf(text.top)-padding);
             rc.bottom=std::min(geometry.cell.bottom,rc.bottom+roundf(text.top)+padding);
             if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-            // Wrapped lines share their interior padding. Split the overlap
-            // so translucent selection/hover never acquire a darker seam.
+            // Wrapped lines overlap in their interior padding. Give the overlap
+            // to the wider line (its descenders/ascenders extend past the
+            // narrower line), so the union is unchanged but translucent fills
+            // never double up. Meet on a whole pixel: two antialiased edges at
+            // a fractional row would leave a faint line through the highlight.
             if (result.count && rc.top<result.lines[result.count-1].bottom) {
                 auto& previous=result.lines[result.count-1];
-                previous.bottom=rc.top=(previous.bottom+rc.top)*.5f;
+                const bool previousWider=previous.right-previous.left>=rc.right-rc.left;
+                previous.bottom=rc.top=roundf(previousWider ? previous.bottom : rc.top);
             }
             if (!result.count) result.bounds=rc;
             else {
@@ -18106,8 +18209,11 @@ bool PublishModePlane(ViewState& state, ViewState::ModePlane& plane) {
 float DragPreviewBadgeSize(const DragPreview& preview) {
     return std::max(preview.side*.58f,GetSystemMetricsForDpi(SM_CXICON,preview.dpi)*.9f);
 }
+float DragShadowSigma(float side) {return side*.065f;}
+float DragShadowPadding(float side) {return std::ceil(3.f*DragShadowSigma(side))+1.f;}
+float DragShadowOffset(float side) {return side*.025f;}
 struct DragPreviewGeometry {
-    D2D1_RECT_F artwork{},operation{},caption{},visible{};
+    D2D1_RECT_F artwork{},operation{},caption{};
     D2D1_SIZE_U extent{};
     float edge=0.f;
 };
@@ -18138,20 +18244,29 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
     const float top=std::max(edge,art.bottom-badge+outset);
     geometry.operation=D2D1::RectF(left,top,left+badge,top+badge);
     auto bounds=D2D1::RectF(0,0,2*edge+side+2*outset,2*edge+side+outset);
-    // Bound rotated squares, not their asynchronously changing artwork.
-    for(size_t i=1;i<std::min(preview.imageCount,kDragPreviewImages);++i) {
+    // Bound rotated squares and their soft shadows, independent of artwork
+    // aspect ratios or whether the native target currently supplies a caption.
+    const float padding=DragShadowPadding(side),offset=DragShadowOffset(side);
+    float pileTop=square.top;
+    const auto shadow=D2D1::RectF(square.left-padding,square.top-padding+offset,
+        square.right+padding,square.bottom+padding+offset);
+    for(size_t i=0;i<std::min(preview.imageCount,kDragPreviewImages);++i) {
         const auto transform=DragStackTransform(preview,i,square);
         for(auto point:{D2D1::Point2F(square.left,square.top),D2D1::Point2F(square.right,square.top),
-            D2D1::Point2F(square.left,square.bottom),D2D1::Point2F(square.right,square.bottom)}) {
+            D2D1::Point2F(square.left,square.bottom),D2D1::Point2F(square.right,square.bottom)})
+            pileTop=std::min(pileTop,transform.TransformPoint(point).y);
+        for(auto point:{D2D1::Point2F(shadow.left,shadow.top),D2D1::Point2F(shadow.right,shadow.top),
+            D2D1::Point2F(shadow.left,shadow.bottom),D2D1::Point2F(shadow.right,shadow.bottom)}) {
             point=transform.TransformPoint(point);
             bounds.left=std::min(bounds.left,point.x-edge); bounds.top=std::min(bounds.top,point.y-edge);
             bounds.right=std::max(bounds.right,point.x+edge); bounds.bottom=std::max(bounds.bottom,point.y+edge);
         }
     }
-    auto visible=bounds;
+    // Reserve the bounded, font-measured caption band from drag start. Its
+    // presence, wrapping and target changes never resize/rebase this canvas.
+    if(preview.captionMaxHeight>0.f) bounds.top-=preview.captionMaxHeight+4*edge;
     if(preview.captionAvailable>0.f) {
         // Keep the canvas origin fixed as native target messages change width.
-        // Only visible content participates in screen-edge placement below.
         const float reserve=std::ceil(preview.captionAvailable)+4*edge,center=(square.left+square.right)*.5f;
         bounds.left=std::min(bounds.left,center-reserve*.5f);
         bounds.right=std::max(bounds.right,center+reserve*.5f);
@@ -18159,15 +18274,11 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
     if(preview.caption) {
         const float width=preview.captionSize.width+2*edge;
         const float x=(square.left+square.right-width)*.5f;
-        geometry.caption=D2D1::RectF(x,bounds.bottom+edge,x+width,bounds.bottom+3*edge+preview.captionSize.height);
-        bounds.left=std::min(bounds.left,x-edge); bounds.right=std::max(bounds.right,x+width+edge);
-        bounds.bottom=geometry.caption.bottom+edge;
-        visible.left=std::min(visible.left,x-edge); visible.right=std::max(visible.right,x+width+edge);
-        visible.bottom=bounds.bottom;
+        const float bottom=pileTop-edge;
+        geometry.caption=D2D1::RectF(x,bottom-2*edge-preview.captionSize.height,x+width,bottom);
     }
     const auto shift=[&](D2D1_RECT_F& r) {r.left-=bounds.left; r.right-=bounds.left; r.top-=bounds.top; r.bottom-=bounds.top;};
-    geometry.visible=visible;
-    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption); shift(geometry.visible);
+    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption);
     geometry.extent=D2D1::SizeU(UINT(std::ceil(bounds.right-bounds.left)),UINT(std::ceil(bounds.bottom-bounds.top)));
     geometry.edge=edge;
     return geometry;
@@ -18175,61 +18286,167 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
 D2D1_SIZE_U DragPreviewExtent(const DragPreview& preview) {
     return LayoutDragPreview(preview).extent;
 }
-POINT PositionDragPreview(const DragPreview& preview,POINT cursor,const RECT& work,bool touch) {
+POINT PositionDragPreview(const DragPreview& preview,POINT cursor,bool touch) {
     const auto geometry=LayoutDragPreview(preview);
     // Anchor the artwork, not its transparent canvas or the operation badge.
     // Touch keeps the entire preview above the promoted contact point.
     const float anchorX=(geometry.artwork.left+geometry.artwork.right)*.5f;
     const float anchorY=touch ? float(geometry.extent.height):geometry.artwork.bottom;
-    const LONG x=LONG(std::lround(cursor.x-anchorX)),y=LONG(std::lround(cursor.y-anchorY));
-    const auto& visible=geometry.visible;
-    const LONG left=LONG(std::ceil(work.left-visible.left)),top=LONG(std::ceil(work.top-visible.top));
-    return {std::clamp(x,left,std::max(left,LONG(std::floor(work.right-visible.right)))),
-        std::clamp(y,top,std::max(top,LONG(std::floor(work.bottom-visible.bottom))))};
+    // The desktop clips offscreen pixels; never detach the pile's hotspot
+    // from the mouse to keep its canvas inside a monitor or work area.
+    return {LONG(std::lround(cursor.x-anchorX)),LONG(std::lround(cursor.y-anchorY))};
+}
+
+// Exact ink of a layout: the union of its glyph outlines, using each color
+// font layer's own glyphs (a layer can be narrower than the base glyph). Image
+// bounds of recorded text are conservative glyph boxes; with no font
+// customizer they made normalized emoji ~9% too small. CPU geometry only.
+class InkBoundsRenderer final : public IDWriteTextRenderer {
+public:
+    explicit InkBoundsRenderer(ID2D1Factory* factory) : factory(factory) {}
+    D2D1_RECT_F bounds{FLT_MAX,FLT_MAX,-FLT_MAX,-FLT_MAX};
+    HRESULT failure=S_OK;
+    bool Valid() const { return SUCCEEDED(failure) && bounds.right>bounds.left && bounds.bottom>bounds.top; }
+    // Stack-owned for one synchronous IDWriteTextLayout::Draw call.
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+        if(iid==__uuidof(IUnknown) || iid==__uuidof(IDWritePixelSnapping) || iid==__uuidof(IDWriteTextRenderer)) {
+            *out=this; return S_OK;
+        }
+        *out=nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE IsPixelSnappingDisabled(void*,BOOL* disabled) override { *disabled=TRUE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetCurrentTransform(void*,DWRITE_MATRIX* transform) override {
+        *transform={1.f,0.f,0.f,1.f,0.f,0.f}; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPixelsPerDip(void*,FLOAT* pixels) override { *pixels=1.f; return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawGlyphRun(void*,FLOAT x,FLOAT y,DWRITE_MEASURING_MODE mode,
+        const DWRITE_GLYPH_RUN* run,const DWRITE_GLYPH_RUN_DESCRIPTION* description,IUnknown*) override {
+        ComPtr<IDWriteFactory2> colors; ComPtr<IDWriteColorGlyphRunEnumerator> layers;
+        if(SUCCEEDED(g_writeFactory.As(&colors)) &&
+            SUCCEEDED(colors->TranslateColorGlyphRun(x,y,run,description,mode,nullptr,0,&layers))) {
+            BOOL more=FALSE;
+            while(SUCCEEDED(layers->MoveNext(&more)) && more) {
+                const DWRITE_COLOR_GLYPH_RUN* layer=nullptr;
+                if(SUCCEEDED(layers->GetCurrentRun(&layer)) && layer)
+                    Add(layer->baselineOriginX,layer->baselineOriginY,layer->glyphRun);
+            }
+        } else Add(x,y,*run);  // DWRITE_E_NOCOLOR: an ordinary outline glyph run.
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawUnderline(void*,FLOAT,FLOAT,const DWRITE_UNDERLINE*,IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawStrikethrough(void*,FLOAT,FLOAT,const DWRITE_STRIKETHROUGH*,IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE DrawInlineObject(void*,FLOAT,FLOAT,IDWriteInlineObject*,BOOL,BOOL,IUnknown*) override { return S_OK; }
+private:
+    ID2D1Factory* factory;
+    void Add(float x,float y,const DWRITE_GLYPH_RUN& run) {
+        ComPtr<ID2D1PathGeometry> path; ComPtr<ID2D1GeometrySink> sink;
+        HRESULT hr=factory->CreatePathGeometry(&path);
+        if(SUCCEEDED(hr)) hr=path->Open(&sink);
+        if(SUCCEEDED(hr)) hr=run.fontFace->GetGlyphRunOutline(run.fontEmSize,run.glyphIndices,run.glyphAdvances,
+            run.glyphOffsets,run.glyphCount,run.isSideways,run.bidiLevel&1,sink.Get());
+        if(SUCCEEDED(hr)) hr=sink->Close();
+        D2D1_RECT_F outline{};
+        if(SUCCEEDED(hr)) hr=path->GetBounds(D2D1::Matrix3x2F::Translation(x,y),&outline);
+        if(FAILED(hr)) { failure=hr; return; }
+        if(outline.right<=outline.left || outline.bottom<=outline.top) return;  // Blank glyphs.
+        bounds={std::min(bounds.left,outline.left),std::min(bounds.top,outline.top),
+            std::max(bounds.right,outline.right),std::max(bounds.bottom,outline.bottom)};
+    }
+};
+
+D2D1_MATRIX_3X2_F CenteredDragLabelTransform(const D2D1_RECT_F& ink,float size,const D2D1_RECT_F& rect) {
+    const float scale=size/(ink.right-ink.left);
+    return D2D1::Matrix3x2F::Scale(scale,scale)*D2D1::Matrix3x2F::Translation(
+        (rect.left+rect.right)*.5f-(ink.left+ink.right)*.5f*scale,
+        (rect.top+rect.bottom)*.5f-(ink.top+ink.bottom)*.5f*scale);
+}
+
+// Hinting and color-font rendering can place visible ink a pixel or more away
+// from the glyph outlines. Rasterize once on the CPU (software D2D into a DIB:
+// no GPU readback or COM) at the transform the outlines suggest, and return
+// the half-coverage ink in layout coordinates, so the cached transform makes
+// the drawn symbol exactly `size` wide and centered.
+bool RenderedDragInk(ID2D1Factory* factory,IDWriteTextLayout* layout,COLORREF foreground,
+                     const D2D1_RECT_F& estimate,float size,D2D1_RECT_F& ink) {
+    const int side=static_cast<int>(std::ceil(size*2.f))+8;
+    const auto area=D2D1::RectF(0.f,0.f,float(side),float(side));
+    const auto transform=CenteredDragLabelTransform(estimate,size,area);
+    BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(info.bmiHeader); info.bmiHeader.biWidth=side;
+    info.bmiHeader.biHeight=-side; info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32;
+    void* bits=nullptr;
+    HDC dc=CreateCompatibleDC(nullptr);
+    HBITMAP dib=dc ? CreateDIBSection(dc,&info,DIB_RGB_COLORS,&bits,nullptr,0) : nullptr;
+    struct Release { HDC dc; HBITMAP dib; HGDIOBJ old;
+        ~Release() { if(old) SelectObject(dc,old); if(dib) DeleteObject(dib); if(dc) DeleteDC(dc); } }
+        release{dc,dib,dib ? SelectObject(dc,dib) : nullptr};
+    if(!bits) return false;
+    const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1DCRenderTarget> software; ComPtr<ID2D1DeviceContext> context; ComPtr<ID2D1SolidColorBrush> brush;
+    const RECT bounds{0,0,side,side};
+    if(FAILED(factory->CreateDCRenderTarget(&properties,&software)) || FAILED(software->BindDC(dc,&bounds)) ||
+        FAILED(software.As(&context)) || FAILED(context->CreateSolidColorBrush(D2D1::ColorF(
+            GetRValue(foreground)/255.f,GetGValue(foreground)/255.f,GetBValue(foreground)/255.f),&brush))) return false;
+    context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    context->BeginDraw(); context->Clear(D2D1::ColorF(0,0.f)); context->SetTransform(transform);
+    context->DrawTextLayout(D2D1::Point2F(),layout,brush.Get(),D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    if(FAILED(context->EndDraw())) return false;
+    int left=side,top=side,right=-1,bottom=-1;
+    const auto* pixels=static_cast<const BYTE*>(bits);
+    for(int y=0;y<side;++y) for(int x=0;x<side;++x) if(pixels[(size_t(y)*side+x)*4+3]>=128) {
+        left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
+    }
+    if(right<=left || bottom<=top) return false;
+    // Map the measured device box back through the transform.
+    const float scale=transform._11;
+    ink={(left-transform._31)/scale,(top-transform._32)/scale,(right-transform._31)/scale,(bottom-transform._32)/scale};
+    return true;
 }
 
 void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brush,
     const std::wstring& text,const wchar_t* family,float size,D2D1_RECT_F rect,COLORREF foreground,
-    bool normalizeWidth=false,DragGlyph* cached=nullptr) {
+    bool normalizeWidth=false,DragGlyph* cached=nullptr,IDWriteTextFormat* preferredFormat=nullptr) {
     DragGlyph local;
     auto& glyph=cached ? *cached:local;
     const auto color=D2D1::ColorF(GetRValue(foreground)/255.f,GetGValue(foreground)/255.f,GetBValue(foreground)/255.f);
-    if(normalizeWidth && glyph.image && glyph.text==text && glyph.size==size && glyph.foreground==foreground) {
-        const auto& b=glyph.bounds;
-        const float scale=size/(b.right-b.left);
+    if(normalizeWidth && glyph.layout && glyph.text==text && glyph.size==size && glyph.foreground==foreground) {
         D2D1_MATRIX_3X2_F previous{}; target->GetTransform(&previous);
-        target->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale)*D2D1::Matrix3x2F::Translation(
-            (rect.left+rect.right)*.5f-(b.left+b.right)*.5f*scale,
-            (rect.top+rect.bottom)*.5f-(b.top+b.bottom)*.5f*scale)*previous);
-        target->DrawImage(glyph.image.Get()); target->SetTransform(previous); return;
+        target->SetTransform(CenteredDragLabelTransform(glyph.bounds,size,rect)*previous);
+        brush->SetColor(color);
+        target->DrawTextLayout(D2D1::Point2F(),glyph.layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        target->SetTransform(previous); return;
     }
     ComPtr<IDWriteTextFormat> format;
     // Segoe UI Emoji has regular color artwork. Asking for semibold invokes
     // synthetic bolding, which flattens the color artwork's edge (U+1F6AB).
     const auto weight=normalizeWidth ? DWRITE_FONT_WEIGHT_NORMAL:DWRITE_FONT_WEIGHT_SEMI_BOLD;
-    if(!g_writeFactory || FAILED(g_writeFactory->CreateTextFormat(family,nullptr,weight,
+    if(!g_writeFactory) return;
+    if(preferredFormat) format=preferredFormat;
+    else if(FAILED(g_writeFactory->CreateTextFormat(family ? family:L"Segoe UI",nullptr,weight,
         DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,size,L"",&format))) return;
-    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     ComPtr<IDWriteTextLayout> layout;
     const float width=rect.right-rect.left,height=rect.bottom-rect.top;
     if(FAILED(g_writeFactory->CreateTextLayout(text.c_str(),UINT32(text.size()),format.Get(),width,height,&layout))) return;
+    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    if(preferredFormat) {
+        // Reuse the mod's already resolved family/face/collection, while the
+        // badge's single scale factor owns size. Never mutate a shared format.
+        if(FAILED(layout->SetFontSize(size,{0,UINT32(text.size())}))) return;
+        const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_NONE,0,0};
+        layout->SetTrimming(&trimming,nullptr);
+    }
     if(normalizeWidth) {
         // Color layers can have narrower ink than the font's base glyph (for
-        // example the clipboard). Measure the actual recorded color drawing,
-        // once per symbol/size, without readback or another GPU device.
-        ComPtr<ID2D1Device> device; target->GetDevice(&device);
-        ComPtr<ID2D1DeviceContext> recording;
-        ComPtr<ID2D1CommandList> image;
-        if(!device || FAILED(device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,&recording)) ||
-            FAILED(recording->CreateCommandList(&image))) return;
-        recording->SetTarget(image.Get()); recording->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        brush->SetColor(color); recording->BeginDraw();
-        recording->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-        const HRESULT draw=recording->EndDraw(); recording->SetTarget(nullptr);
-        D2D1_RECT_F bounds{};
-        if(FAILED(draw) || FAILED(image->Close()) || FAILED(recording->GetImageLocalBounds(image.Get(),&bounds)) ||
-            bounds.right<=bounds.left || bounds.bottom<=bounds.top) return;
-        glyph={text,size,foreground,std::move(image),bounds};
+        // example the clipboard). Estimate from the layered outlines, then
+        // measure the rendered ink once per symbol/size (CPU only).
+        ComPtr<ID2D1Factory> factory; target->GetFactory(&factory);
+        InkBoundsRenderer ink(factory.Get());
+        if(!factory || FAILED(layout->Draw(nullptr,&ink,0.f,0.f)) || !ink.Valid()) return;
+        D2D1_RECT_F rendered{};
+        glyph={text,size,foreground,layout,
+            RenderedDragInk(factory.Get(),layout.Get(),foreground,ink.bounds,size,rendered) ? rendered : ink.bounds};
         DrawCenteredDragLabel(target,brush,text,family,size,rect,foreground,true,&glyph); return;
     }
     DWRITE_OVERHANG_METRICS ink{};
@@ -18246,9 +18463,55 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
     target->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     target->SetTransform(previous);
 }
+DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,float side) {
+    DragShadow result;
+    result.identity=image.pixels.data.Identity(); result.side=side;
+    const float pad=DragShadowPadding(side);
+    const auto rect=DragArtworkRect(image.pixels,side,0.f,0.f);
+    const float width=rect.right-rect.left,height=rect.bottom-rect.top;
+    const auto size=D2D1::SizeU(UINT(std::ceil(width+2*pad)),UINT(std::ceil(height+2*pad)));
+    const auto properties=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+    ComPtr<ID2D1Bitmap1> mask;
+    ComPtr<ID2D1Effect> shadow;
+    if(FAILED(target->CreateBitmap(size,nullptr,0,&properties,&mask)) ||
+        FAILED(target->CreateBitmap(size,nullptr,0,&properties,&result.bitmap)) ||
+        FAILED(target->CreateEffect(CLSID_D2D1Shadow,&shadow)) ||
+        FAILED(shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,DragShadowSigma(side))) ||
+        FAILED(shadow->SetValue(D2D1_SHADOW_PROP_COLOR,D2D1::Vector4F(0.f,0.f,0.f,.42f)))) {
+        result.bitmap.Reset(); return result;
+    }
+    ComPtr<ID2D1Image> previous; target->GetTarget(&previous);
+    D2D1_MATRIX_3X2_F transform{}; target->GetTransform(&transform);
+    target->SetTransform(D2D1::Matrix3x2F::Identity()); target->SetTarget(mask.Get());
+    target->BeginDraw(); target->Clear(D2D1::ColorF(0,0.f));
+    const auto destination=D2D1::RectF(pad,pad,pad+width,pad+height);
+    const auto& pixels=image.pixels;
+    const auto source=D2D1::RectF(0,0,float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width),
+        float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height));
+    if(artwork && pixels.Ready()) {
+        target->DrawBitmap(artwork,&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+    } else {
+        ComPtr<ID2D1SolidColorBrush> silhouette;
+        if(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White,.8f),&silhouette))) {
+            const auto fallback=D2D1::RectF(pad+side*.2f,pad+side*.15f,pad+side*.8f,pad+side*.85f);
+            target->FillRoundedRectangle(D2D1::RoundedRect(fallback,side*.04f,side*.04f),silhouette.Get());
+        }
+    }
+    HRESULT hr=target->EndDraw();
+    if(SUCCEEDED(hr)) {
+        shadow->SetInput(0,mask.Get());
+        target->SetTarget(result.bitmap.Get()); target->BeginDraw(); target->Clear(D2D1::ColorF(0,0.f));
+        target->DrawImage(shadow.Get()); hr=target->EndDraw();
+    }
+    target->SetTarget(previous.Get()); target->SetTransform(transform);
+    if(FAILED(hr)) result.bitmap.Reset();
+    return result;
+}
+
 void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     const std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages>* existingArtwork=nullptr,DragGlyph* glyph=nullptr,
-    const DragTextStyle* textStyle=nullptr) {
+    const DragTextStyle* textStyle=nullptr,const std::array<DragShadow,kDragPreviewImages>* shadows=nullptr) {
     const float side=preview.side;
     const auto geometry=LayoutDragPreview(preview);
     ComPtr<ID2D1SolidColorBrush> brush;
@@ -18271,6 +18534,14 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         const auto& pixels=image.pixels;
         const auto destination=DragArtworkRect(pixels,side,center,bottom);
         target->SetTransform(DragStackTransform(preview,layer,square)*original);
+        if(shadows && (*shadows)[layer].bitmap) {
+            const float pad=DragShadowPadding(side),offset=DragShadowOffset(side);
+            const auto& shadow=(*shadows)[layer].bitmap;
+            const auto size=shadow->GetSize();
+            const auto bounds=D2D1::RectF(destination.left-pad,destination.top-pad+offset,
+                destination.left-pad+size.width,destination.top-pad+offset+size.height);
+            target->DrawBitmap(shadow.Get(),bounds,1.f,D2D1_INTERPOLATION_MODE_LINEAR);
+        }
         ComPtr<ID2D1Bitmap> bitmap=existingArtwork ? (*existingArtwork)[layer]:nullptr;
         if(pixels.Ready() && (bitmap || SUCCEEDED(target->CreateBitmap(D2D1::SizeU(pixels.width,pixels.height),
             pixels.data.data(),pixels.stride,D2D1::BitmapProperties(
@@ -18300,12 +18571,17 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         preview.rtl ? L"\u2B05\uFE0F":L"\u27A1\uFE0F",L"Segoe UI Emoji",badge*.82f,rect,preview.foreground,true,glyph);
     if(preview.count>1) {
         const auto count=preview.count>999 ? L"999+":std::to_wstring(preview.count);
-        const float height=side*.38f,width=std::max(height,height*.65f*float(count.size())+height*.4f);
+        const float height=side*.38f*preview.dragBadgeScaling;
+        const float width=std::max(height,height*.65f*float(count.size())+height*.4f);
         const float x=std::clamp(preview.rtl ? geometry.artwork.right-width:geometry.artwork.left,
             geometry.edge,float(geometry.extent.width)-geometry.edge-width);
         const auto bounds=D2D1::RectF(x,geometry.artwork.top,x+width,geometry.artwork.top+height);
-        color(preview.accent); target->FillRoundedRectangle(D2D1::RoundedRect(bounds,height*.5f,height*.5f),brush.Get());
-        DrawCenteredDragLabel(target,brush.Get(),count,L"Segoe UI",height*.7f,bounds,ReadableForeground(preview.accent,{preview.foreground}));
+        const auto palette=preview.badgePalette;
+        color(COLORREF(palette&0xFFFFFF)); target->FillRoundedRectangle(D2D1::RoundedRect(bounds,height*.5f,height*.5f),brush.Get());
+        brush->SetOpacity(float((palette>>48)&255)/255.f);
+        DrawCenteredDragLabel(target,brush.Get(),count,nullptr,height*.7f,bounds,COLORREF((palette>>24)&0xFFFFFF),
+            false,nullptr,preview.captionFormat.Get());
+        brush->SetOpacity(1.f);
     }
     if(preview.caption) {
         const auto rect=geometry.caption;
@@ -18314,7 +18590,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         target->DrawRoundedRectangle(D2D1::RoundedRect(rect,geometry.edge,geometry.edge),brush.Get(),float(preview.dpi)/96.f);
         color(preview.foreground);
         target->DrawTextLayout(D2D1::Point2F(rect.left+geometry.edge,rect.top+geometry.edge),preview.caption.Get(),brush.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 }
 
@@ -18331,7 +18607,7 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     if(layer.window!=preview->window) layer={};
     const bool entering=!layer.visual;
     if(entering && (FAILED(state.composition->CreateTargetForHwnd(preview->window,TRUE,&layer.target)) ||
-        // This surface scales during lift/settle, unlike pixel-aligned list
+        // This surface scales during entry, unlike pixel-aligned list
         // text. Keep DComp's smooth default instead of snapping emoji texels.
         FAILED(state.composition->CreateVisual(&layer.visual)) ||
         FAILED(layer.target->SetRoot(layer.visual.Get())))) {layer={}; return false;}
@@ -18355,29 +18631,47 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
                 D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&layer.artwork[i]);
         }
     }
+    // Blur only on new artwork or DPI/size changes, and share the result for
+    // identical icons. Pointer motion and operation/caption updates reuse it.
+    for(size_t i=0;i<kDragPreviewImages;++i) {
+        const auto identity=layer.artworkIdentity[i];
+        auto& shadow=layer.shadows[i];
+        if(i>=preview->imageCount) {shadow={}; continue;}
+        if(shadow.identity==identity && shadow.side==preview->side) continue;
+        shadow={}; shadow.identity=identity; shadow.side=preview->side;
+        bool shared=false;
+        for(size_t j=0;j<i;++j) if(layer.shadows[j].identity==identity && layer.shadows[j].side==preview->side) {
+            shadow=layer.shadows[j]; shared=true; break;
+        }
+        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),preview->Image(i),preview->side);
+    }
     ComPtr<ID2D1Image> previous; state.target->GetTarget(&previous);
     ComPtr<IDWriteRenderingParams> previousTextParams; state.target->GetTextRenderingParams(&previousTextParams);
     const auto previousTextMode=state.target->GetTextAntialiasMode();
     D2D1_MATRIX_3X2_F transform{}; state.target->GetTransform(&transform);
     state.target->SetTarget(layer.plane.bitmap.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
     state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
-    DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle);
+    DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle,&layer.shadows);
     const HRESULT draw=state.target->EndDraw();
     state.target->SetTarget(previous.Get()); state.target->SetTransform(transform);
     state.target->SetTextRenderingParams(previousTextParams.Get()); state.target->SetTextAntialiasMode(previousTextMode);
     if(FAILED(draw) || !PublishModePlane(state,layer.plane) || FAILED(layer.visual->SetContent(layer.plane.surface.Get()))) return false;
-    // The tab's existing device/compositor animates a short lift on entry and
-    // a gentle settle on effect/artwork changes. No periodic owner-thread work.
-    if(preview->animate) {
+    // Entry can lift once; changing an operation, caption or thumbnail must
+    // never restart scale animation or make pointer movement appear delayed.
+    if(entering && preview->animate) {
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-        layer.curve=UiCompositionCurve(state,entering ? .88f:.97f,1.f,now);
+        layer.curve=UiCompositionCurve(state,.88f,1.f,now);
         if(layer.curve && SUCCEEDED(state.composition->CreateScaleTransform(&layer.scale))) {
-            const auto image=LayoutDragPreview(*preview).artwork;
-            layer.scale->SetCenterX((image.left+image.right)*.5f); layer.scale->SetCenterY((image.top+image.bottom)*.5f);
             layer.scale->SetScaleX(layer.curve.Get()); layer.scale->SetScaleY(layer.curve.Get());
             layer.visual->SetTransform(layer.scale.Get());
         }
-    } else layer.visual->SetTransform(static_cast<IDCompositionTransform*>(nullptr));
+    } else if(!preview->animate) {
+        layer.visual->SetTransform(static_cast<IDCompositionTransform*>(nullptr)); layer.scale.Reset(); layer.curve.Reset();
+    }
+    if(layer.scale) {
+        const auto image=LayoutDragPreview(*preview).artwork;
+        layer.scale->SetCenterX((image.left+image.right)*.5f); layer.scale->SetCenterY(image.bottom-preview->side*.5f);
+    }
     layer.window=preview->window; layer.snapshot=preview;
     accepted=SUCCEEDED(state.composition->Commit());
     return accepted;
@@ -19688,7 +19982,7 @@ void Paint(ViewState& state) {
                     g_frameTimeLogging.load(std::memory_order_relaxed)))
                     Wh_Log(L"[GPU composition] %s tab=%p origin=%lld header=%.2f->%.2f duration=%u ms columns=%zu grid=%d kind=%s (DWM clock; frame summaries measure CPU submissions)",
                         compositionFrame.Rows() ? L"ROWS" : L"COLUMNS",state.activeTabHost,state.modeComposition.started.QuadPart,state.columnHeaderFrom,
-                        state.columnHeaderTo,kUiTransitionDurationMs,state.columns.size(),state.gridView,
+                        state.columnHeaderTo,static_cast<unsigned>(kUiTransitionDurationMs),state.columns.size(),state.gridView,
                     compositionFrame.Rows() ? L"rows" : state.modeComposition.widths ? L"fit" : L"mode");
                 state.modeComposition.published=true;
             }
@@ -22484,21 +22778,31 @@ void AlignWrappedRenameText(ViewState& state) {
         std::max(0L, (client.right - 1) / 2));
     const LONG y = std::min(std::max(0L, padding.cy - GetSystemMetricsForDpi(SM_CYBORDER, ViewDpi(state))),
         std::max(0L, (client.bottom - 1) / 2));
-    // Padding belongs to this independent editor, so growing or moving it
-    // above a bottom-edge label never leaves an empty band above its text.
+    // Grid captions start at the label's top; list captions center their whole
+    // native text block in the row, including any wrapped filename lines.
     RECT aligned{x, y, std::max(x + 1, client.right - x), std::max(y + 1, client.bottom - y)};
     // EDIT normalizes formatting heights to its own line metrics (and can
     // retain a minimum height in tiny viewports). Comparing EM_GETRECT with
     // the request repeatedly reformats/invalidates an otherwise settled field.
     auto& rename=state.rename;
-    if (!rename.requestedTextRectValid || !EqualRect(&rename.requestedTextRect, &aligned)) {
-        SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
-        rename.requestedTextRect=aligned;
-        rename.requestedTextRectValid=true;
-        InvalidateRect(editor, nullptr, FALSE);
+    const bool wrapped = RenameItemGeometry(state, rename.index).wrapped;
+    const int lineHeight = RenameLineHeight(editor);
+    // A changed formatting width can rewrap the native EDIT. Apply that width
+    // first, then settle the vertical origin using its resulting line count.
+    for (int pass = 0; pass < 2; ++pass) {
+        const LRESULT lines = SendMessageW(editor, EM_GETLINECOUNT, 0, 0);
+        if (!wrapped && lineHeight > 0)
+            aligned.top = std::max<LONG>(y, (client.bottom - lines * lineHeight) / 2);
+        if (!rename.requestedTextRectValid || !EqualRect(&rename.requestedTextRect, &aligned)) {
+            SendMessageW(editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&aligned));
+            rename.requestedTextRect=aligned;
+            rename.requestedTextRectValid=true;
+            InvalidateRect(editor, nullptr, FALSE);
+        }
+        if (SendMessageW(editor, EM_GETLINECOUNT, 0, 0) == lines) break;
     }
     const int first = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
-    if (first > 0 && SendMessageW(editor, EM_GETLINECOUNT, 0, 0) * RenameLineHeight(editor) <= aligned.bottom - aligned.top)
+    if (first > 0 && SendMessageW(editor, EM_GETLINECOUNT, 0, 0) * lineHeight <= aligned.bottom - aligned.top)
         SendMessageW(editor, EM_LINESCROLL, 0, -first);
 }
 
@@ -25052,26 +25356,39 @@ ShellDropText ReadShellDropText(IDataObject* data,DWORD effect) {
     return result;
 }
 bool UpdateDragCaption(ViewState& state,DragPreview& preview,const ShellDropText& text,float available) {
-    if(!state.headerFormat && !text.text.empty() && g_writeFactory) MakeTextFormats(state);
+    if(!state.headerFormat && g_writeFactory) MakeTextFormats(state);
     if(preview.description==text.text && preview.captionDpi==preview.dpi && preview.captionFace==state.textFaceSerial &&
         preview.captionAvailable==available) return false;
+    const auto& source=state.headerFormat;
+    if(source && g_writeFactory && (!preview.captionFormat || preview.captionDpi!=preview.dpi || preview.captionFace!=state.textFaceSerial)) {
+        std::wstring family(source->GetFontFamilyNameLength()+1,L'\0'),locale(source->GetLocaleNameLength()+1,L'\0');
+        ComPtr<IDWriteFontCollection> collection; ComPtr<IDWriteTextFormat> format;
+        if(SUCCEEDED(source->GetFontFamilyName(family.data(),UINT32(family.size()))) &&
+            SUCCEEDED(source->GetLocaleName(locale.data(),UINT32(locale.size()))) && SUCCEEDED(source->GetFontCollection(&collection)) &&
+            SUCCEEDED(g_writeFactory->CreateTextFormat(family.c_str(),collection.Get(),source->GetFontWeight(),source->GetFontStyle(),
+                source->GetFontStretch(),source->GetFontSize()*float(preview.dpi)/ViewDpi(state),locale.c_str(),&format))) {
+            format->SetReadingDirection(preview.rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT:DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+            format->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
+            ComPtr<IDWriteTextLayout> measure; DWRITE_TEXT_METRICS metrics{};
+            if(SUCCEEDED(g_writeFactory->CreateTextLayout(L" ",1,format.Get(),1e6f,1e6f,&measure)) &&
+                SUCCEEDED(measure->GetMetrics(&metrics))) preview.captionMaxHeight=std::ceil(3.f*metrics.height);
+            ComPtr<IDWriteInlineObject> ellipsis;
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};
+            if(SUCCEEDED(g_writeFactory->CreateEllipsisTrimmingSign(format.Get(),&ellipsis)))
+                format->SetTrimming(&trimming,ellipsis.Get());
+            preview.captionFormat=std::move(format);
+        }
+    }
     preview.captionDpi=preview.dpi; preview.captionFace=state.textFaceSerial; preview.captionAvailable=available;
     preview.description=text.text; preview.caption.Reset(); preview.captionSize={};
-    const auto& source=state.headerFormat;
-    if(text.text.empty() || !source || !g_writeFactory) return true;
-    std::wstring family(source->GetFontFamilyNameLength()+1,L'\0'),locale(source->GetLocaleNameLength()+1,L'\0');
-    ComPtr<IDWriteFontCollection> collection; ComPtr<IDWriteTextFormat> format;
-    if(FAILED(source->GetFontFamilyName(family.data(),UINT32(family.size()))) ||
-        FAILED(source->GetLocaleName(locale.data(),UINT32(locale.size()))) || FAILED(source->GetFontCollection(&collection)) ||
-        FAILED(g_writeFactory->CreateTextFormat(family.c_str(),collection.Get(),source->GetFontWeight(),source->GetFontStyle(),
-            source->GetFontStretch(),source->GetFontSize()*float(preview.dpi)/ViewDpi(state),locale.c_str(),&format))) return true;
-    format->SetReadingDirection(preview.rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT:DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
-    format->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
-    if(FAILED(g_writeFactory->CreateTextLayout(text.text.c_str(),UINT32(text.text.size()),format.Get(),std::max(1.f,available),1e6f,&preview.caption))) return true;
+    if(text.text.empty() || !preview.captionFormat || !g_writeFactory || preview.captionMaxHeight<=0.f) return true;
+    if(FAILED(g_writeFactory->CreateTextLayout(text.text.c_str(),UINT32(text.text.size()),preview.captionFormat.Get(),
+        std::max(1.f,available),preview.captionMaxHeight,&preview.caption))) return true;
     if(text.insert.length) preview.caption->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD,text.insert);
     DWRITE_TEXT_METRICS metrics{};
     if(SUCCEEDED(preview.caption->GetMetrics(&metrics))) {
-        preview.captionSize=D2D1::SizeF(std::ceil(metrics.widthIncludingTrailingWhitespace),std::ceil(metrics.height));
+        preview.captionSize=D2D1::SizeF(std::min(std::max(1.f,available),std::ceil(metrics.widthIncludingTrailingWhitespace)),
+            std::min(preview.captionMaxHeight,std::ceil(metrics.height)));
         preview.caption->SetMaxWidth(std::max(1.f,preview.captionSize.width));
     }
     return true;
@@ -25083,6 +25400,99 @@ class ShellDragFeedback final : public IDropSource, public IDropSourceNotify {
     unsigned long long lifetime_;
     std::shared_ptr<PresentationLane> lane_;
     ComPtr<IDataObject> data_;
+    DWORD touchDragKeys_ = MAXDWORD; // Log changes only, never every OLE feedback callback.
+    ShellDropText caption_;
+    HHOOK mouseHook_=nullptr;
+    bool tracking_=false,moving_=false;
+    ShellDragFeedback* previousTracking_=nullptr;
+    inline static thread_local ShellDragFeedback* trackingSource_=nullptr;
+    HWINEVENTHOOK nativeVisualHook_=nullptr;
+    std::vector<HWND> nativeWindows_,preexistingNativeWindows_;
+    bool nativeVisible_=false;
+
+    static bool IsNativePreviewWindow(HWND hwnd) {
+        wchar_t name[64]{};
+        // Observed WinUI drag visual host, independent of Shell SysDragImage
+        // metadata. The host can live in another process on this desktop.
+        return GetClassNameW(hwnd,name,ARRAYSIZE(name)) && !wcscmp(name,L"DragVisualWindow");
+    }
+    static BOOL CALLBACK CollectExistingNativePreview(HWND hwnd,LPARAM context) {
+        if(IsNativePreviewWindow(hwnd) && IsWindowVisible(hwnd))
+            reinterpret_cast<ShellDragFeedback*>(context)->preexistingNativeWindows_.push_back(hwnd);
+        return TRUE;
+    }
+
+    void SetNativePreviewVisible(bool visible) {
+        if(visible==nativeVisible_ || !window_) return;
+        nativeVisible_=visible;
+        if(visible) ShowWindow(window_,SW_HIDE);
+        else {POINT point{}; if(GetCursorPos(&point)) MovePreview(point);}
+    }
+    void RefreshNativePreview() {
+        // Reconcile current visibility rather than replaying queued show/hide
+        // states. Multiple monitor hosts must all disappear before restoration.
+        std::erase_if(nativeWindows_,[](HWND hwnd) {return !IsNativePreviewWindow(hwnd) || !IsWindowVisible(hwnd);});
+        SetNativePreviewVisible(!nativeWindows_.empty());
+    }
+    void NativePreviewEvent(HWND hwnd) {
+        const bool visible=IsNativePreviewWindow(hwnd) && IsWindowVisible(hwnd);
+        if(!visible) {
+            std::erase(preexistingNativeWindows_,hwnd);
+            std::erase(nativeWindows_,hwnd);
+        } else if(std::find(preexistingNativeWindows_.begin(),preexistingNativeWindows_.end(),hwnd)==preexistingNativeWindows_.end() &&
+            std::find(nativeWindows_.begin(),nativeWindows_.end(),hwnd)==nativeWindows_.end()) {
+            nativeWindows_.push_back(hwnd);
+        }
+        RefreshNativePreview();
+    }
+
+    static void CALLBACK NativePreviewVisibilityEvent(HWINEVENTHOOK hook,DWORD,HWND hwnd,LONG object,LONG child,DWORD,DWORD) {
+        WindowCallbackGuard callback;
+        if(object!=OBJID_WINDOW || child || g_unloading.load(std::memory_order_acquire)) return;
+        // Out-of-context events run on the installing STA. Match the hook as
+        // well as the TLS source, including nested drags on that same STA.
+        for(auto* source=trackingSource_;source;source=source->previousTracking_) if(source->nativeVisualHook_==hook) {
+            if(source==trackingSource_) source->NativePreviewEvent(hwnd);
+            break;
+        }
+    }
+    void MovePreview(POINT cursor) {
+        auto* live=State(source_);
+        if(moving_ || !window_ || !live || live->lifetimeToken!=lifetime_ || !live->dragPreview) return;
+        ScopedFlag moving(moving_);
+        const auto owned=live->dragPreview;
+        RefreshNativePreview();
+        if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return;
+        auto& preview=*owned;
+        const auto text=caption_;
+        MONITORINFO monitor{sizeof(monitor)};
+        const auto destination=MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST);
+        const bool hasMonitor=GetMonitorInfoW(destination,&monitor)!=FALSE;
+        for(int pass=0;pass<2;++pass) {
+            if(preview.monitor!=destination) {preview.monitor=destination; PublishDragPreview(*live);}
+            const float available=hasMonitor ? float(monitor.rcWork.right-monitor.rcWork.left)/3.f:preview.captionAvailable;
+            if(UpdateDragCaption(*live,preview,text,available)) PublishDragPreview(*live);
+            const auto size=DragPreviewExtent(preview);
+            const auto position=PositionDragPreview(preview,cursor,live->touch.dragPromoted);
+            SetWindowPos(window_,nullptr,position.x,position.y,int(size.width),int(size.height),
+                SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER|(nativeVisible_ ? 0:SWP_SHOWWINDOW));
+            if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return;
+            const int dpi=DpiOf(window_);
+            if(dpi==preview.dpi) break;
+            preview.side*=float(dpi)/preview.dpi; preview.dpi=dpi;
+            VisitImageTiers([&](UINT size) {live->dragPreviewSize=size; return size<preview.side;});
+            PublishDragPreview(*live); RequestVisibleIcons(*live); RefreshDragPreview(*live);
+        }
+    }
+    static LRESULT CALLBACK TrackMouse(int code,WPARAM message,LPARAM data) {
+        WindowCallbackGuard callback;
+        // OLE captures mouse input on this source STA even over windows that
+        // have no drop target. GiveFeedback need not run in those gaps.
+        if(code==HC_ACTION && (message==WM_MOUSEMOVE || message==WM_NCMOUSEMOVE) &&
+            data && trackingSource_ && !g_unloading.load(std::memory_order_acquire))
+            trackingSource_->MovePreview(reinterpret_cast<const MOUSEHOOKSTRUCT*>(data)->pt);
+        return CallNextHookEx(nullptr,code,message,data);
+    }
 public:
     explicit ShellDragFeedback(ViewState& state,int row,int count,IDataObject* data) :
         source_(state.hwnd),lifetime_(state.lifetimeToken),lane_(state.presenter),data_(data) {
@@ -25099,6 +25509,7 @@ public:
         if(GetCursorPos(&pointer) && GetMonitorInfoW(MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST),&monitor))
             preview->captionAvailable=float(monitor.rcWork.right-monitor.rcWork.left)/3.f;
         preview->monitor=MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST);
+        UpdateDragCaption(state,*preview,{},preview->captionAvailable);
         const auto size=DragPreviewExtent(*preview);
         // A system-class layered, input-transparent window has no DLL callback,
         // focus/capture, drop target or worker of its own.
@@ -25133,14 +25544,56 @@ public:
         RefreshDragPreview(state);
     }
     bool HasPreview() const {return window_!=nullptr;}
-    ~ShellDragFeedback() {
-        if(auto* live=State(source_); live && live->lifetimeToken==lifetime_) {
+    void StartPointerTracking() {
+        if(!window_ || tracking_) return;
+        // A nested OLE drag on the same STA borrows the outer hook; other
+        // Explorer threads/tabs have independent trackingSource_ pointers.
+        if(!trackingSource_) {
+            mouseHook_=SetWindowsHookExW(WH_MOUSE,TrackMouse,nullptr,GetCurrentThreadId());
+            if(!mouseHook_) {
+                Wh_Log(L"[GPU dragdrop] pointer tracking unavailable error=%lu",GetLastError());
+                ReleasePreview();
+                return;
+            }
+        }
+        previousTracking_=trackingSource_; trackingSource_=this; tracking_=true;
+        // Subscribe before the modal loop starts. Ignore visuals belonging to
+        // a preexisting/nested drag, and observe new hosts in any process.
+        nativeVisualHook_=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,NativePreviewVisibilityEvent,
+            0,0,WINEVENT_OUTOFCONTEXT);
+        const DWORD eventError=nativeVisualHook_ ? ERROR_SUCCESS:GetLastError();
+        EnumWindows(CollectExistingNativePreview,reinterpret_cast<LPARAM>(this));
+        if(!nativeVisualHook_) {
+            Wh_Log(L"[GPU drag handoff] visibility observer unavailable error=%lu; using native preview",eventError);
+            StopPointerTracking(); ReleasePreview(); return;
+        }
+    }
+    void StopPointerTracking() {
+        if(!tracking_) return;
+        if(nativeVisualHook_) {UnhookWinEvent(nativeVisualHook_); nativeVisualHook_=nullptr;}
+        trackingSource_=previousTracking_; previousTracking_=nullptr; tracking_=false;
+        if(mouseHook_) {UnhookWindowsHookEx(mouseHook_); mouseHook_=nullptr;}
+    }
+    void ReleasePreview() {
+        if(!window_) return;
+        auto* live=State(source_);
+        const bool newerPreview=live && live->lifetimeToken==lifetime_ &&
+            live->dragPreview && live->dragPreview->window!=window_;
+        if(live && live->lifetimeToken==lifetime_ &&
+            live->dragPreview && live->dragPreview->window==window_) {
             live->dragPreview.reset(); live->dragPreviewEntries={}; live->dragPreviewSize=0;
         }
-        if(lane_ && !lane_->stopping.load(std::memory_order_acquire)) {
-            std::lock_guard lock(lane_->mutex); lane_->dragPreview=std::shared_ptr<const DragPreview>{}; SetEvent(lane_->wake);
+        if(!newerPreview && lane_ && !lane_->stopping.load(std::memory_order_acquire)) {
+            std::lock_guard lock(lane_->mutex);
+            if(!lane_->dragPreview || !*lane_->dragPreview || (*lane_->dragPreview)->window==window_) {
+                lane_->dragPreview=std::shared_ptr<const DragPreview>{}; SetEvent(lane_->wake);
+            }
         }
-        if(window_) DestroyWindow(window_);
+        DestroyWindow(window_); window_=nullptr;
+    }
+    ~ShellDragFeedback() {
+        StopPointerTracking();
+        ReleasePreview();
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         WindowCallbackGuard callback;
@@ -25157,11 +25610,28 @@ public:
     }
     HRESULT STDMETHODCALLTYPE DragEnterTarget(HWND) override {WindowCallbackGuard callback; return S_OK;}
     HRESULT STDMETHODCALLTYPE DragLeaveTarget() override {
-        WindowCallbackGuard callback; ClearShellDropDescription(data_.Get()); return S_OK;
+        WindowCallbackGuard callback;
+        caption_={};
+        if(auto* live=State(source_); live && live->lifetimeToken==lifetime_ && live->dragPreview) {
+            auto& preview=*live->dragPreview;
+            preview.effect=DROPEFFECT_NONE;
+            UpdateDragCaption(*live,preview,{},preview.captionAvailable);
+            PublishDragPreview(*live);
+        }
+        ClearShellDropDescription(data_.Get());
+        RefreshNativePreview();
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape,DWORD keys) override {
         WindowCallbackGuard callback;
         const auto* live=State(source_);
+        if (live && live->lifetimeToken==lifetime_ && live->touch.dragPromoted &&
+            g_perf.load(std::memory_order_relaxed) && (escape || keys!=touchDragKeys_)) {
+            touchDragKeys_=keys;
+            Wh_Log(L"[GPU touch drag] OLE continue pointer=%u escape=%d keys=0x%08lX unloading=%d",
+                live->touch.primary,escape,keys,g_unloading.load(std::memory_order_relaxed));
+            if (escape || !(keys & MK_LBUTTON)) TraceTouchDrag(*live,L"OLE release decision",true);
+        }
         if(escape || g_unloading.load(std::memory_order_acquire) || !live || live->lifetimeToken!=lifetime_ ||
             (keys&MK_RBUTTON)) return DRAGDROP_S_CANCEL;
         // OLE key flags use logical buttons, including swapped-button systems;
@@ -25175,41 +25645,31 @@ public:
         const auto owned=live->dragPreview;
         auto& preview=*owned;
         effect&=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
-        const auto text=ReadShellDropText(data_.Get(),effect);
+        const auto text=effect ? ReadShellDropText(data_.Get(),effect):ShellDropText{};
         if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return DRAGDROP_S_USEDEFAULTCURSORS;
+        caption_=text;
         const auto accent=g_selectionRgb.load(std::memory_order_relaxed);
+        const auto badgePalette=g_swipePalette.load(std::memory_order_relaxed);
         const auto background=ValidRgb(live->itemTip.background) ? live->itemTip.background:live->nativeEditBackground;
         const auto foreground=ValidRgb(live->itemTip.foreground) ? live->itemTip.foreground:live->nativeEditForeground;
-        if(preview.effect!=effect || preview.background!=background || preview.foreground!=foreground || preview.accent!=accent) {
+        if(preview.effect!=effect || preview.background!=background || preview.foreground!=foreground ||
+            preview.accent!=accent || preview.badgePalette!=badgePalette) {
             preview.effect=effect; preview.background=background; preview.foreground=foreground;
             preview.accent=accent;
+            preview.badgePalette=badgePalette;
             PublishDragPreview(*live);
         }
         POINT cursor{};
-        if(GetCursorPos(&cursor)) {
-            MONITORINFO monitor{sizeof(monitor)};
-            if(GetMonitorInfoW(MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST),&monitor)) for(int pass=0;pass<2;++pass) {
-                const auto destination=MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST);
-                if(preview.monitor!=destination) {preview.monitor=destination; PublishDragPreview(*live);}
-                if(UpdateDragCaption(*live,preview,text,float(monitor.rcWork.right-monitor.rcWork.left)/3.f)) PublishDragPreview(*live);
-                const auto size=DragPreviewExtent(preview);
-                const auto position=PositionDragPreview(preview,cursor,monitor.rcWork,live->touch.dragPromoted);
-                SetWindowPos(window_,HWND_TOPMOST,position.x,position.y,int(size.width),int(size.height),SWP_NOACTIVATE|SWP_SHOWWINDOW);
-                if(State(source_)!=live || live->lifetimeToken!=lifetime_) return DRAGDROP_S_USEDEFAULTCURSORS;
-                const int dpi=DpiOf(window_);
-                if(dpi==preview.dpi) break;
-                preview.side*=float(dpi)/preview.dpi; preview.dpi=dpi;
-                VisitImageTiers([&](UINT size) {live->dragPreviewSize=size; return size<preview.side;});
-                PublishDragPreview(*live); RequestVisibleIcons(*live); RefreshDragPreview(*live);
-                // Recalculate the hotspot and bounds immediately at the new
-                // monitor DPI, without waiting for another pointer movement.
-            }
-        }
-        if(!preview.rendered->load(std::memory_order_acquire)) return DRAGDROP_S_USEDEFAULTCURSORS;
+        RefreshNativePreview();
+        if(GetCursorPos(&cursor)) MovePreview(cursor);
+        const bool ready=preview.rendered->load(std::memory_order_acquire);
+        const bool defaultCursor=nativeVisible_ || !ready || !effect;
+        if(defaultCursor) return DRAGDROP_S_USEDEFAULTCURSORS;
         SetCursor(LoadCursorW(nullptr,IDC_ARROW)); return S_OK;
     }
 };
 void StartNativeShellDrag(ViewState& state, int row) {
+    if (state.touch.dragPromoted) TraceTouchDrag(state,L"shared Shell source");
     if (!state.folderView || !state.loaded || !state.visible ||
         !state.detailsViewActive || state.emptyNative || state.optimisticStartedAt ||
         !TabOwnsActiveView(state) || !DisplayedRow(state, row) ||
@@ -25237,11 +25697,11 @@ void StartNativeShellDrag(ViewState& state, int row) {
     }
     const HWND hwnd = state.hwnd;
     ViewState* const sourceState = &state;
+    const auto originFolder=state.folderPath;
+    const auto originItem=state.entries[static_cast<size_t>(row)].path;
     state.shellDragRunning = true;
-    // Keep the origin valid throughout the reentrant OLE modal loop. It is
-    // removed unconditionally when the OLE loop returns, even after navigation.
-    RegisterGpuDragOrigin(objects.Get(), state.hwnd, state.folderPath,
-        state.entries[static_cast<size_t>(row)].path);
+    NativeFileCommandScope command(&state);
+    if (state.touch.dragPromoted) TraceTouchDrag(state,L"enter OLE",true);
     ComPtr<IDropSource> feedback;
     auto* visuals=new ShellDragFeedback(state,row,nativeCount,objects.Get());
     feedback.Attach(visuals);
@@ -25249,13 +25709,16 @@ void StartNativeShellDrag(ViewState& state, int row) {
     DWORD effect = DROPEFFECT_NONE;
     // Shell owns data formats and all target behavior. Feedback is shared by
     // mouse, touchpad and promoted touch, including external applications.
-    NativeFileCommandScope command(&state);
-    // SHDoDragDrop manufactures a generic image if no source bitmap exists.
-    // Our source already implements OLE feedback: bypass that image-producing
-    // wrapper while preserving the exact Shell IDataObject and target routing.
+    // Keep our source visual independent of Shell's generic image wrapper.
+    // WinUI supplies its own visual host; the visibility observer yields to it.
     const DWORD allowed=DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+    // Keep the origin valid throughout the reentrant OLE modal loop. It is
+    // removed unconditionally when the OLE loop returns, even after navigation.
+    RegisterGpuDragOrigin(objects.Get(), hwnd, originFolder, originItem);
+    visuals->StartPointerTracking();
     const HRESULT hr = visuals->HasPreview() ? DoDragDrop(objects.Get(),feedback.Get(),allowed,&effect) :
         SHDoDragDrop(hwnd,objects.Get(),feedback.Get(),allowed,&effect);
+    visuals->StopPointerTracking();
     feedback.Reset();
     UnregisterGpuDragOrigin(objects.Get(), hwnd);
     // The OLE modal loop can re-enter navigation and even destroy this HWND.
@@ -26368,6 +26831,7 @@ void StopColdAttachObserver() {
 struct FrameShellViewHook {
     HWINEVENTHOOK handle = nullptr;
     HWINEVENTHOOK presentationHandle = nullptr;
+    HHOOK presentationMessages = nullptr;
     HWINEVENTHOOK selectionHandle = nullptr;
     HWINEVENTHOOK foregroundHandle = nullptr;
     HWND cleanupWindow = nullptr;
@@ -26401,6 +26865,7 @@ void ReleaseFrameHookResources(HWND frame, const FrameShellViewHook& hooks,
                                HWND destroyingOwner = nullptr) {
     for (HWINEVENTHOOK hook : {hooks.handle,hooks.presentationHandle,hooks.selectionHandle,hooks.foregroundHandle})
         if (hook) UnhookWinEvent(hook);
+    if (hooks.presentationMessages) UnhookWindowsHookEx(hooks.presentationMessages);
     if (hooks.subclassInstalled) {
         RemovePropW(frame,kFrameSizingProperty);
         RemoveWindowSubclass(frame,ExplorerFrameSubclass,reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass));
@@ -26536,7 +27001,7 @@ void ClearFrameShellViewHooks() {
                 if (IsWindow(hooks.cleanupWindow)) receiver=hooks.cleanupWindow;
                 if (!receiver && hooks.subclassInstalled && IsWindow(frame)) receiver=frame;
                 if (!receiver && !hooks.subclassInstalled && !hooks.handle &&
-                    !hooks.presentationHandle && !hooks.selectionHandle && !hooks.foregroundHandle) {
+                    !hooks.presentationHandle && !hooks.presentationMessages && !hooks.selectionHandle && !hooks.foregroundHandle) {
                     if (hooks.ownerThread) CloseHandle(hooks.ownerThread);
                     g_shellViewHooks.erase(it); frame=nullptr;
                 }
@@ -26996,6 +27461,18 @@ bool UpdateCapturedPointer(ViewState& state, std::optional<POINT> delivered = {}
     return true;
 }
 
+void ResumeDeferredShellHints(ViewState& state) {
+    if (LayoutAnimationActive(state, true)) return;
+    if (state.nativeModeHintPending && !state.nativeModeSignalQueued)
+        PostShellVisibilityProbe(state, true);
+    if (state.nativeSettingsHintPending && !state.visibilitySignalQueued)
+        PostShellVisibilityProbe(state);
+    if (state.nativeSelectionDirty && !state.nativeSelectionMessageQueued &&
+        state.visible && state.inScope && state.loaded && !state.namesPreview)
+        QueueNativeSelectionHint(state, false);
+    if (state.loaded && state.visible && state.inScope) QueueFeatureInitialization(state);
+}
+
 // The compositor wake and ordinary WM_PAINT share advancement and bounded data
 // delivery. Each tab keeps at most one paced wake outstanding.
 void AdvanceAnimationFrame(ViewState& state, bool paced) {
@@ -27059,16 +27536,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
         state.marqueeFading = false;
     AdvanceSwipeFeedback(state);
     if (NativeColumnSnapshotReady(state)) QueueFeatureInitialization(state);
-    if (!LayoutAnimationActive(state, true)) {
-        if (state.nativeModeHintPending && !state.nativeModeSignalQueued)
-            PostShellVisibilityProbe(state, true);
-        if (state.nativeSettingsHintPending && !state.visibilitySignalQueued)
-            PostShellVisibilityProbe(state);
-        if (state.nativeSelectionDirty && !state.nativeSelectionMessageQueued &&
-            state.visible && state.inScope && state.loaded && !state.namesPreview)
-            QueueNativeSelectionHint(state, false);
-        if (state.loaded && state.visible && state.inScope) QueueFeatureInitialization(state);
-    }
+    ResumeDeferredShellHints(state);
     if (paced) ++state.frameRedraws;
 }
 
@@ -27235,9 +27703,8 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     return model;
 }
 
-void SubmitPresentation(ViewState& state) {
+void QueuePresentationModel(ViewState& state) {
     if(!state.presenter || state.presentationOnly || g_unloading.load(std::memory_order_acquire)) return;
-    ConsumePresentation(state);
     if(state.presenter->stopping.load(std::memory_order_acquire)) return;
     const bool active=!InactiveGraphics(state);
     if(!active && !state.presentationActive) return;
@@ -27256,6 +27723,11 @@ void SubmitPresentation(ViewState& state) {
     PipelineEvent(*state.background,{.operation=L"presentation.submit[rows,images,active]",
         .a=state.presentationSequence,.b=state.token,
         .v={double(state.total),double(state.presentationActive)}},true);
+}
+
+void SubmitPresentation(ViewState& state) {
+    ConsumePresentation(state);
+    QueuePresentationModel(state);
 }
 
 void SynchronizePresentationGeneration(ViewState& state) {
@@ -27849,6 +28321,8 @@ void ConsumePresentation(ViewState& state) {
         if(!receipt->horizontalMoving) state.horizontalAnimating=false;
     }
     bool geometry=false;
+    bool republishStyle=state.zoomAnimating && receipt->zoomOrigin.QuadPart==state.zoomStartedQpc.QuadPart &&
+        receipt->styleRevision!=state.presentationStyleRevision;
     if(state.zoomAnimating && receipt->zoomOrigin.QuadPart==state.zoomStartedQpc.QuadPart &&
         receipt->styleRevision==state.presentationStyleRevision) {
         state.zoomAnimating=receipt->zoom; state.rowPx=receipt->rowHeight; state.fontPx=receipt->fontSize;
@@ -27860,7 +28334,7 @@ void ConsumePresentation(ViewState& state) {
             MakeTextFormats(state,true);
             // A cold/invalidated owner format can resolve its face here.
             // Publish that new style before requiring it on the next receipt.
-            if (style != state.presentationStyleRevision) Redraw(state);
+            if (style != state.presentationStyleRevision) republishStyle=true;
         }
         if(!state.zoomAnimating && state.zoomLayoutTransition) StopRowTransition(state);
     }
@@ -27899,11 +28373,15 @@ void ConsumePresentation(ViewState& state) {
     PipelineEvent(*state.background,{.operation=L"presentation.accept[thread,frames,scroll,rows]",
         .a=receipt->sequence,.b=receipt->token,.v={double(receipt->thread),double(receipt->frames),receipt->scroll,receipt->rowProgress}},true);
     // The independent render owner replaces Paint's old owner-STA completion
-    // hook: resume deferred column/startup work when its animation settles.
-    if(NativeColumnSnapshotReady(state) || !LayoutAnimationActive(state,true)) QueueFeatureInitialization(state);
+    // hook: resume deferred Shell hints and column/startup work on settlement.
+    if(NativeColumnSnapshotReady(state)) QueueFeatureInitialization(state);
+    ResumeDeferredShellHints(state);
     QueueColumnFit(state);
     if (UpdateHorizontalScrollbarVisibility(state)) Redraw(state);
     UnregisterAnimationWhenIdle(state);
+    // EDITs and other siblings may completely occlude the owner HWND, so
+    // invalidation alone cannot guarantee a paint to publish resolved fonts.
+    if(republishStyle) QueuePresentationModel(state);
 }
 
 void RetireOverlayState(ViewState* state);
@@ -27921,6 +28399,38 @@ bool IsTouchMouseInput() {
 bool TouchControlAt(ViewState& state, POINT point) {
     return point.y < ColumnHeaderHeight(state) ||
         OnScrollbar(state, point.x, point.y) || OnHorizontalBar(state, point.x, point.y);
+}
+
+void TraceTouchHitTest(ViewState& state,PCWSTR stage,POINT screen,POINT client,int hit,bool mapped,DWORD mapError) {
+    if(!g_perf.load(std::memory_order_relaxed)) return;
+    const DWORD error=GetLastError();
+    RECT window{},area{}; GetWindowRect(state.hwnd,&window); ViewClientRect(state,&area);
+    const auto viewport=ContentViewport(state,true);
+    const float docX=float(LogicalX(state,client.x))-ListStartX(state);
+    const float docY=client.y-state.headerPx+state.scrollNow;
+    const int group=GroupAtDocument(state,docY);
+    Wh_Log(L"[GPU touch hit] %s pointer=%u screen=(%ld,%ld) client=(%ld,%ld) mapped=%d map-error=%lu hit=%d held=%d total=%d entries=%llu thisPc=%d loaded=%d names-preview=%d",
+        stage,state.touch.primary,screen.x,screen.y,client.x,client.y,mapped,mapError,hit,state.touch.row,state.total,
+        static_cast<unsigned long long>(state.entries.size()),state.thisPcGpu,state.loaded,state.namesPreview);
+    Wh_Log(L"[GPU touch hit] geometry window=(%ld,%ld,%ld,%ld) client-size=(%ld,%ld) viewport=(%ld,%ld,%ld,%ld) dpi=%d thread-dpi=%p mode=%u grid=%d columns=%d item-width=%.3f row=%.3f header=%.3f scroll=%.3f document=(%.3f,%.3f) group=%d groups=%llu transition=%d",
+        window.left,window.top,window.right,window.bottom,area.right,area.bottom,viewport.left,viewport.top,viewport.right,
+        viewport.bottom,ViewDpi(state),GetThreadDpiAwarenessContext(),unsigned(state.cachedNativeMode),state.gridView,
+        state.itemsPerRow,state.itemWidth,double(state.rowPx),state.headerPx,state.scrollNow,docX,docY,group,
+        static_cast<unsigned long long>(state.sections.size()),state.rowTransitionActive);
+    if(group>=0) {
+        const auto& section=state.sections[size_t(group)];
+        Wh_Log(L"[GPU touch hit] group=%d rows=[%d,%d) document=[%.3f,%.3f) heading=%.3f collapsed=%d fraction=%.3f",
+            group,section.first,section.end,section.documentTop,section.documentEnd,GroupHeadingHeight(state),section.collapsed,section.fraction);
+    }
+    // A bounded view of cached geometry, never Shell item/provider queries.
+    for(int row=0;row<std::min(state.total,3);++row) {
+        const auto visual=LayoutRowVisual(state,row,CurrentRowProgress(state));
+        const auto item=LayoutItem(state,visual);
+        Wh_Log(L"[GPU touch hit] row=%d displayed=%d cell=(%.3f,%.3f,%.3f,%.3f) document-top=%.3f height=%.3f",
+            row,DisplayedRow(state,row),item.cell.left,item.cell.top,item.cell.right,item.cell.bottom,
+            DocumentRowTop(state,row),DisplayRowHeight(state,row));
+    }
+    SetLastError(error);
 }
 
 void CompleteHeaderCheckboxAction(ViewState& state) {
@@ -28083,29 +28593,42 @@ void CancelTouchMarquee(ViewState& state) {
     }
 }
 
-bool TouchDragReady(ViewState& state) {
-    if (!state.touch.dragPending || !state.touch.active || !state.touch.down ||
-        state.touch.epoch != state.mouseFolderEpoch || !TouchItemValid(state) ||
-        state.pendingNativeSelection || state.nativeSelectionUnsafe || state.nativeSelectionImportPending ||
-        state.nativeSelectionAwaitingRefresh || !state.visible || !TabOwnsActiveView(state) ||
-        !state.loaded || !state.folderView || !state.shellBrowser || !state.shellOleInitialized ||
-        !state.detailsViewActive || state.emptyNative || state.optimisticStartedAt || state.shellDragRunning) return false;
+PCWSTR TouchDragBlock(ViewState& state) {
+    if (!state.touch.dragPending) return L"not pending";
+    if (!state.touch.active || !state.touch.down) return L"contact ended";
+    if (state.touch.epoch != state.mouseFolderEpoch || !TouchItemValid(state)) return L"item changed";
+    if (state.pendingNativeSelection || state.nativeSelectionUnsafe || state.nativeSelectionImportPending ||
+        state.nativeSelectionAwaitingRefresh) return L"native selection not ready";
+    if (!state.visible || !TabOwnsActiveView(state)) return L"inactive view";
+    if (!state.loaded || !state.folderView || !state.shellBrowser || !state.shellOleInitialized ||
+        !state.detailsViewActive || state.emptyNative || state.optimisticStartedAt || state.shellDragRunning)
+        return L"Shell source not ready";
     const int row = state.touch.row;
-    return row >= 0 && size_t(row) < state.selectedFlags.size() && state.selectedFlags[size_t(row)];
+    return row >= 0 && size_t(row) < state.selectedFlags.size() && state.selectedFlags[size_t(row)] ?
+        nullptr : L"held item not selected";
 }
+bool TouchDragReady(ViewState& state) { return !TouchDragBlock(state); }
 
 void QueueTouchDrag(ViewState& state) {
-    if (state.touch.dragPosted || !TouchDragReady(state)) return;
+    if (state.touch.dragPosted || state.touch.dragPromoted || !state.touch.dragPending) return;
+    const auto blocked=TouchDragBlock(state);
+    if (g_perf.load(std::memory_order_relaxed) && state.touch.dragBlockTraced!=blocked) {
+        state.touch.dragBlockTraced=blocked;
+        TraceTouchDrag(state,blocked ? blocked : L"ready");
+    }
+    if (blocked) return;
     state.touch.dragPosted = PostMessageW(state.hwnd, kMsgTouchDrag,
         WPARAM(state.lifetimeToken), LPARAM(state.touch.generation)) != FALSE;
+    TraceTouchDrag(state,state.touch.dragPosted ? L"posted" : L"PostMessage failed");
 }
 
 void BeginTouchDrag(ViewState& state) {
     state.touch.dragPosted = false;
+    if (state.touch.dragPromoted) return;
+    TraceTouchDrag(state,L"begin continuation",true);
     if (!TouchDragReady(state) ||
         !state.touchRecognizer || state.touchRecognizer->contacts.size() != 1 ||
         !(state.touchRecognizer->contacts.front().pointerFlags & POINTER_FLAG_PRIMARY)) return;
-    const int row = state.touch.row;
     using Convert = BOOL(WINAPI*)();
     static const auto convert = [] {
         const auto user = GetModuleHandleW(L"user32.dll");
@@ -28113,23 +28636,41 @@ void BeginTouchDrag(ViewState& state) {
         if (!fn) fn = GetProcAddress(user,MAKEINTRESOURCEA(2811)); // Documented Windows 11 export.
         return reinterpret_cast<Convert>(fn);
     }();
-    // OLE's native Shell drag source needs a real mouse-button contact. Ask
-    // USER to promote this single primary contact; never fake input or launch
-    // a modal drag from a recognizer callback or while selection is pending.
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU touch drag] promotion API=%p mouse-button=0x%04X",reinterpret_cast<void*>(convert),
+            unsigned(USHORT(GetKeyState(VK_LBUTTON))));
+    // Request native mouse delivery. Success does not advance this thread's
+    // queued button state: OLE must start from the resulting held mouse message.
+    const HWND hwnd=state.hwnd;
+    const auto lifetime=state.lifetimeToken,generation=state.touch.generation;
     state.touch.dragPromoted = true;
-    if (!convert || !convert()) {
-        Wh_Log(L"[GPU touch] native drag promotion failed pointer=%u error=%lu",state.touch.primary,GetLastError());
+    const BOOL promoted=convert ? convert() : FALSE;
+    const DWORD promotionError=convert ? GetLastError() : ERROR_PROC_NOT_FOUND;
+    if (State(hwnd)!=&state || state.lifetimeToken!=lifetime || state.touch.generation!=generation) return;
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU touch drag] promotion result=%d error=%lu mouse-button=0x%04X",promoted,
+            promoted ? ERROR_SUCCESS : promotionError,unsigned(USHORT(GetKeyState(VK_LBUTTON))));
+    if (!promoted) {
+        Wh_Log(L"[GPU touch] native drag promotion failed pointer=%u error=%lu",state.touch.primary,promotionError);
         StopTouch(state);
         return;
     }
+    state.touchRecognizer->Stop();
+    KillTimer(state.hwnd, kTouchHoldTimerId);
+    TraceTouchDrag(state,L"awaiting promoted mouse DOWN/MOVE");
+}
+
+void BeginPromotedTouchDrag(ViewState& state) {
+    if (!state.touch.dragPromoted || !TouchDragReady(state)) return;
     const HWND hwnd = state.hwnd;
     auto* expected = &state;
+    const auto lifetime=state.lifetimeToken,generation=state.touch.generation;
+    const int row = state.touch.row;
     state.touch.dragPending = false;
-    state.touchRecognizer->Stop();
-    KillTimer(hwnd, kTouchHoldTimerId);
+    TraceTouchDrag(state,L"promoted held mouse accepted",true);
     Wh_Log(L"[GPU touch] Shell drag pointer=%u row=%d",state.touch.primary,row);
     StartNativeShellDrag(state, row);
-    if (State(hwnd) == expected) {
+    if (State(hwnd) == expected && expected->lifetimeToken==lifetime && expected->touch.generation==generation) {
         StopTouch(*expected);
         ResetMouseClickSequence(*expected);
     }
@@ -28204,6 +28745,11 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                 double(event.currentContactCount),event.interactionId == INTERACTION_ID_MANIPULATION ?
                     event.arguments.manipulation.delta.scale : 1.}});
         if (event.interactionId == INTERACTION_ID_HOLD) {
+            if (g_perf.load(std::memory_order_relaxed)) {
+                Wh_Log(L"[GPU touch drag] HOLD flags=0x%X contacts=%u current=%u",unsigned(event.interactionFlags),
+                    event.contactCount,event.currentContactCount);
+                TraceTouchDrag(state,L"native HOLD",true);
+            }
             if (state.touch.checkbox!=-1) {KillTimer(hwnd,kTouchHoldTimerId); continue;}
             if (canceled && state.touch.scrollbarAxis >= 0) {
                 state.touch.holding = false;
@@ -28211,7 +28757,14 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             }
             if ((event.interactionFlags & INTERACTION_FLAG_BEGIN) && state.touch.down && session->contacts.size() == 1) {
                 state.touch.holding = true;
+                state.touch.dragMotionTraced = false;
                 KillTimer(hwnd, kTouchHoldTimerId);
+                if(g_perf.load(std::memory_order_relaxed)) {
+                    POINT origin=state.touch.start;
+                    const bool mapped=MapUiPoint(nullptr,hwnd,origin);
+                    const DWORD error=mapped ? ERROR_SUCCESS:GetLastError();
+                    TraceTouchHitTest(state,L"hold",state.touch.start,origin,RowFromPoint(state,origin.y,origin.x),mapped,error);
+                }
                 if (state.touch.row >= 0 && size_t(state.touch.row) < state.selectedFlags.size() && TouchItemValid(state) &&
                     !state.selectedFlags[size_t(state.touch.row)]) Select(state, state.touch.row);
             }
@@ -28310,6 +28863,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             event.contactCount == 1 && state.touch.row >= 0 && TouchItemValid(state)) {
             if (!state.touch.down) { StopTouch(state); return; }
             state.touch.dragPending = true;
+            TraceTouchDrag(state,L"native held manipulation",true);
             QueueTouchDrag(state);
             continue;
         }
@@ -28460,6 +29014,9 @@ void ArmTouchHold(ViewState& state, const std::shared_ptr<TouchRecognizer>& sess
             (state.touch.holdDeadlineQpc.QuadPart - clock.QuadPart) * 1000. / state.qpcFrequency)));
         state.touch.holdDeadline = GetTickCount64() + duration;
         SetTimer(state.hwnd, kTouchHoldTimerId, duration, nullptr);
+        if (g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU touch drag] hold armed pointer=%u delay=%.3f duration=%u deadline=%lld packet-qpc=%llu packet-time=%lu",
+                state.touch.primary,delay,duration,state.touch.holdDeadlineQpc.QuadPart,contact.PerformanceCount,contact.dwTime);
     } else Wh_Log(L"[GPU touch] hold deadline unavailable hr=0x%08X delay=%.3f",unsigned(hr),delay);
 }
 
@@ -28494,6 +29051,9 @@ void TouchHoldDeadline(ViewState& state, const POINTER_INFO* next = nullptr) {
     packet.dwTime = next ? next->dwTime : GetTickCount();
     packet.PerformanceCount = packet.PerformanceCount ? clock.QuadPart : 0;
     const HRESULT hr = ProcessPointerFramesInteractionContext(session->context, 1, 1, &packet);
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU touch drag] hold clock pointer=%u hr=0x%08X outputs=%u packet-qpc=%llu packet-time=%lu",
+            state.touch.primary,unsigned(hr),session->outputCount,packet.PerformanceCount,packet.dwTime);
     if (SUCCEEDED(hr)) DrainTouchOutput(state, session);
     else { Wh_Log(L"[GPU touch] hold clock failed hr=0x%08X",unsigned(hr)); StopTouch(state); }
 }
@@ -28596,7 +29156,8 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             state.touch.generation = ++state.touchGeneration;
             state.touch.start = state.touch.last = pressed->ptPixelLocation;
             POINT point = pressed->ptPixelLocation;
-            MapUiPoint(nullptr, hwnd, point);
+            const bool mapped=MapUiPoint(nullptr, hwnd, point);
+            const DWORD mapError=mapped ? ERROR_SUCCESS:GetLastError();
             SetTouchInputMode(state, true);
             ClearPointerHover(state);
             state.touch.checkbox=SelectionCheckboxAt(state,point);
@@ -28612,15 +29173,18 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 state.dividerClickEpoch == state.mouseFolderEpoch &&
                 DWORD(inputTime-DWORD(state.dividerClickTick)) <= GetDoubleClickTime())
                 state.touch.doubleDivider = divider;
-            state.touch.row = state.touch.control ? -1 : RowFromPoint(state, point.y, point.x);
+            const int hit=state.touch.control ? -1 : RowFromPoint(state, point.y, point.x);
+            state.touch.row = hit;
             if (state.touch.row >= 0 && size_t(state.touch.row) < state.entries.size())
                 state.touch.item = state.entries[size_t(state.touch.row)].path;
             else state.touch.row = -1;
+            TraceTouchHitTest(state,L"down",pressed->ptPixelLocation,point,hit,mapped,mapError);
             StopScrollAnimation(state); state.horizontalAnimating = false;
             state.columnMenuPending = false;
             ApplyManipulationStatus(state, 1);
             Wh_Log(L"[GPU touch] DOWN hwnd=%p pointer=%u device=%p control=%d row=%d contacts=%u history=%u",
                 hwnd,first.pointerId,first.sourceDevice,state.touch.control,state.touch.row,pointers,entries);
+            TraceTouchDrag(state,L"physical DOWN");
         }
         if (!state.touch.active) continue; // A canceled contact cannot resurrect itself through UPDATE/UP.
         state.touch.sampledAt.QuadPart=LONGLONG(first.PerformanceCount);
@@ -28696,12 +29260,10 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
             state.touch.scrollbarMenuEligible = false;
             KillTimer(hwnd,kTouchHoldTimerId);
         }
-        if(state.touch.holding && !state.touch.control && state.touch.contacts==1 &&
-            contactCount==1 && state.touch.row>=0 && TouchItemValid(state) &&
-            (std::abs(state.touch.last.x-state.touch.start.x)>=GetSystemMetricsForDpi(SM_CXDRAG,ViewDpi(state)) ||
-             std::abs(state.touch.last.y-state.touch.start.y)>=GetSystemMetricsForDpi(SM_CYDRAG,ViewDpi(state)))) {
-            state.touch.dragPending=state.touch.consumed=true;
-            QueueTouchDrag(state);
+        if (g_perf.load(std::memory_order_relaxed) && !state.touch.dragMotionTraced &&
+            (state.touch.last.x!=state.touch.start.x || state.touch.last.y!=state.touch.start.y)) {
+            state.touch.dragMotionTraced=true;
+            TraceTouchDrag(state,L"first physical movement",true);
         }
         if (state.touch.control) {
             const HRESULT hr = session->Process(pointers, frame);
@@ -28771,7 +29333,17 @@ bool HandleTouchPointer(ViewState& state, UINT message, WPARAM wParam) {
     if (message == WM_POINTERENTER || message == WM_POINTERLEAVE ||
         message == WM_POINTERROUTEDTO || message == WM_POINTERROUTEDRELEASED) return true;
     if (!state.visible || !state.inScope || !TabOwnsActiveView(state)) { StopTouch(state); return true; }
-    if (state.touch.dragPromoted) return true; // USER/OLE owns the promoted mouse contact now.
+    if (state.touch.dragPromoted) {
+        // Before OLE starts, release, cancellation or another contact revokes
+        // the queued handoff. During OLE, USER owns release/drop processing.
+        if (state.touch.dragPending) {
+            POINTER_INFO contact{};
+            if (message==WM_POINTERUP || message==WM_POINTERDOWN ||
+                (GetPointerInfo(id,&contact) && (contact.pointerFlags & POINTER_FLAG_CANCELED)))
+                StopTouch(state);
+        }
+        return true;
+    }
     if (!StartTouchRecognizer(state)) { SetActive(state.hwnd, false); return true; }
     auto session = state.touchRecognizer;
     UINT32 entries = 0, pointers = 0;
@@ -28838,9 +29410,19 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             (msg == WM_SHOWWINDOW && !wParam) || msg == WM_DESTROY ||
             (msg == WM_CAPTURECHANGED && (s->touch.control || s->touch.gesture == TouchGesture::Marquee) &&
                 !s->releasingPointerCapture)) &&
-            s->touch.active && !s->touch.dragPromoted) StopTouch(*s);
+            s->touch.active && (!s->touch.dragPromoted || s->touch.dragPending)) StopTouch(*s);
         const bool mouse = msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST;
         const bool touch = (mouse || msg == WM_CONTEXTMENU) && IsTouchMouseInput();
+        if (mouse && s->touch.dragPromoted && s->touch.dragPending) {
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU touch drag] promoted mouse message=0x%X keys=0x%llX touch=%d button=0x%04X",
+                    msg,static_cast<unsigned long long>(wParam),touch,unsigned(USHORT(GetKeyState(VK_LBUTTON))));
+            if (touch && (msg==WM_LBUTTONDOWN || msg==WM_MOUSEMOVE) && (wParam & MK_LBUTTON)) {
+                BeginPromotedTouchDrag(*s);
+                return 0;
+            }
+            if (touch && msg==WM_LBUTTONUP) { StopTouch(*s); return 0; }
+        }
         if (touch && s->touchRecognizer) {
             // Raw touch owns this stream through release and promotion. OLE
             // consumes its promoted drag messages; they are not list clicks.
@@ -29349,8 +29931,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     CapturedSelectionStillCurrent(*s,*prepared);
                 if (!IsWindow(hwnd) || State(hwnd)!=s) return 0;
                 if (s->pendingNativeSelection!=prepared->generation) return 0;
+                // Rows republished since capture (e.g. a refresh queued by a
+                // late Shell event) make this import stale, not a failed commit.
                 if (FAILED(hr) || FAILED(prepared->result) || count!=prepared->expectedCount ||
                     !identitiesCurrent || s->folderView.Get()!=view.Get() ||
+                    s->directoryToken!=prepared->directoryToken ||
                     s->namespaceIdentities!=prepared->namespaceIdentities ||
                     s->nativeSelectionDirty || prepared->entries.size()!=prepared->children.size()) {
                     PipelineEvent(*s->background,{.operation=L"selection.import.retry",.a=prepared->generation,.b=static_cast<unsigned>(count),
@@ -30111,6 +30696,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->framePaintPending=false;
                 AcknowledgeAnimationFrame(hwnd);
             }
+            s->frameInputDeferred=false;
+            // An acknowledgment permits the pacer to enqueue its next wake.
+            // Hidden HWNDs cannot consume paints; retire their registration
+            // instead, retaining animation state for a subsequent show.
+            UnregisterViewAnimation(*s);
+        } else if(s && lParam &&
+            (reinterpret_cast<const WINDOWPOS*>(lParam)->flags & SWP_SHOWWINDOW) && NeedsAnimationFrames(*s)) {
+            RegisterViewAnimation(*s);
         }
         break;
     case WM_WINDOWPOSCHANGING:
@@ -31558,16 +32151,9 @@ void QueueNativeRenameEditor(HWND editor) {
 // This process/thread-scoped in-context subscription performs ONLY the shared
 // presentation barrier. Discovery, COM, tab lifecycle and selection stay on the
 // existing asynchronous subscription. Parent changes close the reparent gap.
-void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed,
-                                LONG objectId, LONG childId, DWORD, DWORD) {
-    WindowCallbackGuard callback;
+void ObserveNativeSurfaceEvent(DWORD event, HWND changed, LONG objectId, LONG childId) {
     if (!changed || g_unloading.load(std::memory_order_relaxed)) return;
     const HWND frame=GetAncestor(changed,GA_ROOT);
-    AcquireSRWLockShared(&g_shellHookLock);
-    const auto hook=g_shellViewHooks.find(frame);
-    const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
-    ReleaseSRWLockShared(&g_shellHookLock);
-    if(!owns) return;
     // USER reports a child z-order change on its parent. Explorer can select
     // an already-visible tab this way, without a tab-host SHOW event.
     if(event==EVENT_OBJECT_REORDER && !childId &&
@@ -31601,6 +32187,49 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     if(objectId==OBJID_WINDOW && !childId &&
         (event==EVENT_OBJECT_CREATE || event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_PARENTCHANGE))
         SuppressAppearingNativeSurface(changed,event);
+}
+
+void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed,
+                                LONG objectId, LONG childId, DWORD, DWORD) {
+    WindowCallbackGuard callback;
+    if(!changed || g_unloading.load(std::memory_order_acquire)) return;
+    const HWND frame=GetAncestor(changed,GA_ROOT);
+    AcquireSRWLockShared(&g_shellHookLock);
+    const auto hook=g_shellViewHooks.find(frame);
+    const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
+    ReleaseSRWLockShared(&g_shellHookLock);
+    if(owns) ObserveNativeSurfaceEvent(event,changed,objectId,childId);
+}
+
+// USER can reject an in-context WinEvent DLL registration. A thread-local
+// message hook needs no DLL registration/injection and still runs before the
+// native host's first show/layout. Queued discovery remains on its own lane.
+LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
+    WindowCallbackGuard callback;
+    if(code>=0 && lp && !g_unloading.load(std::memory_order_acquire)) {
+        const auto& message=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        DWORD event=message.message==WM_CREATE ? EVENT_OBJECT_CREATE :
+            message.message==WM_SHOWWINDOW ? (message.wParam ? EVENT_OBJECT_SHOW:EVENT_OBJECT_HIDE) :
+            message.message==WM_WINDOWPOSCHANGING ? EVENT_OBJECT_LOCATIONCHANGE : 0;
+        if(!event) return CallNextHookEx(nullptr,code,wp,lp);
+        const HWND frame=event ? GetAncestor(message.hwnd,GA_ROOT):nullptr;
+        AcquireSRWLockShared(&g_shellHookLock);
+        const auto hook=g_shellViewHooks.find(frame);
+        const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationMessages;
+        ReleaseSRWLockShared(&g_shellHookLock);
+        if(owns) {
+            auto* position=message.message==WM_WINDOWPOSCHANGING ? reinterpret_cast<WINDOWPOS*>(message.lParam):nullptr;
+            if(position && (position->flags&SWP_SHOWWINDOW)) event=EVENT_OBJECT_SHOW;
+            ObserveNativeSurfaceEvent(event,message.hwnd,OBJID_WINDOW,0);
+            // SetParent has already changed the parent at CHANGING, even
+            // for hidden views which receive neither SHOW nor CHANGED.
+            if(position) {
+                SuppressAppearingNativeSurface(message.hwnd,EVENT_OBJECT_PARENTCHANGE);
+                position->flags=ConstrainNativePosition(message.hwnd,position->flags);
+            }
+        }
+    }
+    return CallNextHookEx(nullptr,code,wp,lp);
 }
 
 // View creation/show notifications cover messages Explorer sends directly to
@@ -32954,6 +33583,8 @@ void InitializeFrameShellEvents(ViewState& state) {
         nullptr : previousHook->second.handle;
     HWINEVENTHOOK sharedPresentationHook = previousHook == g_shellViewHooks.end() ?
         nullptr : previousHook->second.presentationHandle;
+    HHOOK sharedPresentationMessages = previousHook == g_shellViewHooks.end() ?
+        nullptr : previousHook->second.presentationMessages;
     HWND cleanupWindow=previousHook==g_shellViewHooks.end() ? nullptr : previousHook->second.cleanupWindow;
     ReleaseSRWLockShared(&g_shellHookLock);
     HANDLE ownerThread=nullptr;
@@ -32971,19 +33602,25 @@ void InitializeFrameShellEvents(ViewState& state) {
     }
     HWINEVENTHOOK candidateHook = nullptr;
     HWINEVENTHOOK candidatePresentationHook = nullptr;
+    HHOOK candidatePresentationMessages = nullptr;
     HWINEVENTHOOK candidateSelectionHook = nullptr;
     HWINEVENTHOOK candidateForegroundHook = nullptr;
     const bool subclassInstalled = SetWindowSubclass(state.frameHwnd, ExplorerFrameSubclass,
         reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass), PresentationMinimized(state) ? 1 : 0) != FALSE;
-    if (!sharedPresentationHook) {
+    if (!sharedPresentationHook && !sharedPresentationMessages) {
         HMODULE module=nullptr;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 reinterpret_cast<LPCWSTR>(NativeSurfaceEvent),&module))
             candidatePresentationHook=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_PARENTCHANGE,
                 module,NativeSurfaceEvent,GetCurrentProcessId(),
                 GetWindowThreadProcessId(state.frameHwnd,nullptr),WINEVENT_INCONTEXT);
-        if (!candidatePresentationHook)
-            Wh_Log(L"[GPU host] synchronous presentation barrier unavailable error=%lu",GetLastError());
+        if (!candidatePresentationHook) {
+            const DWORD error=GetLastError();
+            candidatePresentationMessages=SetWindowsHookExW(WH_CALLWNDPROC,NativeSurfaceMessages,nullptr,
+                GetWindowThreadProcessId(state.frameHwnd,nullptr));
+            if(!candidatePresentationMessages)
+                Wh_Log(L"[GPU host] synchronous presentation barriers unavailable event-error=%lu message-error=%lu",error,GetLastError());
+        }
     }
     if (!sharedHook) {
         DWORD ownerThread = GetWindowThreadProcessId(state.frameHwnd, nullptr);
@@ -33005,11 +33642,13 @@ void InitializeFrameShellEvents(ViewState& state) {
     if (newOwner) {viewHook.cleanupWindow=cleanupWindow; viewHook.ownerThread=ownerThread;}
     if (!viewHook.handle) viewHook.handle = candidateHook;
     if (!viewHook.presentationHandle) viewHook.presentationHandle = candidatePresentationHook;
+    if (!viewHook.presentationMessages) viewHook.presentationMessages = candidatePresentationMessages;
     if (!viewHook.selectionHandle) viewHook.selectionHandle = candidateSelectionHook;
     if (!viewHook.foregroundHandle) viewHook.foregroundHandle = candidateForegroundHook;
     viewHook.subclassInstalled |= subclassInstalled;
     sharedPresentationHook=viewHook.presentationHandle;
-    if (viewHook.handle || viewHook.presentationHandle || viewHook.selectionHandle || viewHook.foregroundHandle || viewHook.subclassInstalled) {
+    sharedPresentationMessages=viewHook.presentationMessages;
+    if (viewHook.handle || viewHook.presentationHandle || viewHook.presentationMessages || viewHook.selectionHandle || viewHook.foregroundHandle || viewHook.subclassInstalled) {
         ++viewHook.owners;
         state.viewEvents = viewHook.handle;
         state.nativeSelectionEvents = viewHook.selectionHandle;
@@ -33026,6 +33665,8 @@ void InitializeFrameShellEvents(ViewState& state) {
         UnhookWinEvent(candidateHook);
     if (candidatePresentationHook && candidatePresentationHook != sharedPresentationHook)
         UnhookWinEvent(candidatePresentationHook);
+    if (candidatePresentationMessages && candidatePresentationMessages != sharedPresentationMessages)
+        UnhookWindowsHookEx(candidatePresentationMessages);
     if (candidateSelectionHook && candidateSelectionHook != state.nativeSelectionEvents)
         UnhookWinEvent(candidateSelectionHook);
     if (candidateForegroundHook && candidateForegroundHook != state.nativeForegroundEvents)
@@ -33885,7 +34526,7 @@ bool HandleNativeFileKey(const MSG& msg, ViewState* owner) {
         if (!live || live->lifetimeToken!=lifetime || live->token!=viewToken ||
             live->nativeHwnd!=target) return true;
         const HRESULT hr=InvokeNativeFileKey(*live,native.Get(),key);
-        if (FAILED(hr)) Wh_Log(L"[GPU selection] file shortcut failed key=0x%X hr=0x%08X",key.key,static_cast<unsigned>(hr));
+        if (FAILED(hr)) Wh_Log(L"[GPU selection] file shortcut failed key=0x%X hr=0x%08X",static_cast<unsigned>(key.key),static_cast<unsigned>(hr));
         return true;
     };
     if (owner) return handle(*owner,true);

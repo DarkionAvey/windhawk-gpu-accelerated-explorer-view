@@ -2,7 +2,9 @@ param(
     [string]$SourceFile,
     [string]$WindhawkDirectory,
     [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+    [switch]$Coverage,
+    [string]$LlvmToolsDirectory
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'repository.ps1')
@@ -29,7 +31,7 @@ $minified = Join-Path $root ('latest.minified.' + [guid]::NewGuid().ToString('N'
 # A release always runs the complete C++ and DLL-unload suites. Focused test
 # arguments belong to run-regressions.ps1 and cannot accidentally publish.
 try {
-    & (Join-Path $root 'tests\run-regressions.ps1') -SourceFile $source -WindhawkDirectory $WindhawkDirectory -MinifiedSourceFile $minified -Jobs $Jobs -KeepArtifacts:$KeepArtifacts
+    & (Join-Path $root 'tests\run-regressions.ps1') -SourceFile $source -WindhawkDirectory $WindhawkDirectory -MinifiedSourceFile $minified -Jobs $Jobs -KeepArtifacts:$KeepArtifacts -Coverage:$Coverage -LlvmToolsDirectory $LlvmToolsDirectory
     if ((Get-SourceHash $source) -ne $sourceHash -or
         (Get-SourceHash $readme) -ne $readmeHash) {
         throw 'Source or README changed during testing; run the build again before publishing'

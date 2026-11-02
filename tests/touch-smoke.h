@@ -1003,6 +1003,7 @@ void DriftingHistorySwipes(Device& input,const std::wstring& fixture) {
 }
 
 void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
+    std::vector<std::weak_ptr<TabBackground>> retired;
     const auto parent=std::filesystem::path(fixture)/L"swipe-history-parent";
     std::filesystem::create_directory(parent);
     for(int i=0;i<256;++i) {
@@ -1085,10 +1086,24 @@ void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
         Check(state.scrollNow==acceptedScroll && !state.animationActive,
             "late native history completion moved the already-positioned parent");
         StopTouchpad(state); state.touchRecognizer.reset();
+        retired.push_back(state.background);
     }
     Check(std::filesystem::weakly_canonical(parent).parent_path()==std::filesystem::weakly_canonical(fixture),
         "history return cleanup escaped its private fixture");
-    Check(Eventually([&] {std::error_code error; std::filesystem::remove_all(parent,error); return !error;}),
+    std::error_code cleanupError;
+    const bool drained=Eventually([&] {
+        // Retired workers can release marshaled Shell references on this STA.
+        // Sleeping here prevents that real completion from ever being served.
+        MSG message{};
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        if(std::any_of(retired.begin(),retired.end(),[](const auto& work) {return !work.expired();})) return false;
+        cleanupError.clear(); std::filesystem::remove_all(parent,cleanupError); return !cleanupError;
+    });
+    if(!drained) std::cout<<"HISTORY cleanup retained="<<std::count_if(retired.begin(),retired.end(),
+        [](const auto& work) {return !work.expired();})<<" error="<<cleanupError.message()<<std::endl;
+    Check(drained,
         "history return fixture cleanup did not drain native/watch handles");
     std::cout<<"PASS: real Shell travel log and native LTR/RTL Back swipes publish the parent at its returned child before any visible rows; late native completion preserves the viewport\n";
 }

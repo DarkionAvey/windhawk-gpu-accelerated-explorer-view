@@ -168,6 +168,7 @@ static void TestEditorSelectionOwnership(const std::wstring& directory) {
 }
 
 static void TestRenameHandoff(const std::wstring& directory) {
+    ModifierFixture::Session keyboard;
     auto factory=g_writeFactory;
     if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
         __uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"rename fonts");

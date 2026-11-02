@@ -385,7 +385,7 @@ void ExerciseCommands(ProviderSelectionFixture::Browser& host) {
     std::cout<<"PASS: native menus update Details/List, large/medium/small icons, sorting, grouping and Refresh; queued choices, native fallback and exclusive GPU presentation\n";
 }
 
-void Child(const std::wstring& fixture) {
+void Child(const std::wstring& fixture, const std::wstring& provider) {
     wchar_t desktop[256]{}; DWORD length = 0;
     Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME,
         desktop, sizeof(desktop), &length) && std::wstring(desktop).starts_with(L"gpu-overlay-menu-"),
@@ -402,7 +402,9 @@ void Child(const std::wstring& fixture) {
     const auto alias = std::filesystem::path(fixture) / L"menu-alias";
     ProviderSelectionFixture::DiskAndAlias(disk, alias);
     unsigned trials = 0;
-    for (const auto& location : {root, archive, alias}) {
+    Check(provider==L"filesystem" || provider==L"archive" || provider==L"delegated", "native menu provider argument");
+    const auto& location=provider==L"filesystem" ? root:provider==L"archive" ? archive:alias;
+    {
     ProviderSelectionFixture::Browser host;
     auto& state = host.state;
     SetWindowLongPtrW(host.frame, GWL_EXSTYLE, GetWindowLongPtrW(host.frame, GWL_EXSTYLE) & ~WS_EX_NOACTIVATE);
@@ -447,6 +449,7 @@ void Child(const std::wstring& fixture) {
             Check(SuppressNativeContent(state), "restore suppression after native reference menu");
             SetPresentationVisibility(state.hwnd, true);
             Check(!IsWindowVisible(state.nativeHwnd), "real menu test did not suppress the native view");
+            std::vector<Item> observed;
             {
                 Popup popup(state.nativeHwnd, host.frame);
                 if (target < 0) BackgroundContextMenu(state, point);
@@ -487,12 +490,23 @@ void Child(const std::wstring& fixture) {
                 std::cout << "ACTUAL MENU mode=" << mode << " target=" << target << " opened=" << popup.opened
                     << " expired=" << popup.expired << " items=" << popup.items.size() << std::endl;
                 Check(popup.Displayed(), "right click did not display a real native popup with the native host suppressed");
+                observed=popup.items;
                 if (popup.items != reference) {
                     for (const auto& item : reference) std::wcout << L"REFERENCE " << item.text << L" state=" << item.state << L'\n';
                     for (const auto& item : popup.items) std::wcout << L"HIDDEN " << item.text << L" state=" << item.state << L'\n';
                 }
-                Check(popup.items == reference, "displayed popup commands/submenus/states differ with the native host hidden");
             }
+            if(observed!=reference) {
+                // Failure-only control: distinguish a host-visibility effect
+                // from changing commands/states in the native provider itself.
+                RestoreNativeContent(state);
+                Popup control(state.nativeHwnd,host.frame);
+                NativeContextMenu(state,point,false);
+                std::cout<<"NATIVE CONTROL displayed="<<control.Displayed()<<std::endl;
+                for(const auto& item:control.items)
+                    std::wcout<<L"NATIVE CONTROL "<<item.text<<L" state="<<item.state<<L'\n';
+            }
+            Check(observed==reference,"displayed popup commands/submenus/states differ with the native host hidden");
             Check(!IsWindowVisible(state.nativeHwnd), "popup exposed the suppressed native list");
             int selected = -1;
             Check(SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &selected)) &&
@@ -501,44 +515,11 @@ void Child(const std::wstring& fixture) {
         }
     }
     }
+    Check(trials==12, "native menu provider did not exercise every mode and selection");
     Check(SetFileAttributesW(alias.c_str(), FILE_ATTRIBUTE_NORMAL), "restore private delegated directory attributes");
     std::cout << "PASS: " << trials << " displayed item and background popups; roots match visible native commands/states; native hosts stay hidden; private desktop\n";
 }
 }
-static void TestNativeMenuInteraction() {
-    const std::wstring name = L"gpu-overlay-menu-" + std::to_wstring(GetCurrentProcessId());
-    HDESK desktop = CreateDesktopW(name.c_str(), nullptr, nullptr, 0, GENERIC_ALL, nullptr);
-    Check(desktop != nullptr, "private menu desktop creation");
-    wchar_t station[256]{}; DWORD length = 0;
-    Check(GetUserObjectInformationW(GetProcessWindowStation(), UOI_NAME, station, sizeof(station), &length),
-        "private menu window station");
-    std::wstring destination = std::wstring(station) + L"\\" + name;
-    std::wstring module(32768, L'\0');
-    module.resize(GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size())));
-    std::wstring command = L"\"" + module + L"\" --native-context-menu-child";
-    SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
-    HANDLE read = nullptr, write = nullptr;
-    Check(CreatePipe(&read, &write, &attributes, 65536) && SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0),
-        "private menu diagnostics pipe");
-    HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        &attributes, OPEN_EXISTING, 0, nullptr);
-    STARTUPINFOW startup{sizeof(startup)}; startup.lpDesktop = destination.data();
-    startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdOutput = startup.hStdError = write; startup.hStdInput = input;
-    PROCESS_INFORMATION child{};
-    const BOOL created = CreateProcessW(module.c_str(), command.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child);
-    CloseHandle(write); if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
-    if (!created) { CloseHandle(read); CloseDesktop(desktop); Check(false, "private menu child creation"); }
-    const DWORD waited = WaitForSingleObject(child.hProcess, 60000);
-    DWORD result = DWORD(-1);
-    if (waited == WAIT_OBJECT_0) GetExitCodeProcess(child.hProcess, &result);
-    else TerminateProcess(child.hProcess, 125); // Test process only; never live Explorer/provider threads.
-    DWORD available = 0, received = 0;
-    char buffer[4096];
-    while (PeekNamedPipe(read, nullptr, 0, nullptr, &available, nullptr) && available &&
-        ReadFile(read, buffer, std::min<DWORD>(available, sizeof(buffer)), &received, nullptr) && received)
-        std::cout.write(buffer, received);
-    CloseHandle(read);
-    CloseHandle(child.hThread); CloseHandle(child.hProcess); CloseDesktop(desktop);
-    Check(waited == WAIT_OBJECT_0 && result == 0, "actual native menu interaction failed on the isolated desktop");
+static void TestNativeMenuInteraction(const wchar_t* provider) {
+    PrivateDesktopFixture::Run(L"menu",L"--native-context-menu-child "+std::wstring(provider),60000);
 }

@@ -251,6 +251,11 @@ static void TestRejectedProviderSelection(const std::filesystem::path& target) {
     state.selected=state.anchor=second;
     Check(SyncNativeSelection(state),"prior valid selection");
     Check(DeleteFileW(state.entries[size_t(stale)].path.c_str()),"remove private stale item");
+    // DefView's shared notification broker is not this fixture's completion
+    // signal. Refresh the actual native model, keeping the GPU snapshot stale.
+    ComPtr<IShellView> refreshed;
+    Check(SUCCEEDED(state.folderView.As(&refreshed)) && SUCCEEDED(refreshed->Refresh()),
+        "refresh native membership after private removal");
     Check(Eventually([&] {
         host.Pump(); int count=-1;
         return SUCCEEDED(state.folderView->ItemCount(SVGIO_ALLVIEW,&count)) && count==98;

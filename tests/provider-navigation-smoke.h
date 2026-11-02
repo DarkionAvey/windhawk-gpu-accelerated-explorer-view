@@ -124,7 +124,7 @@ void Destination(ProviderSelectionFixture::Browser& host, int expected) {
         Check(state.directoryToken == token && state.total == expected,
             "unchanged provider verification replaced the snapshot");
         const auto hints = host.shellHints;
-        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, state.directoryFolderIdentity.get(), nullptr);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST | SHCNF_FLUSH, state.directoryFolderIdentity.get(), nullptr);
         const bool notified = Eventually([&] {
             host.Pump(); ReceiveDirectoryResults(state);
             return host.shellHints > hints && !state.watchedChangePending && !state.namespaceCheckPending;

@@ -611,6 +611,10 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         state.rowTransitionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.045);
         Check(Eventually([&] { frame(); return state.rowTransitionPresentedProgress > 0.f; }),
               "deletion has no intermediate submitted frame");
+        // The checks below advance each animation explicitly. Hold that clock
+        // across provider waits and GPU submissions as well as the retarget
+        // call: otherwise real time can settle the scene between assertions.
+        AnimationClockFixture::Freeze retargetClock;
         const int row = [&] {
             // Sample one overlap instant. Private filesystem/provider latency
             // must not expire the scene while this retarget assertion waits.
@@ -650,8 +654,14 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
             Check(paints+1 == state.paintCalls, "paced paint left a duplicate WM_PAINT invalidation");
             auto markQueued=[&] {
                 RegisterAnimationWindow(state.hwnd);
-                ExclusiveSrwLock lock(g_frameLock);
-                for(auto& frame:g_activeFrames) if(frame.hwnd==state.hwnd) frame.queued=true;
+                {
+                    ExclusiveSrwLock lock(g_frameLock);
+                    for(auto& frame:g_activeFrames) if(frame.hwnd==state.hwnd) frame.queued=true;
+                }
+                // Retire preceding real clock posts while the held wake
+                // prevents another one. No queue API runs under the lock.
+                MSG preceding{};
+                while(PeekMessageW(&preceding,state.hwnd,kMsgFrame,kMsgFrame,PM_REMOVE|PM_QS_POSTMESSAGE)) {}
             };
             auto stillQueued=[&] {
                 ExclusiveSrwLock lock(g_frameLock);
@@ -681,7 +691,19 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
                 constexpr UINT restorePost = WM_APP+0x500;
                 for(int n=0;n<128;++n) Check(PostMessageW(state.hwnd,restorePost,n,0),"restore post fixture");
                 ResumeInputDeferredFrame(state.hwnd,state.lifetimeToken,state.token,WM_KEYDOWN);
-                Check(!state.framePaintPending && !stillQueued() && state.paintCalls==before+1,
+                const bool queued=stillQueued();
+                MSG nextFrame{};
+                const bool nextWake=PeekMessageW(&nextFrame,state.hwnd,kMsgFrame,kMsgFrame,
+                    PM_NOREMOVE|PM_QS_POSTMESSAGE) && nextFrame.message==kMsgFrame && nextFrame.hwnd==state.hwnd;
+                // A new real clock post is also evidence that the held wake
+                // was acknowledged: its queued latch blocked further posts.
+                const bool acknowledged=!queued || nextWake;
+                if(state.framePaintPending || !acknowledged || state.paintCalls!=before+1)
+                    std::cout<<"INPUT FRAME bits="<<bits<<" pending="<<state.framePaintPending
+                        <<" queued="<<queued<<" next="<<nextWake<<" paints="<<before<<"->"<<state.paintCalls
+                        <<" deferred="<<state.frameInputDeferred<<" graphics="<<state.graphicsOperations
+                        <<" update="<<GetUpdateRect(state.hwnd,nullptr,FALSE)<<std::endl;
+                Check(!state.framePaintPending && acknowledged && state.paintCalls==before+1,
                     "input completion did not present/ack exactly one frame before queue idle");
                 MSG posted{}; unsigned remaining=0;
                 while(PeekMessageW(&posted,state.hwnd,restorePost,restorePost,PM_REMOVE)) ++remaining;

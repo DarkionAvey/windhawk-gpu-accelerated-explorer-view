@@ -18213,7 +18213,7 @@ float DragShadowSigma(float side) {return side*.065f;}
 float DragShadowPadding(float side) {return std::ceil(3.f*DragShadowSigma(side))+1.f;}
 float DragShadowOffset(float side) {return side*.025f;}
 struct DragPreviewGeometry {
-    D2D1_RECT_F artwork{},operation{},caption{},visible{};
+    D2D1_RECT_F artwork{},operation{},caption{};
     D2D1_SIZE_U extent{};
     float edge=0.f;
 };
@@ -18278,8 +18278,7 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
         geometry.caption=D2D1::RectF(x,bottom-2*edge-preview.captionSize.height,x+width,bottom);
     }
     const auto shift=[&](D2D1_RECT_F& r) {r.left-=bounds.left; r.right-=bounds.left; r.top-=bounds.top; r.bottom-=bounds.top;};
-    geometry.visible=bounds; // Fixed edge clamping, including the reserved caption band.
-    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption); shift(geometry.visible);
+    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption);
     geometry.extent=D2D1::SizeU(UINT(std::ceil(bounds.right-bounds.left)),UINT(std::ceil(bounds.bottom-bounds.top)));
     geometry.edge=edge;
     return geometry;
@@ -18287,17 +18286,15 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
 D2D1_SIZE_U DragPreviewExtent(const DragPreview& preview) {
     return LayoutDragPreview(preview).extent;
 }
-POINT PositionDragPreview(const DragPreview& preview,POINT cursor,const RECT& work,bool touch) {
+POINT PositionDragPreview(const DragPreview& preview,POINT cursor,bool touch) {
     const auto geometry=LayoutDragPreview(preview);
     // Anchor the artwork, not its transparent canvas or the operation badge.
     // Touch keeps the entire preview above the promoted contact point.
     const float anchorX=(geometry.artwork.left+geometry.artwork.right)*.5f;
     const float anchorY=touch ? float(geometry.extent.height):geometry.artwork.bottom;
-    const LONG x=LONG(std::lround(cursor.x-anchorX)),y=LONG(std::lround(cursor.y-anchorY));
-    const auto& visible=geometry.visible;
-    const LONG left=LONG(std::ceil(work.left-visible.left)),top=LONG(std::ceil(work.top-visible.top));
-    return {std::clamp(x,left,std::max(left,LONG(std::floor(work.right-visible.right)))),
-        std::clamp(y,top,std::max(top,LONG(std::floor(work.bottom-visible.bottom))))};
+    // The desktop clips offscreen pixels; never detach the pile's hotspot
+    // from the mouse to keep its canvas inside a monitor or work area.
+    return {LONG(std::lround(cursor.x-anchorX)),LONG(std::lround(cursor.y-anchorY))};
 }
 
 // Exact ink of a layout: the union of its glyph outlines, using each color
@@ -25404,6 +25401,98 @@ class ShellDragFeedback final : public IDropSource, public IDropSourceNotify {
     std::shared_ptr<PresentationLane> lane_;
     ComPtr<IDataObject> data_;
     DWORD touchDragKeys_ = MAXDWORD; // Log changes only, never every OLE feedback callback.
+    ShellDropText caption_;
+    HHOOK mouseHook_=nullptr;
+    bool tracking_=false,moving_=false;
+    ShellDragFeedback* previousTracking_=nullptr;
+    inline static thread_local ShellDragFeedback* trackingSource_=nullptr;
+    HWINEVENTHOOK nativeVisualHook_=nullptr;
+    std::vector<HWND> nativeWindows_,preexistingNativeWindows_;
+    bool nativeVisible_=false;
+
+    static bool IsNativePreviewWindow(HWND hwnd) {
+        wchar_t name[64]{};
+        // Observed WinUI drag visual host, independent of Shell SysDragImage
+        // metadata. The host can live in another process on this desktop.
+        return GetClassNameW(hwnd,name,ARRAYSIZE(name)) && !wcscmp(name,L"DragVisualWindow");
+    }
+    static BOOL CALLBACK CollectExistingNativePreview(HWND hwnd,LPARAM context) {
+        if(IsNativePreviewWindow(hwnd) && IsWindowVisible(hwnd))
+            reinterpret_cast<ShellDragFeedback*>(context)->preexistingNativeWindows_.push_back(hwnd);
+        return TRUE;
+    }
+
+    void SetNativePreviewVisible(bool visible) {
+        if(visible==nativeVisible_ || !window_) return;
+        nativeVisible_=visible;
+        if(visible) ShowWindow(window_,SW_HIDE);
+        else {POINT point{}; if(GetCursorPos(&point)) MovePreview(point);}
+    }
+    void RefreshNativePreview() {
+        // Reconcile current visibility rather than replaying queued show/hide
+        // states. Multiple monitor hosts must all disappear before restoration.
+        std::erase_if(nativeWindows_,[](HWND hwnd) {return !IsNativePreviewWindow(hwnd) || !IsWindowVisible(hwnd);});
+        SetNativePreviewVisible(!nativeWindows_.empty());
+    }
+    void NativePreviewEvent(HWND hwnd) {
+        const bool visible=IsNativePreviewWindow(hwnd) && IsWindowVisible(hwnd);
+        if(!visible) {
+            std::erase(preexistingNativeWindows_,hwnd);
+            std::erase(nativeWindows_,hwnd);
+        } else if(std::find(preexistingNativeWindows_.begin(),preexistingNativeWindows_.end(),hwnd)==preexistingNativeWindows_.end() &&
+            std::find(nativeWindows_.begin(),nativeWindows_.end(),hwnd)==nativeWindows_.end()) {
+            nativeWindows_.push_back(hwnd);
+        }
+        RefreshNativePreview();
+    }
+
+    static void CALLBACK NativePreviewVisibilityEvent(HWINEVENTHOOK hook,DWORD,HWND hwnd,LONG object,LONG child,DWORD,DWORD) {
+        WindowCallbackGuard callback;
+        if(object!=OBJID_WINDOW || child || g_unloading.load(std::memory_order_acquire)) return;
+        // Out-of-context events run on the installing STA. Match the hook as
+        // well as the TLS source, including nested drags on that same STA.
+        for(auto* source=trackingSource_;source;source=source->previousTracking_) if(source->nativeVisualHook_==hook) {
+            if(source==trackingSource_) source->NativePreviewEvent(hwnd);
+            break;
+        }
+    }
+    void MovePreview(POINT cursor) {
+        auto* live=State(source_);
+        if(moving_ || !window_ || !live || live->lifetimeToken!=lifetime_ || !live->dragPreview) return;
+        ScopedFlag moving(moving_);
+        const auto owned=live->dragPreview;
+        RefreshNativePreview();
+        if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return;
+        auto& preview=*owned;
+        const auto text=caption_;
+        MONITORINFO monitor{sizeof(monitor)};
+        const auto destination=MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST);
+        const bool hasMonitor=GetMonitorInfoW(destination,&monitor)!=FALSE;
+        for(int pass=0;pass<2;++pass) {
+            if(preview.monitor!=destination) {preview.monitor=destination; PublishDragPreview(*live);}
+            const float available=hasMonitor ? float(monitor.rcWork.right-monitor.rcWork.left)/3.f:preview.captionAvailable;
+            if(UpdateDragCaption(*live,preview,text,available)) PublishDragPreview(*live);
+            const auto size=DragPreviewExtent(preview);
+            const auto position=PositionDragPreview(preview,cursor,live->touch.dragPromoted);
+            SetWindowPos(window_,nullptr,position.x,position.y,int(size.width),int(size.height),
+                SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER|(nativeVisible_ ? 0:SWP_SHOWWINDOW));
+            if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return;
+            const int dpi=DpiOf(window_);
+            if(dpi==preview.dpi) break;
+            preview.side*=float(dpi)/preview.dpi; preview.dpi=dpi;
+            VisitImageTiers([&](UINT size) {live->dragPreviewSize=size; return size<preview.side;});
+            PublishDragPreview(*live); RequestVisibleIcons(*live); RefreshDragPreview(*live);
+        }
+    }
+    static LRESULT CALLBACK TrackMouse(int code,WPARAM message,LPARAM data) {
+        WindowCallbackGuard callback;
+        // OLE captures mouse input on this source STA even over windows that
+        // have no drop target. GiveFeedback need not run in those gaps.
+        if(code==HC_ACTION && (message==WM_MOUSEMOVE || message==WM_NCMOUSEMOVE) &&
+            data && trackingSource_ && !g_unloading.load(std::memory_order_acquire))
+            trackingSource_->MovePreview(reinterpret_cast<const MOUSEHOOKSTRUCT*>(data)->pt);
+        return CallNextHookEx(nullptr,code,message,data);
+    }
 public:
     explicit ShellDragFeedback(ViewState& state,int row,int count,IDataObject* data) :
         source_(state.hwnd),lifetime_(state.lifetimeToken),lane_(state.presenter),data_(data) {
@@ -25455,14 +25544,56 @@ public:
         RefreshDragPreview(state);
     }
     bool HasPreview() const {return window_!=nullptr;}
-    ~ShellDragFeedback() {
-        if(auto* live=State(source_); live && live->lifetimeToken==lifetime_) {
+    void StartPointerTracking() {
+        if(!window_ || tracking_) return;
+        // A nested OLE drag on the same STA borrows the outer hook; other
+        // Explorer threads/tabs have independent trackingSource_ pointers.
+        if(!trackingSource_) {
+            mouseHook_=SetWindowsHookExW(WH_MOUSE,TrackMouse,nullptr,GetCurrentThreadId());
+            if(!mouseHook_) {
+                Wh_Log(L"[GPU dragdrop] pointer tracking unavailable error=%lu",GetLastError());
+                ReleasePreview();
+                return;
+            }
+        }
+        previousTracking_=trackingSource_; trackingSource_=this; tracking_=true;
+        // Subscribe before the modal loop starts. Ignore visuals belonging to
+        // a preexisting/nested drag, and observe new hosts in any process.
+        nativeVisualHook_=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_HIDE,nullptr,NativePreviewVisibilityEvent,
+            0,0,WINEVENT_OUTOFCONTEXT);
+        const DWORD eventError=nativeVisualHook_ ? ERROR_SUCCESS:GetLastError();
+        EnumWindows(CollectExistingNativePreview,reinterpret_cast<LPARAM>(this));
+        if(!nativeVisualHook_) {
+            Wh_Log(L"[GPU drag handoff] visibility observer unavailable error=%lu; using native preview",eventError);
+            StopPointerTracking(); ReleasePreview(); return;
+        }
+    }
+    void StopPointerTracking() {
+        if(!tracking_) return;
+        if(nativeVisualHook_) {UnhookWinEvent(nativeVisualHook_); nativeVisualHook_=nullptr;}
+        trackingSource_=previousTracking_; previousTracking_=nullptr; tracking_=false;
+        if(mouseHook_) {UnhookWindowsHookEx(mouseHook_); mouseHook_=nullptr;}
+    }
+    void ReleasePreview() {
+        if(!window_) return;
+        auto* live=State(source_);
+        const bool newerPreview=live && live->lifetimeToken==lifetime_ &&
+            live->dragPreview && live->dragPreview->window!=window_;
+        if(live && live->lifetimeToken==lifetime_ &&
+            live->dragPreview && live->dragPreview->window==window_) {
             live->dragPreview.reset(); live->dragPreviewEntries={}; live->dragPreviewSize=0;
         }
-        if(lane_ && !lane_->stopping.load(std::memory_order_acquire)) {
-            std::lock_guard lock(lane_->mutex); lane_->dragPreview=std::shared_ptr<const DragPreview>{}; SetEvent(lane_->wake);
+        if(!newerPreview && lane_ && !lane_->stopping.load(std::memory_order_acquire)) {
+            std::lock_guard lock(lane_->mutex);
+            if(!lane_->dragPreview || !*lane_->dragPreview || (*lane_->dragPreview)->window==window_) {
+                lane_->dragPreview=std::shared_ptr<const DragPreview>{}; SetEvent(lane_->wake);
+            }
         }
-        if(window_) DestroyWindow(window_);
+        DestroyWindow(window_); window_=nullptr;
+    }
+    ~ShellDragFeedback() {
+        StopPointerTracking();
+        ReleasePreview();
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         WindowCallbackGuard callback;
@@ -25479,7 +25610,17 @@ public:
     }
     HRESULT STDMETHODCALLTYPE DragEnterTarget(HWND) override {WindowCallbackGuard callback; return S_OK;}
     HRESULT STDMETHODCALLTYPE DragLeaveTarget() override {
-        WindowCallbackGuard callback; ClearShellDropDescription(data_.Get()); return S_OK;
+        WindowCallbackGuard callback;
+        caption_={};
+        if(auto* live=State(source_); live && live->lifetimeToken==lifetime_ && live->dragPreview) {
+            auto& preview=*live->dragPreview;
+            preview.effect=DROPEFFECT_NONE;
+            UpdateDragCaption(*live,preview,{},preview.captionAvailable);
+            PublishDragPreview(*live);
+        }
+        ClearShellDropDescription(data_.Get());
+        RefreshNativePreview();
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape,DWORD keys) override {
         WindowCallbackGuard callback;
@@ -25504,8 +25645,9 @@ public:
         const auto owned=live->dragPreview;
         auto& preview=*owned;
         effect&=DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
-        const auto text=ReadShellDropText(data_.Get(),effect);
+        const auto text=effect ? ReadShellDropText(data_.Get(),effect):ShellDropText{};
         if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return DRAGDROP_S_USEDEFAULTCURSORS;
+        caption_=text;
         const auto accent=g_selectionRgb.load(std::memory_order_relaxed);
         const auto badgePalette=g_swipePalette.load(std::memory_order_relaxed);
         const auto background=ValidRgb(live->itemTip.background) ? live->itemTip.background:live->nativeEditBackground;
@@ -25518,26 +25660,11 @@ public:
             PublishDragPreview(*live);
         }
         POINT cursor{};
-        if(GetCursorPos(&cursor)) {
-            MONITORINFO monitor{sizeof(monitor)};
-            if(GetMonitorInfoW(MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST),&monitor)) for(int pass=0;pass<2;++pass) {
-                const auto destination=MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST);
-                if(preview.monitor!=destination) {preview.monitor=destination; PublishDragPreview(*live);}
-                if(UpdateDragCaption(*live,preview,text,float(monitor.rcWork.right-monitor.rcWork.left)/3.f)) PublishDragPreview(*live);
-                const auto size=DragPreviewExtent(preview);
-                const auto position=PositionDragPreview(preview,cursor,monitor.rcWork,live->touch.dragPromoted);
-                SetWindowPos(window_,HWND_TOPMOST,position.x,position.y,int(size.width),int(size.height),SWP_NOACTIVATE|SWP_SHOWWINDOW);
-                if(State(source_)!=live || live->lifetimeToken!=lifetime_) return DRAGDROP_S_USEDEFAULTCURSORS;
-                const int dpi=DpiOf(window_);
-                if(dpi==preview.dpi) break;
-                preview.side*=float(dpi)/preview.dpi; preview.dpi=dpi;
-                VisitImageTiers([&](UINT size) {live->dragPreviewSize=size; return size<preview.side;});
-                PublishDragPreview(*live); RequestVisibleIcons(*live); RefreshDragPreview(*live);
-                // Recalculate the hotspot and bounds immediately at the new
-                // monitor DPI, without waiting for another pointer movement.
-            }
-        }
-        if(!preview.rendered->load(std::memory_order_acquire)) return DRAGDROP_S_USEDEFAULTCURSORS;
+        RefreshNativePreview();
+        if(GetCursorPos(&cursor)) MovePreview(cursor);
+        const bool ready=preview.rendered->load(std::memory_order_acquire);
+        const bool defaultCursor=nativeVisible_ || !ready || !effect;
+        if(defaultCursor) return DRAGDROP_S_USEDEFAULTCURSORS;
         SetCursor(LoadCursorW(nullptr,IDC_ARROW)); return S_OK;
     }
 };
@@ -25570,11 +25697,11 @@ void StartNativeShellDrag(ViewState& state, int row) {
     }
     const HWND hwnd = state.hwnd;
     ViewState* const sourceState = &state;
+    const auto originFolder=state.folderPath;
+    const auto originItem=state.entries[static_cast<size_t>(row)].path;
     state.shellDragRunning = true;
-    // Keep the origin valid throughout the reentrant OLE modal loop. It is
-    // removed unconditionally when the OLE loop returns, even after navigation.
-    RegisterGpuDragOrigin(objects.Get(), state.hwnd, state.folderPath,
-        state.entries[static_cast<size_t>(row)].path);
+    NativeFileCommandScope command(&state);
+    if (state.touch.dragPromoted) TraceTouchDrag(state,L"enter OLE",true);
     ComPtr<IDropSource> feedback;
     auto* visuals=new ShellDragFeedback(state,row,nativeCount,objects.Get());
     feedback.Attach(visuals);
@@ -25582,14 +25709,16 @@ void StartNativeShellDrag(ViewState& state, int row) {
     DWORD effect = DROPEFFECT_NONE;
     // Shell owns data formats and all target behavior. Feedback is shared by
     // mouse, touchpad and promoted touch, including external applications.
-    NativeFileCommandScope command(&state);
-    // SHDoDragDrop manufactures a generic image if no source bitmap exists.
-    // Our source already implements OLE feedback: bypass that image-producing
-    // wrapper while preserving the exact Shell IDataObject and target routing.
+    // Keep our source visual independent of Shell's generic image wrapper.
+    // WinUI supplies its own visual host; the visibility observer yields to it.
     const DWORD allowed=DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
-    if (state.touch.dragPromoted) TraceTouchDrag(state,L"enter OLE",true);
+    // Keep the origin valid throughout the reentrant OLE modal loop. It is
+    // removed unconditionally when the OLE loop returns, even after navigation.
+    RegisterGpuDragOrigin(objects.Get(), hwnd, originFolder, originItem);
+    visuals->StartPointerTracking();
     const HRESULT hr = visuals->HasPreview() ? DoDragDrop(objects.Get(),feedback.Get(),allowed,&effect) :
         SHDoDragDrop(hwnd,objects.Get(),feedback.Get(),allowed,&effect);
+    visuals->StopPointerTracking();
     feedback.Reset();
     UnregisterGpuDragOrigin(objects.Get(), hwnd);
     // The OLE modal loop can re-enter navigation and even destroy this HWND.
@@ -26702,6 +26831,7 @@ void StopColdAttachObserver() {
 struct FrameShellViewHook {
     HWINEVENTHOOK handle = nullptr;
     HWINEVENTHOOK presentationHandle = nullptr;
+    HHOOK presentationMessages = nullptr;
     HWINEVENTHOOK selectionHandle = nullptr;
     HWINEVENTHOOK foregroundHandle = nullptr;
     HWND cleanupWindow = nullptr;
@@ -26735,6 +26865,7 @@ void ReleaseFrameHookResources(HWND frame, const FrameShellViewHook& hooks,
                                HWND destroyingOwner = nullptr) {
     for (HWINEVENTHOOK hook : {hooks.handle,hooks.presentationHandle,hooks.selectionHandle,hooks.foregroundHandle})
         if (hook) UnhookWinEvent(hook);
+    if (hooks.presentationMessages) UnhookWindowsHookEx(hooks.presentationMessages);
     if (hooks.subclassInstalled) {
         RemovePropW(frame,kFrameSizingProperty);
         RemoveWindowSubclass(frame,ExplorerFrameSubclass,reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass));
@@ -26870,7 +27001,7 @@ void ClearFrameShellViewHooks() {
                 if (IsWindow(hooks.cleanupWindow)) receiver=hooks.cleanupWindow;
                 if (!receiver && hooks.subclassInstalled && IsWindow(frame)) receiver=frame;
                 if (!receiver && !hooks.subclassInstalled && !hooks.handle &&
-                    !hooks.presentationHandle && !hooks.selectionHandle && !hooks.foregroundHandle) {
+                    !hooks.presentationHandle && !hooks.presentationMessages && !hooks.selectionHandle && !hooks.foregroundHandle) {
                     if (hooks.ownerThread) CloseHandle(hooks.ownerThread);
                     g_shellViewHooks.erase(it); frame=nullptr;
                 }
@@ -27330,6 +27461,18 @@ bool UpdateCapturedPointer(ViewState& state, std::optional<POINT> delivered = {}
     return true;
 }
 
+void ResumeDeferredShellHints(ViewState& state) {
+    if (LayoutAnimationActive(state, true)) return;
+    if (state.nativeModeHintPending && !state.nativeModeSignalQueued)
+        PostShellVisibilityProbe(state, true);
+    if (state.nativeSettingsHintPending && !state.visibilitySignalQueued)
+        PostShellVisibilityProbe(state);
+    if (state.nativeSelectionDirty && !state.nativeSelectionMessageQueued &&
+        state.visible && state.inScope && state.loaded && !state.namesPreview)
+        QueueNativeSelectionHint(state, false);
+    if (state.loaded && state.visible && state.inScope) QueueFeatureInitialization(state);
+}
+
 // The compositor wake and ordinary WM_PAINT share advancement and bounded data
 // delivery. Each tab keeps at most one paced wake outstanding.
 void AdvanceAnimationFrame(ViewState& state, bool paced) {
@@ -27393,16 +27536,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
         state.marqueeFading = false;
     AdvanceSwipeFeedback(state);
     if (NativeColumnSnapshotReady(state)) QueueFeatureInitialization(state);
-    if (!LayoutAnimationActive(state, true)) {
-        if (state.nativeModeHintPending && !state.nativeModeSignalQueued)
-            PostShellVisibilityProbe(state, true);
-        if (state.nativeSettingsHintPending && !state.visibilitySignalQueued)
-            PostShellVisibilityProbe(state);
-        if (state.nativeSelectionDirty && !state.nativeSelectionMessageQueued &&
-            state.visible && state.inScope && state.loaded && !state.namesPreview)
-            QueueNativeSelectionHint(state, false);
-        if (state.loaded && state.visible && state.inScope) QueueFeatureInitialization(state);
-    }
+    ResumeDeferredShellHints(state);
     if (paced) ++state.frameRedraws;
 }
 
@@ -27569,9 +27703,8 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     return model;
 }
 
-void SubmitPresentation(ViewState& state) {
+void QueuePresentationModel(ViewState& state) {
     if(!state.presenter || state.presentationOnly || g_unloading.load(std::memory_order_acquire)) return;
-    ConsumePresentation(state);
     if(state.presenter->stopping.load(std::memory_order_acquire)) return;
     const bool active=!InactiveGraphics(state);
     if(!active && !state.presentationActive) return;
@@ -27590,6 +27723,11 @@ void SubmitPresentation(ViewState& state) {
     PipelineEvent(*state.background,{.operation=L"presentation.submit[rows,images,active]",
         .a=state.presentationSequence,.b=state.token,
         .v={double(state.total),double(state.presentationActive)}},true);
+}
+
+void SubmitPresentation(ViewState& state) {
+    ConsumePresentation(state);
+    QueuePresentationModel(state);
 }
 
 void SynchronizePresentationGeneration(ViewState& state) {
@@ -28183,6 +28321,8 @@ void ConsumePresentation(ViewState& state) {
         if(!receipt->horizontalMoving) state.horizontalAnimating=false;
     }
     bool geometry=false;
+    bool republishStyle=state.zoomAnimating && receipt->zoomOrigin.QuadPart==state.zoomStartedQpc.QuadPart &&
+        receipt->styleRevision!=state.presentationStyleRevision;
     if(state.zoomAnimating && receipt->zoomOrigin.QuadPart==state.zoomStartedQpc.QuadPart &&
         receipt->styleRevision==state.presentationStyleRevision) {
         state.zoomAnimating=receipt->zoom; state.rowPx=receipt->rowHeight; state.fontPx=receipt->fontSize;
@@ -28194,7 +28334,7 @@ void ConsumePresentation(ViewState& state) {
             MakeTextFormats(state,true);
             // A cold/invalidated owner format can resolve its face here.
             // Publish that new style before requiring it on the next receipt.
-            if (style != state.presentationStyleRevision) Redraw(state);
+            if (style != state.presentationStyleRevision) republishStyle=true;
         }
         if(!state.zoomAnimating && state.zoomLayoutTransition) StopRowTransition(state);
     }
@@ -28233,11 +28373,15 @@ void ConsumePresentation(ViewState& state) {
     PipelineEvent(*state.background,{.operation=L"presentation.accept[thread,frames,scroll,rows]",
         .a=receipt->sequence,.b=receipt->token,.v={double(receipt->thread),double(receipt->frames),receipt->scroll,receipt->rowProgress}},true);
     // The independent render owner replaces Paint's old owner-STA completion
-    // hook: resume deferred column/startup work when its animation settles.
-    if(NativeColumnSnapshotReady(state) || !LayoutAnimationActive(state,true)) QueueFeatureInitialization(state);
+    // hook: resume deferred Shell hints and column/startup work on settlement.
+    if(NativeColumnSnapshotReady(state)) QueueFeatureInitialization(state);
+    ResumeDeferredShellHints(state);
     QueueColumnFit(state);
     if (UpdateHorizontalScrollbarVisibility(state)) Redraw(state);
     UnregisterAnimationWhenIdle(state);
+    // EDITs and other siblings may completely occlude the owner HWND, so
+    // invalidation alone cannot guarantee a paint to publish resolved fonts.
+    if(republishStyle) QueuePresentationModel(state);
 }
 
 void RetireOverlayState(ViewState* state);
@@ -30552,6 +30696,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->framePaintPending=false;
                 AcknowledgeAnimationFrame(hwnd);
             }
+            s->frameInputDeferred=false;
+            // An acknowledgment permits the pacer to enqueue its next wake.
+            // Hidden HWNDs cannot consume paints; retire their registration
+            // instead, retaining animation state for a subsequent show.
+            UnregisterViewAnimation(*s);
+        } else if(s && lParam &&
+            (reinterpret_cast<const WINDOWPOS*>(lParam)->flags & SWP_SHOWWINDOW) && NeedsAnimationFrames(*s)) {
+            RegisterViewAnimation(*s);
         }
         break;
     case WM_WINDOWPOSCHANGING:
@@ -31999,16 +32151,9 @@ void QueueNativeRenameEditor(HWND editor) {
 // This process/thread-scoped in-context subscription performs ONLY the shared
 // presentation barrier. Discovery, COM, tab lifecycle and selection stay on the
 // existing asynchronous subscription. Parent changes close the reparent gap.
-void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed,
-                                LONG objectId, LONG childId, DWORD, DWORD) {
-    WindowCallbackGuard callback;
+void ObserveNativeSurfaceEvent(DWORD event, HWND changed, LONG objectId, LONG childId) {
     if (!changed || g_unloading.load(std::memory_order_relaxed)) return;
     const HWND frame=GetAncestor(changed,GA_ROOT);
-    AcquireSRWLockShared(&g_shellHookLock);
-    const auto hook=g_shellViewHooks.find(frame);
-    const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
-    ReleaseSRWLockShared(&g_shellHookLock);
-    if(!owns) return;
     // USER reports a child z-order change on its parent. Explorer can select
     // an already-visible tab this way, without a tab-host SHOW event.
     if(event==EVENT_OBJECT_REORDER && !childId &&
@@ -32042,6 +32187,49 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     if(objectId==OBJID_WINDOW && !childId &&
         (event==EVENT_OBJECT_CREATE || event==EVENT_OBJECT_SHOW || event==EVENT_OBJECT_PARENTCHANGE))
         SuppressAppearingNativeSurface(changed,event);
+}
+
+void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND changed,
+                                LONG objectId, LONG childId, DWORD, DWORD) {
+    WindowCallbackGuard callback;
+    if(!changed || g_unloading.load(std::memory_order_acquire)) return;
+    const HWND frame=GetAncestor(changed,GA_ROOT);
+    AcquireSRWLockShared(&g_shellHookLock);
+    const auto hook=g_shellViewHooks.find(frame);
+    const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationHandle==sourceHook;
+    ReleaseSRWLockShared(&g_shellHookLock);
+    if(owns) ObserveNativeSurfaceEvent(event,changed,objectId,childId);
+}
+
+// USER can reject an in-context WinEvent DLL registration. A thread-local
+// message hook needs no DLL registration/injection and still runs before the
+// native host's first show/layout. Queued discovery remains on its own lane.
+LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
+    WindowCallbackGuard callback;
+    if(code>=0 && lp && !g_unloading.load(std::memory_order_acquire)) {
+        const auto& message=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        DWORD event=message.message==WM_CREATE ? EVENT_OBJECT_CREATE :
+            message.message==WM_SHOWWINDOW ? (message.wParam ? EVENT_OBJECT_SHOW:EVENT_OBJECT_HIDE) :
+            message.message==WM_WINDOWPOSCHANGING ? EVENT_OBJECT_LOCATIONCHANGE : 0;
+        if(!event) return CallNextHookEx(nullptr,code,wp,lp);
+        const HWND frame=event ? GetAncestor(message.hwnd,GA_ROOT):nullptr;
+        AcquireSRWLockShared(&g_shellHookLock);
+        const auto hook=g_shellViewHooks.find(frame);
+        const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationMessages;
+        ReleaseSRWLockShared(&g_shellHookLock);
+        if(owns) {
+            auto* position=message.message==WM_WINDOWPOSCHANGING ? reinterpret_cast<WINDOWPOS*>(message.lParam):nullptr;
+            if(position && (position->flags&SWP_SHOWWINDOW)) event=EVENT_OBJECT_SHOW;
+            ObserveNativeSurfaceEvent(event,message.hwnd,OBJID_WINDOW,0);
+            // SetParent has already changed the parent at CHANGING, even
+            // for hidden views which receive neither SHOW nor CHANGED.
+            if(position) {
+                SuppressAppearingNativeSurface(message.hwnd,EVENT_OBJECT_PARENTCHANGE);
+                position->flags=ConstrainNativePosition(message.hwnd,position->flags);
+            }
+        }
+    }
+    return CallNextHookEx(nullptr,code,wp,lp);
 }
 
 // View creation/show notifications cover messages Explorer sends directly to
@@ -33395,6 +33583,8 @@ void InitializeFrameShellEvents(ViewState& state) {
         nullptr : previousHook->second.handle;
     HWINEVENTHOOK sharedPresentationHook = previousHook == g_shellViewHooks.end() ?
         nullptr : previousHook->second.presentationHandle;
+    HHOOK sharedPresentationMessages = previousHook == g_shellViewHooks.end() ?
+        nullptr : previousHook->second.presentationMessages;
     HWND cleanupWindow=previousHook==g_shellViewHooks.end() ? nullptr : previousHook->second.cleanupWindow;
     ReleaseSRWLockShared(&g_shellHookLock);
     HANDLE ownerThread=nullptr;
@@ -33412,19 +33602,25 @@ void InitializeFrameShellEvents(ViewState& state) {
     }
     HWINEVENTHOOK candidateHook = nullptr;
     HWINEVENTHOOK candidatePresentationHook = nullptr;
+    HHOOK candidatePresentationMessages = nullptr;
     HWINEVENTHOOK candidateSelectionHook = nullptr;
     HWINEVENTHOOK candidateForegroundHook = nullptr;
     const bool subclassInstalled = SetWindowSubclass(state.frameHwnd, ExplorerFrameSubclass,
         reinterpret_cast<UINT_PTR>(ExplorerFrameSubclass), PresentationMinimized(state) ? 1 : 0) != FALSE;
-    if (!sharedPresentationHook) {
+    if (!sharedPresentationHook && !sharedPresentationMessages) {
         HMODULE module=nullptr;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 reinterpret_cast<LPCWSTR>(NativeSurfaceEvent),&module))
             candidatePresentationHook=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_PARENTCHANGE,
                 module,NativeSurfaceEvent,GetCurrentProcessId(),
                 GetWindowThreadProcessId(state.frameHwnd,nullptr),WINEVENT_INCONTEXT);
-        if (!candidatePresentationHook)
-            Wh_Log(L"[GPU host] synchronous presentation barrier unavailable error=%lu",GetLastError());
+        if (!candidatePresentationHook) {
+            const DWORD error=GetLastError();
+            candidatePresentationMessages=SetWindowsHookExW(WH_CALLWNDPROC,NativeSurfaceMessages,nullptr,
+                GetWindowThreadProcessId(state.frameHwnd,nullptr));
+            if(!candidatePresentationMessages)
+                Wh_Log(L"[GPU host] synchronous presentation barriers unavailable event-error=%lu message-error=%lu",error,GetLastError());
+        }
     }
     if (!sharedHook) {
         DWORD ownerThread = GetWindowThreadProcessId(state.frameHwnd, nullptr);
@@ -33446,11 +33642,13 @@ void InitializeFrameShellEvents(ViewState& state) {
     if (newOwner) {viewHook.cleanupWindow=cleanupWindow; viewHook.ownerThread=ownerThread;}
     if (!viewHook.handle) viewHook.handle = candidateHook;
     if (!viewHook.presentationHandle) viewHook.presentationHandle = candidatePresentationHook;
+    if (!viewHook.presentationMessages) viewHook.presentationMessages = candidatePresentationMessages;
     if (!viewHook.selectionHandle) viewHook.selectionHandle = candidateSelectionHook;
     if (!viewHook.foregroundHandle) viewHook.foregroundHandle = candidateForegroundHook;
     viewHook.subclassInstalled |= subclassInstalled;
     sharedPresentationHook=viewHook.presentationHandle;
-    if (viewHook.handle || viewHook.presentationHandle || viewHook.selectionHandle || viewHook.foregroundHandle || viewHook.subclassInstalled) {
+    sharedPresentationMessages=viewHook.presentationMessages;
+    if (viewHook.handle || viewHook.presentationHandle || viewHook.presentationMessages || viewHook.selectionHandle || viewHook.foregroundHandle || viewHook.subclassInstalled) {
         ++viewHook.owners;
         state.viewEvents = viewHook.handle;
         state.nativeSelectionEvents = viewHook.selectionHandle;
@@ -33467,6 +33665,8 @@ void InitializeFrameShellEvents(ViewState& state) {
         UnhookWinEvent(candidateHook);
     if (candidatePresentationHook && candidatePresentationHook != sharedPresentationHook)
         UnhookWinEvent(candidatePresentationHook);
+    if (candidatePresentationMessages && candidatePresentationMessages != sharedPresentationMessages)
+        UnhookWindowsHookEx(candidatePresentationMessages);
     if (candidateSelectionHook && candidateSelectionHook != state.nativeSelectionEvents)
         UnhookWinEvent(candidateSelectionHook);
     if (candidateForegroundHook && candidateForegroundHook != state.nativeForegroundEvents)

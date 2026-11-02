@@ -2,10 +2,21 @@
 #undef WH_MOD_ID
 #define WH_MOD_ID L"gpu-accelerated-explorer-view"
 #include <windhawk_api.h>
+// Exercise USER's observed in-context registration failure with real window
+// creation/layout and the production owner-thread fallback.
+static bool failPresentationRegistration=false;
+static HWINEVENTHOOK WINAPI RegisterFixtureWinEvent(DWORD a,DWORD b,HMODULE m,WINEVENTPROC callback,DWORD p,DWORD t,DWORD flags) {
+    if(failPresentationRegistration && (flags&WINEVENT_INCONTEXT)) {
+        SetLastError(ERROR_MOD_NOT_FOUND); return nullptr;
+    }
+    return ::SetWinEventHook(a,b,m,callback,p,t,flags);
+}
+#define SetWinEventHook RegisterFixtureWinEvent
 #ifndef GPU_OVERLAY_SOURCE
 #define GPU_OVERLAY_SOURCE "../latest.cpp"
 #endif
 #include GPU_OVERLAY_SOURCE
+#undef SetWinEventHook
 #include "touch-calibration.h"
 
 extern "C" __declspec(dllexport) BOOL PrepareMessages() {return RegisterFrameHookReleaseMessage();}
@@ -87,7 +98,7 @@ extern "C" __declspec(dllexport) BOOL FailedInitialization() {
     return UnregisterClassW(kOverlayClass,conflict.hInstance) && unwound;
 }
 static bool editDestroyed=false;
-extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
+extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement(BOOL failRegistration) {
     TouchCalibration digitizer;
     if(!digitizer.Ready()) return FALSE; // Assert the OS input prerequisite before starting the lifecycle probe.
     g_unloading=false; g_backgroundShutdown=false;
@@ -107,6 +118,7 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     state->hwnd=overlay;
     ++g_instances;
     RegisterTabOverlay(frame,frame,overlay);
+    failPresentationRegistration=failRegistration!=FALSE;
     InitializeFrameShellEvents(*state);
     HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,frame,nullptr,type.hInstance,nullptr);
     HWND view=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,320,240,host,nullptr,type.hInstance,nullptr);
@@ -119,6 +131,8 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
     const bool blocked=host && view && GetPropW(host,kSuppressedHostProperty)==overlay &&
         !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE) && list && GetPropW(list,kNativeViewportProperty);
     const bool installed=!g_shellViewHooks.empty();
+    failPresentationRegistration=false;
+    const bool observer=installed && (!failRegistration || g_shellViewHooks.at(frame).presentationMessages);
 #ifdef PRESENTATION_MODEL_FIELDS
     // Start the real presentation and frame threads inside this DLL, then
     // disable with an animation in flight. The host verifies actual unmapping
@@ -200,7 +214,7 @@ extern "C" __declspec(dllexport) BOOL NativeBarrierRetirement() {
         TranslateMessage(&pending); DispatchMessageW(&pending);
     }
     for(const auto name : {L"CabinetWClass",L"CtrlNotifySink",L"SHELLDLL_DefView",L"DirectUIHWND"}) UnregisterClassW(name,type.hInstance);
-    return blocked && retired;
+    return observer && blocked && retired;
 }
 static bool editFontAliveDuringDestroy=false;
 static LRESULT CALLBACK ObserveEditDestruction(HWND window,UINT message,WPARAM wParam,LPARAM lParam,

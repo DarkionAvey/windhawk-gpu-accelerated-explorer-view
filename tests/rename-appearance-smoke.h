@@ -235,8 +235,8 @@ LRESULT CALLBACK ObserveColors(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_P
         Check(GetObjectW(reinterpret_cast<HBRUSH>(result),sizeof(brush),&brush),"native EDIT paint brush");
         colors.text=GetTextColor(reinterpret_cast<HDC>(wp));
         colors.background=GetBkColor(reinterpret_cast<HDC>(wp)); colors.brush=brush.lbColor; ++colors.calls;
-        // Only a window DC that can reach visible pixels counts. This private
-        // frame is off-screen, where USER clips every paint to nothing.
+        // Only a window DC that can reach visible pixels counts. The private
+        // desktop keeps the in-bounds frame isolated from the user's desktop.
         RECT visible{};
         if(GetObjectType(reinterpret_cast<HDC>(wp))!=OBJ_MEMDC &&
             GetClipBox(reinterpret_cast<HDC>(wp),&visible)!=NULLREGION) ++colors.onscreen;    }
@@ -244,7 +244,7 @@ LRESULT CALLBACK ObserveColors(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_P
 }
 void Palette(ViewState& state) {
     // Let the real EDIT request colors while USER paints it. PrintWindow is
-    // not supported for these offscreen EDITs; no paint messages are fabricated.
+    // not a substitute for this client paint; no paint messages are fabricated.
     PaintColors colors{state.rename.editor};
     RECT client{},window{};
     Check(IsWindowVisible(colors.editor) && GetClientRect(colors.editor,&client) && client.right>0 && client.bottom>0,
@@ -294,6 +294,13 @@ static void TestRenameAppearanceImpl(const std::wstring& directory) {
         const bool grid=mode==FVM_ICON || mode==FVM_SMALLICON || mode==FVM_THUMBNAIL, details=mode==FVM_DETAILS;
         StyleFixture::dpi=dpi;
         PresentationFixture::Tab tab(L"rename appearance",80,rtl,grid,grouped,Scale96(330,dpi),Scale96(210,dpi));
+        // USER may discard an offscreen EDIT's invalidation. This scenario
+        // owns a private desktop, so real native paints can stay within its
+        // monitor bounds without exposing windows or changing user focus.
+        MONITORINFO monitor{sizeof(monitor)};
+        Check(GetMonitorInfoW(MonitorFromWindow(tab.frame,MONITOR_DEFAULTTOPRIMARY),&monitor) &&
+            SetWindowPos(tab.frame,nullptr,monitor.rcWork.left,monitor.rcWork.top,0,0,
+                SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"private rename paint bounds");
         auto& state=tab.state;
         ApplyViewLayout(state,{mode,mode==FVM_THUMBNAIL ? 192 : 48},false);
         if(rtl) SetWindowLongPtrW(tab.frame,GWL_EXSTYLE,GetWindowLongPtrW(tab.frame,GWL_EXSTYLE)|WS_EX_LAYOUTRTL);
@@ -438,7 +445,7 @@ static void TestRenameAppearanceImpl(const std::wstring& directory) {
     std::cout<<"PASS: native rename colors/smoothing, actual prefix coordinates and basename selection, API selection changes without layout, full wrapped-name growth, wheel/native pinch/compositor hide/restore with preserved text/selection and updated fonts; GPU selection and real resize/reveal in grouped/ungrouped LTR/RTL views at 96/144/192 DPI\n";
 }
 
-static void TestRenameAppearance(const std::wstring& directory) {
+static void RenameAppearanceVariants(const std::wstring& directory) {
     TestRenameAppearanceImpl(directory);
     const auto manifest=std::filesystem::path(__FILE__).parent_path()/L"rename-native-controls.manifest";
     ACTCTXW settings{sizeof(settings)}; settings.lpSource=manifest.c_str();
@@ -450,4 +457,12 @@ static void TestRenameAppearance(const std::wstring& directory) {
     catch(...) {DeactivateActCtx(0,cookie); ReleaseActCtx(context); throw;}
     DeactivateActCtx(0,cookie); ReleaseActCtx(context);
     std::cout<<"PASS: rename appearance exercised both USER32 and themed COMCTL32 native controls\n";
+}
+
+static void TestRenameAppearance(const std::wstring& directory) {
+    wchar_t desktop[256]{}; DWORD length=0;
+    Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),UOI_NAME,desktop,sizeof(desktop),&length),
+        "rename desktop identity");
+    if(std::wstring_view(desktop).starts_with(L"gpu-overlay-rename-")) RenameAppearanceVariants(directory);
+    else PrivateDesktopFixture::Run(L"rename",L"--test rename-appearance",900000);
 }

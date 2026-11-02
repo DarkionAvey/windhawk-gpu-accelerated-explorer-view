@@ -78,8 +78,14 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
         const auto token=state.directoryToken;
         for(int i=0;i<100;++i) QueueShellItemUpdate(state,path);
         FlushShellChangeHints(state,GetTickCount64()+kShellVisualCoalesceMs+1);
-        Check(state.sortCheckPending && !state.directoryPending && state.directoryToken==token,
+        Check(!state.directoryPending && state.directoryToken==token,
             "item hint synchronously refreshed rows instead of observing the sort key");
+        // The UI deliberately uses a try-lock when publishing to a worker.
+        // Wait for acceptance through the same retry path as idle maintenance.
+        Check(Eventually([&] { RevalidateActiveSort(state); return state.sortCheckPending; }),
+            "sort-key observation was never accepted by its worker");
+        Check(!state.directoryPending && state.directoryToken==token,
+            "sort-key submission restarted names enumeration");
         Check(Eventually([&] { ReceiveDirectoryResults(state); return !state.sortCheckPending; }),
             "sort-key observation did not finish");
         Check(state.watchedChangePending==changed,"sort key change detection did not match actual file data");
@@ -179,7 +185,7 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     const auto renamedPath=JoinPath(directory,L"ZZZ-live-Shell-rename.txt");
     state.selected=-1; state.selectedFlags.assign(state.total,0);
     Check(MoveFileW(oldPath.c_str(),renamedPath.c_str()),"external Shell rename fixture");
-    SHChangeNotify(SHCNE_RENAMEITEM,SHCNF_PATHW|SHCNF_FLUSHNOWAIT,oldPath.c_str(),renamedPath.c_str());
+    SHChangeNotify(SHCNE_RENAMEITEM,SHCNF_PATHW|SHCNF_FLUSH,oldPath.c_str(),renamedPath.c_str());
     Check(Eventually([&] {
         MSG message{};
         while(PeekMessageW(&message,state.hwnd,kMsgShellItemCreated,kMsgShellItemCreated,PM_REMOVE))
@@ -197,7 +203,8 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     const auto generation=state.directoryToken;
     state.shellItemOverflow=true; state.shellVisualChangeAt=GetTickCount64();
     FlushShellChangeHints(state,GetTickCount64()+kShellVisualCoalesceMs+1);
-    Check(Eventually([&] { ReceiveDirectoryResults(state); return !state.sortCheckPending; }),"sort overflow observation");
+    Check(Eventually([&] { UpdateWatchedDirectory(state,GetTickCount64()); ReceiveDirectoryResults(state);
+        return !state.sortCheckPending && !state.sortCheckOverflow; }),"sort overflow observation");
     Check(state.directoryToken==generation && !state.watchedChangePending && !state.rowTransitionActive,
         "unchanged sorted overflow replaced or animated the displayed snapshot");
     const std::vector<std::wstring> retry{state.entries.front().path};
@@ -208,12 +215,14 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
             "contended sort submission blocked or lost its retry intent");
     }
     UpdateWatchedDirectory(state,GetTickCount64());
-    Check(Eventually([&] { ReceiveDirectoryResults(state); return !state.sortCheckPending; }) &&
+    Check(Eventually([&] { UpdateWatchedDirectory(state,GetTickCount64()); ReceiveDirectoryResults(state);
+        return !state.sortCheckPending && state.sortUpdatedItems.empty(); }) &&
         state.directoryToken==generation && !state.watchedChangePending,"sort submission retry did not settle unchanged");
     state.sort.explicitOrder=false;
     QueueShellItemUpdate(state,state.entries.front().path);
     FlushShellChangeHints(state,GetTickCount64()+kShellVisualCoalesceMs+1);
-    Check(Eventually([&] { ReceiveDirectoryResults(state); return !state.sortCheckPending; }) &&
+    Check(Eventually([&] { UpdateWatchedDirectory(state,GetTickCount64()); ReceiveDirectoryResults(state);
+        return !state.sortCheckPending && state.sortUpdatedItems.empty(); }) &&
         state.directoryToken==generation && !state.watchedChangePending,
         "unchanged natural-order hints replaced the displayed snapshot");
     state.sort=DefaultSort();
