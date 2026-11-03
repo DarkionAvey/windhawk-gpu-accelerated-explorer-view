@@ -218,6 +218,11 @@ static void TestTypeSearchInput(const std::wstring& fixture) {
     Check(Eventually([&] {live.Pump(); return state.typeSearch.empty();}),"native type-search timeout did not clear the query");
     Check(!OverlayKeyboardTarget(space),"idle Space no longer belongs to native preview extensions");
     Check(!OverlayKeyboardTarget(back),"idle Backspace no longer belongs to native navigation");
+    TypeToSelect(state,L'A');
+    for(wchar_t ch:std::wstring(L"\U0001F600")) TypeToSelect(state,ch);
+    TypeToSelect(state,L'\b');
+    Check(state.typeSearch==L"A","search Backspace left an orphaned emoji surrogate");
+    ClearTypeSearch(state);
     g_dispatchOriginal=original;
     std::cout<<"PASS: Windows-translated Space routing, incremental whitespace/punctuation matching and real timeout\n";
 }

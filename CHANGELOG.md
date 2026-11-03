@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 (unreleased)
+
+- Match filenames across emoji in type-to-select searches, preserve highlight
+  positions, and remove complete surrogate pairs with Backspace.
+- Use the same Windows native-digit policy for section and drag counts,
+  preserving section grouping and the drag count overflow suffix.
+
 ## 1.0.0
 
 - Show tooltip dates with a localized relative phrase from Windows ICU,

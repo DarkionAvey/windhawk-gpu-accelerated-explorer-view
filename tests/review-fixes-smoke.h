@@ -85,8 +85,22 @@ static void TestDragCountLocale() {
             if(count>999) expected+=L'+';
             Check(FormatDragCount(count,rtl,locale)==expected,"badge ignored locale digits, direction or overflow suffix");
         }
+        // Independent Windows formatting supplies grouping and separators;
+        // native-digit expectations are applied without using the mod helper.
+        wchar_t grouped[128]{};
+        Check(GetNumberFormatEx(locale,0,L"1234567",nullptr,grouped,ARRAYSIZE(grouped)),"native grouped section count");
+        wchar_t decimal[8]{};
+        Check(GetLocaleInfoEx(locale,LOCALE_SDECIMAL,decimal,ARRAYSIZE(decimal)),"native decimal separator");
+        std::wstring expected=grouped;
+        const auto fraction=expected.find(decimal);
+        if(fraction!=std::wstring::npos) expected.resize(fraction);
+        if(policy==2 || (policy==0 && rtl)) for(auto& ch:expected)
+            if(ch>=L'0' && ch<=L'9') ch=digits[ch-L'0'];
+        Check(FormatSelectionCount(1234567,rtl,locale)==expected,"section count lost grouping or native digits");
+        Check(FormatSelectionCount(37,rtl,locale)==FormatDragCount(37,rtl,locale),
+            "section and drag badges disagree on digit substitution");
     }
-    std::cout<<"PASS: count badge follows actual English/Arabic/Persian digit policies and overflow\n";
+    std::cout<<"PASS: section/drag counts follow actual English/Arabic/Persian digit policies, grouping and overflow\n";
 }
 
 namespace DragPropertyFixture {

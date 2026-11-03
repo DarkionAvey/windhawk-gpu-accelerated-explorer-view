@@ -1,6 +1,7 @@
 // Count live-view queries while running actual timer, input, projection and
 // startup paths. All windows stay off screen and file access is read-only.
 static void TestTypeSearchPrefix() {
+    Check(g_typeSearchUnicode.Initialize(),"system Unicode classification");
     for(const auto* query:{L"programfil",L"Program fi",L"pro gram f i"})
         Check(MatchesTypeSearchPrefix(L"Program files",query),"type search did not ignore filename/query whitespace");
     Check(TypeSearchPrefixLength(L"Program files",L"programfil")==11 &&
@@ -18,6 +19,16 @@ static void TestTypeSearchPrefix() {
           MatchesTypeSearchPrefix(L"a\u2014b\u20acc",L"abc") &&
           !MatchesTypeSearchPrefix(L"file.txt",L"---"),
           "type-search separator folding lost Unicode letters or matched a separator-only query");
+    Check(TypeSearchPrefixLength(L"file\U0001F600name.txt",L"filename")==10 &&
+          TypeSearchPrefixLength(L"filename.txt",L"fi\U0001F600lename")==8 &&
+          TypeSearchPrefixLength(L"file\U0001F468\u200D\U0001F469name.txt",L"filename")==13 &&
+          TypeSearchPrefixLength(L"file\u2605\uFE0Fname.txt",L"filename")==10,
+          "emoji, joiners or variation selectors broke matching/original UTF-16 highlight offsets");
+    Check(MatchesTypeSearchPrefix(L"\U00010400-file.txt",L"\U00010400file") &&
+          !MatchesTypeSearchPrefix(L"\U00010400-file.txt",L"file") &&
+          !MatchesTypeSearchPrefix(L"\U0001D7D8-file.txt",L"file") &&
+          !MatchesTypeSearchPrefix(L"\U0001F600name.txt",std::wstring(1,wchar_t(0xD83D))),
+          "supplementary letters/digits were skipped or an incomplete surrogate became a match");
     Check(MatchesTypeSearchPrefix(L"Flower in the park.jpg", L"f") &&
           MatchesTypeSearchPrefix(L"Flower in the park.jpg", L"flower") &&
           MatchesTypeSearchPrefix(L"folder", L"FOL"),
@@ -26,6 +37,7 @@ static void TestTypeSearchPrefix() {
           !MatchesTypeSearchPrefix(L"file.txt", L"files") &&
           !MatchesTypeSearchPrefix(L"file.txt", L""),
           "type-search highlighted a non-prefix or empty query");
+    g_typeSearchUnicode.Reset();
     std::cout << "PASS: visible quick-search highlights share the type-to-select prefix matcher\n";
 }
 
