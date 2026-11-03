@@ -8215,8 +8215,9 @@ std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,cons
     if(months) return ItemTipRelativeOffset{double(months),SystemRelativeTime::Month};
     return ItemTipRelativeOffset{std::trunc(days/7.),SystemRelativeTime::Week};
 }
-std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wchar_t* localeName) {
-    std::wstring text = FormatFileTime(time);
+std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wchar_t* localeName,
+                             std::wstring text = {}) {
+    if (text.empty()) text = FormatFileTime(time);
     if (text.empty()) return text;
     if(const auto offset=ItemTipDateOffset(time,now); offset && localeName && *localeName) {
         static const SystemRelativeTime formatter;
@@ -8225,11 +8226,11 @@ std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wc
     }
     return text;
 }
-std::wstring ItemTipDate(REFPROPERTYKEY, const FILETIME& time) {
+std::wstring ItemTipDate(REFPROPERTYKEY, const FILETIME& time,std::wstring text = {}) {
     FILETIME now{}; GetSystemTimeAsFileTime(&now);
     wchar_t localeName[LOCALE_NAME_MAX_LENGTH]{};
     GetUserDefaultLocaleName(localeName,ARRAYSIZE(localeName));
-    return FormatItemTipDate(time,now,localeName);
+    return FormatItemTipDate(time,now,localeName,std::move(text));
 }
 
 std::wstring ItemTipComparison(std::wstring value, bool date) {
@@ -8257,7 +8258,19 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         for (const auto& cell : job.cells) if (SameKey(cell.key, key)) return &cell.text;
         return nullptr;
     };
-    const auto add = [&](REFPROPERTYKEY key, std::wstring value, bool requireViewable) {
+    const auto openStore = [&] {
+        if (!storeAttempted && current() && job.rows.size() < job.rowLimit) {
+            storeAttempted = true;
+            EntryPropertyStore(job.path, job.identity.get(), recalled ? GPS_FASTPROPERTIESONLY : GPS_DEFAULT, store.GetAddressOf());
+        }
+    };
+    const auto timestamp = [](const PROPVARIANT& property,FILETIME& time) {
+        if (property.vt==VT_FILETIME) {time=property.filetime; return true;}
+        SYSTEMTIME utc{};
+        return property.vt==VT_DATE && VariantTimeToSystemTime(property.date,&utc) && SystemTimeToFileTime(&utc,&time);
+    };
+    const auto add = [&](REFPROPERTYKEY key, std::wstring value, bool requireViewable,
+                         const PROPVARIANT* raw = nullptr) {
         if (value.find_first_not_of(L" \t\r\n") == std::wstring::npos || job.rows.size() >= job.rowLimit) return;
         ComPtr<IPropertyDescription> description;
         std::wstring label;
@@ -8274,8 +8287,26 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         if (label.empty()) return; // No canonical names or hardcoded English fallback.
         for (auto& ch : value) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
         VARTYPE type = VT_EMPTY;
-        const bool date = description && SUCCEEDED(description->GetPropertyType(&type)) && type == VT_FILETIME;
-        // Cached date columns lack our optional Windows-friendly suffix.
+        const bool date = description && SUCCEEDED(description->GetPropertyType(&type)) &&
+            (type==VT_FILETIME || type==VT_DATE);
+        if (date) {
+            FILETIME time{};
+            bool known = raw && timestamp(*raw,time);
+            // These timestamps already belong to the names snapshot. Other
+            // date properties are identified by their Shell schema, never by
+            // translated labels or by parsing a cached display string.
+            if (!known && SameKey(key,PKEY_DateCreated)) time=job.created;
+            else if (!known && SameKey(key,PKEY_DateModified)) time=job.modified;
+            known = known || time.dwLowDateTime || time.dwHighDateTime;
+            if (!known && current()) {
+                openStore();
+                PROPVARIANT property{};
+                if (store && SUCCEEDED(store->GetValue(key,&property)))
+                    known=timestamp(property,time);
+                PropVariantClear(&property);
+            }
+            if (known) value=ItemTipDate(key,time,std::move(value));
+        }
         auto comparison = ItemTipComparison(value, date);
         if (std::find(displayedValues.begin(), displayedValues.end(), comparison) != displayedValues.end()) return;
         displayedValues.push_back(std::move(comparison));
@@ -8287,16 +8318,11 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         visited.push_back(key);
         return true;
     };
-    const auto openStore = [&] {
-        if (!storeAttempted && current() && job.rows.size() < job.rowLimit) {
-            storeAttempted = true;
-            EntryPropertyStore(job.path, job.identity.get(), recalled ? GPS_FASTPROPERTIESONLY : GPS_DEFAULT, store.GetAddressOf());
-        }
-    };
     job.rows.clear();
     for (const auto& key : {PKEY_Size, PKEY_ItemTypeText, PKEY_DateCreated, PKEY_DateModified}) {
         if (!first(key)) continue;
         std::wstring text;
+        PROPVARIANT property{};
         bool resolved = cached(key) != nullptr;
         if (const auto* value = cached(key)) text = *value;
         else if (SameKey(key, PKEY_Size)) {
@@ -8307,17 +8333,16 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
             if (!resolved && job.folder && !job.namespaceItem) resolved = true;
         } else if (SameKey(key, PKEY_ItemTypeText)) text = !job.type.empty() ? job.type :
             !job.namespaceItem ? GetTypeName(typeNames, job.path, job.folder) : L"";
-        else text = ItemTipDate(key, SameKey(key, PKEY_DateCreated) ? job.created : job.modified);
+        else text = FormatFileTime(SameKey(key, PKEY_DateCreated) ? job.created : job.modified);
         if (text.empty() && !resolved) {
             openStore();
-            PROPVARIANT value{};
-            if (store && SUCCEEDED(store->GetValue(key, &value))) {
-                text = value.vt == VT_FILETIME ? ItemTipDate(key, value.filetime) : FormatShellDetail(nullptr, key, &value);
+            if (store && SUCCEEDED(store->GetValue(key, &property))) {
+                text = property.vt == VT_FILETIME ? FormatFileTime(property.filetime) : FormatShellDetail(nullptr, key, &property);
             }
-            PropVariantClear(&value);
             if (text.empty() && SameKey(key, PKEY_ItemTypeText)) text = GetTypeName(typeNames, job.path, job.folder);
         }
-        add(key, std::move(text), false);
+        add(key, std::move(text), false,&property);
+        PropVariantClear(&property);
     }
     if (!job.detailed || recalled || job.folder || job.namespaceItem || !current() || job.rows.size() >= job.rowLimit) return;
     ComPtr<IShellItem2> item;
@@ -8338,8 +8363,8 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
             openStore();
             PROPVARIANT value{};
             if (store && SUCCEEDED(store->GetValue(key,&value)))
-                add(key,value.vt==VT_FILETIME ? ItemTipDate(key,value.filetime) :
-                    FormatShellDetail(nullptr,key,&value),true);
+                add(key,value.vt==VT_FILETIME ? FormatFileTime(value.filetime) :
+                    FormatShellDetail(nullptr,key,&value),true,&value);
             PropVariantClear(&value);
         }
     }
@@ -27060,15 +27085,21 @@ void ConsumeItemTip(ViewState& state) {
     // The pointer may have rested elsewhere, pressed or left meanwhile.
     if (!ItemTipEligible(state, state.hovered) ||
         state.entries[static_cast<size_t>(state.hovered)].path != tip.item) { HideItemTip(state); return; }
-    // Detail jobs can finish after hover started. Prefer their newer strings
-    // as well, especially folder-size text supplied by another mod.
+    // Detail jobs can finish after hover started. Prefer their newer strings,
+    // especially folder-size text supplied by another mod. Timestamp rows are
+    // already complete on the worker: plain column text would strip their
+    // relative phrases. Keep that coherent snapshot instead of resolving or
+    // formatting optional metadata on Explorer's STA.
     CaptureItemTipCells(state.entries[static_cast<size_t>(state.hovered)], *result);
-    for (auto& row : result->rows) for (const auto& cell : result->cells)
-        if (SameKey(row.key, cell.key)) {
-            row.value = cell.text;
-            for (auto& ch : row.value) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
-            break;
-        }
+    for (auto& row : result->rows) {
+        if (row.date) continue;
+        for (const auto& cell : result->cells)
+            if (SameKey(row.key, cell.key)) {
+                row.value = cell.text;
+                for (auto& ch : row.value) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+                break;
+            }
+    }
     std::unordered_set<std::wstring> values;
     std::erase_if(result->rows, [&](const auto& row) {
         return row.value.find_first_not_of(L" \t\r\n") == std::wstring::npos ||

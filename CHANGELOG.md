@@ -6,6 +6,9 @@
   positions, and remove complete surrogate pairs with Backspace.
 - Use the same Windows native-digit policy for section and drag counts,
   preserving section grouping and the drag count overflow suffix.
+- Include localized relative phrases for cached tooltip dates and additional
+  timestamp properties, keeping their existing date text and preserving the
+  phrases when the completed tooltip receives newer cached column values.
 
 ## 1.0.0
 

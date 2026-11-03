@@ -52,6 +52,11 @@ static void TestItemTipRelativeDates() {
             const std::wstring absolute=std::wstring(date)+L" "+time;
             Check(FormatItemTipDate(item.time,now,locale.windows)==absolute+L" \x00B7 "+std::wstring(phrase,size_t(length)),
                 "tooltip lost its exact date, separator or native localized relative phrase");
+            wchar_t cached[256]{};
+            Check(GetDateFormatEx(LOCALE_NAME_USER_DEFAULT,DATE_LONGDATE,&local,nullptr,cached,ARRAYSIZE(cached),nullptr),
+                "native cached date display");
+            Check(FormatItemTipDate(item.time,now,locale.windows,cached)==std::wstring(cached)+L" \x00B7 "+std::wstring(phrase,size_t(length)),
+                "cached date lost its native text or localized relative phrase");
             Check(FormatItemTipDate(item.time,now,nullptr)==absolute,"relative formatter failure lost the actual date");
         }
     }
@@ -89,6 +94,12 @@ static void ItemTipScenario(const std::wstring& directory) {
         Check(file != INVALID_HANDLE_VALUE, "item tip fixture file");
         DWORD written = 0;
         const bool wrote = WriteFile(file, "item tip", 8, &written, nullptr) && written == 8;
+        SYSTEMTIME date{}; date.wYear=2020; date.wMonth=1; date.wDay=2;
+        FILETIME created{},modified{};
+        Check(SystemTimeToFileTime(&date,&created),"tooltip creation timestamp");
+        date.wYear=2021; date.wMonth=2;
+        Check(SystemTimeToFileTime(&date,&modified) && SetFileTime(file,&created,nullptr,&modified),
+            "distinct private tooltip timestamps");
         CloseHandle(file);
         Check(wrote, "item tip fixture contents");
     }
@@ -110,14 +121,18 @@ static void ItemTipScenario(const std::wstring& directory) {
     {
         ComPtr<IPropertyStore> store;
         Check(SUCCEEDED(EntryPropertyStore((root / L"photo.jpg").wstring(), nullptr, GPS_READWRITE, &store)), "JPEG metadata writer");
-        PROPVARIANT comment{}, tags{};
+        PROPVARIANT comment{}, tags{}, taken{};
+        SYSTEMTIME captured{}; captured.wYear=2019; captured.wMonth=3; captured.wDay=4;
+        FILETIME capturedTime{};
         const std::wstring text = L"Private fixture comment\r\n" + std::wstring(2048, L'x');
         const wchar_t* keywords[]{L"fixture", L"tooltip"};
         Check(SUCCEEDED(InitPropVariantFromString(text.c_str(), &comment)) &&
             SUCCEEDED(InitPropVariantFromStringVector(keywords, ARRAYSIZE(keywords), &tags)) &&
+            SystemTimeToFileTime(&captured,&capturedTime) && SUCCEEDED(InitPropVariantFromFileTime(&capturedTime,&taken)) &&
             SUCCEEDED(store->SetValue(PKEY_Comment, comment)) && SUCCEEDED(store->SetValue(PKEY_Keywords, tags)) &&
+            SUCCEEDED(store->SetValue(PKEY_Photo_DateTaken,taken)) &&
             SUCCEEDED(store->Commit()), "JPEG comments/tags");
-        PropVariantClear(&comment); PropVariantClear(&tags);
+        PropVariantClear(&comment); PropVariantClear(&tags); PropVariantClear(&taken);
     }
     {
         // One second of PCM audio; Windows resolves bitrate from the WAV.
@@ -205,6 +220,8 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(valueOf(PKEY_DateCreated).starts_with(FormatFileTime(file.created)) &&
         (FormatFileTime(file.created) == FormatFileTime(file.lastWrite) ? valueOf(PKEY_DateModified).empty() :
             valueOf(PKEY_DateModified).starts_with(FormatFileTime(file.lastWrite))), "file item tip dates/deduplication");
+    for(const auto& key:{PKEY_DateCreated,PKEY_DateModified})
+        Check(valueOf(key).find(L" \x00B7 ")!=std::wstring::npos,"uncached tooltip date lacks a relative phrase");
     for (const auto& row : tip.rows) {
         ComPtr<IPropertyDescription> description; PWSTR label = nullptr;
         Check(SUCCEEDED(PSGetPropertyDescription(row.key, IID_PPV_ARGS(&description))) &&
@@ -385,7 +402,8 @@ static void ItemTipScenario(const std::wstring& directory) {
 
     // Reuse real Details columns without presenting a partial popup.
     state.columns.clear(); state.columnsView = true;
-    for (const auto& key : {PKEY_Size, PKEY_ItemTypeText, PKEY_DateModified, PKEY_Comment, PKEY_Keywords, PKEY_Image_Dimensions}) {
+    for (const auto& key : {PKEY_Size, PKEY_ItemTypeText, PKEY_DateCreated, PKEY_DateModified,
+            PKEY_Photo_DateTaken, PKEY_Comment, PKEY_Keywords, PKEY_Image_Dimensions}) {
         ExplorerColumn column; column.key = key;
         ComPtr<IPropertyDescription> description; PWSTR label = nullptr;
         Check(SUCCEEDED(PSGetPropertyDescription(key, IID_PPV_ARGS(&description))) &&
@@ -397,8 +415,27 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(Eventually([&] {
         ReceiveDirectoryResults(state); QueueVisibleDetails(state);
         return HasCachedColumnCell(state.entries[size_t(photo)], PKEY_Keywords) &&
-            HasCachedColumnCell(state.entries[size_t(folder)], PKEY_Size);
+            HasCachedColumnCell(state.entries[size_t(folder)], PKEY_Size) &&
+            HasCachedColumnCell(state.entries[size_t(note)], PKEY_DateCreated) &&
+            HasCachedColumnCell(state.entries[size_t(note)], PKEY_DateModified);
     }), "real column cache completion");
+    Check(hover(note),"cached timestamp tooltip completion");
+    for(const auto& key:{PKEY_DateCreated,PKEY_DateModified})
+        Check(valueOf(key).find(L" \x00B7 ")!=std::wstring::npos,"cached tooltip date lacks a relative phrase");
+    {
+        // Resolve all configured rows without popup-height clipping. The JPEG
+        // handler supplies a timestamp beyond the standard filesystem slots.
+        ItemTipJob facts; const auto& entry=state.entries[size_t(photo)];
+        facts.path=entry.path; facts.created=entry.created; facts.modified=entry.lastWrite;
+        facts.detailed=true; facts.rowLimit=100; CaptureItemTipCells(entry,facts);
+        ShellSizeBinding binding; std::map<std::wstring,std::wstring> names;
+        ResolveItemTip(facts,binding,names,[]{return true;});
+        for(const auto& row:facts.rows) if(row.date)
+            Check(row.value.find(L" \x00B7 ")!=std::wstring::npos,"additional timestamp lost its relative phrase");
+        if(configured(root/L"photo.jpg",PKEY_Photo_DateTaken))
+            Check(std::any_of(facts.rows.begin(),facts.rows.end(),[](const auto& row){return SameKey(row.key,PKEY_Photo_DateTaken);}),
+                "configured photo timestamp was not resolved");
+    }
     ItemTipHoverMoved(state, -1); state.hovered = photo; ShowItemTip(state, client);
     Check(!shown() && tip.token, "cached tooltip appeared before completion");
     Check(hover(photo) && valueOf(PKEY_Size) == state.entries[size_t(photo)].size, "cached JPEG tooltip completion");
