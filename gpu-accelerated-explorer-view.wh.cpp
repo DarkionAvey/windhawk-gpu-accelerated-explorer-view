@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.347
+// @version         1.0.0
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -289,6 +289,7 @@ HRESULT CreatePixelAlignedVisual(IDCompositionDevice* device,IDCompositionVisual
 }
 constexpr wchar_t kOverlayProperty[] = L"WindhawkExplorerGpuOverlayOwnsShellView";
 constexpr wchar_t kViewToggleOwnerProperty[] = L"WindhawkExplorerGpuViewToggleOwner";
+constexpr wchar_t kDragPreviewProperty[] = L"WindhawkGpuDragPreview";
 constexpr wchar_t kRenameEditorProperty[] = L"WindhawkExplorerGpuRenameEditor"; // Frame-child EDIT in a GPU stack.
 constexpr wchar_t kSuppressedHostProperty[] = L"WindhawkGpuSuppressedFolderHost";
 constexpr wchar_t kNativeViewportProperty[] = L"WindhawkGpuNativeViewport";
@@ -381,7 +382,6 @@ constexpr UINT_PTR kTimerId = 101;
 constexpr UINT_PTR kTypeSearchTimerId = 105;
 constexpr UINT_PTR kZoomAutoRefitTimerId = 106;
 constexpr UINT_PTR kTouchHoldTimerId = 107;
-constexpr UINT kMsgTouchDrag = WM_APP + 77;
 // Input batching only: expiry never substitutes for gesture/animation/data completion.
 constexpr UINT kZoomAutoRefitDebounceMs = 200;
 constexpr UINT kMsgDispose = WM_APP + 31;
@@ -400,6 +400,7 @@ constexpr UINT kMsgRenameDecision = WM_APP + 43;
 constexpr UINT kMsgShellVisibilityChanged = WM_APP + 45;
 constexpr UINT kMsgThisPcRows = WM_APP + 46;
 constexpr UINT kMsgTabActivated = WM_APP + 47;
+constexpr UINT kMsgBeginRename = WM_APP + 48;
 // Reconcile a native Ctrl+A only AFTER Explorer has processed its accelerator.
 // A large selection is never constructed from individual PIDLs on the UI STA.
 constexpr UINT kMsgAdoptNativeSelectAll = WM_APP + 49;
@@ -409,10 +410,8 @@ constexpr UINT kMsgNativeSelectionChanged = WM_APP + 50;
 // SelectionChanged from the ShellFolderView COM connection point is the
 // preferred native signal. Deliver it asynchronously to the overlay STA.
 constexpr UINT kMsgShellSelectionEvent = WM_APP + 51;
-constexpr UINT kMsgPreparedSelection = WM_APP + 62;
 // Defer control actions/layout outside native button and frame transactions.
 constexpr UINT kMsgViewToggle = WM_APP + 52;
-constexpr UINT kMsgViewToggleLayout = WM_APP + 66;
 // File/folder creation identity is separate from interactive create intent.
 // Shell change notifications say what was created, not which command did it.
 constexpr UINT kMsgShellItemCreated = WM_APP + 53;
@@ -423,9 +422,11 @@ constexpr UINT kMsgShellSystemChanged = WM_APP + 55;
 constexpr UINT kMsgWorkerFailed = WM_APP + 56;
 constexpr UINT kMsgInitializeFeatures = WM_APP + 57;
 constexpr UINT kMsgNativeRowsHint = WM_APP + 58;
+constexpr UINT kMsgPreparedSelection = WM_APP + 62;
 constexpr UINT kMsgColumnMenuReady = WM_APP + 63;
 constexpr UINT kMsgDetailsReady = WM_APP + 64;
 constexpr UINT kMsgFrameStateChanged = WM_APP + 65;
+constexpr UINT kMsgViewToggleLayout = WM_APP + 66;
 constexpr UINT kMsgInputFocusChanged = WM_APP + 67;
 constexpr UINT kMsgColumnFitReady = WM_APP + 68;
 constexpr UINT kMsgRetireGraphics = WM_APP + 69;
@@ -433,24 +434,24 @@ constexpr UINT kMsgFilesystemChanged = WM_APP + 70;
 constexpr UINT kMsgFlushDirectoryChanges = WM_APP + 71;
 constexpr UINT kMsgPresentationReady = WM_APP + 72;
 constexpr UINT kMsgNativeCatalog = WM_APP + 73;
+constexpr UINT kMsgNativeRenameEditor = WM_APP + 74;
+constexpr UINT kMsgStyleChanged = WM_APP + 75;
+constexpr UINT kMsgTabResumeRefresh = WM_APP + 76;
+constexpr UINT kMsgTouchDrag = WM_APP + 77;
+// Hovered-item tooltip metadata resolved on the tab's Columns lane.
+constexpr UINT kMsgItemTipReady = WM_APP + 78;
+constexpr UINT kMsgReconcileEmptySnapshot = WM_APP + 79;
+constexpr UINT kMsgNativeInputLayout = WM_APP + 80;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
     return g_releaseFrameHooksMessage!=0;
 }
-constexpr UINT kMsgNativeRenameEditor = WM_APP + 74;
-constexpr UINT kMsgStyleChanged = WM_APP + 75;
-constexpr UINT kMsgTabResumeRefresh = WM_APP + 76;
-// Hovered-item tooltip metadata resolved on the tab's Columns lane.
-constexpr UINT kMsgItemTipReady = WM_APP + 78;
-constexpr UINT kMsgReconcileEmptySnapshot = WM_APP + 79;
-constexpr UINT kMsgNativeInputLayout = WM_APP + 80;
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
-constexpr UINT kMsgBeginRename = WM_APP + 48;
 // One navigation-rebind policy regardless of whether the signal came from
 // a Shell view event, the message dispatcher, or an overlay action.
 constexpr ULONGLONG kNavigationRetryWindowMs = 700;
@@ -1362,6 +1363,8 @@ struct DragPreview : DragPreviewImage {
     unsigned long long captionFace=0;
     int captionDpi=0;
     float captionAvailable=0.f;
+    float captionWorkWidth=0.f,captionPreferredWidth=0.f;
+    std::wstring countLabel;
     HMONITOR monitor=nullptr;
     float side=0.f;
     int dpi=96,count=1;
@@ -1489,6 +1492,11 @@ std::atomic<unsigned long long> g_compositionStarted{0}, g_compositionCompleted{
 bool PresentationFramesActive();
 void SignalPresentationFrames();
 
+HRESULT CompositorWaitResult(DWORD result) {
+    if (result==WAIT_FAILED) return HRESULT_FROM_WIN32(GetLastError());
+    return (result&0x80000000UL) ? HRESULT_FROM_NT(result):HRESULT_FROM_WIN32(result);
+}
+
 DWORD WINAPI CompositionFrameProc(LPVOID context) {
     const HANDLE wake=static_cast<HANDLE>(context);
     using WaitForClock=DWORD(WINAPI*)(UINT,const HANDLE*,DWORD);
@@ -1517,10 +1525,10 @@ DWORD WINAPI CompositionFrameProc(LPVOID context) {
             HRESULT hr=S_OK;
             if(waitForClock) {
                 const DWORD result=waitForClock(1,&wake,INFINITE);
+                const HRESULT status=CompositorWaitResult(result); // Capture last error before any other API.
                 if(g_frameStopping.load(std::memory_order_acquire)) break;
                 if(result==WAIT_OBJECT_0) continue; // Control wake, not a frame.
-                if(result!=WAIT_OBJECT_0+1) hr=(result&0x80000000UL) ?
-                    HRESULT_FROM_NT(result):HRESULT_FROM_WIN32(result);
+                if(result!=WAIT_OBJECT_0+1) hr=status;
             } else hr=DwmFlush(); // Compatibility with pre-Windows 11 hosts.
             if (SUCCEEDED(hr)) g_compositionCompleted.store(cycle,std::memory_order_release);
             if (tracePacing) QueryPerformanceCounter(&pacingEnd);
@@ -1818,6 +1826,7 @@ struct ItemTipJob {
     SharedPidl identity;
     std::wstring path;
     bool folder = false, namespaceItem = false;
+    DWORD attributes = 0;
     std::wstring type;
     ULONGLONG size = 0;
     bool sizeKnown = false;
@@ -2396,6 +2405,7 @@ void WriteFrameSummary(const FrameSummary& summary) {
     auto sorted=p.intervals;
     std::sort(sorted.begin(),sorted.begin()+p.samples);
     const auto percentile=[&](double q) {return p.samples ? sorted[static_cast<size_t>((p.samples-1)*q)] : 0.;};
+    const double frames=static_cast<double>(std::max<size_t>(1,p.frames));
     const double rate=p.intervalTotal>0. ? 1000.*p.intervalSubmits/p.intervalTotal : 0.;
     Wh_Log(L"[GPU frames] tab=%p thread=%lu folder=%s mode=%u rows=%d hz=%d frames=%zu submitted=%zu submitHz=%.1f "
         L"interval-ms p50=%.2f p95=%.2f p99=%.2f max=%.2f late=%zu/%zu "
@@ -2403,9 +2413,9 @@ void WriteFrameSummary(const FrameSummary& summary) {
         L"upload=%.2f/%.2f draw=%.2f/%.2f present=%.2f/%.2f flush=%.2f/%.2f cleanup=%.2f/%.2f icons=%zu text-cache=%zu/%zu text-wait=%zu activity=0x%X",
         summary.tab,summary.thread,summary.folder.c_str(),summary.mode,summary.rows,summary.hz,
         p.frames,p.submitted,rate,percentile(.5),percentile(.95),percentile(.99),percentile(1.),p.late,p.samples,
-        p.cpuTotal/p.frames,p.cpuMax,p.totals[0]/p.frames,p.maxima[0],p.totals[1]/p.frames,p.maxima[1],
-        p.totals[2]/p.frames,p.maxima[2],p.totals[3]/p.frames,p.maxima[3],p.totals[4]/p.frames,p.maxima[4],
-        p.totals[5]/p.frames,p.maxima[5],p.totals[6]/p.frames,p.maxima[6],summary.icons,p.textHits,p.textMisses,p.textDeferred,p.activity);
+        p.cpuTotal/frames,p.cpuMax,p.totals[0]/frames,p.maxima[0],p.totals[1]/frames,p.maxima[1],
+        p.totals[2]/frames,p.maxima[2],p.totals[3]/frames,p.maxima[3],p.totals[4]/frames,p.maxima[4],
+        p.totals[5]/frames,p.maxima[5],p.totals[6]/frames,p.maxima[6],summary.icons,p.textHits,p.textMisses,p.textDeferred,p.activity);
 }
 
 DWORD WINAPI PipelineWriterProc(LPVOID context) {
@@ -3162,6 +3172,7 @@ struct ViewState {
         LARGE_INTEGER started{};
     };
     std::vector<GroupSection> sections;
+    std::optional<std::wstring> keyboardSectionKey; // Empty group keys are valid; null means item focus.
     std::shared_ptr<const SectionBadges> sectionBadges;
     bool sectionBadgeAnimating = false; // Lane paint only: a painted badge is still moving.
     int groupRevealRow = -1; // Owner: reveal after the expanding group settles.
@@ -3770,6 +3781,8 @@ struct ViewState {
         ComPtr<IDCompositionVisual> visual;
         ComPtr<IDCompositionScaleTransform> scale;
         ComPtr<IDCompositionAnimation> curve;
+        ComPtr<IDCompositionAnimation> opacityCurve;
+        ComPtr<IDCompositionEffectGroup> opacity;
         std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages> artwork;
         std::array<const void*,kDragPreviewImages> artworkIdentity{};
         std::array<DragShadow,kDragPreviewImages> shadows;
@@ -3903,7 +3916,7 @@ struct SwipeFeedbackSnapshot {
     X(columnModeTransition) X(columnPresentationPending) X(columnHeaderFrom) X(columnHeaderTo) \
     X(columnTransitionStartedQpc) X(columnMotion) X(disappearingColumns) X(columnDragArmed) X(columnDragActive) \
     X(columnDragKey) X(columnDragSource) X(columnDragDestination) X(columnDragPointerX) X(columnDragGrabOffset) \
-    X(columnWiggleAwaitRelease) X(grouping) X(groupAnimating) X(hotSection) X(sort) \
+    X(columnWiggleAwaitRelease) X(grouping) X(groupAnimating) X(hotSection) X(keyboardSectionKey) X(sort) \
     X(rowTransitionActive) X(groupingLayoutTransition) X(zoomLayoutTransition) X(reflowLayoutTransition) X(rowTransitionStartedQpc) \
     X(rowTransitionPresentedProgress) X(rowSceneRevision) X(rowMotion) X(rowMotionFirst) X(disappearingRows) \
     X(groupHeaderMotion) X(disappearingHeaders) X(rowTransitionOldScroll) X(zebraExtentAnimating) \
@@ -4036,7 +4049,7 @@ void PublishSwipeFeedback(ViewState& state) {
 int DpiOf(HWND hwnd);
 int ViewDpi(const ViewState& state) {
     const int dpi = state.presentationOnly ? state.presentationDpi : DpiOf(state.hwnd);
-    return dpi >= 72 && dpi <= 768 ? dpi : 96;
+    return std::clamp(dpi,72,768);
 }
 BOOL ViewClientRect(const ViewState& state,RECT* rect) {
     if(state.presentationOnly) { *rect=state.presentationClient; return TRUE; }
@@ -4268,6 +4281,7 @@ void PublishGroupIntents(ViewState& state) {
 void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     preserveCollapse = preserveCollapse &&
         SameShellGroup(state.displayedGrouping, state.grouping);
+    if(!preserveCollapse) state.keyboardSectionKey.reset();
     std::map<std::wstring, ViewState::GroupSection> previous;
     if (preserveCollapse) {
         for (const auto& section : state.sections)
@@ -4277,6 +4291,7 @@ void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     state.rowGroup.clear();
     state.displayedGrouping = state.namesPreview ? ShellGroupSpec{} : state.grouping;
     if (state.namesPreview || !state.grouping.enabled) {
+        state.keyboardSectionKey.reset();
         state.presentationGroupIntents.reset();
         LayoutGroupSections(state);
         return;
@@ -4302,6 +4317,8 @@ void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     }
     state.groupAnimating = false;
     state.hotSection = -1;
+    if(state.keyboardSectionKey && std::none_of(state.sections.begin(),state.sections.end(),
+        [&](const auto& section) {return section.key==*state.keyboardSectionKey;})) state.keyboardSectionKey.reset();
     LayoutGroupSections(state);
     PublishGroupIntents(state);
 }
@@ -4555,6 +4572,12 @@ int NextDisplayedRow(const ViewState& state, int index, bool down) {
         i = down ? state.sections[static_cast<size_t>(gi)].end :
             state.sections[static_cast<size_t>(gi)].first - 1;
     }
+    return -1;
+}
+int KeyboardFocusedSection(const ViewState& state) {
+    if (state.keyboardSectionKey)
+        for(size_t i=0;i<state.sections.size();++i)
+            if(state.sections[i].key==*state.keyboardSectionKey) return int(i);
     return -1;
 }
 void ToggleGroupSection(ViewState& state, int index) {
@@ -5937,11 +5960,38 @@ HWND PreviousVisibleSibling(HWND hwnd) {
     return hwnd;
 }
 
+bool IsNativeContentSibling(HWND hwnd) {
+    wchar_t name[64]{};
+    return GetClassNameW(hwnd,name,ARRAYSIZE(name)) &&
+        (!wcscmp(name,L"ShellTabWindowClass") || !wcscmp(name,L"CtrlNotifySink") ||
+         !wcscmp(name,L"SHELLDLL_DefView"));
+}
+bool IsOverlayStackSibling(const ViewState& state,HWND hwnd) {
+    if(hwnd==state.hwnd || hwnd==state.viewToggle || hwnd==state.rename.editor || IsNativeContentSibling(hwnd)) return true;
+    wchar_t name[64]{};
+    return GetClassNameW(hwnd,name,ARRAYSIZE(name)) && !wcscmp(name,kOverlayClass);
+}
+HWND PreviousOverlayStackSibling(const ViewState& state,HWND hwnd) {
+    while((hwnd=PreviousVisibleSibling(hwnd))) if(IsOverlayStackSibling(state,hwnd)) return hwnd;
+    return nullptr;
+}
+HWND OverlayStackAnchor(const ViewState& state) {
+    HWND anchor=HWND_TOP;
+    // Preserve unrelated native surfaces already above the content stack,
+    // including during subsequent layout, activation and rename repairs.
+    for(HWND child=GetWindow(state.frameHwnd,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT)) {
+        if(!IsWindowVisible(child)) continue;
+        if(IsOverlayStackSibling(state,child)) break;
+        anchor=child;
+    }
+    return anchor;
+}
+
 bool OverlayStackingNeeded(const ViewState& state) {
     HWND previous=nullptr;
     for(HWND child:{state.rename.editor,state.viewToggle,state.hwnd}) {
         if(!child || GetParent(child)!=state.frameHwnd || (child!=state.hwnd && !IsWindowVisible(child))) continue;
-        if(PreviousVisibleSibling(child)!=previous) return true;
+        if(PreviousOverlayStackSibling(state,child)!=previous) return true;
         previous=child;
     }
     return false;
@@ -5966,7 +6016,7 @@ bool PositionOverlayWindows(ViewState& state,const RECT* overlayBounds=nullptr,
     HWND previous=nullptr;
     for(size_t i=0;i<count;++i) {
         auto& window=windows[i];
-        restack|=PreviousVisibleSibling(window.hwnd)!=previous;
+        restack|=PreviousOverlayStackSibling(state,window.hwnd)!=previous;
         previous=window.hwnd;
         if(window.bounds) {
             RECT current{}; GetWindowRect(window.hwnd,&current);
@@ -5990,7 +6040,7 @@ bool PositionOverlayWindows(ViewState& state,const RECT* overlayBounds=nullptr,
     ScopedFlag repair(t_overlayStacking);
     HDWP batch=BeginDeferWindowPos(static_cast<int>(count));
     if(!batch) return false;
-    previous=HWND_TOP;
+    previous=OverlayStackAnchor(state);
     for(size_t i=0;i<count;++i) {
         auto& window=windows[i];
         if(restack) window.flags&=~SWP_NOZORDER;
@@ -6117,7 +6167,7 @@ bool BelongsToThisProcess(HWND hwnd) {
 
 int DpiOf(HWND hwnd) {
     UINT dpi = GetDpiForWindow(hwnd);
-    return dpi >= 72 && dpi <= 768 ? static_cast<int>(dpi) : 96;
+    return dpi ? static_cast<int>(std::clamp<UINT>(dpi,72,768)) : 96;
 }
 
 int Scale96(int value, int dpi) { return MulDiv(value, dpi, 96); }
@@ -6165,11 +6215,11 @@ void RefreshThemeColor() {
     if (!ValidRgb(accent)) accent = RGB(0,120,215);
     if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
         accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
-    if (g_dynamicAccent.load(std::memory_order_relaxed)) g_selectionRgb.store(accent);
     HIGHCONTRASTW contrast{sizeof(contrast)};
     const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
         (contrast.dwFlags&HCF_HIGHCONTRASTON);
     if(highContrast) accent=GetSysColor(COLOR_HIGHLIGHT);
+    if (g_dynamicAccent.load(std::memory_order_relaxed)) g_selectionRgb.store(accent);
     COLORREF foreground=highContrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : 0;
     const auto previous=g_swipePalette.load(std::memory_order_relaxed);
     const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : 0) | accent;
@@ -6351,7 +6401,8 @@ unsigned SystemStyleChangeMask(UINT message, WPARAM action, LPARAM area) {
     case WM_FONTCHANGE: return kStyleFonts | kStyleFontCollection;
     case WM_SETTINGCHANGE: {
         if (action==SPI_SETDOUBLECLICKTIME || action==SPI_SETDOUBLECLKWIDTH ||
-            action==SPI_SETDOUBLECLKHEIGHT || action==SPI_SETMOUSEHOVERTIME) return kStyleInput;
+            action==SPI_SETDOUBLECLKHEIGHT || action==SPI_SETMOUSEHOVERTIME ||
+            action==SPI_SETWHEELSCROLLLINES || action==SPI_SETWHEELSCROLLCHARS) return kStyleInput;
         if (action==SPI_SETHIGHCONTRAST) return kStyleColors | kStyleFonts;
         if (action==SPI_SETNONCLIENTMETRICS || action==SPI_SETICONTITLELOGFONT ||
             action==SPI_SETFONTSMOOTHING || action==SPI_SETFONTSMOOTHINGTYPE ||
@@ -6382,6 +6433,13 @@ void QueueStyleChange(ViewState& state, unsigned changes) {
     if (!state.styleChangeQueued)
         state.styleChangeQueued = PostMessageW(state.hwnd,kMsgStyleChanged,
             static_cast<WPARAM>(state.lifetimeToken),0)!=FALSE;
+}
+
+void RefreshWheelSettings() {
+    UINT wheelLines = 3;
+    if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0) ||
+        (wheelLines != WHEEL_PAGESCROLL && wheelLines > 100)) wheelLines = 3;
+    g_wheelLines.store(wheelLines, std::memory_order_relaxed);
 }
 
 void LoadSettings() {
@@ -6418,10 +6476,7 @@ void LoadSettings() {
     g_touchpadSwipeNavigation.store(
         Wh_GetIntSetting(L"Navigation.touchpadSwipeNavigation") != 0);
     g_preSort.store(Wh_GetIntSetting(L"Columns.preSort") != 0);
-    UINT wheelLines = 3;
-    if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0) ||
-        (wheelLines != WHEEL_PAGESCROLL && wheelLines > 100)) wheelLines = 3;
-    g_wheelLines.store(wheelLines, std::memory_order_relaxed);
+    RefreshWheelSettings();
     const auto placementSetting = WindhawkUtils::StringSetting::make(L"Columns.folderPlacement");
     const wchar_t* placement = placementSetting.get();
     g_folderPlacement.store(
@@ -7232,10 +7287,9 @@ std::wstring JoinPath(const std::wstring& base, const std::wstring& leaf) {
 
 std::wstring FormatFileTime(const FILETIME& ft) {
     if (!ft.dwLowDateTime && !ft.dwHighDateTime) return L"";
-    FILETIME local{};
-    if (!FileTimeToLocalFileTime(&ft, &local)) return L"";
-    SYSTEMTIME st{};
-    if (!FileTimeToSystemTime(&local, &st)) return L"";
+    SYSTEMTIME utc{},st{};
+    if (!FileTimeToSystemTime(&ft,&utc) ||
+        !SystemTimeToTzSpecificLocalTimeEx(nullptr,&utc,&st)) return L"";
     wchar_t date[96]{}, time[96]{};
     if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &st,
                          nullptr, date, ARRAYSIZE(date), nullptr) ||
@@ -8092,21 +8146,89 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
-std::wstring ItemTipDate(REFPROPERTYKEY key, const FILETIME& time) {
+// Windhawk's MinGW headers omit icu.h. Bind the documented, stable Windows
+// ICU C ABI directly; no bundled ICU data, SDK path or extra DLL dependency.
+struct SystemRelativeTime {
+    enum Unit : int32_t {Year,Quarter,Month,Week,Day,Hour,Minute,Second};
+    HMODULE module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    using Open=void*(__cdecl*)(const char*,void*,int32_t,int32_t,int32_t*);
+    using Close=void(__cdecl*)(void*);
+    using Format=int32_t(__cdecl*)(const void*,double,int32_t,wchar_t*,int32_t,int32_t*);
+    using Locale=int32_t(__cdecl*)(const char*,char*,int32_t,int32_t*,int32_t*);
+    Open open=module ? reinterpret_cast<Open>(GetProcAddress(module,"ureldatefmt_open")):nullptr;
+    Close close=module ? reinterpret_cast<Close>(GetProcAddress(module,"ureldatefmt_close")):nullptr;
+    Format format=module ? reinterpret_cast<Format>(GetProcAddress(module,"ureldatefmt_format")):nullptr;
+    Locale locale=module ? reinterpret_cast<Locale>(GetProcAddress(module,"uloc_forLanguageTag")):nullptr;
+    ~SystemRelativeTime() {if(module) FreeLibrary(module);}
+    std::wstring Render(double offset,Unit unit,const wchar_t* localeName) const {
+        if(!open || !close || !format || !locale || !localeName) return {};
+        char tag[LOCALE_NAME_MAX_LENGTH*4]{},id[LOCALE_NAME_MAX_LENGTH*4]{};
+        if(!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,localeName,-1,tag,sizeof(tag),nullptr,nullptr)) return {};
+        int32_t status=0,parsed=0;
+        locale(tag,id,int32_t(sizeof(id)),&parsed,&status);
+        if(status>0 || parsed!=int32_t(strlen(tag))) return {};
+        // ICU UDAT_STYLE_LONG and UDISPCTX_CAPITALIZATION_FOR_STANDALONE.
+        void* formatter=open(id,nullptr,0,0x104,&status);
+        if(!formatter || status>0) {if(formatter) close(formatter); return {};}
+        status=0;
+        const int32_t length=format(formatter,offset,unit,nullptr,0,&status);
+        std::wstring result;
+        constexpr int32_t bufferOverflow=15; // ICU U_BUFFER_OVERFLOW_ERROR.
+        if(length>0 && (status<=0 || status==bufferOverflow)) {
+            result.resize(size_t(length)+1); status=0;
+            const auto written=format(formatter,offset,unit,result.data(),int32_t(result.size()),&status);
+            if(status<=0 && written>=0 && size_t(written)<result.size()) result.resize(size_t(written));
+            else result.clear();
+        }
+        close(formatter);
+        return result;
+    }
+};
+struct ItemTipRelativeOffset {double value=0; SystemRelativeTime::Unit unit=SystemRelativeTime::Second;};
+std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,const FILETIME& now,
+    const DYNAMIC_TIME_ZONE_INFORMATION* zone=nullptr) {
+    if(!time.dwLowDateTime && !time.dwHighDateTime) return {};
+    SYSTEMTIME utc{},utcNow{},local{},localNow{};
+    if(!FileTimeToSystemTime(&time,&utc) || !FileTimeToSystemTime(&now,&utcNow) ||
+        !SystemTimeToTzSpecificLocalTimeEx(zone,&utc,&local) ||
+        !SystemTimeToTzSpecificLocalTimeEx(zone,&utcNow,&localNow)) return {};
+    const auto ticks=[](const FILETIME& value) {return (ULONGLONG(value.dwHighDateTime)<<32)|value.dwLowDateTime;};
+    const double seconds=(double(ticks(time))-double(ticks(now)))/10000000.;
+    // Local calendar dates, represented at fictitious UTC midnight: a day
+    // remains a calendar day through 23/25-hour daylight-saving transitions.
+    const auto midnight=[](SYSTEMTIME value,FILETIME& result) {
+        value.wHour=value.wMinute=value.wSecond=value.wMilliseconds=0;
+        return SystemTimeToFileTime(&value,&result)!=FALSE;
+    };
+    FILETIME day{},dayNow{};
+    if(!midnight(local,day) || !midnight(localNow,dayNow)) return {};
+    const double days=std::round((double(ticks(day))-double(ticks(dayNow)))/864000000000.);
+    if(days==0) {
+        if(std::abs(seconds)<60.) return ItemTipRelativeOffset{std::trunc(seconds),SystemRelativeTime::Second};
+        if(std::abs(seconds)<3600.) return ItemTipRelativeOffset{std::trunc(seconds/60.),SystemRelativeTime::Minute};
+        return ItemTipRelativeOffset{std::trunc(seconds/3600.),SystemRelativeTime::Hour};
+    }
+    if(std::abs(days)<7.) return ItemTipRelativeOffset{days,SystemRelativeTime::Day};
+    const int months=(int(local.wYear)-int(localNow.wYear))*12+int(local.wMonth)-int(localNow.wMonth);
+    if(std::abs(months)>=12) return ItemTipRelativeOffset{std::trunc(months/12.),SystemRelativeTime::Year};
+    if(months) return ItemTipRelativeOffset{double(months),SystemRelativeTime::Month};
+    return ItemTipRelativeOffset{std::trunc(days/7.),SystemRelativeTime::Week};
+}
+std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wchar_t* localeName) {
     std::wstring text = FormatFileTime(time);
     if (text.empty()) return text;
-    PROPVARIANT value{}; value.vt = VT_FILETIME; value.filetime = time;
-    PWSTR relative = nullptr, absolute = nullptr;
-    const auto flags = static_cast<PROPDESC_FORMAT_FLAGS>(PDFF_HIDETIME | PDFF_SHORTDATE);
-    PSFormatForDisplayAlloc(key, value, flags, &absolute);
-    PSFormatForDisplayAlloc(key, value,
-        static_cast<PROPDESC_FORMAT_FLAGS>(flags | PDFF_RELATIVEDATE), &relative);
-    // Windows supplies friendly dates such as Yesterday where supported.
-    // Never invent English age phrases or duplicate an ordinary calendar date.
-    if (relative && *relative && absolute && wcscmp(relative, absolute) != 0)
-        text += L" \x00B7 " + std::wstring(relative);
-    CoTaskMemFree(relative); CoTaskMemFree(absolute);
+    if(const auto offset=ItemTipDateOffset(time,now); offset && localeName && *localeName) {
+        static const SystemRelativeTime formatter;
+        const auto relative=formatter.Render(offset->value,offset->unit,localeName);
+        if(!relative.empty()) text+=L" \x00B7 "+relative;
+    }
     return text;
+}
+std::wstring ItemTipDate(REFPROPERTYKEY, const FILETIME& time) {
+    FILETIME now{}; GetSystemTimeAsFileTime(&now);
+    wchar_t localeName[LOCALE_NAME_MAX_LENGTH]{};
+    GetUserDefaultLocaleName(localeName,ARRAYSIZE(localeName));
+    return FormatItemTipDate(time,now,localeName);
 }
 
 std::wstring ItemTipComparison(std::wstring value, bool date) {
@@ -8121,6 +8243,11 @@ std::wstring ItemTipComparison(std::wstring value, bool date) {
 template<class Current>
 void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
                     std::map<std::wstring, std::wstring>& typeNames, Current&& current) {
+    // Recheck on the worker: a file can be dehydrated after the names snapshot.
+    const DWORD currentAttributes=job.namespaceItem ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(job.path.c_str());
+    const DWORD attributes=job.attributes | (currentAttributes==INVALID_FILE_ATTRIBUTES ? 0:currentAttributes);
+    const bool recalled=(attributes & (FILE_ATTRIBUTE_OFFLINE |
+        FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))!=0;
     ComPtr<IPropertyStore> store;
     bool storeAttempted = false;
     std::vector<PROPERTYKEY> visited;
@@ -8162,7 +8289,7 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
     const auto openStore = [&] {
         if (!storeAttempted && current() && job.rows.size() < job.rowLimit) {
             storeAttempted = true;
-            EntryPropertyStore(job.path, job.identity.get(), GPS_DEFAULT, store.GetAddressOf());
+            EntryPropertyStore(job.path, job.identity.get(), recalled ? GPS_FASTPROPERTIESONLY : GPS_DEFAULT, store.GetAddressOf());
         }
     };
     job.rows.clear();
@@ -8172,7 +8299,7 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         bool resolved = cached(key) != nullptr;
         if (const auto* value = cached(key)) text = *value;
         else if (SameKey(key, PKEY_Size)) {
-            resolved = ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding, job.listing);
+            resolved = !recalled && ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding, job.listing);
             if (!resolved && job.sizeKnown) { text = FormatSize(job.size); resolved = true; }
             // Filesystem directory allocation is not its contents' size.
             // Only cached/column-provider text can supply a folder size.
@@ -8191,48 +8318,29 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         }
         add(key, std::move(text), false);
     }
-    if (!job.detailed || job.folder || job.namespaceItem || !current() || job.rows.size() >= job.rowLimit) return;
-    // A folder's column catalog includes volume capacity, free space, paths,
-    // and other inherited context. Extra rows must belong to the file itself.
-    // Enumerate its handler's keys before reusing cached optional columns, so
-    // an enabled disk-space column cannot leak back into this popup.
-    ComPtr<IPropertyStore> fileStore;
-    if (FAILED(EntryPropertyStore(job.path, job.identity.get(), GPS_HANDLERPROPERTIESONLY,
-        fileStore.GetAddressOf())) || !fileStore) return;
-    DWORD properties = 0;
-    std::vector<PROPERTYKEY> fileKeys;
-    if (FAILED(fileStore->GetCount(&properties))) return;
-    for (DWORD i = 0; i < properties && current(); ++i) {
-        PROPERTYKEY key{};
-        if (SUCCEEDED(fileStore->GetAt(i, &key))) fileKeys.push_back(key);
-    }
-    const auto read = [&](REFPROPERTYKEY key, bool requireViewable) {
-        if (!first(key) || std::none_of(fileKeys.begin(), fileKeys.end(),
-            [&](const auto& present) { return SameKey(present, key); })) return;
-        if (const auto* value = cached(key)) { add(key, *value, false); return; }
-        PROPVARIANT value{};
-        if (SUCCEEDED(fileStore->GetValue(key, &value)))
-            add(key, value.vt == VT_FILETIME ? ItemTipDate(key, value.filetime) :
-                FormatShellDetail(nullptr, key, &value), requireViewable);
-        PropVariantClear(&value);
-    };
-    // The item's FullDetails list orders relevant image/audio/document fields
-    // ahead of generic filesystem properties. It is not a metadata whitelist.
+    if (!job.detailed || recalled || job.folder || job.namespaceItem || !current() || job.rows.size() >= job.rowLimit) return;
     ComPtr<IShellItem2> item;
-    if (current() && job.rows.size() < job.rowLimit) {
-        if (job.identity) SHCreateItemFromIDList(job.identity.get(), IID_PPV_ARGS(&item));
-        else SHCreateItemFromParsingName(job.path.c_str(), nullptr, IID_PPV_ARGS(&item));
-    }
-    ComPtr<IPropertyDescriptionList> list;
-    UINT count = 0;
-    if (item && SUCCEEDED(item->GetPropertyDescriptionList(PKEY_PropList_FullDetails, IID_PPV_ARGS(&list))) &&
-        SUCCEEDED(list->GetCount(&count))) for (UINT i = 0; i < count && current() && job.rows.size() < job.rowLimit; ++i) {
-        ComPtr<IPropertyDescription> description; PROPERTYKEY key{};
-        if (SUCCEEDED(list->GetAt(i, IID_PPV_ARGS(&description))) && SUCCEEDED(description->GetPropertyKey(&key))) read(key, true);
-    }
-    for (const auto& key : fileKeys) {
-        if (!current() || job.rows.size() >= job.rowLimit) break;
-        read(key, true);
+    if (job.identity) SHCreateItemFromIDList(job.identity.get(), IID_PPV_ARGS(&item));
+    else SHCreateItemFromParsingName(job.path.c_str(), nullptr, IID_PPV_ARGS(&item));
+    if (!item) return;
+    // Honor the type's configured hover/preview lists. Resolve only requested
+    // properties, retaining Windows display labels and duplicate suppression.
+    for (const auto& listKey : {PKEY_PropList_InfoTip,PKEY_PropList_PreviewDetails}) {
+        ComPtr<IPropertyDescriptionList> list; UINT count=0;
+        if (FAILED(item->GetPropertyDescriptionList(listKey,IID_PPV_ARGS(&list))) ||
+            FAILED(list->GetCount(&count))) continue;
+        for (UINT i=0;i<count && current() && job.rows.size()<job.rowLimit;++i) {
+            ComPtr<IPropertyDescription> description; PROPERTYKEY key{};
+            if (FAILED(list->GetAt(i,IID_PPV_ARGS(&description))) ||
+                FAILED(description->GetPropertyKey(&key)) || !first(key)) continue;
+            if (const auto* value=cached(key)) {add(key,*value,true); continue;}
+            openStore();
+            PROPVARIANT value{};
+            if (store && SUCCEEDED(store->GetValue(key,&value)))
+                add(key,value.vt==VT_FILETIME ? ItemTipDate(key,value.filetime) :
+                    FormatShellDetail(nullptr,key,&value),true);
+            PropVariantClear(&value);
+        }
     }
 }
 
@@ -12216,6 +12324,9 @@ float InlineDriveLabelWidth(float available, float label, int dpi) {
 float SelectionCheckboxSize(const ViewState& state) {
     return static_cast<float>(Scale96(20, ViewDpi(state)));
 }
+float SelectionCheckboxBorder(float side) {
+    return std::max(1.f,std::min(roundf(side/20.f),floorf(side*.5f)));
+}
 float SelectionCheckboxSpace(const ViewState& state) {
     return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
 }
@@ -16051,14 +16162,21 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             UINT32 count = 0;
             if (SUCCEEDED(layout->HitTestTextRange(0, std::min(highlight, static_cast<UINT32>(text.size())),
                 l, t, matches, ARRAYSIZE(matches), &count))) {
-                state.target->PushAxisAlignedClip(D2D1::RectF(l,t,r,b), D2D1_ANTIALIAS_MODE_ALIASED);
+                // The outline includes horizontal padding outside the glyph
+                // box. Keep it inside its own clip, including shortened labels.
+                const auto clip=SnapDrawRect(state.target.Get(),D2D1::RectF(l-1.f,t,r+1.f,b));
+                state.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
                 for (UINT32 i=0; i<count; ++i) {
                     const auto& m = matches[i];
                     if (!m.isText || m.isTrimmed || m.width <= 0.f || m.height <= 0.f) continue;
                     // Hit-test metrics are fractional; fill the same pixels
                     // that StrokeRoundedRect outlines.
-                    const auto rc = D2D1::RoundedRect(SnapDrawRect(state.target.Get(),D2D1::RectF(m.left-1.f, m.top,
-                        m.left+m.width+1.f, m.top+m.height)), 2.f, 2.f);
+                    auto bounds=SnapDrawRect(state.target.Get(),D2D1::RectF(m.left-1.f,m.top,
+                        m.left+m.width+1.f,m.top+m.height));
+                    bounds.left=std::max(bounds.left,clip.left); bounds.right=std::min(bounds.right,clip.right);
+                    bounds.top=std::max(bounds.top,clip.top); bounds.bottom=std::min(bounds.bottom,clip.bottom);
+                    if(bounds.right<=bounds.left || bounds.bottom<=bounds.top) continue;
+                    const auto rc = D2D1::RoundedRect(bounds, 2.f, 2.f);
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
@@ -16114,8 +16232,9 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
     if (state.rtlLayout) cx = state.paintWidth - cx;
     const float cy = ColumnHeaderOffset(state,dpi) +
         static_cast<float>(Scale96(kHeader96, dpi)) * .5f;
-    const float halfWidth = static_cast<float>(Scale96(5, dpi));
-    const float halfHeight = static_cast<float>(Scale96(3, dpi));
+    // Match the expanded section chevron's 2:1 width/height, retaining the bold sort stroke.
+    const float halfWidth = static_cast<float>(Scale96(4, dpi));
+    const float halfHeight = halfWidth*.5f;
     const float wingY = cy + (descending ? -halfHeight : halfHeight);
     const float tipY = cy + (descending ? halfHeight : -halfHeight);
     const float thickness = std::max(1.f, Scale96(1, dpi) * 1.5f);
@@ -17736,6 +17855,14 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
             selectedWeight += overlap(rc.left, rc.right, AnimatedSelectionRow(state)*state.rowPx);
         }
     }
+    if(state.inputFocusIndicators) {
+        const int focused=KeyboardFocusedSection(state);
+        if(focused>=0) {
+            const auto visual=LayoutGroupHeader(state,size_t(focused),CurrentRowProgress(state));
+            const float focusedRow=(visual.top-state.headerPx+state.scrollNow)/std::max(1.f,state.rowPx);
+            selectedWeight+=std::clamp(1.f-fabsf(visualRow-focusedRow),0.f,1.f);
+        }
+    }
     selectedWeight = std::clamp(selectedWeight, 0.f, 1.f);
     const float hoverAlpha = g_hoverAlpha.load(std::memory_order_relaxed) / 100.f;
     const float base = g_selectionAlpha.load(std::memory_order_relaxed) / 100.f;
@@ -17823,8 +17950,8 @@ bool EnsureSelectionCheckGlyph(ViewState& state) {
     return state.selectionCheckGlyph != nullptr;
 }
 
-// A checked selection checkbox stretched into a pill: the same accent fill,
-// text-colored outline and contrast-checked check color, plus the count.
+// A checked selection checkbox stretched into a pill: accent fill and a shared
+// contrast-checked foreground for the outline, checkmark and count.
 void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opacity) {
     const float alpha = opacity*badge.reveal;
     if (!badge.badge || !VisibleOpacity(alpha)) return;
@@ -17840,14 +17967,13 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
     const float radius = (pill.bottom-pill.top)*.5f;
     state.brush->SetColor(Packed(ThemeRgb(COLORREF(palette&0xFFFFFF)),alpha));
     state.target->FillRoundedRectangle(D2D1::RoundedRect(pill,radius,radius),state.brush.Get());
-    // DrawSelectionCheckbox's outline rule, scaled from the same 20-unit box.
-    const float border = std::max(1.f,roundf((pill.bottom-pill.top)/20.f));
-    const unsigned outline = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
-    state.brush->SetColor(Packed(outline,alpha*.8f));
-    state.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left+border*.5f,pill.top+border*.5f,
-        pill.right-border*.5f,pill.bottom-border*.5f),radius-border*.5f,radius-border*.5f),state.brush.Get(),border);
     const unsigned foreground = ThemeRgb(COLORREF((palette>>24)&0xFFFFFF));
     const float foregroundAlpha = alpha*float((palette>>48)&255)/255.f;
+    // Match the DPI-sized item checkbox, independently of heading/font zoom.
+    const float border = SelectionCheckboxBorder(SelectionCheckboxSize(state));
+    state.brush->SetColor(Packed(foreground,foregroundAlpha));
+    state.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left+border*.5f,pill.top+border*.5f,
+        pill.right-border*.5f,pill.bottom-border*.5f),radius-border*.5f,radius-border*.5f),state.brush.Get(),border);
     const float center = (badge.pill.top+badge.pill.bottom)*.5f;
     if (EnsureSelectionCheckGlyph(state)) {
         const auto glyph = mirror(D2D1::RectF(badge.glyphLeft,center-badge.glyph*.5f,
@@ -17884,19 +18010,18 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         std::clamp(height / std::max(1.f, GroupHeadingHeight(state)), 0.f, 1.f);
     state.brush->SetColor(Packed(headerColor, .75f * opacity));
     const float thickness = std::max(1.f, static_cast<float>(Scale96(1, dpi)));
-    if (collapsed) {
-        StrokeLine(state,D2D1::Point2F(centerX-arrowDirection*unit*.5f,
-            centerY-unit), D2D1::Point2F(centerX+arrowDirection*unit*.5f,
-            centerY), state.brush.Get(), thickness);
-        StrokeLine(state,D2D1::Point2F(centerX+arrowDirection*unit*.5f,
-            centerY), D2D1::Point2F(centerX-arrowDirection*unit*.5f,
-            centerY+unit), state.brush.Get(), thickness);
-    } else {
-        StrokeLine(state,D2D1::Point2F(centerX-unit, centerY-unit*.5f),
-            D2D1::Point2F(centerX, centerY+unit*.5f), state.brush.Get(), thickness);
-        StrokeLine(state,D2D1::Point2F(centerX, centerY+unit*.5f),
-            D2D1::Point2F(centerX+unit, centerY-unit*.5f), state.brush.Get(), thickness);
-    }
+    // Follow the existing section expansion, including interrupted/reversed
+    // toggles. Mirror after rotation so RTL opens downward too.
+    const float expanded = section ? std::clamp(section->fraction,0.f,1.f) : (collapsed ? 0.f : 1.f);
+    const float angle = expanded*1.57079632679f;
+    const float cosine = std::cos(angle), sine = std::sin(angle);
+    const auto rotate = [&](float x,float y) {
+        return D2D1::Point2F(centerX+arrowDirection*unit*(x*cosine-y*sine),
+            centerY+unit*(x*sine+y*cosine));
+    };
+    const auto start=rotate(-.5f,-1.f), tip=rotate(.5f,0.f), end=rotate(-.5f,1.f);
+    StrokeLine(state,start,tip,state.brush.Get(),thickness);
+    StrokeLine(state,tip,end,state.brush.Get(),thickness);
     auto text = GroupHeadingTextRect(state,top,height,listEnd);
     // The paint's single clock sample, shared with item opacity motion.
     const auto badge = LayoutGroupBadge(state,section,text,state.itemOpacityNow);
@@ -17913,6 +18038,7 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
 
 bool MatchesTypeSearchPrefix(const std::wstring& name,
                              const std::wstring& prefix);
+UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
 
 void ResetItemContentOpacity(ViewState& state) {
     state.itemOpacityRows.clear();
@@ -18093,7 +18219,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     rect = SnapDrawRect(state.target.Get(),rect);
     if (rect.right <= rect.left || rect.bottom <= rect.top) return;
     const float unit = (rect.right-rect.left)/20.f;
-    const float border = std::max(1.f,std::min(roundf(unit),floorf((rect.right-rect.left)*.5f)));
+    const float border = SelectionCheckboxBorder(rect.right-rect.left);
     const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
         rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
     const auto palette = g_swipePalette.load(std::memory_order_relaxed);
@@ -18120,9 +18246,9 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
 // DWM uses the same absolute QPC origin and cubic as the existing input/hit
 // geometry. No new timer, render thread, Shell call or animation clock.
 ComPtr<IDCompositionAnimation> UiCompositionCurve(ViewState& state, float from, float to,
-                                                 LARGE_INTEGER origin = {}) {
+                                                 LARGE_INTEGER origin = {},
+                                                 float seconds = kUiTransitionDurationMs / 1000.f) {
     ComPtr<IDCompositionAnimation> curve;
-    constexpr float seconds = kUiTransitionDurationMs / 1000.f;
     const float delta = to-from;
     if (!state.composition || FAILED(state.composition->CreateAnimation(&curve)) ||
         FAILED(curve->AddCubic(0.,from,3.f*delta/seconds,
@@ -19089,6 +19215,36 @@ DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,cons
     return result;
 }
 
+std::wstring FormatDragCount(int count,bool rtl,LPCWSTR locale=LOCALE_NAME_USER_DEFAULT) {
+    const auto number=std::to_wstring(std::min(count,999));
+    wchar_t formatted[64]{},decimal[]=L".",thousands[]=L",";
+    NUMBERFMTW format{0,1,0,decimal,thousands,1};
+    std::wstring text=GetNumberFormatEx(locale,0,number.c_str(),&format,formatted,ARRAYSIZE(formatted)) ? formatted:number;
+    // GetNumberFormatEx formats separators, but does not substitute digits.
+    // Honor Windows' national/contextual digit policy for this badge's direction.
+    DWORD policy=1; wchar_t digits[32]{};
+    if(GetLocaleInfoEx(locale,LOCALE_IDIGITSUBSTITUTION|LOCALE_RETURN_NUMBER,
+        reinterpret_cast<LPWSTR>(&policy),sizeof(policy)/sizeof(wchar_t)) &&
+        (policy==2 || (policy==0 && rtl)) &&
+        GetLocaleInfoEx(locale,LOCALE_SNATIVEDIGITS,digits,ARRAYSIZE(digits))) {
+        std::array<std::wstring_view,10> native{}; size_t at=0;
+        for(auto& digit:native) {
+            if(!digits[at]) break;
+            const size_t length=IS_HIGH_SURROGATE(digits[at]) && IS_LOW_SURROGATE(digits[at+1]) ? 2:1;
+            digit={digits+at,length}; at+=length;
+        }
+        if(!native.back().empty()) {
+            std::wstring localized;
+            for(wchar_t ch:text) {
+                if(ch>=L'0' && ch<=L'9') localized+=native[size_t(ch-L'0')]; else localized+=ch;
+            }
+            text=std::move(localized);
+        }
+    }
+    if(count>999) text+=L'+';
+    return text;
+}
+
 void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     const std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages>* existingArtwork=nullptr,DragGlyph* glyph=nullptr,
     const DragTextStyle* textStyle=nullptr,const std::array<DragShadow,kDragPreviewImages>* shadows=nullptr) {
@@ -19152,7 +19308,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     DrawCenteredDragLabel(target,brush.Get(),blocked ? L"\U0001F6AB":preview.effect&DROPEFFECT_LINK ? L"\U0001F517":preview.effect&DROPEFFECT_COPY ? L"\U0001F4CB":
         preview.rtl ? L"\u2B05\uFE0F":L"\u27A1\uFE0F",L"Segoe UI Emoji",badge*.82f,rect,preview.foreground,true,glyph);
     if(preview.count>1) {
-        const auto count=preview.count>999 ? L"999+":std::to_wstring(preview.count);
+        const auto count=preview.countLabel.empty() ? FormatDragCount(preview.count,preview.rtl):preview.countLabel;
         const float height=side*.38f*preview.dragBadgeScaling;
         const float width=std::max(height,height*.65f*float(count.size())+height*.4f);
         const float x=std::clamp(preview.rtl ? geometry.artwork.right-width:geometry.artwork.left,
@@ -19182,7 +19338,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
 bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>& preview) {
     auto& layer=state.dragComposition;
     if(!preview || !IsWindow(preview->window) ||
-        ULONG_PTR(GetPropW(preview->window,L"WindhawkGpuDragPreview"))!=preview->token) {layer={}; return true;}
+        ULONG_PTR(GetPropW(preview->window,kDragPreviewProperty))!=preview->token) {layer={}; return true;}
     bool accepted=false;
     struct Feedback {
         const DragPreview& preview; bool& accepted;
@@ -19245,13 +19401,21 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     // never restart scale animation or make pointer movement appear delayed.
     if(entering && preview->animate) {
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-        layer.curve=UiCompositionCurve(state,.88f,1.f,now);
+        layer.curve=UiCompositionCurve(state,.65f,1.f,now,.080f);
+        layer.opacityCurve=UiCompositionCurve(state,0.f,1.f,now,.080f);
+        if(layer.opacityCurve) {
+            if(FAILED(state.composition->CreateEffectGroup(&layer.opacity)) ||
+                FAILED(layer.opacity->SetOpacity(layer.opacityCurve.Get())) ||
+                FAILED(layer.visual->SetEffect(layer.opacity.Get()))) return false;
+        }
         if(layer.curve && SUCCEEDED(state.composition->CreateScaleTransform(&layer.scale))) {
             layer.scale->SetScaleX(layer.curve.Get()); layer.scale->SetScaleY(layer.curve.Get());
             layer.visual->SetTransform(layer.scale.Get());
         }
     } else if(!preview->animate) {
         layer.visual->SetTransform(static_cast<IDCompositionTransform*>(nullptr)); layer.scale.Reset(); layer.curve.Reset();
+        if(FAILED(layer.visual->SetEffect(nullptr))) return false;
+        layer.opacity.Reset(); layer.opacityCurve.Reset();
     }
     if(layer.scale) {
         const auto image=LayoutDragPreview(*preview).artwork;
@@ -20103,6 +20267,9 @@ void Paint(ViewState& state) {
             }
         }
     }
+    D2D1_RECT_F movingSelectionRect{};
+    SelectionShape movingSelectionShape;
+    float movingSelectionOpacity=0.f;
     if (state.selectionFeedbackVisible && state.keyboardSelectionAnimating &&
         state.keyboardSelectionTo == state.selected &&
         state.selected >= 0 && state.selected < state.total) {
@@ -20118,11 +20285,13 @@ void Paint(ViewState& state) {
             header + visualRow * row - state.scrollNow, row,
             xName, nameRight, listEnd,-1.f,0.f,&shape);
         InterpolateSelectionBounds(state, rc, progress);
-        FillSelectionRect(state, rc, SelectionBaseOpacity(state, hover, visualRow, rc.left, rc.right),&shape);
+        movingSelectionRect=rc; movingSelectionShape=shape;
+        movingSelectionOpacity=SelectionBaseOpacity(state,hover,visualRow,rc.left,rc.right);
+        FillSelectionRect(state,rc,movingSelectionOpacity,&shape);
     }
     // Windows-style focus-only caret for Ctrl+arrow navigation. Reuse the
     // selection geometry and brush; no separate text layout or frame worker.
-    if (state.inputFocusIndicators && state.keyboardCaretVisible && DisplayedRow(state, state.selected) &&
+    if (state.inputFocusIndicators && !state.keyboardSectionKey && state.keyboardCaretVisible && DisplayedRow(state, state.selected) &&
         !ModelSelected(state,state.selected)) {
         const int index = state.selected;
         const float y = header + DocumentRowTop(state, index) - state.scrollNow;
@@ -20136,7 +20305,7 @@ void Paint(ViewState& state) {
     }
     D2D1_RECT_F hoverRect{};
     SelectionShape hoverShape;
-    float hoverOpacity = 0.f;
+    float hoverOverlayOpacity = 0.f;
     if (hover.strength > 0.f && hover.right > hover.left) {
         const float y = header + hover.row * row - state.scrollNow;
         // The content clip and Fill's RTL mapping are identical to every
@@ -20164,11 +20333,14 @@ void Paint(ViewState& state) {
         }
         hoverRect.left = hover.left;
         hoverRect.right = hover.right;
-        hoverOpacity = opacity;
+        // A header has no selected Shell item underneath its own hover.
+        // Atlas item geometry may overlap its source band during reflow.
+        hoverOverlayOpacity=(sectionHover && KeyboardFocusedSection(state)<0 && !state.keyboardSelectionAnimating ?
+            g_hoverAlpha.load(std::memory_order_relaxed)/100.f : HoverOverlayOpacity(state,hover,visibleItems))*opacity;
         if (!compositionFrame.Rows() || !sectionHover) {
             RowSourceScope source(state,index,0);
             FillSelectionRect(state, hoverRect,
-                HoverOverlayOpacity(state, hover, visibleItems) * opacity,&hoverShape);
+                hoverOverlayOpacity,&hoverShape);
         }
     }
     // The decorative passes above may cross the edge margins in square mode,
@@ -20350,8 +20522,7 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         const float nameTextRight = usage.visible ? usage.labelRight : geometry.text.right;
-        const UINT32 match = typeSearchVisible && MatchesTypeSearchPrefix(e.name, state.typeSearch) ?
-            static_cast<UINT32>(state.typeSearch.size()) : 0;
+        const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(e.name,state.typeSearch) : 0;
         if (!(state.rename.editor && i == state.rename.index))
             Text(state, e.name, geometry.text.left, geometry.text.top,
                 nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
@@ -20442,14 +20613,19 @@ void Paint(ViewState& state) {
         D2D1::RectF(w-rowBgEnd,header,w-rowBgStart,contentBottom) :
         D2D1::RectF(rowBgStart,header,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
     // ClearBodyBand reserves transparent space above items for sticky headings.
-    // Restore only the shared hover's intersection with each reserved band,
-    // below its text, so crossing a heading never swaps to a separate fill.
-    for (const auto& heading:headings) if (hoverOpacity > 0.f) {
+    // Restore shared input feedback after masking item contents. Header bands
+    // must not cut holes into a selection/hover moving between ordinary rows.
+    for (const auto& heading:headings) {
         RowSourceScope source(state,heading.key,0,true);
         state.target->PushAxisAlignedClip(D2D1::RectF(0.f,heading.visual.top,w,
             heading.visual.top+heading.visual.height),D2D1_ANTIALIAS_MODE_ALIASED);
-        FillSelectionRect(state,hoverRect,g_hoverAlpha.load(std::memory_order_relaxed)/100.f *
-            hoverOpacity,&hoverShape);
+        FillSelectionRect(state,movingSelectionRect,movingSelectionOpacity,&movingSelectionShape);
+        if(heading.section && state.keyboardSectionKey && heading.section->key==*state.keyboardSectionKey && state.inputFocusIndicators) {
+            const auto focus=GroupHoverRect(state,heading.key,heading.visual);
+            const float visualRow=(heading.visual.top-header+state.scrollNow)/std::max(1.f,row);
+            FillSelectionRect(state,focus,SelectionBaseOpacity(state,hover,visualRow,focus.left,focus.right)*heading.visual.opacity);
+        }
+        FillSelectionRect(state,hoverRect,hoverOverlayOpacity,&hoverShape);
         state.target->PopAxisAlignedClip();
     }
     state.target->PopAxisAlignedClip(); // group hover background margins
@@ -22314,6 +22490,7 @@ void TrySyncLastFolderSelection(ViewState& state) {
 void Select(ViewState& state, int index, bool keyboardNavigation = false) {
     if (state.optimisticStartedAt || index < 0 || index >= state.total ||
         !DisplayedRow(state, index)) return;
+    state.keyboardSectionKey.reset();
     // All directional navigation shares one visual transition, including
     // Home/End/Page Up/Page Down. The logical Shell selection is immediate.
     const int previous = state.selected;
@@ -22450,8 +22627,8 @@ bool IsKeyboardMovementKey(UINT key, bool grid = false) {
     }
 }
 
-// The key target is always an actual displayed Shell item, never a group
-// heading. All movement keys share this target resolver.
+// Item/range target resolver. Plain arrows visit section headings separately
+// in NavigateKeyboardSelection; selection ranges remain Shell-item based.
 int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge = false) {
     if (state.total <= 0) return -1;
     int origin = state.selected;
@@ -22536,6 +22713,54 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
                                bool control, bool shift) {
     TraceSelectionIdentity(state, L"key.before-target");
     if (state.optimisticStartedAt) return;
+    bool bulkSelection=false;
+    if(!state.sections.empty() && KeyboardFocusedSection(state)<0 && !control && !shift) {
+        int count=0;
+        for(size_t i=0;i<state.selectedFlags.size();++i)
+            if(state.selectedFlags[i] && DisplayedRow(state,int(i)) && ++count==2) {bulkSelection=true; break;}
+    }
+    // First collapse a multi-selection at its existing directional edge;
+    // subsequent single-item movement can stop on section headers.
+    if(!control && !shift && !bulkSelection && !state.sections.empty()) {
+        const int focused=KeyboardFocusedSection(state);
+        const auto focusHeader=[&](int index) {
+            if(index<0 || size_t(index)>=state.sections.size()) return;
+            SuppressPointerHoverForKeyboard(state);
+            state.keyboardSectionKey=state.sections[size_t(index)].key;
+            const auto visual=LayoutGroupHeader(state,size_t(index),CurrentRowProgress(state),false);
+            float target=state.scrollNow;
+            if(visual.top<state.headerPx) target+=visual.top-state.headerPx;
+            else if(visual.top+visual.height>state.headerPx+ViewHeight(state)-ScrollBottomPadding(state))
+                target+=visual.top+visual.height-(state.headerPx+ViewHeight(state)-ScrollBottomPadding(state));
+            MoveScroll(state,target); Redraw(state);
+        };
+        if(key==VK_HOME) {focusHeader(0); return;}
+        if(focused>=0 && (key==VK_UP || key==VK_DOWN)) {
+            const auto& group=state.sections[size_t(focused)];
+            if(key==VK_DOWN) {
+                if(!group.collapsed && group.first<group.end) Select(state,group.first,true);
+                else focusHeader(focused+1);
+            } else if(focused>0) {
+                const auto& previous=state.sections[size_t(focused-1)];
+                if(!previous.collapsed && previous.first<previous.end) Select(state,previous.end-1,true);
+                else focusHeader(focused-1);
+            }
+            return;
+        }
+        if(key==VK_END && state.sections.back().collapsed) {focusHeader(int(state.sections.size())-1); return;}
+        if(focused<0 && (key==VK_UP || key==VK_DOWN)) {
+            const int row=state.selected;
+            const int group=row>=0 && size_t(row)<state.rowGroup.size() ? state.rowGroup[size_t(row)] : -1;
+            if(group<0) {focusHeader(0); return;}
+            const auto& section=state.sections[size_t(group)];
+            const int stride=state.gridView ? std::max(1,state.itemsPerRow) : 1;
+            if(key==VK_UP && row-section.first<stride) {focusHeader(group); return;}
+            if(key==VK_DOWN && row+stride>=section.end && size_t(group+1)<state.sections.size()) {
+                focusHeader(group+1); return;
+            }
+        }
+    }
+    state.keyboardSectionKey.reset();
     if ((key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
         state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0)
         RefreshHoverUnderCursor(state);
@@ -24544,12 +24769,58 @@ void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = fals
 // Search the current display order, wrap around, and retain the prefix briefly.
 bool MatchesTypeSearchPrefix(const std::wstring& name,
                              const std::wstring& prefix) {
-    return !prefix.empty() && name.size() >= prefix.size() &&
-        CompareStringOrdinal(name.c_str(), static_cast<int>(prefix.size()),
-            prefix.c_str(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL;
+    return TypeSearchPrefixLength(name,prefix)!=0;
+}
+UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix) {
+    if(prefix.empty()) return 0;
+    if(prefix.size()<=name.size() && CompareStringOrdinal(name.data(),int(prefix.size()),prefix.data(),int(prefix.size()),TRUE)==CSTR_EQUAL)
+        return UINT32(prefix.size());
+    const auto separator=[](wchar_t ch) {
+        WORD basic=0,extended=0;
+        GetStringTypeW(CT_CTYPE1,&ch,1,&basic);
+        GetStringTypeW(CT_CTYPE3,&ch,1,&extended);
+        return (basic&(C1_SPACE|C1_PUNCT))!=0 || (extended&C3_SYMBOL)!=0;
+    };
+    size_t n=0,p=0;
+    bool matched=false;
+    // Compare letter/number runs without constructing folded copies for
+    // every row. Return the original filename extent for visible highlights.
+    while(p<prefix.size()) {
+        if(separator(prefix[p])) {++p; continue;}
+        while(n<name.size() && separator(name[n])) ++n;
+        size_t ne=n,pe=p;
+        while(ne<name.size() && !separator(name[ne])) ++ne;
+        while(pe<prefix.size() && !separator(prefix[pe])) ++pe;
+        const auto length=std::min(ne-n,pe-p);
+        if(!length || CompareStringOrdinal(name.data()+n,int(length),prefix.data()+p,int(length),TRUE)!=CSTR_EQUAL) return 0;
+        n+=length; p+=length;
+        matched=true;
+    }
+    return matched ? UINT32(n) : 0;
+}
+bool TypeSearchActive(const ViewState& state) {
+    return !state.typeSearch.empty() && state.lastTyped && GetTickCount64()-state.lastTyped<=kTypeSearchTimeoutMs;
+}
+void ClearTypeSearch(ViewState& state) {
+    if(state.typeSearch.empty()) return;
+    state.typeSearch.clear(); state.lastTyped=0;
+    KillTimer(state.hwnd,kTypeSearchTimerId); Redraw(state);
+}
+void ObserveTypeSearchPointerInput(const MSG& message) {
+    switch(message.message) {
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
+    case WM_NCLBUTTONDOWN: case WM_NCRBUTTONDOWN: case WM_NCMBUTTONDOWN: case WM_NCXBUTTONDOWN:
+        break;
+    default: return;
+    }
+    const HWND overlay=OverlayUnder(GetAncestor(message.hwnd,GA_ROOT));
+    auto* state=overlay ? State(overlay) : nullptr;
+    if(!state) return;
+    ClearTypeSearch(*state);
 }
 
 void TypeToSelect(ViewState& state, wchar_t ch) {
+    state.keyboardSectionKey.reset();
     if (ch == L'\b' || (ch >= L' ' && ch != 0x7F))
         SuppressPointerHoverForKeyboard(state);
     const ULONGLONG now = GetTickCount64();
@@ -25992,7 +26263,7 @@ ShellDropText ReadShellDropText(IDataObject* data,DWORD effect) {
 bool UpdateDragCaption(ViewState& state,DragPreview& preview,const ShellDropText& text,float available) {
     if(!state.headerFormat && g_writeFactory) MakeTextFormats(state);
     if(preview.description==text.text && preview.captionDpi==preview.dpi && preview.captionFace==state.textFaceSerial &&
-        preview.captionAvailable==available) return false;
+        preview.captionWorkWidth==available) return false;
     const auto& source=state.headerFormat;
     if(source && g_writeFactory && (!preview.captionFormat || preview.captionDpi!=preview.dpi || preview.captionFace!=state.textFaceSerial)) {
         std::wstring family(source->GetFontFamilyNameLength()+1,L'\0'),locale(source->GetLocaleNameLength()+1,L'\0');
@@ -26006,6 +26277,13 @@ bool UpdateDragCaption(ViewState& state,DragPreview& preview,const ShellDropText
             ComPtr<IDWriteTextLayout> measure; DWRITE_TEXT_METRICS metrics{};
             if(SUCCEEDED(g_writeFactory->CreateTextLayout(L" ",1,format.Get(),1e6f,1e6f,&measure)) &&
                 SUCCEEDED(measure->GetMetrics(&metrics))) preview.captionMaxHeight=std::ceil(3.f*metrics.height);
+            // A readable forty-average-character line, measured in the actual
+            // caption font at this monitor's DPI, bounded by its work area.
+            constexpr wchar_t alphabet[]=L"abcdefghijklmnopqrstuvwxyz";
+            measure.Reset();
+            if(SUCCEEDED(g_writeFactory->CreateTextLayout(alphabet,26,format.Get(),1e6f,1e6f,&measure)) &&
+                SUCCEEDED(measure->GetMetrics(&metrics)))
+                preview.captionPreferredWidth=std::ceil(metrics.widthIncludingTrailingWhitespace*40.f/26.f);
             ComPtr<IDWriteInlineObject> ellipsis;
             const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};
             if(SUCCEEDED(g_writeFactory->CreateEllipsisTrimmingSign(format.Get(),&ellipsis)))
@@ -26013,6 +26291,8 @@ bool UpdateDragCaption(ViewState& state,DragPreview& preview,const ShellDropText
             preview.captionFormat=std::move(format);
         }
     }
+    preview.captionWorkWidth=available;
+    available=std::min(available,std::max(1.f,preview.captionPreferredWidth));
     preview.captionDpi=preview.dpi; preview.captionFace=state.textFaceSerial; preview.captionAvailable=available;
     preview.description=text.text; preview.caption.Reset(); preview.captionSize={};
     if(text.text.empty() || !preview.captionFormat || !g_writeFactory || preview.captionMaxHeight<=0.f) return true;
@@ -26104,7 +26384,8 @@ class ShellDragFeedback final : public IDropSource, public IDropSourceNotify {
         const bool hasMonitor=GetMonitorInfoW(destination,&monitor)!=FALSE;
         for(int pass=0;pass<2;++pass) {
             if(preview.monitor!=destination) {preview.monitor=destination; PublishDragPreview(*live);}
-            const float available=hasMonitor ? float(monitor.rcWork.right-monitor.rcWork.left)/3.f:preview.captionAvailable;
+            const float available=hasMonitor ? std::max(1.f,float(monitor.rcWork.right-monitor.rcWork.left)-
+                4.f*LayoutDragPreview(preview).edge):preview.captionWorkWidth;
             if(UpdateDragCaption(*live,preview,text,available)) PublishDragPreview(*live);
             const auto size=DragPreviewExtent(preview);
             const auto position=PositionDragPreview(preview,cursor,live->touch.dragPromoted);
@@ -26135,15 +26416,17 @@ public:
         auto preview=std::make_shared<DragPreview>();
         preview->side=std::clamp(state.iconPx,float(systemIcon*4),float(systemIcon*8));
         preview->dpi=dpi; preview->count=count;
+        preview->countLabel=FormatDragCount(count,state.rtlLayout);
         preview->rtl=state.rtlLayout; preview->background=state.nativeEditBackground;
         preview->foreground=state.nativeEditForeground; preview->accent=g_selectionRgb.load(std::memory_order_relaxed);
         BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0); preview->animate=animations!=FALSE;
         preview->token=ULONG_PTR(g_nextToken.fetch_add(1,std::memory_order_relaxed));
         POINT pointer{}; MONITORINFO monitor{sizeof(monitor)};
         if(GetCursorPos(&pointer) && GetMonitorInfoW(MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST),&monitor))
-            preview->captionAvailable=float(monitor.rcWork.right-monitor.rcWork.left)/3.f;
+            preview->captionWorkWidth=std::max(1.f,float(monitor.rcWork.right-monitor.rcWork.left)-
+                4.f*LayoutDragPreview(*preview).edge);
         preview->monitor=MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST);
-        UpdateDragCaption(state,*preview,{},preview->captionAvailable);
+        UpdateDragCaption(state,*preview,{},preview->captionWorkWidth);
         const auto size=DragPreviewExtent(*preview);
         // A system-class layered, input-transparent window has no DLL callback,
         // focus/capture, drop target or worker of its own.
@@ -26151,7 +26434,8 @@ public:
             L"Static",L"",WS_POPUP,0,0,int(size.width),int(size.height),state.frameHwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
         if(!window_) return;
         if(!SetLayeredWindowAttributes(window_,0,255,LWA_ALPHA) ||
-            !SetPropW(window_,L"WindhawkGpuDragPreview",reinterpret_cast<HANDLE>(preview->token))) {
+            !SetPropW(window_,kDragPreviewProperty,reinterpret_cast<HANDLE>(preview->token))) {
+            RemovePropW(window_,kDragPreviewProperty);
             DestroyWindow(window_); window_=nullptr; return;
         }
         preview->window=window_; state.dragPreview=std::move(preview);
@@ -26223,6 +26507,7 @@ public:
                 lane_->dragPreview=std::shared_ptr<const DragPreview>{}; SetEvent(lane_->wake);
             }
         }
+        RemovePropW(window_,kDragPreviewProperty);
         DestroyWindow(window_); window_=nullptr;
     }
     ~ShellDragFeedback() {
@@ -26249,7 +26534,7 @@ public:
         if(auto* live=State(source_); live && live->lifetimeToken==lifetime_ && live->dragPreview) {
             auto& preview=*live->dragPreview;
             preview.effect=DROPEFFECT_NONE;
-            UpdateDragCaption(*live,preview,{},preview.captionAvailable);
+            UpdateDragCaption(*live,preview,{},preview.captionWorkWidth);
             PublishDragPreview(*live);
         }
         ClearShellDropDescription(data_.Get());
@@ -26668,6 +26953,7 @@ void ShowItemTip(ViewState& state, POINT client) {
     facts.path = entry.path;
     facts.identity = entry.shellIdentity;
     facts.folder = entry.folder;
+    facts.attributes = entry.attributes;
     facts.namespaceItem = entry.shellIdentity && entry.path.starts_with(L"windhawk:pidl:");
     facts.type = entry.type;
     facts.detailed = g_detailedItemTips.load(std::memory_order_relaxed);
@@ -26946,16 +27232,20 @@ std::vector<HWND> FrameOverlays(HWND frame) {
 // sibling directly below the stack instead: the same final order, Explorer's
 // own relative order preserved, and no covered frame. Any thread; HWNDs only.
 HWND KeepBelowOverlayStack(HWND hwnd, HWND after, UINT flags) {
-    if ((flags & SWP_NOZORDER) || t_overlayStacking || g_unloading.load(std::memory_order_relaxed) ||
-        after == HWND_BOTTOM || after == HWND_TOPMOST || after == HWND_NOTOPMOST) return after;
-    const HWND frame = GetAncestor(hwnd, GA_PARENT);
-    if (!frame || GetPropW(hwnd, kViewToggleOwnerProperty) || GetPropW(hwnd, kRenameEditorProperty) ||
-        !IsExplorerFrame(frame)) return after;
-    HWND overlay = nullptr;
-    for (HWND candidate : FrameOverlays(frame)) {
-        if (candidate == hwnd) return after;
-        if (!overlay && GetParent(candidate) == frame && IsWindowVisible(candidate)) overlay = candidate;
-    }
+    if ((flags & SWP_NOZORDER) || t_overlayStacking ||
+        after == HWND_BOTTOM || after == HWND_TOPMOST || after == HWND_NOTOPMOST ||
+        g_unloading.load(std::memory_order_relaxed)) return after;
+    // Only known native content hosts belong below the GPU list. Future frame
+    // children (search popups, XAML islands, etc.) retain their native z-order.
+    if (!IsNativeContentSibling(hwnd)) return after;
+    const HWND frame=GetParent(hwnd);
+    if (!frame || (after!=HWND_TOP && GetParent(after)!=frame)) return after;
+    HWND overlay=nullptr;
+    AcquireSRWLockShared(&g_tabRegistryLock);
+    const auto found=g_tabOverlaysByFrame.find(frame);
+    if (found!=g_tabOverlaysByFrame.end()) for (HWND candidate:found->second)
+        if (GetParent(candidate)==frame && IsWindowVisible(candidate)) {overlay=candidate; break;}
+    ReleaseSRWLockShared(&g_tabRegistryLock);
     if (!overlay || after == overlay) return after;
     // HWND_TOP, or any window above the overlay, would place hwnd above it.
     bool above = after == HWND_TOP;
@@ -27569,7 +27859,8 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         const HWND button = reinterpret_cast<HWND>(lp);
         const HWND overlay = reinterpret_cast<HWND>(GetPropW(button, kViewToggleOwnerProperty));
         if (auto state = State(overlay); state && state->frameHwnd == hwnd && state->viewToggle == button) {
-            if (!g_unloading.load(std::memory_order_relaxed) && TabOwnsActiveView(*state))
+            if (!g_unloading.load(std::memory_order_relaxed) && state->inScope &&
+                state->detailsViewActive && TabOwnsActiveView(*state))
                 PostMessageW(overlay, kMsgViewToggle, 0, 0);
             return 0;
         }
@@ -29483,6 +29774,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_TAP && !canceled && TouchItemValid(state)) {
+            ClearTypeSearch(state);
             if (state.touch.contacts > 1) {
                 // Native recognition owns tap timing and movement tolerance.
                 // Anchor to the first finger, never the centroid between rows.
@@ -29729,7 +30021,7 @@ void ArmTouchHold(ViewState& state, const std::shared_ptr<TouchRecognizer>& sess
         if (g_perf.load(std::memory_order_relaxed))
             Wh_Log(L"[GPU touch drag] hold armed pointer=%u delay=%.3f duration=%u deadline=%lld packet-qpc=%llu packet-time=%lu",
                 state.touch.primary,delay,duration,state.touch.holdDeadlineQpc.QuadPart,contact.PerformanceCount,contact.dwTime);
-    } else Wh_Log(L"[GPU touch] hold deadline unavailable hr=0x%08X delay=%.3f",unsigned(hr),delay);
+    } else if (g_perf.load(std::memory_order_relaxed)) Wh_Log(L"[GPU touch] hold deadline unavailable hr=0x%08X delay=%.3f",unsigned(hr),delay);
 }
 
 void TouchHoldDeadline(ViewState& state, const POINTER_INFO* next = nullptr) {
@@ -30084,6 +30376,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    if(s && s->keyboardSectionKey &&
+        (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
+         msg==WM_MBUTTONDOWN || msg==WM_POINTERDOWN)) {
+        s->keyboardSectionKey.reset(); Redraw(*s);
+    }
     if (s && !s->itemTip.item.empty()) {
         // Pressing, wheeling or typing dismisses the hovered item's tooltip
         // until another item is hovered; hiding this view just hides it.
@@ -30191,6 +30488,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
          (msg==WM_KEYDOWN && wParam!=VK_CONTROL && wParam!=VK_SHIFT &&
             !(wParam=='N' && (GetKeyState(VK_CONTROL)&0x8000) && (GetKeyState(VK_SHIFT)&0x8000)))))
         ClearInteractiveCreation(*s);
+    if(s && (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN || msg==WM_XBUTTONDOWN))
+        ClearTypeSearch(*s);
     std::optional<PipelineScope> pipelineMessage;
     if (s && s->background) {
         EnsurePipelineTrace(*s);
@@ -30502,6 +30801,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 RepositionRenameEdit(*s);
             }
             if (changes & kStyleInput) {
+                RefreshWheelSettings();
                 s->checkboxHeaderActionPending=false; s->checkboxHeaderActionSelection.clear();
                 const bool checkSelect=s->clickPolicy.checkSelect;
                 s->clickPolicy = ReadShellClickPolicy();
@@ -32268,13 +32568,17 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
     case WM_CHAR:
+        if(s && wParam==L' ' && KeyboardFocusedSection(*s)>=0) return 0;
+        // Backspace is applied on KEYDOWN, before Shell navigation accelerators.
+        // Its translated character must not delete a second character.
+        if (s && wParam == L'\b') return 0;
         // Ctrl+Space was already applied to the GPU selection on KEYDOWN.
         // Never let its generated character toggle the native list a second time.
         if (s && (wParam == L' ' || wParam == 0) &&
             (GetKeyState(VK_CONTROL) & 0x8000) &&
             !(GetKeyState(VK_SHIFT) & 0x8000))
             return 0;
-        if (s && wParam == L' ') {
+        if (s && wParam == L' ' && !TypeSearchActive(*s)) {
             // Space remains a native Shell key so selection-aware preview
             // extensions can observe it. It is not a filename-search letter.
             if (IsWindow(s->nativeHwnd))
@@ -32301,6 +32605,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s) {
             const MSG key=NativeFileWindowKey(hwnd,msg,wParam,lParam);
+            const int focusedSection=KeyboardFocusedSection(*s);
+            if(focusedSection>=0 && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) {
+                if(wParam==VK_RETURN || wParam==VK_SPACE) {
+                    if(!(lParam&(1LL<<30))) ToggleGroupSection(*s,focusedSection);
+                    return 0;
+                }
+                if(wParam==VK_LEFT || wParam==VK_RIGHT) {
+                    const bool expand=(wParam==VK_RIGHT)!=s->rtlLayout;
+                    if(s->sections[size_t(focusedSection)].collapsed==expand) ToggleGroupSection(*s,focusedSection);
+                    return 0;
+                }
+            }
             if (HandleNativeFileKey(key,s)) return 0;
             const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -32335,6 +32651,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (!control && !shift) Open(*s,s->selected);
                 return 0;
             case VK_BACK:
+                if (TypeSearchActive(*s) && !control &&
+                    !(GetKeyState(VK_MENU) & 0x8000)) {
+                    TypeToSelect(*s,L'\b');
+                    return 0;
+                }
                 if (!(GetKeyState(VK_CONTROL) & 0x8000) &&
                     !(GetKeyState(VK_MENU) & 0x8000) &&
                     !(GetKeyState(VK_SHIFT) & 0x8000) &&
@@ -32401,7 +32722,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && wParam==WPARAM(s->lifetimeToken)) SetActive(hwnd, false);
         return 0;
     case kMsgViewToggle:
-        if (s && s->inScope && TabOwnsActiveView(*s))
+        if (s && s->inScope && s->detailsViewActive && TabOwnsActiveView(*s))
             SetActive(hwnd, !s->visible);
         return 0;
     case kMsgItemTipReady:
@@ -32965,7 +33286,9 @@ LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
             // for hidden views which receive neither SHOW nor CHANGED.
             if(position) {
                 SuppressAppearingNativeSurface(message.hwnd,EVENT_OBJECT_PARENTCHANGE);
-                position->flags=ConstrainNativePosition(message.hwnd,position->flags);
+                // API hooks already recorded the caller's intent and may have
+                // replaced SHOW with our suppression HIDE. Do not record it twice.
+                position->flags=ConstrainNativePosition(message.hwnd,position->flags,false);
             }
         }
     }
@@ -33528,6 +33851,7 @@ void ReportShellNavigationEvent(HWND overlay, ShellNavigationSignal signal,
     }
 }
 
+// reason is a diagnostic tag only; visible captions come from Shell resources.
 void MaybeDisplayImmediateBack(HWND overlay, const wchar_t* reason) {
     ViewState* state = IsWindow(overlay) ? State(overlay) : nullptr;
     if (!state || state->immediateBackTab != state->activeTabHost ||
@@ -35064,7 +35388,7 @@ void CheckOverlaySize(HWND frame) {
 // The native Shell view retains keyboard focus for Shell-aware preview tools.
 // Only keys that OUR renderer owns are rerouted to our HWND; all other keys,
 // especially Space and unknown extension accelerators, stay native.
-bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
+bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching = false, bool sectionFocused = false) {
     if (msg.message == WM_CHAR) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         // Ctrl+Space can translate to either U+0020 or NUL. Check its scan
@@ -35074,15 +35398,19 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
             const UINT scan = static_cast<UINT>((msg.lParam >> 16) & 0xFF);
             return MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) == VK_SPACE;
         }
-        return msg.wParam != L' ' && !ctrl &&
+        return (msg.wParam != L' ' || searching || sectionFocused) && !ctrl &&
                !(GetKeyState(VK_MENU) & 0x8000);
     }
     if (msg.message != WM_KEYDOWN) return false;
     if (GetKeyState(VK_MENU) & 0x8000) return false;
+    if(sectionFocused && !(GetKeyState(VK_CONTROL)&0x8000) &&
+        (msg.wParam==VK_SPACE || msg.wParam==VK_LEFT || msg.wParam==VK_RIGHT)) return true;
     if (IsNativeFileKey(msg)) return true;
     if (IsKeyboardMovementKey(static_cast<UINT>(msg.wParam), grid))
         return true; // Includes Shift ranges and Ctrl focus-only movement.
     switch (msg.wParam) {
+    case VK_BACK:
+        return searching && !(GetKeyState(VK_CONTROL) & 0x8000);
     case VK_ESCAPE:
         return !(GetKeyState(VK_CONTROL) & 0x8000);
     case VK_RETURN: case VK_F5: case VK_F2: case VK_APPS:
@@ -35091,6 +35419,8 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
     case VK_F10:
         return (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     case VK_SPACE:
+        if(searching && !(GetKeyState(VK_CONTROL)&0x8000)) return true;
+        [[fallthrough]];
     case VK_ADD:
         return (GetKeyState(VK_CONTROL) & 0x8000) &&
                !(GetKeyState(VK_SHIFT) & 0x8000);
@@ -35115,8 +35445,8 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
 // List-owned keyboard commands are recovered from a bare frame; other controls
 // keep their input, and no focus/activation change is needed.
 HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
-    if (!msg.hwnd || g_unloading.load(std::memory_order_relaxed) ||
-        !IsOverlayKeyboardCommand(msg, true)) return nullptr;
+    if (!msg.hwnd || (msg.message!=WM_KEYDOWN && msg.message!=WM_CHAR) ||
+        g_unloading.load(std::memory_order_relaxed)) return nullptr;
     const HWND focused = GetFocus();
     const bool frameKey = IsExplorerFrame(msg.hwnd);
     HWND overlay = nullptr, native = msg.hwnd;
@@ -35143,7 +35473,7 @@ HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
     if (!state || msg.hwnd == overlay || !state->visible ||
         !OverlayHasInputFocus(*state) ||
         !state->detailsViewActive || state->emptyNative ||
-        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView))
+        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView,TypeSearchActive(*state),KeyboardFocusedSection(*state)>=0))
         return nullptr;
     if (frameKey) {
         if (!state->inScope || state->frameHwnd != msg.hwnd ||
@@ -35368,10 +35698,21 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
     }
     if (msg && HandleNativeFileKey(*msg)) return TRUE;
     if (msg) NoteNativeNewFolderShortcut(*msg);
+    if(msg && msg->message==WM_KEYDOWN) {
+        if(const HWND overlay=OverlayKeyboardTarget(*msg)) {
+            if(const auto* state=State(overlay); state && KeyboardFocusedSection(*state)>=0) {
+                SendMessageW(overlay,msg->message,msg->wParam,msg->lParam);
+                return TRUE;
+            }
+        }
+    }
     // Frame-targeted list keys may be consumed before DispatchMessage. Use the
     // same resolver there as a fallback for message loops without accelerators.
     if (msg) {
-        if (HWND overlay = OverlayKeyboardTarget(*msg, true)) {
+        // Active-search Backspace also belongs to us when the native list
+        // owns focus: Explorer can consume it before normal dispatch.
+        const bool searchBackspace=msg->message==WM_KEYDOWN && msg->wParam==VK_BACK;
+        if (HWND overlay = OverlayKeyboardTarget(*msg, !searchBackspace)) {
             SendMessageW(overlay, msg->message, msg->wParam, msg->lParam);
             return TRUE;
         }
@@ -35537,6 +35878,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     ApiCallbackGuard callback(ApiHook::Dispatch);
     NativeFileKeyMessageScope input(msg);
     if (g_unloading.load(std::memory_order_acquire)) return g_dispatchOriginal(msg);
+    if(msg) ObserveTypeSearchPointerInput(*msg);
     MSG renamedInput{};
     if (msg && RouteNativeRenameMessage(*msg, renamedInput)) return g_dispatchOriginal(&renamedInput);
     InputFrameCompletion completion(msg,true);
@@ -35784,8 +36126,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     }
     // WM_SETTINGCHANGE is normally broadcast to TOP-LEVEL Explorer windows,
     // not to our child overlay HWND. Forward posted broadcasts through the
-    // existing dispatch hook; synchronous broadcasts are covered by native
-    // reorder hints and the bounded existing-timer safety probe.
+    // existing dispatch hook; the frame subclass covers sent broadcasts.
     if (msg->message == WM_SETTINGCHANGE) {
         HWND frame = GetAncestor(msg->hwnd, GA_ROOT);
         if (IsExplorerFrame(frame))
@@ -36031,7 +36372,7 @@ void DrawViewToggle(const ViewState& state, const DRAWITEMSTRUCT& destination) {
     const int dpi = state.viewToggleDpi ? state.viewToggleDpi : 96;
     InflateRect(&bounds, -Scale96(1, dpi), -Scale96(1, dpi));
     const int radius = Scale96(4, dpi);
-    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    const bool disabled = !state.inScope || !state.detailsViewActive || (item.itemState & ODS_DISABLED) != 0;
     if (!disabled && (state.viewToggleHot || (item.itemState & ODS_SELECTED))) {
         SetDCBrushColor(item.hDC, blend((item.itemState & ODS_SELECTED) ? 18 : 10));
         SelectObject(item.hDC, brush); SelectObject(item.hDC, GetStockObject(NULL_PEN));
@@ -36250,8 +36591,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
         auto state = State(overlay);
         if (!state || GetWindowThreadProcessId(overlay, nullptr) != GetCurrentThreadId()) continue;
         const bool show = g_showNativeViewToggleButton.load(std::memory_order_relaxed) &&
-            state->activeTabHost == active && state->inScope &&
-            state->detailsViewActive && !IsIconic(frame) && IsWindowVisible(frame);
+            state->activeTabHost == active && !IsIconic(frame) && IsWindowVisible(frame);
         if (!show) {
             if (IsWindow(state->viewToggleTooltip)) SendMessageW(state->viewToggleTooltip, TTM_POP, 0, 0);
             if (IsWindow(state->viewToggle) && IsWindowVisible(state->viewToggle))
@@ -36259,10 +36599,13 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             continue;
         }
         ConsumeStatusButtonGeometry(*state);
-        const bool gpu = state->visible;
-        const wchar_t* caption = gpu ? L"Switch to native Explorer view" : L"Switch to GPU overlay view";
-        const wchar_t* hint = gpu ? L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)" :
-            L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)";
+        const bool available=state->inScope && state->detailsViewActive;
+        const bool gpu = available && state->visible;
+        const wchar_t* caption = !available ? L"GPU view unavailable for this folder or layout" :
+            gpu ? L"Switch to native Explorer view" : L"Switch to GPU overlay view";
+        const wchar_t* hint = !state->inScope ? L"GPU view unavailable for this folder." :
+            !state->detailsViewActive ? L"GPU view unavailable in this Explorer layout." :
+            gpu ? L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)" : L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)";
         if (!IsWindow(state->viewToggle)) {
             state->viewToggle = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"BUTTON", L"",
                 WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON | BS_ICON | BS_FLAT, 0, 0, 1, 1, frame,
@@ -36301,14 +36644,18 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 }
             }
         }
+        // Keep native hover/tooltips alive. Unavailable actions are rejected
+        // internally by the command handler, while our painter dims the icon.
+        InvalidateRect(state->viewToggle, nullptr, FALSE);
         wchar_t current[64]{}; GetWindowTextW(state->viewToggle, current, ARRAYSIZE(current));
         if (wcscmp(current, caption) != 0) {
             SetWindowTextW(state->viewToggle, caption);
+        }
+        if (IsWindow(state->viewToggleTooltip)) {
             TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
             tool.hwnd = frame; tool.uId = reinterpret_cast<UINT_PTR>(state->viewToggle);
             tool.lpszText = const_cast<LPWSTR>(hint);
-            if (IsWindow(state->viewToggleTooltip))
-                SendMessageW(state->viewToggleTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+            SendMessageW(state->viewToggleTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
         }
         const int dpi = DpiOf(frame);
         if (state->viewToggleDpi != dpi || state->viewToggleIconColor != state->viewToggleForeground ||

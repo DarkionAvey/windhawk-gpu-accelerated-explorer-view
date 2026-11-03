@@ -564,6 +564,8 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         switchCaptionIs(L"GPU view unavailable for this folder or layout"),
         "unsupported namespace lost its explanatory presence button or offered GPU activation");
     TOOLINFOW disabledTip{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
+    wchar_t unavailableHint[512]{};
+    disabledTip.lpszText=unavailableHint;
     disabledTip.hwnd=frame; disabledTip.uId=reinterpret_cast<UINT_PTR>(switchButton);
     Check(SendMessageW(state->viewToggleTooltip,TTM_GETTOOLINFOW,0,reinterpret_cast<LPARAM>(&disabledTip)) &&
         (disabledTip.uFlags&TTF_SUBCLASS) && (disabledTip.uFlags&TTF_IDISHWND),
@@ -574,6 +576,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     state->inScope=true;
     const bool supportedLayout=state->detailsViewActive;
     state->detailsViewActive=false; RefreshViewToggleForFrame(frame);
+    disabledTip.lpszText=unavailableHint;
     Check(SendMessageW(state->viewToggleTooltip,TTM_GETTOOLINFOW,0,reinterpret_cast<LPARAM>(&disabledTip)) &&
         disabledTip.lpszText && wcscmp(disabledTip.lpszText,L"GPU view unavailable in this Explorer layout.")==0,
         "disabled switch tooltip did not update when the unavailability reason changed");

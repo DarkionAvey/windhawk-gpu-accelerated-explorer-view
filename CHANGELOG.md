@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.348 (unreleased)
+## 1.0.0
 
 - Show tooltip dates with a localized relative phrase from Windows ICU,
   alongside the actual date and time.

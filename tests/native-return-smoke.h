@@ -136,10 +136,16 @@ static void TestNativeReturnRoutesCore(const std::wstring& fixture) {
         }
         Check(Eventually([&] {live.Pump(); return !live.state->detailsViewActive && !::IsWindowVisible(live.overlay);}),"native-only mode did not concede presentation");
         NativeReturnFixture::CheckNative(live);
-        Check(::IsWindowVisible(live.state->viewToggle) && !IsWindowEnabled(live.state->viewToggle),
-            "deterministic native fallback hid the presence button or offered an unavailable view");
+        Check(::IsWindowVisible(live.state->viewToggle) && IsWindowEnabled(live.state->viewToggle),
+            "native fallback lost the enabled presence button needed for hover hints");
         wchar_t caption[128]{}; GetWindowTextW(live.state->viewToggle,caption,ARRAYSIZE(caption));
         Check(wcsstr(caption,L"unavailable"),"fallback button did not explain refusal");
+        wchar_t hint[512]{};
+        TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
+        tool.hwnd=live.frame; tool.uId=reinterpret_cast<UINT_PTR>(live.state->viewToggle); tool.lpszText=hint;
+        Check(SendMessageW(live.state->viewToggleTooltip,TTM_GETTOOLINFOW,0,reinterpret_cast<LPARAM>(&tool)) &&
+            tool.lpszText && !wcscmp(tool.lpszText,L"GPU view unavailable in this Explorer layout."),
+            "native fallback toggle did not expose its unavailable-layout hover hint");
         g_showNativeViewToggleButton=false; RefreshViewToggleForFrame(live.frame);
         Check(!::IsWindowVisible(live.state->viewToggle),"button ignored its explicit hide option");
         g_showNativeViewToggleButton=true; RefreshViewToggleForFrame(live.frame);

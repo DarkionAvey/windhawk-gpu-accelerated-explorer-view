@@ -421,6 +421,7 @@ static void TestPresentationOwners() {
         FocusFixture::Session focus(tab.frame,s.hwnd);
         Check(s.sections.size()==3,"keyboard section fixture grouping");
         s.selected=s.sections[0].end-1;
+        s.selectedFlags.assign(s.total,0); s.selectedFlags[size_t(s.selected)]=1;
         NavigateKeyboardSelection(s,VK_DOWN,false,false);
         Check(KeyboardFocusedSection(s)==1,"Down skipped the next section header");
         NavigateKeyboardSelection(s,VK_UP,false,false);
