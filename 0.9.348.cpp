@@ -16079,14 +16079,21 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             UINT32 count = 0;
             if (SUCCEEDED(layout->HitTestTextRange(0, std::min(highlight, static_cast<UINT32>(text.size())),
                 l, t, matches, ARRAYSIZE(matches), &count))) {
-                state.target->PushAxisAlignedClip(D2D1::RectF(l,t,r,b), D2D1_ANTIALIAS_MODE_ALIASED);
+                // The outline includes horizontal padding outside the glyph
+                // box. Keep it inside its own clip, including shortened labels.
+                const auto clip=SnapDrawRect(state.target.Get(),D2D1::RectF(l-1.f,t,r+1.f,b));
+                state.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
                 for (UINT32 i=0; i<count; ++i) {
                     const auto& m = matches[i];
                     if (!m.isText || m.isTrimmed || m.width <= 0.f || m.height <= 0.f) continue;
                     // Hit-test metrics are fractional; fill the same pixels
                     // that StrokeRoundedRect outlines.
-                    const auto rc = D2D1::RoundedRect(SnapDrawRect(state.target.Get(),D2D1::RectF(m.left-1.f, m.top,
-                        m.left+m.width+1.f, m.top+m.height)), 2.f, 2.f);
+                    auto bounds=SnapDrawRect(state.target.Get(),D2D1::RectF(m.left-1.f,m.top,
+                        m.left+m.width+1.f,m.top+m.height));
+                    bounds.left=std::max(bounds.left,clip.left); bounds.right=std::min(bounds.right,clip.right);
+                    bounds.top=std::max(bounds.top,clip.top); bounds.bottom=std::min(bounds.bottom,clip.bottom);
+                    if(bounds.right<=bounds.left || bounds.bottom<=bounds.top) continue;
+                    const auto rc = D2D1::RoundedRect(bounds, 2.f, 2.f);
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
@@ -17941,6 +17948,7 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
 
 bool MatchesTypeSearchPrefix(const std::wstring& name,
                              const std::wstring& prefix);
+UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
 
 void ResetItemContentOpacity(ViewState& state) {
     state.itemOpacityRows.clear();
@@ -20408,8 +20416,7 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         const float nameTextRight = usage.visible ? usage.labelRight : geometry.text.right;
-        const UINT32 match = typeSearchVisible && MatchesTypeSearchPrefix(e.name, state.typeSearch) ?
-            static_cast<UINT32>(state.typeSearch.size()) : 0;
+        const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(e.name,state.typeSearch) : 0;
         if (!(state.rename.editor && i == state.rename.index))
             Text(state, e.name, geometry.text.left, geometry.text.top,
                 nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
@@ -24602,9 +24609,43 @@ void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = fals
 // Search the current display order, wrap around, and retain the prefix briefly.
 bool MatchesTypeSearchPrefix(const std::wstring& name,
                              const std::wstring& prefix) {
-    return !prefix.empty() && name.size() >= prefix.size() &&
-        CompareStringOrdinal(name.c_str(), static_cast<int>(prefix.size()),
-            prefix.c_str(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL;
+    return TypeSearchPrefixLength(name,prefix)!=0;
+}
+UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix) {
+    size_t n=0,p=0;
+    // Compare non-whitespace runs without constructing folded copies for
+    // every row. Return the original filename extent for visible highlights.
+    while(p<prefix.size()) {
+        if(iswspace(prefix[p])) {++p; continue;}
+        while(n<name.size() && iswspace(name[n])) ++n;
+        size_t ne=n,pe=p;
+        while(ne<name.size() && !iswspace(name[ne])) ++ne;
+        while(pe<prefix.size() && !iswspace(prefix[pe])) ++pe;
+        const auto length=std::min(ne-n,pe-p);
+        if(!length || CompareStringOrdinal(name.data()+n,int(length),prefix.data()+p,int(length),TRUE)!=CSTR_EQUAL) return 0;
+        n+=length; p+=length;
+    }
+    return UINT32(n);
+}
+bool TypeSearchActive(const ViewState& state) {
+    return !state.typeSearch.empty() && state.lastTyped && GetTickCount64()-state.lastTyped<=kTypeSearchTimeoutMs;
+}
+void ClearTypeSearch(ViewState& state) {
+    if(state.typeSearch.empty()) return;
+    state.typeSearch.clear(); state.lastTyped=0;
+    KillTimer(state.hwnd,kTypeSearchTimerId); Redraw(state);
+}
+void ObserveTypeSearchPointerInput(const MSG& message) {
+    switch(message.message) {
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
+    case WM_NCLBUTTONDOWN: case WM_NCRBUTTONDOWN: case WM_NCMBUTTONDOWN: case WM_NCXBUTTONDOWN:
+        break;
+    default: return;
+    }
+    const HWND overlay=OverlayUnder(GetAncestor(message.hwnd,GA_ROOT));
+    auto* state=overlay ? State(overlay) : nullptr;
+    if(!state) return;
+    ClearTypeSearch(*state);
 }
 
 void TypeToSelect(ViewState& state, wchar_t ch) {
@@ -29560,6 +29601,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             continue;
         }
         if (event.interactionId == INTERACTION_ID_TAP && !canceled && TouchItemValid(state)) {
+            ClearTypeSearch(state);
             if (state.touch.contacts > 1) {
                 // Native recognition owns tap timing and movement tolerance.
                 // Anchor to the first finger, never the centroid between rows.
@@ -30268,6 +30310,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
          (msg==WM_KEYDOWN && wParam!=VK_CONTROL && wParam!=VK_SHIFT &&
             !(wParam=='N' && (GetKeyState(VK_CONTROL)&0x8000) && (GetKeyState(VK_SHIFT)&0x8000)))))
         ClearInteractiveCreation(*s);
+    if(s && (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN || msg==WM_XBUTTONDOWN))
+        ClearTypeSearch(*s);
     std::optional<PipelineScope> pipelineMessage;
     if (s && s->background) {
         EnsurePipelineTrace(*s);
@@ -32352,7 +32396,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             (GetKeyState(VK_CONTROL) & 0x8000) &&
             !(GetKeyState(VK_SHIFT) & 0x8000))
             return 0;
-        if (s && wParam == L' ') {
+        if (s && wParam == L' ' && !TypeSearchActive(*s)) {
             // Space remains a native Shell key so selection-aware preview
             // extensions can observe it. It is not a filename-search letter.
             if (IsWindow(s->nativeHwnd))
@@ -33043,7 +33087,9 @@ LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
             // for hidden views which receive neither SHOW nor CHANGED.
             if(position) {
                 SuppressAppearingNativeSurface(message.hwnd,EVENT_OBJECT_PARENTCHANGE);
-                position->flags=ConstrainNativePosition(message.hwnd,position->flags);
+                // API hooks already recorded the caller's intent and may have
+                // replaced SHOW with our suppression HIDE. Do not record it twice.
+                position->flags=ConstrainNativePosition(message.hwnd,position->flags,false);
             }
         }
     }
@@ -35143,7 +35189,7 @@ void CheckOverlaySize(HWND frame) {
 // The native Shell view retains keyboard focus for Shell-aware preview tools.
 // Only keys that OUR renderer owns are rerouted to our HWND; all other keys,
 // especially Space and unknown extension accelerators, stay native.
-bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
+bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching = false) {
     if (msg.message == WM_CHAR) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         // Ctrl+Space can translate to either U+0020 or NUL. Check its scan
@@ -35153,7 +35199,7 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
             const UINT scan = static_cast<UINT>((msg.lParam >> 16) & 0xFF);
             return MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) == VK_SPACE;
         }
-        return msg.wParam != L' ' && !ctrl &&
+        return (msg.wParam != L' ' || searching) && !ctrl &&
                !(GetKeyState(VK_MENU) & 0x8000);
     }
     if (msg.message != WM_KEYDOWN) return false;
@@ -35170,6 +35216,8 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
     case VK_F10:
         return (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     case VK_SPACE:
+        if(searching && !(GetKeyState(VK_CONTROL)&0x8000)) return true;
+        [[fallthrough]];
     case VK_ADD:
         return (GetKeyState(VK_CONTROL) & 0x8000) &&
                !(GetKeyState(VK_SHIFT) & 0x8000);
@@ -35194,8 +35242,8 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false) {
 // List-owned keyboard commands are recovered from a bare frame; other controls
 // keep their input, and no focus/activation change is needed.
 HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
-    if (!msg.hwnd || g_unloading.load(std::memory_order_relaxed) ||
-        !IsOverlayKeyboardCommand(msg, true)) return nullptr;
+    if (!msg.hwnd || (msg.message!=WM_KEYDOWN && msg.message!=WM_CHAR) ||
+        g_unloading.load(std::memory_order_relaxed)) return nullptr;
     const HWND focused = GetFocus();
     const bool frameKey = IsExplorerFrame(msg.hwnd);
     HWND overlay = nullptr, native = msg.hwnd;
@@ -35222,7 +35270,7 @@ HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
     if (!state || msg.hwnd == overlay || !state->visible ||
         !OverlayHasInputFocus(*state) ||
         !state->detailsViewActive || state->emptyNative ||
-        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView))
+        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView,TypeSearchActive(*state)))
         return nullptr;
     if (frameKey) {
         if (!state->inScope || state->frameHwnd != msg.hwnd ||
@@ -35616,6 +35664,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
     ApiCallbackGuard callback(ApiHook::Dispatch);
     NativeFileKeyMessageScope input(msg);
     if (g_unloading.load(std::memory_order_acquire)) return g_dispatchOriginal(msg);
+    if(msg) ObserveTypeSearchPointerInput(*msg);
     MSG renamedInput{};
     if (msg && RouteNativeRenameMessage(*msg, renamedInput)) return g_dispatchOriginal(&renamedInput);
     InputFrameCompletion completion(msg,true);
@@ -36328,8 +36377,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
         auto state = State(overlay);
         if (!state || GetWindowThreadProcessId(overlay, nullptr) != GetCurrentThreadId()) continue;
         const bool show = g_showNativeViewToggleButton.load(std::memory_order_relaxed) &&
-            state->activeTabHost == active && state->inScope &&
-            state->detailsViewActive && !IsIconic(frame) && IsWindowVisible(frame);
+            state->activeTabHost == active && !IsIconic(frame) && IsWindowVisible(frame);
         if (!show) {
             if (IsWindow(state->viewToggleTooltip)) SendMessageW(state->viewToggleTooltip, TTM_POP, 0, 0);
             if (IsWindow(state->viewToggle) && IsWindowVisible(state->viewToggle))
@@ -36337,10 +36385,13 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             continue;
         }
         ConsumeStatusButtonGeometry(*state);
-        const bool gpu = state->visible;
-        const wchar_t* caption = gpu ? L"Switch to native Explorer view" : L"Switch to GPU overlay view";
-        const wchar_t* hint = gpu ? L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)" :
-            L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)";
+        const bool available=state->inScope && state->detailsViewActive;
+        const bool gpu = available && state->visible;
+        const wchar_t* caption = !available ? L"GPU view unavailable for this folder or layout" :
+            gpu ? L"Switch to native Explorer view" : L"Switch to GPU overlay view";
+        const wchar_t* hint = !state->inScope ? L"GPU view unavailable for this folder." :
+            !state->detailsViewActive ? L"GPU view unavailable in this Explorer layout." :
+            gpu ? L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)" : L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)";
         if (!IsWindow(state->viewToggle)) {
             state->viewToggle = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"BUTTON", L"",
                 WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON | BS_ICON | BS_FLAT, 0, 0, 1, 1, frame,
@@ -36379,6 +36430,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 }
             }
         }
+        EnableWindow(state->viewToggle,available);
         wchar_t current[64]{}; GetWindowTextW(state->viewToggle, current, ARRAYSIZE(current));
         if (wcscmp(current, caption) != 0) {
             SetWindowTextW(state->viewToggle, caption);

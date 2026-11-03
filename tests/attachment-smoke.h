@@ -560,13 +560,15 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     }
     state->rtlLayout=false;
     state->inScope=false; RefreshViewToggleForFrame(frame);
-    Check(!IsWindowVisible(switchButton),"unsupported namespace left an active GPU switch");
+    Check(IsWindowVisible(switchButton) && !IsWindowEnabled(switchButton) &&
+        switchCaptionIs(L"GPU view unavailable for this folder or layout"),
+        "unsupported namespace lost its explanatory presence button or offered GPU activation");
     state->inScope=true;
     const HWND selectedHost=state->activeTabHost;
     state->activeTabHost=host; RefreshViewToggleForFrame(frame);
     Check(!IsWindowVisible(switchButton),"inactive tab retained its switch");
     state->activeTabHost=selectedHost; RefreshViewToggleForFrame(frame);
-    Check(IsWindowVisible(switchButton) && state->viewToggle==switchButton &&
+    Check(IsWindowVisible(switchButton) && IsWindowEnabled(switchButton) && state->viewToggle==switchButton &&
         FocusFixture::Foreground()==foregroundBeforeSwitch && FocusFixture::Focus()==focusBeforeSwitch && !FocusFixture::sets,
         "switch maintenance moved focus/activation or failed to reuse the active tab's control");
     {

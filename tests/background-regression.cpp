@@ -1970,6 +1970,7 @@ static void TestPreviewInput() {
 #include "large-tile-smoke.h"
 #include "dense-grid-smoke.h"
 #include "icon-alpha-smoke.h"
+#include "type-search-border-smoke.h"
 #include "icon-sizing-smoke.h"
 #include "shell-overlay-smoke.h"
 #include "shell-provider-smoke.h"
@@ -1996,6 +1997,7 @@ static void TestPreviewInput() {
 #include "cloud-item-tip-smoke.h"
 
 #include "option-effects-smoke.h"
+#include "native-return-smoke.h"
 #include "regression-manifest.h"
 #include <set>
 

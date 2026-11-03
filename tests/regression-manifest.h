@@ -153,6 +153,11 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("cloud-item-tip", PARALLEL, TestCloudItemTip(fixture)),
     // Graphics and native view integration.
     REGRESSION("real-native-viewport", PARALLEL, TestRealNativeViewport(fixture)),
+    REGRESSION("native-return-routes", PARALLEL, TestNativeReturnRoutes(fixture)),
+    REGRESSION("native-return-unload", PARALLEL, TestNativeReturnUnload(fixture)),
+    FOCUSED("native-return-routes-core", PARALLEL, TestNativeReturnRoutesCore(fixture)),
+    FOCUSED("native-return-unload-core", PARALLEL, TestNativeReturnUnloadCore(fixture)),
+    REGRESSION("type-search-input", PARALLEL, TestTypeSearchInput(fixture)),
     REGRESSION("private-fixture-release", PARALLEL, TestPrivateFixtureRelease(fixture)),
     REGRESSION("native-uia-batch", PARALLEL, TestNativeUiaBatch()),
     REGRESSION("real-native-uia-pressure", PARALLEL, TestRealNativeUiaPressure(fixture)),
@@ -177,6 +182,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("background-tab-startup", PARALLEL, TestBackgroundTabStartup(fixture)),
     REGRESSION("attached-lifecycle", PARALLEL, TestAttachedLifecycle(fixture)),
     REGRESSION("type-search-prefix", PARALLEL, TestTypeSearchPrefix()),
+    REGRESSION("type-search-border", PARALLEL, TestTypeSearchBorder(fixture)),
     REGRESSION("ui-feedback-audit", PARALLEL, TestUiFeedbackAudit(fixture)),
     REGRESSION("marquee-selection", PARALLEL, RegressionManifest::MarqueeSelection(fixture)),
 

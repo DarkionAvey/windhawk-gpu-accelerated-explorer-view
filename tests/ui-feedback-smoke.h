@@ -1,6 +1,13 @@
 // Count live-view queries while running actual timer, input, projection and
 // startup paths. All windows stay off screen and file access is read-only.
 static void TestTypeSearchPrefix() {
+    for(const auto* query:{L"programfil",L"Program fi",L"pro gram f i"})
+        Check(MatchesTypeSearchPrefix(L"Program files",query),"type search did not ignore filename/query whitespace");
+    Check(TypeSearchPrefixLength(L"Program files",L"programfil")==11 &&
+        TypeSearchPrefixLength(L"Program files",L"Program fi")==10,
+        "type-search highlight did not include skipped filename spaces");
+    Check(MatchesTypeSearchPrefix(L"Folder (1) & [x]",L"folder(1)&[") &&
+        !MatchesTypeSearchPrefix(L"Folder (1)",L"folder[1]"),"type search ignored punctuation instead of matching it");
     Check(MatchesTypeSearchPrefix(L"Flower in the park.jpg", L"f") &&
           MatchesTypeSearchPrefix(L"Flower in the park.jpg", L"flower") &&
           MatchesTypeSearchPrefix(L"folder", L"FOL"),

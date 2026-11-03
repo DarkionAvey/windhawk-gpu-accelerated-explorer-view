@@ -2,6 +2,13 @@
 
 ## 0.9.348 (unreleased)
 
+- Restore native Explorer visibility on toggle and unload when the fallback
+  presentation hook is active.
+- Keep Space in active type-to-select searches and match names with or without
+  whitespace while preserving punctuation.
+- Keep type-to-select highlight borders intact at text edges and in narrow labels.
+- Keep the view toggle visible during unsupported-folder or layout fallback,
+  with an explanation when GPU presentation is unavailable.
 - Keep native content below the GPU view without demoting unrelated popups.
 - Apply wheel-settings and high-contrast selection changes without reloading.
 - Follow each file type's tooltip property lists and avoid content reads for
