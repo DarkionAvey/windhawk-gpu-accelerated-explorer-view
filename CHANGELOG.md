@@ -2,6 +2,15 @@
 
 ## 0.9.348 (unreleased)
 
+- Let keyboard navigation visit section headers; Enter/Space toggles them and
+  Left/Right collapses or expands the focused section.
+- Use the normal selection background for focused section headers and preserve
+  moving selection feedback across header bands.
+- Rotate section header chevrons with the expand/collapse animation.
+- Give column sort chevrons shallower proportions while retaining their bold stroke.
+- Match the section selection-counter border to its checkmark color and the
+  item checkbox's DPI-scaled border thickness.
+- Give the drag icon pile a stronger scale entrance and an 80 ms fade-in.
 - Restore native Explorer visibility on toggle and unload when the fallback
   presentation hook is active.
 - Keep Space in active type-to-select searches and match names with or without
@@ -10,6 +19,8 @@
 - Let Backspace correct active type-to-select searches instead of navigating away.
 - Keep the view toggle visible during unsupported-folder or layout fallback,
   with an explanation when GPU presentation is unavailable.
+- Keep the unavailable toggle enabled for hover hints, dim its icon, and block
+  its action internally.
 - Keep native content below the GPU view without demoting unrelated popups.
 - Apply wheel-settings and high-contrast selection changes without reloading.
 - Follow each file type's tooltip property lists and avoid content reads for

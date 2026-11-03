@@ -130,13 +130,20 @@ static void TestDragPreview(const std::wstring& fixture) {
                 SetPropW(preview->window,L"WindhawkGpuDragPreview",reinterpret_cast<HANDLE>(preview->token)),"private drag popup");
             const auto device=state.d3d.Get();
             Check(RenderDragPreview(state,preview) && preview->rendered->load() && state.dragComposition.visual &&
-                state.dragComposition.curve && state.d3d.Get()==device,"drag preview did not reuse tab GPU/compositor animation");
+                state.dragComposition.curve && state.dragComposition.opacityCurve && state.dragComposition.opacity && state.d3d.Get()==device,"drag preview did not reuse tab GPU/compositor scale and fade animations");
+            const auto entryScale=state.dragComposition.curve.Get();
+            const auto entryFade=state.dragComposition.opacityCurve.Get();
             const auto artwork=state.dragComposition.artwork[0].Get(); preview->effect=DROPEFFECT_COPY;
             const auto rear=state.dragComposition.artwork[1].Get();
             Check(artwork && RenderDragPreview(state,preview) && state.dragComposition.artwork[0].Get()==artwork,
                 "effect feedback uploaded the same artwork again");
+            Check(state.dragComposition.curve.Get()==entryScale && state.dragComposition.opacityCurve.Get()==entryFade,
+                "effect feedback restarted drag entry scale/fade");
             Check(rear && state.dragComposition.artwork[1].Get()==rear && state.dragComposition.artwork[2].Get()==artwork &&
                 state.dragComposition.artwork[3].Get()==rear,"stack images reuploaded identical shared pixels");
+            preview->animate=false;
+            Check(RenderDragPreview(state,preview) && !state.dragComposition.curve && !state.dragComposition.opacityCurve &&
+                !state.dragComposition.scale && !state.dragComposition.opacity,"disabled animations retained drag entry scale/fade");
             Check(RenderDragPreview(state,nullptr) && !state.dragComposition.target && !state.dragComposition.plane.bitmap,
                 "drag preview resources survived cancellation");
             ++preview->token;

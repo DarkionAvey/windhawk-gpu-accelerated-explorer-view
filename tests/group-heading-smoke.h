@@ -151,6 +151,49 @@ static void TestStickyGroupHeaders(HWND frame) {
             state.activeTabHost=activeTabHost;
             g_filenameOnly=filenameOnly; g_animateHover=animate; g_zebra=zebra;
         }
+        if(!state.gridView) {
+            const auto savedSelection=state.selectedFlags;
+            const int savedCaret=state.selected;
+            const auto filenameOnly=g_filenameOnly.exchange(ViewOption::AlwaysOff);
+            const bool zebra=g_zebra.exchange(false);
+            const int selectionAlpha=g_selectionAlpha.exchange(60);
+            state.selectedFlags.assign(state.total,0);
+            state.activeTabHost=state.frameHwnd;
+            const auto alphaAtMiddle=[&](const std::vector<BYTE>& band) {
+                const int a=int(rtl ? 640-ListEndX(state) : ListStartX(state))+1;
+                const int b=int(rtl ? 640-ListStartX(state) : ListEndX(state))-1;
+                const float logicalX=ListEndX(state)-Scale96(24,ViewDpi(state));
+                const int physicalX=int(rtl ? 640-logicalX : logicalX);
+                return int(band[(size_t(int(heading*.5f))*(b-a)+physicalX-a)*4+3]);
+            };
+            state.keyboardSectionKey=state.sections[0].key;
+            Check(std::abs(alphaAtMiddle(paintBand())-153)<=2,
+                "keyboard-focused section did not use the normal filled selection background");
+            state.keyboardSectionKey.reset();
+            state.scrollNow=state.scrollTarget=state.sections[1].documentTop-2.f*state.rowPx;
+            state.selected=60; state.selectedFlags[60]=1;
+            StopSelectionFade(state);
+            const auto from=CurrentSelectionRect(state,59);
+            AnimationClockFixture::Freeze clock;
+            StartKeyboardSelectionAnimation(state,60,DocumentRowTop(state,59)/state.rowPx,from.left,from.right);
+            const auto began=state.keyboardSelectionStartedQpc;
+            const float desired=(state.sections[1].documentTop+(heading-state.rowPx)*.5f)/state.rowPx;
+            LONGLONG low=0,high=LONGLONG(state.qpcFrequency*kUiTransitionDurationMs/1000.);
+            while(high-low>1) {
+                const auto middle=low+(high-low)/2;
+                AnimationClockFixture::instant.QuadPart=began.QuadPart+middle;
+                if(AnimatedSelectionRow(state)<desired) low=middle; else high=middle;
+            }
+            AnimationClockFixture::instant.QuadPart=began.QuadPart+high;
+            const float offset=state.sections[1].documentTop-state.scrollNow;
+            Check(std::abs(alphaAtMiddle(paintBand(nullptr,offset,heading))-153)<=2,
+                "section header cut a hole in the moving keyboard selection background");
+            StopKeyboardSelectionAnimation(state);
+            state.selectedFlags=savedSelection; state.selected=savedCaret;
+            state.activeTabHost=activeTabHost;
+            state.scrollNow=state.scrollTarget=heading+state.rowPx*5.25f;
+            g_filenameOnly=filenameOnly; g_zebra=zebra; g_selectionAlpha=selectionAlpha;
+        }
         const auto captured=CaptureVisibleGroupHeaders(state);
         Check(std::any_of(captured.begin(),captured.end(),[](const auto& h) { return h.key==L"0"; }),
             "offscreen natural header was lost from the sticky transition capture");

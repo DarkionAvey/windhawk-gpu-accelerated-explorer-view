@@ -414,6 +414,39 @@ static void TestPresentationOwners() {
         Check(!adapter || info.CurrentUsage<=256ULL*1024*1024,"closed presentation tabs retained GPU allocations");
         std::cout<<"PRESENTATION MEMORY tabs=20 4K peak-local-MiB="<<peak/1048576.<<" closed-local-MiB="<<info.CurrentUsage/1048576.<<std::endl;
     }
+    for(bool rtl:{false,true}) for(bool grid:{false,true}) {
+        Regression::Scope scope(grid ? "keyboard section grid" : "keyboard section list");
+        PresentationFixture::Tab tab(L"keyboard sections",60,rtl,grid,true);
+        auto& s=tab.state;
+        FocusFixture::Session focus(tab.frame,s.hwnd);
+        Check(s.sections.size()==3,"keyboard section fixture grouping");
+        s.selected=s.sections[0].end-1;
+        NavigateKeyboardSelection(s,VK_DOWN,false,false);
+        Check(KeyboardFocusedSection(s)==1,"Down skipped the next section header");
+        NavigateKeyboardSelection(s,VK_UP,false,false);
+        Check(KeyboardFocusedSection(s)<0 && s.selected==s.sections[0].end-1,
+            "Up from a header did not return to the previous section's items");
+        NavigateKeyboardSelection(s,VK_HOME,false,false);
+        Check(KeyboardFocusedSection(s)==0,"Home did not reach the first section header");
+        NavigateKeyboardSelection(s,VK_DOWN,false,false);
+        Check(KeyboardFocusedSection(s)<0 && s.selected==s.sections[0].first,
+            "Down from an expanded header did not reach its first item");
+        NavigateKeyboardSelection(s,VK_UP,false,false);
+        Check(KeyboardFocusedSection(s)==0,"Up skipped the current section header");
+        const auto selected=s.selectedFlags;
+        ToggleGroupSection(s,0);
+        Check(KeyboardFocusedSection(s)==0 && s.selectedFlags==selected,
+            "header toggle lost keyboard focus or changed item selection");
+        NavigateKeyboardSelection(s,VK_DOWN,false,false);
+        Check(KeyboardFocusedSection(s)==1,"collapsed section trapped keyboard navigation");
+        NavigateKeyboardSelection(s,VK_UP,false,false);
+        Check(KeyboardFocusedSection(s)==0,"Up skipped a collapsed section header");
+        NavigateKeyboardSelection(s,VK_END,false,false);
+        Check(KeyboardFocusedSection(s)<0 && s.selected==s.total-1,"End failed to leave header focus");
+        NavigateKeyboardSelection(s,VK_HOME,false,false);
+        TypeToSelect(s,L'N');
+        Check(KeyboardFocusedSection(s)<0,"type-to-select retained section header focus");
+    }
     ShutDownFrames(); g_frameStopping=false;
     g_smooth=smooth; g_autoRefitColumns=automatic;
     g_writeFactory.Reset();

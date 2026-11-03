@@ -3172,6 +3172,7 @@ struct ViewState {
         LARGE_INTEGER started{};
     };
     std::vector<GroupSection> sections;
+    std::optional<std::wstring> keyboardSectionKey; // Empty group keys are valid; null means item focus.
     std::shared_ptr<const SectionBadges> sectionBadges;
     bool sectionBadgeAnimating = false; // Lane paint only: a painted badge is still moving.
     int groupRevealRow = -1; // Owner: reveal after the expanding group settles.
@@ -3780,6 +3781,8 @@ struct ViewState {
         ComPtr<IDCompositionVisual> visual;
         ComPtr<IDCompositionScaleTransform> scale;
         ComPtr<IDCompositionAnimation> curve;
+        ComPtr<IDCompositionAnimation> opacityCurve;
+        ComPtr<IDCompositionEffectGroup> opacity;
         std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages> artwork;
         std::array<const void*,kDragPreviewImages> artworkIdentity{};
         std::array<DragShadow,kDragPreviewImages> shadows;
@@ -3913,7 +3916,7 @@ struct SwipeFeedbackSnapshot {
     X(columnModeTransition) X(columnPresentationPending) X(columnHeaderFrom) X(columnHeaderTo) \
     X(columnTransitionStartedQpc) X(columnMotion) X(disappearingColumns) X(columnDragArmed) X(columnDragActive) \
     X(columnDragKey) X(columnDragSource) X(columnDragDestination) X(columnDragPointerX) X(columnDragGrabOffset) \
-    X(columnWiggleAwaitRelease) X(grouping) X(groupAnimating) X(hotSection) X(sort) \
+    X(columnWiggleAwaitRelease) X(grouping) X(groupAnimating) X(hotSection) X(keyboardSectionKey) X(sort) \
     X(rowTransitionActive) X(groupingLayoutTransition) X(zoomLayoutTransition) X(reflowLayoutTransition) X(rowTransitionStartedQpc) \
     X(rowTransitionPresentedProgress) X(rowSceneRevision) X(rowMotion) X(rowMotionFirst) X(disappearingRows) \
     X(groupHeaderMotion) X(disappearingHeaders) X(rowTransitionOldScroll) X(zebraExtentAnimating) \
@@ -4278,6 +4281,7 @@ void PublishGroupIntents(ViewState& state) {
 void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     preserveCollapse = preserveCollapse &&
         SameShellGroup(state.displayedGrouping, state.grouping);
+    if(!preserveCollapse) state.keyboardSectionKey.reset();
     std::map<std::wstring, ViewState::GroupSection> previous;
     if (preserveCollapse) {
         for (const auto& section : state.sections)
@@ -4287,6 +4291,7 @@ void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     state.rowGroup.clear();
     state.displayedGrouping = state.namesPreview ? ShellGroupSpec{} : state.grouping;
     if (state.namesPreview || !state.grouping.enabled) {
+        state.keyboardSectionKey.reset();
         state.presentationGroupIntents.reset();
         LayoutGroupSections(state);
         return;
@@ -4312,6 +4317,8 @@ void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     }
     state.groupAnimating = false;
     state.hotSection = -1;
+    if(state.keyboardSectionKey && std::none_of(state.sections.begin(),state.sections.end(),
+        [&](const auto& section) {return section.key==*state.keyboardSectionKey;})) state.keyboardSectionKey.reset();
     LayoutGroupSections(state);
     PublishGroupIntents(state);
 }
@@ -4565,6 +4572,12 @@ int NextDisplayedRow(const ViewState& state, int index, bool down) {
         i = down ? state.sections[static_cast<size_t>(gi)].end :
             state.sections[static_cast<size_t>(gi)].first - 1;
     }
+    return -1;
+}
+int KeyboardFocusedSection(const ViewState& state) {
+    if (state.keyboardSectionKey)
+        for(size_t i=0;i<state.sections.size();++i)
+            if(state.sections[i].key==*state.keyboardSectionKey) return int(i);
     return -1;
 }
 void ToggleGroupSection(ViewState& state, int index) {
@@ -12244,6 +12257,9 @@ float InlineDriveLabelWidth(float available, float label, int dpi) {
 float SelectionCheckboxSize(const ViewState& state) {
     return static_cast<float>(Scale96(20, ViewDpi(state)));
 }
+float SelectionCheckboxBorder(float side) {
+    return std::max(1.f,std::min(roundf(side/20.f),floorf(side*.5f)));
+}
 float SelectionCheckboxSpace(const ViewState& state) {
     return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
 }
@@ -16149,8 +16165,9 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
     if (state.rtlLayout) cx = state.paintWidth - cx;
     const float cy = ColumnHeaderOffset(state,dpi) +
         static_cast<float>(Scale96(kHeader96, dpi)) * .5f;
-    const float halfWidth = static_cast<float>(Scale96(5, dpi));
-    const float halfHeight = static_cast<float>(Scale96(3, dpi));
+    // Match the expanded section chevron's 2:1 width/height, retaining the bold sort stroke.
+    const float halfWidth = static_cast<float>(Scale96(4, dpi));
+    const float halfHeight = halfWidth*.5f;
     const float wingY = cy + (descending ? -halfHeight : halfHeight);
     const float tipY = cy + (descending ? halfHeight : -halfHeight);
     const float thickness = std::max(1.f, Scale96(1, dpi) * 1.5f);
@@ -17771,6 +17788,14 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
             selectedWeight += overlap(rc.left, rc.right, AnimatedSelectionRow(state)*state.rowPx);
         }
     }
+    if(state.inputFocusIndicators) {
+        const int focused=KeyboardFocusedSection(state);
+        if(focused>=0) {
+            const auto visual=LayoutGroupHeader(state,size_t(focused),CurrentRowProgress(state));
+            const float focusedRow=(visual.top-state.headerPx+state.scrollNow)/std::max(1.f,state.rowPx);
+            selectedWeight+=std::clamp(1.f-fabsf(visualRow-focusedRow),0.f,1.f);
+        }
+    }
     selectedWeight = std::clamp(selectedWeight, 0.f, 1.f);
     const float hoverAlpha = g_hoverAlpha.load(std::memory_order_relaxed) / 100.f;
     const float base = g_selectionAlpha.load(std::memory_order_relaxed) / 100.f;
@@ -17858,8 +17883,8 @@ bool EnsureSelectionCheckGlyph(ViewState& state) {
     return state.selectionCheckGlyph != nullptr;
 }
 
-// A checked selection checkbox stretched into a pill: the same accent fill,
-// text-colored outline and contrast-checked check color, plus the count.
+// A checked selection checkbox stretched into a pill: accent fill and a shared
+// contrast-checked foreground for the outline, checkmark and count.
 void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opacity) {
     const float alpha = opacity*badge.reveal;
     if (!badge.badge || !VisibleOpacity(alpha)) return;
@@ -17875,14 +17900,13 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
     const float radius = (pill.bottom-pill.top)*.5f;
     state.brush->SetColor(Packed(ThemeRgb(COLORREF(palette&0xFFFFFF)),alpha));
     state.target->FillRoundedRectangle(D2D1::RoundedRect(pill,radius,radius),state.brush.Get());
-    // DrawSelectionCheckbox's outline rule, scaled from the same 20-unit box.
-    const float border = std::max(1.f,roundf((pill.bottom-pill.top)/20.f));
-    const unsigned outline = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
-    state.brush->SetColor(Packed(outline,alpha*.8f));
-    state.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left+border*.5f,pill.top+border*.5f,
-        pill.right-border*.5f,pill.bottom-border*.5f),radius-border*.5f,radius-border*.5f),state.brush.Get(),border);
     const unsigned foreground = ThemeRgb(COLORREF((palette>>24)&0xFFFFFF));
     const float foregroundAlpha = alpha*float((palette>>48)&255)/255.f;
+    // Match the DPI-sized item checkbox, independently of heading/font zoom.
+    const float border = SelectionCheckboxBorder(SelectionCheckboxSize(state));
+    state.brush->SetColor(Packed(foreground,foregroundAlpha));
+    state.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left+border*.5f,pill.top+border*.5f,
+        pill.right-border*.5f,pill.bottom-border*.5f),radius-border*.5f,radius-border*.5f),state.brush.Get(),border);
     const float center = (badge.pill.top+badge.pill.bottom)*.5f;
     if (EnsureSelectionCheckGlyph(state)) {
         const auto glyph = mirror(D2D1::RectF(badge.glyphLeft,center-badge.glyph*.5f,
@@ -17919,19 +17943,18 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         std::clamp(height / std::max(1.f, GroupHeadingHeight(state)), 0.f, 1.f);
     state.brush->SetColor(Packed(headerColor, .75f * opacity));
     const float thickness = std::max(1.f, static_cast<float>(Scale96(1, dpi)));
-    if (collapsed) {
-        StrokeLine(state,D2D1::Point2F(centerX-arrowDirection*unit*.5f,
-            centerY-unit), D2D1::Point2F(centerX+arrowDirection*unit*.5f,
-            centerY), state.brush.Get(), thickness);
-        StrokeLine(state,D2D1::Point2F(centerX+arrowDirection*unit*.5f,
-            centerY), D2D1::Point2F(centerX-arrowDirection*unit*.5f,
-            centerY+unit), state.brush.Get(), thickness);
-    } else {
-        StrokeLine(state,D2D1::Point2F(centerX-unit, centerY-unit*.5f),
-            D2D1::Point2F(centerX, centerY+unit*.5f), state.brush.Get(), thickness);
-        StrokeLine(state,D2D1::Point2F(centerX, centerY+unit*.5f),
-            D2D1::Point2F(centerX+unit, centerY-unit*.5f), state.brush.Get(), thickness);
-    }
+    // Follow the existing section expansion, including interrupted/reversed
+    // toggles. Mirror after rotation so RTL opens downward too.
+    const float expanded = section ? std::clamp(section->fraction,0.f,1.f) : (collapsed ? 0.f : 1.f);
+    const float angle = expanded*1.57079632679f;
+    const float cosine = std::cos(angle), sine = std::sin(angle);
+    const auto rotate = [&](float x,float y) {
+        return D2D1::Point2F(centerX+arrowDirection*unit*(x*cosine-y*sine),
+            centerY+unit*(x*sine+y*cosine));
+    };
+    const auto start=rotate(-.5f,-1.f), tip=rotate(.5f,0.f), end=rotate(-.5f,1.f);
+    StrokeLine(state,start,tip,state.brush.Get(),thickness);
+    StrokeLine(state,tip,end,state.brush.Get(),thickness);
     auto text = GroupHeadingTextRect(state,top,height,listEnd);
     // The paint's single clock sample, shared with item opacity motion.
     const auto badge = LayoutGroupBadge(state,section,text,state.itemOpacityNow);
@@ -18129,7 +18152,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     rect = SnapDrawRect(state.target.Get(),rect);
     if (rect.right <= rect.left || rect.bottom <= rect.top) return;
     const float unit = (rect.right-rect.left)/20.f;
-    const float border = std::max(1.f,std::min(roundf(unit),floorf((rect.right-rect.left)*.5f)));
+    const float border = SelectionCheckboxBorder(rect.right-rect.left);
     const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
         rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
     const auto palette = g_swipePalette.load(std::memory_order_relaxed);
@@ -18156,9 +18179,9 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
 // DWM uses the same absolute QPC origin and cubic as the existing input/hit
 // geometry. No new timer, render thread, Shell call or animation clock.
 ComPtr<IDCompositionAnimation> UiCompositionCurve(ViewState& state, float from, float to,
-                                                 LARGE_INTEGER origin = {}) {
+                                                 LARGE_INTEGER origin = {},
+                                                 float seconds = kUiTransitionDurationMs / 1000.f) {
     ComPtr<IDCompositionAnimation> curve;
-    constexpr float seconds = kUiTransitionDurationMs / 1000.f;
     const float delta = to-from;
     if (!state.composition || FAILED(state.composition->CreateAnimation(&curve)) ||
         FAILED(curve->AddCubic(0.,from,3.f*delta/seconds,
@@ -19311,13 +19334,21 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     // never restart scale animation or make pointer movement appear delayed.
     if(entering && preview->animate) {
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-        layer.curve=UiCompositionCurve(state,.88f,1.f,now);
+        layer.curve=UiCompositionCurve(state,.65f,1.f,now,.080f);
+        layer.opacityCurve=UiCompositionCurve(state,0.f,1.f,now,.080f);
+        if(layer.opacityCurve) {
+            if(FAILED(state.composition->CreateEffectGroup(&layer.opacity)) ||
+                FAILED(layer.opacity->SetOpacity(layer.opacityCurve.Get())) ||
+                FAILED(layer.visual->SetEffect(layer.opacity.Get()))) return false;
+        }
         if(layer.curve && SUCCEEDED(state.composition->CreateScaleTransform(&layer.scale))) {
             layer.scale->SetScaleX(layer.curve.Get()); layer.scale->SetScaleY(layer.curve.Get());
             layer.visual->SetTransform(layer.scale.Get());
         }
     } else if(!preview->animate) {
         layer.visual->SetTransform(static_cast<IDCompositionTransform*>(nullptr)); layer.scale.Reset(); layer.curve.Reset();
+        if(FAILED(layer.visual->SetEffect(nullptr))) return false;
+        layer.opacity.Reset(); layer.opacityCurve.Reset();
     }
     if(layer.scale) {
         const auto image=LayoutDragPreview(*preview).artwork;
@@ -20169,6 +20200,9 @@ void Paint(ViewState& state) {
             }
         }
     }
+    D2D1_RECT_F movingSelectionRect{};
+    SelectionShape movingSelectionShape;
+    float movingSelectionOpacity=0.f;
     if (state.selectionFeedbackVisible && state.keyboardSelectionAnimating &&
         state.keyboardSelectionTo == state.selected &&
         state.selected >= 0 && state.selected < state.total) {
@@ -20184,11 +20218,13 @@ void Paint(ViewState& state) {
             header + visualRow * row - state.scrollNow, row,
             xName, nameRight, listEnd,-1.f,0.f,&shape);
         InterpolateSelectionBounds(state, rc, progress);
-        FillSelectionRect(state, rc, SelectionBaseOpacity(state, hover, visualRow, rc.left, rc.right),&shape);
+        movingSelectionRect=rc; movingSelectionShape=shape;
+        movingSelectionOpacity=SelectionBaseOpacity(state,hover,visualRow,rc.left,rc.right);
+        FillSelectionRect(state,rc,movingSelectionOpacity,&shape);
     }
     // Windows-style focus-only caret for Ctrl+arrow navigation. Reuse the
     // selection geometry and brush; no separate text layout or frame worker.
-    if (state.inputFocusIndicators && state.keyboardCaretVisible && DisplayedRow(state, state.selected) &&
+    if (state.inputFocusIndicators && !state.keyboardSectionKey && state.keyboardCaretVisible && DisplayedRow(state, state.selected) &&
         !ModelSelected(state,state.selected)) {
         const int index = state.selected;
         const float y = header + DocumentRowTop(state, index) - state.scrollNow;
@@ -20202,7 +20238,7 @@ void Paint(ViewState& state) {
     }
     D2D1_RECT_F hoverRect{};
     SelectionShape hoverShape;
-    float hoverOpacity = 0.f;
+    float hoverOverlayOpacity = 0.f;
     if (hover.strength > 0.f && hover.right > hover.left) {
         const float y = header + hover.row * row - state.scrollNow;
         // The content clip and Fill's RTL mapping are identical to every
@@ -20230,11 +20266,11 @@ void Paint(ViewState& state) {
         }
         hoverRect.left = hover.left;
         hoverRect.right = hover.right;
-        hoverOpacity = opacity;
+        hoverOverlayOpacity=HoverOverlayOpacity(state,hover,visibleItems)*opacity;
         if (!compositionFrame.Rows() || !sectionHover) {
             RowSourceScope source(state,index,0);
             FillSelectionRect(state, hoverRect,
-                HoverOverlayOpacity(state, hover, visibleItems) * opacity,&hoverShape);
+                hoverOverlayOpacity,&hoverShape);
         }
     }
     // The decorative passes above may cross the edge margins in square mode,
@@ -20507,14 +20543,19 @@ void Paint(ViewState& state) {
         D2D1::RectF(w-rowBgEnd,header,w-rowBgStart,contentBottom) :
         D2D1::RectF(rowBgStart,header,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
     // ClearBodyBand reserves transparent space above items for sticky headings.
-    // Restore only the shared hover's intersection with each reserved band,
-    // below its text, so crossing a heading never swaps to a separate fill.
-    for (const auto& heading:headings) if (hoverOpacity > 0.f) {
+    // Restore shared input feedback after masking item contents. Header bands
+    // must not cut holes into a selection/hover moving between ordinary rows.
+    for (const auto& heading:headings) {
         RowSourceScope source(state,heading.key,0,true);
         state.target->PushAxisAlignedClip(D2D1::RectF(0.f,heading.visual.top,w,
             heading.visual.top+heading.visual.height),D2D1_ANTIALIAS_MODE_ALIASED);
-        FillSelectionRect(state,hoverRect,g_hoverAlpha.load(std::memory_order_relaxed)/100.f *
-            hoverOpacity,&hoverShape);
+        FillSelectionRect(state,movingSelectionRect,movingSelectionOpacity,&movingSelectionShape);
+        if(heading.section && state.keyboardSectionKey && heading.section->key==*state.keyboardSectionKey && state.inputFocusIndicators) {
+            const auto focus=GroupHoverRect(state,heading.key,heading.visual);
+            const float visualRow=(heading.visual.top-header+state.scrollNow)/std::max(1.f,row);
+            FillSelectionRect(state,focus,SelectionBaseOpacity(state,hover,visualRow,focus.left,focus.right)*heading.visual.opacity);
+        }
+        FillSelectionRect(state,hoverRect,hoverOverlayOpacity,&hoverShape);
         state.target->PopAxisAlignedClip();
     }
     state.target->PopAxisAlignedClip(); // group hover background margins
@@ -22379,6 +22420,7 @@ void TrySyncLastFolderSelection(ViewState& state) {
 void Select(ViewState& state, int index, bool keyboardNavigation = false) {
     if (state.optimisticStartedAt || index < 0 || index >= state.total ||
         !DisplayedRow(state, index)) return;
+    state.keyboardSectionKey.reset();
     // All directional navigation shares one visual transition, including
     // Home/End/Page Up/Page Down. The logical Shell selection is immediate.
     const int previous = state.selected;
@@ -22515,8 +22557,8 @@ bool IsKeyboardMovementKey(UINT key, bool grid = false) {
     }
 }
 
-// The key target is always an actual displayed Shell item, never a group
-// heading. All movement keys share this target resolver.
+// Item/range target resolver. Plain arrows visit section headings separately
+// in NavigateKeyboardSelection; selection ranges remain Shell-item based.
 int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge = false) {
     if (state.total <= 0) return -1;
     int origin = state.selected;
@@ -22601,6 +22643,46 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
                                bool control, bool shift) {
     TraceSelectionIdentity(state, L"key.before-target");
     if (state.optimisticStartedAt) return;
+    if(!control && !shift && !state.sections.empty()) {
+        const int focused=KeyboardFocusedSection(state);
+        const auto focusHeader=[&](int index) {
+            if(index<0 || size_t(index)>=state.sections.size()) return;
+            SuppressPointerHoverForKeyboard(state);
+            state.keyboardSectionKey=state.sections[size_t(index)].key;
+            const auto visual=LayoutGroupHeader(state,size_t(index),CurrentRowProgress(state),false);
+            float target=state.scrollNow;
+            if(visual.top<state.headerPx) target+=visual.top-state.headerPx;
+            else if(visual.top+visual.height>state.headerPx+ViewHeight(state)-ScrollBottomPadding(state))
+                target+=visual.top+visual.height-(state.headerPx+ViewHeight(state)-ScrollBottomPadding(state));
+            MoveScroll(state,target); Redraw(state);
+        };
+        if(key==VK_HOME) {focusHeader(0); return;}
+        if(focused>=0 && (key==VK_UP || key==VK_DOWN)) {
+            const auto& group=state.sections[size_t(focused)];
+            if(key==VK_DOWN) {
+                if(!group.collapsed && group.first<group.end) Select(state,group.first,true);
+                else focusHeader(focused+1);
+            } else if(focused>0) {
+                const auto& previous=state.sections[size_t(focused-1)];
+                if(!previous.collapsed && previous.first<previous.end) Select(state,previous.end-1,true);
+                else focusHeader(focused-1);
+            }
+            return;
+        }
+        if(key==VK_END && state.sections.back().collapsed) {focusHeader(int(state.sections.size())-1); return;}
+        if(focused<0 && (key==VK_UP || key==VK_DOWN)) {
+            const int row=state.selected;
+            const int group=row>=0 && size_t(row)<state.rowGroup.size() ? state.rowGroup[size_t(row)] : -1;
+            if(group<0) {focusHeader(0); return;}
+            const auto& section=state.sections[size_t(group)];
+            const int stride=state.gridView ? std::max(1,state.itemsPerRow) : 1;
+            if(key==VK_UP && row-section.first<stride) {focusHeader(group); return;}
+            if(key==VK_DOWN && row+stride>=section.end && size_t(group+1)<state.sections.size()) {
+                focusHeader(group+1); return;
+            }
+        }
+    }
+    state.keyboardSectionKey.reset();
     if ((key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
         state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0)
         RefreshHoverUnderCursor(state);
@@ -24660,6 +24742,7 @@ void ObserveTypeSearchPointerInput(const MSG& message) {
 }
 
 void TypeToSelect(ViewState& state, wchar_t ch) {
+    state.keyboardSectionKey.reset();
     if (ch == L'\b' || (ch >= L' ' && ch != 0x7F))
         SuppressPointerHoverForKeyboard(state);
     const ULONGLONG now = GetTickCount64();
@@ -27698,7 +27781,8 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         const HWND button = reinterpret_cast<HWND>(lp);
         const HWND overlay = reinterpret_cast<HWND>(GetPropW(button, kViewToggleOwnerProperty));
         if (auto state = State(overlay); state && state->frameHwnd == hwnd && state->viewToggle == button) {
-            if (!g_unloading.load(std::memory_order_relaxed) && TabOwnsActiveView(*state))
+            if (!g_unloading.load(std::memory_order_relaxed) && state->inScope &&
+                state->detailsViewActive && TabOwnsActiveView(*state))
                 PostMessageW(overlay, kMsgViewToggle, 0, 0);
             return 0;
         }
@@ -30214,6 +30298,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    if(s && s->keyboardSectionKey &&
+        (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
+         msg==WM_MBUTTONDOWN || msg==WM_POINTERDOWN)) {
+        s->keyboardSectionKey.reset(); Redraw(*s);
+    }
     if (s && !s->itemTip.item.empty()) {
         // Pressing, wheeling or typing dismisses the hovered item's tooltip
         // until another item is hovered; hiding this view just hides it.
@@ -32401,6 +32490,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
     case WM_CHAR:
+        if(s && wParam==L' ' && KeyboardFocusedSection(*s)>=0) return 0;
         // Backspace is applied on KEYDOWN, before Shell navigation accelerators.
         // Its translated character must not delete a second character.
         if (s && wParam == L'\b') return 0;
@@ -32437,6 +32527,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s) {
             const MSG key=NativeFileWindowKey(hwnd,msg,wParam,lParam);
+            const int focusedSection=KeyboardFocusedSection(*s);
+            if(focusedSection>=0 && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) {
+                if(wParam==VK_RETURN || wParam==VK_SPACE) {
+                    if(!(lParam&(1LL<<30))) ToggleGroupSection(*s,focusedSection);
+                    return 0;
+                }
+                if(wParam==VK_LEFT || wParam==VK_RIGHT) {
+                    const bool expand=(wParam==VK_RIGHT)!=s->rtlLayout;
+                    if(s->sections[size_t(focusedSection)].collapsed==expand) ToggleGroupSection(*s,focusedSection);
+                    return 0;
+                }
+            }
             if (HandleNativeFileKey(key,s)) return 0;
             const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -32542,7 +32644,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && wParam==WPARAM(s->lifetimeToken)) SetActive(hwnd, false);
         return 0;
     case kMsgViewToggle:
-        if (s && s->inScope && TabOwnsActiveView(*s))
+        if (s && s->inScope && s->detailsViewActive && TabOwnsActiveView(*s))
             SetActive(hwnd, !s->visible);
         return 0;
     case kMsgItemTipReady:
@@ -35208,7 +35310,7 @@ void CheckOverlaySize(HWND frame) {
 // The native Shell view retains keyboard focus for Shell-aware preview tools.
 // Only keys that OUR renderer owns are rerouted to our HWND; all other keys,
 // especially Space and unknown extension accelerators, stay native.
-bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching = false) {
+bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching = false, bool sectionFocused = false) {
     if (msg.message == WM_CHAR) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         // Ctrl+Space can translate to either U+0020 or NUL. Check its scan
@@ -35218,11 +35320,13 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching 
             const UINT scan = static_cast<UINT>((msg.lParam >> 16) & 0xFF);
             return MapVirtualKeyW(scan, MAPVK_VSC_TO_VK) == VK_SPACE;
         }
-        return (msg.wParam != L' ' || searching) && !ctrl &&
+        return (msg.wParam != L' ' || searching || sectionFocused) && !ctrl &&
                !(GetKeyState(VK_MENU) & 0x8000);
     }
     if (msg.message != WM_KEYDOWN) return false;
     if (GetKeyState(VK_MENU) & 0x8000) return false;
+    if(sectionFocused && !(GetKeyState(VK_CONTROL)&0x8000) &&
+        (msg.wParam==VK_SPACE || msg.wParam==VK_LEFT || msg.wParam==VK_RIGHT)) return true;
     if (IsNativeFileKey(msg)) return true;
     if (IsKeyboardMovementKey(static_cast<UINT>(msg.wParam), grid))
         return true; // Includes Shift ranges and Ctrl focus-only movement.
@@ -35291,7 +35395,7 @@ HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
     if (!state || msg.hwnd == overlay || !state->visible ||
         !OverlayHasInputFocus(*state) ||
         !state->detailsViewActive || state->emptyNative ||
-        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView,TypeSearchActive(*state)))
+        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView,TypeSearchActive(*state),KeyboardFocusedSection(*state)>=0))
         return nullptr;
     if (frameKey) {
         if (!state->inScope || state->frameHwnd != msg.hwnd ||
@@ -35516,6 +35620,14 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
     }
     if (msg && HandleNativeFileKey(*msg)) return TRUE;
     if (msg) NoteNativeNewFolderShortcut(*msg);
+    if(msg && msg->message==WM_KEYDOWN) {
+        if(const HWND overlay=OverlayKeyboardTarget(*msg)) {
+            if(const auto* state=State(overlay); state && KeyboardFocusedSection(*state)>=0) {
+                SendMessageW(overlay,msg->message,msg->wParam,msg->lParam);
+                return TRUE;
+            }
+        }
+    }
     // Frame-targeted list keys may be consumed before DispatchMessage. Use the
     // same resolver there as a fallback for message loops without accelerators.
     if (msg) {
@@ -36182,7 +36294,7 @@ void DrawViewToggle(const ViewState& state, const DRAWITEMSTRUCT& destination) {
     const int dpi = state.viewToggleDpi ? state.viewToggleDpi : 96;
     InflateRect(&bounds, -Scale96(1, dpi), -Scale96(1, dpi));
     const int radius = Scale96(4, dpi);
-    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    const bool disabled = !state.inScope || !state.detailsViewActive || (item.itemState & ODS_DISABLED) != 0;
     if (!disabled && (state.viewToggleHot || (item.itemState & ODS_SELECTED))) {
         SetDCBrushColor(item.hDC, blend((item.itemState & ODS_SELECTED) ? 18 : 10));
         SelectObject(item.hDC, brush); SelectObject(item.hDC, GetStockObject(NULL_PEN));
@@ -36454,15 +36566,18 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 }
             }
         }
-        EnableWindow(state->viewToggle,available);
+        // Keep native hover/tooltips alive. Unavailable actions are rejected
+        // internally by the command handler, while our painter dims the icon.
+        InvalidateRect(state->viewToggle, nullptr, FALSE);
         wchar_t current[64]{}; GetWindowTextW(state->viewToggle, current, ARRAYSIZE(current));
         if (wcscmp(current, caption) != 0) {
             SetWindowTextW(state->viewToggle, caption);
+        }
+        if (IsWindow(state->viewToggleTooltip)) {
             TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
             tool.hwnd = frame; tool.uId = reinterpret_cast<UINT_PTR>(state->viewToggle);
             tool.lpszText = const_cast<LPWSTR>(hint);
-            if (IsWindow(state->viewToggleTooltip))
-                SendMessageW(state->viewToggleTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+            SendMessageW(state->viewToggleTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
         }
         const int dpi = DpiOf(frame);
         if (state->viewToggleDpi != dpi || state->viewToggleIconColor != state->viewToggleForeground ||
