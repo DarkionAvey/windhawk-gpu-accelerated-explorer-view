@@ -192,6 +192,17 @@ static void TestTypeSearchInput(const std::wstring& fixture) {
     Check(OverlayKeyboardTarget(character)==live.overlay,"translated search Space escaped to the Shell");
     DispatchHook(&character); TypeToSelect(state,L'f'); TypeToSelect(state,L'i');
     Check(state.typeSearch==L"Program fi" && state.entries[size_t(state.selected)].name==L"Program files.txt","Space broke incremental search");
+    MSG back=space; back.wParam=VK_BACK;
+    back.lParam=1|(LPARAM(MapVirtualKeyW(VK_BACK,MAPVK_VK_TO_VSC))<<16);
+    Check(OverlayKeyboardTarget(back)==live.overlay,"active-search Backspace escaped to Shell navigation");
+    ModifierFixture::Translate(&back);
+    DispatchHook(&back);
+    Check(state.typeSearch==L"Program f","Backspace did not delete exactly one search character");
+    Check(PeekMessageW(&character,live.native,WM_CHAR,WM_CHAR,PM_REMOVE) && character.wParam==L'\b',"Windows did not translate Backspace");
+    DispatchHook(&character);
+    Check(state.typeSearch==L"Program f","translated Backspace deleted a second character");
+    TypeToSelect(state,L'i');
+    Check(state.entries[size_t(state.selected)].name==L"Program files.txt","search did not continue after correcting a typo");
     for(const auto* query:{L"programfil",L"Program fi",L"folder(1)&["}) {
         type(query);
         const auto expected=query[0]==L'f' ? L"Folder (1) & [x].txt":L"Program files.txt";
@@ -200,6 +211,7 @@ static void TestTypeSearchInput(const std::wstring& fixture) {
     // The actual USER timer is the timeout authority. No manufactured timer.
     Check(Eventually([&] {live.Pump(); return state.typeSearch.empty();}),"native type-search timeout did not clear the query");
     Check(!OverlayKeyboardTarget(space),"idle Space no longer belongs to native preview extensions");
+    Check(!OverlayKeyboardTarget(back),"idle Backspace no longer belongs to native navigation");
     g_dispatchOriginal=original;
     std::cout<<"PASS: Windows-translated Space routing, incremental whitespace/punctuation matching and real timeout\n";
 }

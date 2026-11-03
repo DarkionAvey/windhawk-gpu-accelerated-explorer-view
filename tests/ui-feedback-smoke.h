@@ -7,7 +7,17 @@ static void TestTypeSearchPrefix() {
         TypeSearchPrefixLength(L"Program files",L"Program fi")==10,
         "type-search highlight did not include skipped filename spaces");
     Check(MatchesTypeSearchPrefix(L"Folder (1) & [x]",L"folder(1)&[") &&
-        !MatchesTypeSearchPrefix(L"Folder (1)",L"folder[1]"),"type search ignored punctuation instead of matching it");
+        MatchesTypeSearchPrefix(L"Folder (1)",L"folder[1]"),"type search did not ignore punctuation");
+    for(const auto* query:{L"gpuacceleratedex",L"gpu-accelerated-explorer"})
+        Check(MatchesTypeSearchPrefix(L"gpu-accelerated-explorer-view.wh",query),"type search did not match optional filename punctuation");
+    Check(MatchesTypeSearchPrefix(L"Program files",L"Programfi") &&
+          MatchesTypeSearchPrefix(L"Program files",L"program files") &&
+          TypeSearchPrefixLength(L"gpu-accelerated-explorer-view.wh",L"gpuacceleratedex")==18,
+          "type-search punctuation folding lost the original highlight extent");
+    Check(MatchesTypeSearchPrefix(L"\u6587\u4ef6-\u00e9.txt",L"\u6587\u4ef6\u00e9") &&
+          MatchesTypeSearchPrefix(L"a\u2014b\u20acc",L"abc") &&
+          !MatchesTypeSearchPrefix(L"file.txt",L"---"),
+          "type-search separator folding lost Unicode letters or matched a separator-only query");
     Check(MatchesTypeSearchPrefix(L"Flower in the park.jpg", L"f") &&
           MatchesTypeSearchPrefix(L"Flower in the park.jpg", L"flower") &&
           MatchesTypeSearchPrefix(L"folder", L"FOL"),

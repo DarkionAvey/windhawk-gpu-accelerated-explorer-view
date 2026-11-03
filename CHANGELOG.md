@@ -5,8 +5,9 @@
 - Restore native Explorer visibility on toggle and unload when the fallback
   presentation hook is active.
 - Keep Space in active type-to-select searches and match names with or without
-  whitespace while preserving punctuation.
+  whitespace, punctuation or symbols.
 - Keep type-to-select highlight borders intact at text edges and in narrow labels.
+- Let Backspace correct active type-to-select searches instead of navigating away.
 - Keep the view toggle visible during unsupported-folder or layout fallback,
   with an explanation when GPU presentation is unavailable.
 - Keep native content below the GPU view without demoting unrelated popups.

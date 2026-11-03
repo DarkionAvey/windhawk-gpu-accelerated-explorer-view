@@ -24612,20 +24612,31 @@ bool MatchesTypeSearchPrefix(const std::wstring& name,
     return TypeSearchPrefixLength(name,prefix)!=0;
 }
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix) {
+    if(prefix.empty()) return 0;
+    if(prefix.size()<=name.size() && CompareStringOrdinal(name.data(),int(prefix.size()),prefix.data(),int(prefix.size()),TRUE)==CSTR_EQUAL)
+        return UINT32(prefix.size());
+    const auto separator=[](wchar_t ch) {
+        WORD basic=0,extended=0;
+        GetStringTypeW(CT_CTYPE1,&ch,1,&basic);
+        GetStringTypeW(CT_CTYPE3,&ch,1,&extended);
+        return (basic&(C1_SPACE|C1_PUNCT))!=0 || (extended&C3_SYMBOL)!=0;
+    };
     size_t n=0,p=0;
-    // Compare non-whitespace runs without constructing folded copies for
+    bool matched=false;
+    // Compare letter/number runs without constructing folded copies for
     // every row. Return the original filename extent for visible highlights.
     while(p<prefix.size()) {
-        if(iswspace(prefix[p])) {++p; continue;}
-        while(n<name.size() && iswspace(name[n])) ++n;
+        if(separator(prefix[p])) {++p; continue;}
+        while(n<name.size() && separator(name[n])) ++n;
         size_t ne=n,pe=p;
-        while(ne<name.size() && !iswspace(name[ne])) ++ne;
-        while(pe<prefix.size() && !iswspace(prefix[pe])) ++pe;
+        while(ne<name.size() && !separator(name[ne])) ++ne;
+        while(pe<prefix.size() && !separator(prefix[pe])) ++pe;
         const auto length=std::min(ne-n,pe-p);
         if(!length || CompareStringOrdinal(name.data()+n,int(length),prefix.data()+p,int(length),TRUE)!=CSTR_EQUAL) return 0;
         n+=length; p+=length;
+        matched=true;
     }
-    return UINT32(n);
+    return matched ? UINT32(n) : 0;
 }
 bool TypeSearchActive(const ViewState& state) {
     return !state.typeSearch.empty() && state.lastTyped && GetTickCount64()-state.lastTyped<=kTypeSearchTimeoutMs;
@@ -32390,6 +32401,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
     case WM_CHAR:
+        // Backspace is applied on KEYDOWN, before Shell navigation accelerators.
+        // Its translated character must not delete a second character.
+        if (s && wParam == L'\b') return 0;
         // Ctrl+Space was already applied to the GPU selection on KEYDOWN.
         // Never let its generated character toggle the native list a second time.
         if (s && (wParam == L' ' || wParam == 0) &&
@@ -32457,6 +32471,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (!control && !shift) Open(*s,s->selected);
                 return 0;
             case VK_BACK:
+                if (TypeSearchActive(*s) && !control &&
+                    !(GetKeyState(VK_MENU) & 0x8000)) {
+                    TypeToSelect(*s,L'\b');
+                    return 0;
+                }
                 if (!(GetKeyState(VK_CONTROL) & 0x8000) &&
                     !(GetKeyState(VK_MENU) & 0x8000) &&
                     !(GetKeyState(VK_SHIFT) & 0x8000) &&
@@ -35208,6 +35227,8 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching 
     if (IsKeyboardMovementKey(static_cast<UINT>(msg.wParam), grid))
         return true; // Includes Shift ranges and Ctrl focus-only movement.
     switch (msg.wParam) {
+    case VK_BACK:
+        return searching && !(GetKeyState(VK_CONTROL) & 0x8000);
     case VK_ESCAPE:
         return !(GetKeyState(VK_CONTROL) & 0x8000);
     case VK_RETURN: case VK_F5: case VK_F2: case VK_APPS:
@@ -35498,7 +35519,10 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
     // Frame-targeted list keys may be consumed before DispatchMessage. Use the
     // same resolver there as a fallback for message loops without accelerators.
     if (msg) {
-        if (HWND overlay = OverlayKeyboardTarget(*msg, true)) {
+        // Active-search Backspace also belongs to us when the native list
+        // owns focus: Explorer can consume it before normal dispatch.
+        const bool searchBackspace=msg->message==WM_KEYDOWN && msg->wParam==VK_BACK;
+        if (HWND overlay = OverlayKeyboardTarget(*msg, !searchBackspace)) {
             SendMessageW(overlay, msg->message, msg->wParam, msg->lParam);
             return TRUE;
         }
