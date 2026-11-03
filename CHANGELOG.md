@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.346
+
+- Sorting, switching views, refreshing and resizing the window use less of
+  Explorer's UI thread: the hidden native list no longer lays out its rows
+  while the GPU view is shown. It regains its real size only while a native
+  context menu is open, so right-click menus keep working.
+
 ## 0.9.345
 
 - Icons in grid views glide to their new places when the number of columns

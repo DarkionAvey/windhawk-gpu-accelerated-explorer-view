@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.345
+// @version         0.9.346
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -444,6 +444,7 @@ constexpr UINT kMsgTabResumeRefresh = WM_APP + 76;
 // Hovered-item tooltip metadata resolved on the tab's Columns lane.
 constexpr UINT kMsgItemTipReady = WM_APP + 78;
 constexpr UINT kMsgReconcileEmptySnapshot = WM_APP + 79;
+constexpr UINT kMsgNativeInputLayout = WM_APP + 80;
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
@@ -3323,6 +3324,9 @@ struct ViewState {
     unsigned long long nativeContextMenuToken = 0;
     bool nativeContextMenuOpening = false;
     bool nativeContextMenuPending = false;
+    // Hidden native lists stay 0x0 except while a native menu session needs
+    // their real input geometry; collapse is posted once that session ends.
+    bool nativeInputLayout = false, nativeInputLayoutCollapseQueued = false;
     bool inputFocusMessageQueued = false;
     HWND viewControlFocusReturn = nullptr, viewControlFocusExpected = nullptr, viewControlFocusTab = nullptr;
     unsigned long long viewControlFocusToken = 0;
@@ -3659,6 +3663,7 @@ struct ViewState {
     struct NativeViewportOwnership {
         HWND hwnd = nullptr, parent = nullptr, owner = nullptr;
         RECT bounds{}; // Latest nonempty parent-relative layout, before suppression.
+        bool inputLayout = false; // Real size for a native menu session; otherwise 0x0.
     };
     std::vector<std::unique_ptr<NativeViewportOwnership>> suppressedNativeViewports;
     struct NativeHostOwnership {
@@ -5563,6 +5568,13 @@ LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                     viewport->bounds.bottom = viewport->bounds.top + height;
                 }
             }
+            // A hidden list at real size still realizes rows on every sort,
+            // view change, refresh and resize. Collapse unless a native menu
+            // session currently needs its input geometry.
+            if (!viewport->inputLayout) {
+                pos.cx = pos.cy = 0;
+                pos.flags &= ~SWP_NOSIZE;
+            }
         };
         constrainViewport(true);
         const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
@@ -5634,10 +5646,13 @@ bool NativeViewAvailable(HWND hwnd, HWND backgroundTab = nullptr) {
     return minimizedHost != nullptr || (backgroundTab && IsChild(backgroundTab,hwnd));
 }
 
-// Keep the native presentation child's real layout while its host is hidden.
-// CDefView's mouse context-menu handler validates the point against that child,
-// and namespace views can defer their model/selection until layout exists.
-// Collapsing it to 0x0 breaks native input even when its COM calls return S_OK.
+// Hiding the host prevents flashes but does not suspend DirectUI's layout:
+// a hidden list at real size still realizes rows on Explorer's UI thread for
+// every sort, view change, refresh and resize. Give the unused presentation
+// child an empty viewport; its Shell model, mode, columns and commands remain
+// intact. CDefView's mouse context-menu handler validates the point against
+// this child, so a native menu session restores its real geometry first
+// (SetNativeInputLayout). The parent Shell view itself keeps its real layout.
 void SuppressNativeViewport(ViewState& state, HWND child) {
     if (t_nativeVisibilityInternal || state.disposalQueued || g_unloading.load(std::memory_order_relaxed)) return;
     wchar_t cls[80]{};
@@ -5651,6 +5666,7 @@ void SuppressNativeViewport(ViewState& state, HWND child) {
     std::erase_if(state.suppressedNativeViewports, [](const auto& item) { return !item->hwnd; });
     auto viewport = std::make_unique<ViewState::NativeViewportOwnership>();
     viewport->hwnd = child; viewport->parent = GetParent(child); viewport->owner = state.hwnd;
+    viewport->inputLayout = state.nativeInputLayout;
     GetWindowRect(child, &viewport->bounds);
     MapWindowPoints(nullptr, viewport->parent, reinterpret_cast<POINT*>(&viewport->bounds), 2);
     if (!SetPropW(child, kNativeViewportProperty, viewport.get())) return;
@@ -5663,7 +5679,13 @@ void SuppressNativeViewport(ViewState& state, HWND child) {
         .a=reinterpret_cast<UINT_PTR>(child),.b=reinterpret_cast<UINT_PTR>(state.nativeHwnd),
         .v={static_cast<double>(viewport->bounds.right-viewport->bounds.left),
             static_cast<double>(viewport->bounds.bottom-viewport->bounds.top)}});
+    const bool collapse = !viewport->inputLayout;
     state.suppressedNativeViewports.push_back(std::move(viewport));
+    if (collapse) {
+        ScopedFlag internal(t_nativeVisibilityInternal);
+        g_setWindowPosOriginal(child, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    }
 }
 
 // A hidden child's CREATE/SHOW accessibility event can be absent or arrive
@@ -5688,6 +5710,8 @@ void SuppressDispatchedNativeViewport(HWND target) {
 // A hidden content host can skip the layout that normally sizes its Shell
 // view. Keep the same real client geometry the GPU surface is using; native
 // mouse input validates this geometry, whereas keyboard context menus do not.
+// An unlaid-out direct list child records the view's client bounds for menu
+// sessions and restoration; it is sized only while input layout is active.
 // Run only after suppression, using the dedicated host and direct list child.
 void PreserveNativeContentLayout(ViewState& state, HWND native, HWND host) {
     ScopedFlag internal(t_nativeVisibilityInternal);
@@ -5703,12 +5727,51 @@ void PreserveNativeContentLayout(ViewState& state, HWND native, HWND host) {
     for (const auto& viewport : state.suppressedNativeViewports) {
         if (!IsWindow(viewport->hwnd) || GetParent(viewport->hwnd) != native ||
             viewport->parent != native) continue;
+        if (!GetClientRect(native, &bounds) || bounds.right <= 0 || bounds.bottom <= 0) continue;
+        if (viewport->bounds.right <= viewport->bounds.left || viewport->bounds.bottom <= viewport->bounds.top)
+            viewport->bounds = bounds;
+        if (!viewport->inputLayout) continue;
         RECT actual{}; GetClientRect(viewport->hwnd, &actual);
         if (actual.right > 0 && actual.bottom > 0) continue;
-        if (GetClientRect(native, &bounds) && bounds.right > 0 && bounds.bottom > 0 &&
-            g_setWindowPosOriginal(viewport->hwnd, nullptr, 0, 0, bounds.right, bounds.bottom,
+        if (g_setWindowPosOriginal(viewport->hwnd, nullptr, 0, 0, bounds.right, bounds.bottom,
                 SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE)) viewport->bounds = bounds;
     }
+}
+
+// Give every owned list its last real geometry for the duration of a native
+// menu session, or collapse it again. The host stays hidden throughout; the
+// subclass never records these internal transitions as native layout.
+void SetNativeInputLayout(ViewState& state, bool expanded) {
+    state.nativeInputLayoutCollapseQueued = false;
+    if (state.nativeInputLayout == expanded) return;
+    state.nativeInputLayout = expanded;
+    ScopedFlag internal(t_nativeVisibilityInternal);
+    for (const auto& viewport : state.suppressedNativeViewports) {
+        if (!IsWindow(viewport->hwnd) || GetPropW(viewport->hwnd, kNativeViewportProperty) != viewport.get()) continue;
+        viewport->inputLayout = expanded;
+        RECT r = viewport->bounds;
+        if (expanded && (r.right <= r.left || r.bottom <= r.top) &&
+            (viewport->parent != state.nativeHwnd || !GetClientRect(viewport->parent, &r))) continue;
+        g_setWindowPosOriginal(viewport->hwnd, nullptr, r.left, r.top,
+            expanded ? r.right - r.left : 0, expanded ? r.bottom - r.top : 0,
+            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | (expanded ? 0 : SWP_NOMOVE));
+    }
+    PipelineEvent(*state.background,{.operation=L"native.viewport.inputLayout[expanded,viewports]",
+        .a=reinterpret_cast<UINT_PTR>(state.nativeHwnd),
+        .v={double(expanded),double(state.suppressedNativeViewports.size())}});
+}
+
+bool NativeMenuSessionActive(const ViewState& state) {
+    return state.nativeContextMenuToken == state.token &&
+        (state.nativeContextMenuOpening || state.nativeContextMenuPending || state.nativeContextMenuFocus);
+}
+
+// Collapse after the menu lifecycle has settled, outside the focus/input
+// notification that observed its end. A later session simply re-expands.
+void ReconcileNativeInputLayout(ViewState& state) {
+    if (!state.nativeInputLayout || state.nativeInputLayoutCollapseQueued || NativeMenuSessionActive(state)) return;
+    state.nativeInputLayoutCollapseQueued = PostMessageW(state.hwnd, kMsgNativeInputLayout,
+        static_cast<WPARAM>(state.lifetimeToken), 0) != FALSE;
 }
 
 bool SuppressNativeContent(ViewState& state, HWND native = nullptr) {
@@ -5769,6 +5832,8 @@ void RestoreNativeContent(ViewState& state) {
     ScopedFlag restoring(t_nativeVisibilityInternal);
     state.nativePresentationPending = false;
     if (IsWindow(state.hwnd)) SetPresentationVisibility(state.hwnd, false);
+    // Restoration uses each list's recorded real bounds below.
+    state.nativeInputLayout = state.nativeInputLayoutCollapseQueued = false;
     auto viewports = std::move(state.suppressedNativeViewports);
     state.suppressedNativeViewports.clear();
     for (const auto& viewport : viewports) {
@@ -7293,6 +7358,7 @@ void RefreshNativeContextMenuFeedback(ViewState& state) {
         !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd)) {
         state.nativeContextMenuFocus = state.nativeContextMenuPopup = nullptr;
         state.nativeContextMenuPending = false;
+        ReconcileNativeInputLayout(state);
         return;
     }
     // Popup replacement can hide the old surface before showing its successor
@@ -24169,6 +24235,10 @@ void NativeContextMenu(ViewState& state, POINT screen, bool keyboard) {
     state.nativeContextMenuPopup = nullptr;
     state.nativeContextMenuOpening = true;
     state.nativeContextMenuPending = false;
+    // CDefView validates a mouse point against the list's real geometry before
+    // entering its menu operation. Keyboard requests share the same session so
+    // Show more options and later native commands see one consistent layout.
+    SetNativeInputLayout(state, true);
     SendMessageW(target, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(target),
         keyboard ? static_cast<LPARAM>(-1) : MAKELPARAM(screen.x, screen.y));
     auto* live = State(owner);
@@ -30867,6 +30937,19 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         return 0;
+    case kMsgNativeInputLayout:
+        if (s && s->lifetimeToken == static_cast<unsigned long long>(wParam)) {
+            s->nativeInputLayoutCollapseQueued = false;
+            // Posted messages also dispatch inside modal menu loops. Keep the
+            // geometry while any menu or owned popup of this frame is still up.
+            GUITHREADINFO gui{sizeof(gui)};
+            const bool menuMode = GetGUIThreadInfo(GetCurrentThreadId(), &gui) &&
+                (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE));
+            if (!g_unloading.load(std::memory_order_relaxed) && !NativeMenuSessionActive(*s) &&
+                !s->nativeFileCommandDepth && !menuMode && !VisibleOwnedPopup(s->frameHwnd))
+                SetNativeInputLayout(*s, false);
+        }
+        return 0;
     case kMsgInputFocusChanged:
         if (s && s->lifetimeToken == static_cast<unsigned long long>(wParam)) {
             s->inputFocusMessageQueued = false;
@@ -34960,6 +35043,9 @@ struct InputFrameCompletion {
                 state->nativeContextMenuPending = false;
                 state->nativeContextMenuFocus = state->nativeContextMenuPopup = nullptr;
             }
+            // A collapse deferred by a modal menu loop retries on the next
+            // interaction; the posted handler runs after this input.
+            if (starts) ReconcileNativeInputLayout(*state);
         }
     }
     ~InputFrameCompletion() {

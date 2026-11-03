@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              gpu-accelerated-explorer-view-fork
-// @name            GPU-accelerated explorer.exe list and grid views - Fork
+// @id              gpu-accelerated-explorer-view
+// @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
 // @version         0.9.240
 // @author          DarkionAvey

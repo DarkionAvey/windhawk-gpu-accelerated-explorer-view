@@ -1,5 +1,29 @@
 // Real read-only ExplorerBrowser controls, owned by this test process. This
 // exercises native DirectUI message dispatch, not an IFolderView2 substitute.
+
+// The view's own DShellFolderViewEvents completion signal. IShellView::Refresh
+// can return with the previous model still counted (Recycle Bin), so a count
+// alone cannot tell a stale model from a repopulated one.
+class NativeEnumerationDone final : public IDispatch {
+    ULONG refs=1;
+public:
+    unsigned completed=0;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+        *out=nullptr;
+        if(iid!=IID_IUnknown && iid!=IID_IDispatch && iid!=DIID_DShellFolderViewEvents) return E_NOINTERFACE;
+        *out=static_cast<IDispatch*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { const auto n=--refs; if(!n) delete this; return n; }
+    HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* count) override { *count=0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT,LCID,ITypeInfo**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID,LPOLESTR*,UINT,LCID,DISPID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Invoke(DISPID id,REFIID,LCID,WORD,DISPPARAMS*,VARIANT*,EXCEPINFO*,UINT*) override {
+        if(id==DISPID_FILELISTENUMDONE) ++completed;
+        return S_OK;
+    }
+};
+
 class NativeViewportEvents final : public IExplorerBrowserEvents {
     ULONG refs=1;
 public:
@@ -112,14 +136,35 @@ static void TestRealNativeViewport(const std::wstring& directory) {
             if(!ready) std::cout<<"NATIVE MODEL recycle="<<recycle<<" presentation="<<presentation
                 <<" expected="<<baselineCount<<" actual="<<count<<std::endl;
             Check(ready,"hidden native viewport changed the item model or failed to finish enumeration");
+            // Outside a native menu session an owned list is hidden at 0x0,
+            // while its last real layout stays recorded for menus/restoration.
             const auto retainedViewports=[&] {
                 Check(!state.suppressedNativeViewports.empty(),"native viewports absent after repair");
                 for(const auto& child : state.suppressedNativeViewports) {
                     if(!child->hwnd) continue;
                     RECT r{}; GetClientRect(child->hwnd,&r);
-                    Check(GetPropW(child->hwnd,kNativeViewportProperty)==child.get() && r.right>0 && r.bottom>0 && !IsWindowVisible(child->hwnd),
-                        "hidden native child lost its input layout");
+                    const auto& b=child->bounds;
+                    Check(GetPropW(child->hwnd,kNativeViewportProperty)==child.get() && !IsWindowVisible(child->hwnd),
+                        "hidden native child lost its suppression");
+                    Check(r.right==0 && r.bottom==0,"hidden native child laid out rows outside a menu session");
+                    Check(b.right>b.left && b.bottom>b.top,"hidden native child lost its recorded input layout");
                 }
+            };
+            // A native menu session restores exactly the recorded geometry,
+            // still hidden, then collapses again.
+            const auto menuInputLayout=[&] {
+                SetNativeInputLayout(state,true);
+                for(const auto& child : state.suppressedNativeViewports) {
+                    if(!child->hwnd) continue;
+                    RECT r{}; GetClientRect(child->hwnd,&r);
+                    const auto& b=child->bounds;
+                    Check(r.right==b.right-b.left && r.bottom==b.bottom-b.top && r.right>0 && r.bottom>0 &&
+                        !IsWindowVisible(child->hwnd),"native menu session did not restore hidden input geometry");
+                }
+                pump();
+                SetNativeInputLayout(state,false);
+                pump();
+                retainedViewports();
             };
             if(repaired) retainedViewports();
             PROPERTYKEY deleted{}; PSGetPropertyKeyFromName(L"System.Recycle.DateDeleted",&deleted);
@@ -146,6 +191,7 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                 Check(SuppressNativeContent(state),"late native model reacquisition");
                 retainedViewports();
                 Check(!state.suppressedNativeViewports.empty(),"real DirectUI viewport was not acquired");
+                menuInputLayout();
                 {
                     std::vector<HWND> children;
                     for(const auto& viewport : state.suppressedNativeViewports)
@@ -179,13 +225,30 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                     Check(selectedReady,"hidden native viewport failed to accept/retain selection after native view changes");
                 }
                 ComPtr<IShellView> shell;
-                Check(SUCCEEDED(sink->view.As(&shell)) && SUCCEEDED(shell->Refresh()),
-                    "native model refresh failed while presentation was suppressed");
+                Check(SUCCEEDED(sink->view.As(&shell)),"native shell view");
+                ComPtr<IDispatch> automation;
+                ComPtr<IConnectionPointContainer> points;
+                ComPtr<IConnectionPoint> point;
+                Check(SUCCEEDED(shell->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&automation))) &&
+                    SUCCEEDED(automation.As(&points)) &&
+                    SUCCEEDED(points->FindConnectionPoint(DIID_DShellFolderViewEvents,&point)),
+                    "native view enumeration events");
+                auto* enumeration=new NativeEnumerationDone;
+                DWORD enumerationCookie=0;
+                Check(SUCCEEDED(point->Advise(enumeration,&enumerationCookie)),"native view enumeration advise");
+                Check(SUCCEEDED(shell->Refresh()),"native model refresh failed while presentation was suppressed");
+                // Diagnostics only: the model count at each step after Refresh.
+                const auto modelCount=[&] { int n=-1; sink->view->ItemCount(SVGIO_ALLVIEW,&n); return n; };
+                const int afterRefreshCall=modelCount();
+                unsigned refreshPolls=0;
                 Check(Eventually([&] {
-                    pump();
+                    pump(); ++refreshPolls;
                     int refreshed=-1;
-                    return SUCCEEDED(sink->view->ItemCount(SVGIO_ALLVIEW,&refreshed)) && refreshed==baselineCount;
-                }),"native model did not repopulate after refresh");
+                    return enumeration->completed && SUCCEEDED(sink->view->ItemCount(SVGIO_ALLVIEW,&refreshed)) &&
+                        refreshed==baselineCount;
+                },30000),"native model did not repopulate after refresh");
+                const int afterRefreshWait=modelCount();
+                point->Unadvise(enumerationCookie); enumeration->Release();
                 Check(SuppressNativeContent(state),"refresh native child repair");
                 retainedViewports();
                 for(const auto& viewport : state.suppressedNativeViewports) {
@@ -196,12 +259,25 @@ static void TestRealNativeViewport(const std::wstring& directory) {
                     batch=NativeDeferWindowPosHook(batch,viewport->hwnd,nullptr,11,13,860,640,
                         SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSENDCHANGING);
                     Check(batch && EndDeferWindowPos(batch),"native viewport deferred bounds");
+                    // Native layout is recorded as intent; the hidden list stays 0x0.
                     RECT rect{}; GetClientRect(viewport->hwnd,&rect);
-                    Check(rect.right==860 && rect.bottom==640 && !IsWindowVisible(viewport->hwnd),"native layout was altered while hidden");
+                    const auto& b=viewport->bounds;
+                    Check(rect.right==0 && rect.bottom==0 && !IsWindowVisible(viewport->hwnd),
+                        "hidden native list applied a native layout pass");
+                    Check(b.left==11 && b.top==13 && b.right-b.left==860 && b.bottom-b.top==640,
+                        "native layout intent was not recorded while hidden");
                 }
+                // A menu session after native relayout uses that latest intent.
+                const int beforeMenu=modelCount();
+                menuInputLayout();
+                const int afterMenu=modelCount();
                 std::vector<HWND> children;
                 for(const auto& viewport : state.suppressedNativeViewports) if(viewport->hwnd) children.push_back(viewport->hwnd);
                 RestoreNativeContent(state);
+                const int afterRestore=modelCount();
+                std::cout<<"NATIVE REFRESH recycle="<<recycle<<" presentation="<<presentation<<" baseline="<<baselineCount
+                    <<" after-call="<<afterRefreshCall<<" polls="<<refreshPolls<<" after-wait="<<afterRefreshWait
+                    <<" before-menu="<<beforeMenu<<" after-menu="<<afterMenu<<" after-restore="<<afterRestore<<std::endl;
                 for(HWND child : children) {
                     RECT rect{}; GetWindowRect(child,&rect);
                     Check(!GetPropW(child,kNativeViewportProperty) && rect.right-rect.left==860 && rect.bottom-rect.top==640,

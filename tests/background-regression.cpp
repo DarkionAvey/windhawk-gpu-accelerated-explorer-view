@@ -388,18 +388,23 @@ static void TestNativeSuppression() {
         0,24,200,176,native,nullptr,cls.hInstance,nullptr);
     Check(late && !GetPropW(late,kNativeViewportProperty),"late native child setup");
     Check(SuppressNativeContent(state),"recheck already suppressed host");
-    RECT lateBounds{}; GetClientRect(late,&lateBounds);
-    Check(GetPropW(late,kNativeViewportProperty) && lateBounds.right==200 && lateBounds.bottom==176 && !IsWindowVisible(late),
-        "known hidden host skipped its later presentation child");
+    // An owned late list is hidden at 0x0 and keeps its real layout as intent.
+    const auto collapsedWithIntent=[&](HWND child) {
+        const RECT intent{0,24,200,200};
+        RECT actual{}; GetClientRect(child,&actual);
+        const auto owned=std::find_if(state.suppressedNativeViewports.begin(),state.suppressedNativeViewports.end(),
+            [&](const auto& viewport) { return viewport->hwnd==child; });
+        return GetPropW(child,kNativeViewportProperty) && !IsWindowVisible(child) && actual.right==0 && actual.bottom==0 &&
+            owned!=state.suppressedNativeViewports.end() && EqualRect(&(*owned)->bounds,&intent);
+    };
+    Check(collapsedWithIntent(late),"known hidden host skipped its later presentation child");
     DestroyWindow(late);
     // A child can dispatch work before the queued lifecycle/maintenance pass.
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     late=CreateWindowExW(0,WC_LISTVIEWW,L"first dispatch native list",WS_CHILD|WS_VISIBLE,
         0,24,200,176,native,nullptr,cls.hInstance,nullptr);
     SuppressDispatchedNativeViewport(late);
-    GetClientRect(late,&lateBounds);
-    Check(GetPropW(late,kNativeViewportProperty) && lateBounds.right==200 && lateBounds.bottom==176 && !IsWindowVisible(late),
-        "first native work dispatch escaped viewport suppression");
+    Check(collapsedWithIntent(late),"first native work dispatch escaped viewport suppression");
     DestroyWindow(late);
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
     // No overlay messages, paints, timers, or frame worker are allowed here.
@@ -1880,6 +1885,7 @@ static void TestPreviewInput() {
 #include "ui-feedback-smoke.h"
 #include "frame-budget-smoke.h"
 #include "native-viewport-smoke.h"
+#include "native-viewport-cost-benchmark.h"
 #include "native-uia-smoke.h"
 #include "pipeline-trace-smoke.h"
 #include "refresh-smoke.h"

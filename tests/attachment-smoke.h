@@ -192,6 +192,14 @@ static void CheckNestedGraphicsMessages(State& state) {
     }
 }
 
+// An owned native list is hidden at 0x0 and records its real layout as intent.
+static bool CollapsedNativeViewport(HWND list, const RECT& intent) {
+    const auto* viewport=static_cast<const ViewState::NativeViewportOwnership*>(GetPropW(list,kNativeViewportProperty));
+    RECT actual{}; GetClientRect(list,&actual);
+    return viewport && !IsWindowVisible(list) && actual.right==0 && actual.bottom==0 &&
+        EqualRect(&viewport->bounds,&intent);
+}
+
 static void TestAttachedLifecycle(const std::wstring& directory) {
     Check(SUCCEEDED(OleInitialize(nullptr)), "attachment STA initialization");
     Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -283,8 +291,8 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         Check(late && !GetPropW(late,kNativeViewportProperty),"late sorting child fixture");
         bool entered=false;
         response->sortRequest=[&](const SORTCOLUMN*,int count) {
-            RECT r{}; GetClientRect(late,&r); entered=true;
-            Check(count==1 && r.right==640 && r.bottom==480 && !IsWindowVisible(late) && GetPropW(late,kNativeViewportProperty),
+            entered=true;
+            Check(count==1 && CollapsedNativeViewport(late,{0,0,640,480}),
                 "header sorting entered Shell with an unsuppressed late child");
             return E_NOTIMPL;
         };
@@ -324,8 +332,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             "reparented loading host remained visible before queued lifecycle delivery");
         HWND list=CreateWindowExW(0,WC_LISTVIEWW,L"",WS_CHILD|WS_VISIBLE|LVS_REPORT,
             0,0,400,300,replacement,nullptr,cls.hInstance,nullptr);
-        RECT listBounds{}; GetClientRect(list,&listBounds);
-        Check(list && GetPropW(list,kNativeViewportProperty) && listBounds.right==400 && listBounds.bottom==300 && !IsWindowVisible(list),
+        Check(list && CollapsedNativeViewport(list,{0,0,400,300}),
             "replacement native viewport performed visible layout before its queued capture");
         Check(IsWindowVisible(overlay) && state->nativeHwnd==native && state->loaded,
             "synchronous suppression changed binding, contents or GPU presentation");
