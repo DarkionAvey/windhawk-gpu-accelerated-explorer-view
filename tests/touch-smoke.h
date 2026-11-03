@@ -551,6 +551,7 @@ void PinchAcquisition(Device& input,const std::wstring& fixture) {
         auto& view=tab.state;
         view.columns[0].width=2000; UpdateColumns(view);
         Check(HorizontalBar(view).usable,"pinch acquisition fixture overflow");
+        PublishHorizontalScrollbar(view); // A presented frame shows the settled bar.
         SelectionUiFixture::Setup(tab,fixture); Install(view);
         FocusFixture::Session focus(tab.frame,view.hwnd);
         const LONG slop=std::max(GetSystemMetricsForDpi(SM_CXDRAG,dpi),GetSystemMetricsForDpi(SM_CYDRAG,dpi));
@@ -639,6 +640,7 @@ void ScrollbarInteractions(Device& input,const std::wstring& fixture) {
         auto& view=tab.state;
         view.columns[0].width=1400; UpdateColumns(view);
         Check(HorizontalBar(view).usable,"settled scrollbar fixture overflow");
+        PublishHorizontalScrollbar(view); // A presented frame shows the settled bar.
         SelectionUiFixture::Setup(tab,fixture); Install(view);
         FocusFixture::Session focus(tab.frame,view.hwnd);
         AnimationClockFixture::Freeze clock;
@@ -761,6 +763,7 @@ void HorizontalBottomClearance(Device& input,const std::wstring& fixture) {
         auto& view=tab.state;
         view.columns[0].width=1400; UpdateColumns(view);
         Check(HorizontalBar(view).usable,"settled bottom-clearance fixture overflow");
+        PublishHorizontalScrollbar(view); // A presented frame shows the settled bar.
         SelectionUiFixture::Setup(tab,fixture); Install(view);
         FocusFixture::Session focus(tab.frame,view.hwnd);
         // Both an overflowing list and one that fits before reserving the bar
@@ -943,6 +946,7 @@ void DriftingHistorySwipes(Device& input,const std::wstring& fixture) {
         auto& view=tab.state;
         view.columns[0].width=2000; UpdateColumns(view);
         Check(HorizontalBar(view).usable,"drifting history fixture overflow");
+        PublishHorizontalScrollbar(view); // A presented frame shows the settled bar.
         SelectionUiFixture::Setup(tab,fixture); Install(view);
         FocusFixture::Session focus(tab.frame,view.hwnd);
         ComPtr<ShellView> shell; shell.Attach(new ShellView); shell->hwnd=view.nativeHwnd;
@@ -1115,6 +1119,7 @@ void ScrollbarMenus(Device& input,const std::wstring& fixture) {
         auto& view=tab.state;
         view.columns[0].width=1400; UpdateColumns(view);
         Check(HorizontalBar(view).usable,"settled touch menu fixture overflow");
+        PublishHorizontalScrollbar(view); // A presented frame shows the settled bar.
         auto* native=SelectionUiFixture::Setup(tab,fixture); Install(view);
         FocusFixture::Session focus(tab.frame,view.hwnd);
         MenuFixture::Session menus(view.hwnd);

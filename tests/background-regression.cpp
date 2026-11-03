@@ -1905,6 +1905,7 @@ static void TestPreviewInput() {
 #include "dense-grid-smoke.h"
 #include "icon-alpha-smoke.h"
 #include "icon-sizing-smoke.h"
+#include "shell-overlay-smoke.h"
 #include "shell-provider-smoke.h"
 #include "shell-size-smoke.h"
 #include "provider-selection-smoke.h"

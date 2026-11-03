@@ -122,6 +122,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("dense-grid-drawing", PARALLEL, TestDenseGridDrawing()),
     REGRESSION("icon-alpha-quality", PARALLEL, TestIconAlphaQuality(fixture)),
     REGRESSION("native-icon-sizing", PARALLEL, TestNativeIconSizing(fixture)),
+    REGRESSION("shell-overlays", PARALLEL, TestShellOverlays(fixture)),
     REGRESSION("pipeline-trace", PARALLEL, TestPipelineTrace()),
     REGRESSION("property-pool-isolation", PARALLEL, TestPropertyPoolIsolation(fixture)),
     REGRESSION("drive-space-refresh", PARALLEL, TestDriveSpaceRefresh()),

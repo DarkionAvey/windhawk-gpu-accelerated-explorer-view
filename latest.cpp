@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.341
+// @version         0.9.343
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1325,6 +1325,10 @@ struct IconRecord {
     size_t cacheBytes = 0;
     UINT requestedSize = 32;
     bool sourceLimited = false;
+    // An overlay query record holds no pixels, only the item's Shell overlay
+    // as a system image-list index (-1: none); its artwork is shared.
+    bool overlayQuery = false;
+    int overlayImage = -1;
     bool presentationListed=false;
     std::list<const std::wstring*>::iterator presentationRecent;
     IconRecord() = default;
@@ -1404,6 +1408,8 @@ struct IconJob {
     SharedPidl shellIdentity;
     std::wstring extension;
     int dpi = 96;
+    bool overlayQuery = false; // Resolve the item's Shell overlay, not artwork.
+    int imageListIndex = -1;   // Decode this system image-list entry unchanged.
 };
 std::wstring_view BaseIconKey(std::wstring_view key);
 // Probe a size tier without constructing or rehashing the provider identity.
@@ -1465,6 +1471,8 @@ struct IconResult {
     bool useAttributes = false;
     HRESULT initializeResult = S_OK, decodeResult = S_OK;
     bool hadIcon = false;
+    bool overlayQuery = false;
+    int overlayImage = -1;
 };
 std::atomic<unsigned long long> g_nextToken{1};
 
@@ -2801,6 +2809,7 @@ struct PresentationRowCache {
     std::shared_ptr<const Entry> entry;
     IconKeyContext icons;
     std::array<std::wstring,2> iconKeys; // Exact image, then association fallback.
+    std::wstring overlayKey; // The item's Shell overlay query.
 };
 // Hovered-item tooltip: one popup per tab, painted with that tab's DirectWrite
 // face and palette through standard Win32, Direct2D and DWM calls only.
@@ -2982,6 +2991,7 @@ struct ViewState {
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     bool horizontalScrollbarAdmitted = false; // Optional chrome waits for settled column geometry.
+    bool horizontalScrollbarPublished = false; // A presented frame has shown the admitted bar.
     bool columnVerticalBarVisible = false; // Last layout's scrollbar clearance.
     bool columnTransitionActive = false;
     bool columnTransitionSpring = false;
@@ -3901,7 +3911,8 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     std::vector<int> sectionIndices;
     unsigned long long observerId=0;
     LONGLONG observerQpc=0,observerCommitQpc=0;
-    struct Image { std::wstring key; IconPixels pixels; UINT requestedSize=0; bool association=false; };
+    struct Image { std::wstring key; IconPixels pixels; UINT requestedSize=0; bool association=false;
+        bool overlayQuery=false; int overlayImage=-1; };
     std::vector<Image> images;
     ClipboardPaths clipboard;
 };
@@ -6663,7 +6674,10 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
     if (lane.associationEpoch != epoch) {
         lane.thumbnailStyles.clear(); lane.associationEpoch = epoch;
     }
-    const UINT badge = std::clamp<UINT>(Scale96(32,job.dpi),16,128);
+    // Match the drawn badge: a quarter of the requested tier, never below the
+    // small-icon size, so it is extracted at its display size, not upscaled.
+    const UINT badge = std::clamp<UINT>(std::max<UINT>((job.pixelSize+3)/4,
+        static_cast<UINT>(GetSystemMetricsForDpi(SM_CXSMICON, static_cast<UINT>(job.dpi)))),16,256);
     const auto key = job.extension + L"|" + std::to_wstring(badge);
     auto found = lane.thumbnailStyles.find(key);
     if (found == lane.thumbnailStyles.end()) {
@@ -6671,6 +6685,32 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
         found = lane.thumbnailStyles.emplace(key,LoadThumbnailStyle(factory,job.extension,badge)).first;
     }
     return DecorateThumbnail(std::move(pixels),found->second,job.textureLimit,8ULL*job.pixelSize*job.pixelSize);
+}
+
+// Explorer's view asks the item's parent folder for its overlay. That covers
+// every registered IShellIconOverlayIdentifier (cloud sync providers) and
+// the built-in link/share overlays, honoring the user's overlay registry.
+// Identifier handlers can perform provider IPC, so this runs on a provider
+// lane. The result is a system image-list index; -1 means no overlay.
+int ShellOverlayImage(const IconJob& job) {
+    OwnedPidl parsed;
+    PCIDLIST_ABSOLUTE pidl = job.shellIdentity.get();
+    if (!pidl) {
+        PIDLIST_ABSOLUTE raw = nullptr;
+        if (FAILED(SHParseDisplayName(job.path.c_str(), nullptr, &raw, 0, nullptr))) return -1;
+        parsed.reset(raw);
+        pidl = parsed.get();
+    }
+    // The toolchain declares the interface without a __uuidof binding.
+    static constexpr IID kShellIconOverlay{0x7d688a70,0xc613,0x11d0,{0x99,0x9b,0x00,0xc0,0x4f,0xd6,0x55,0xe1}};
+    ComPtr<IShellIconOverlay> overlay;
+    PCUITEMID_CHILD child = nullptr;
+    // Index 0 is the generic document icon, never an overlay; an
+    // implementation that succeeds without writing the index reports none.
+    int image = OI_DEFAULT;
+    return SUCCEEDED(SHBindToParent(pidl, kShellIconOverlay, reinterpret_cast<void**>(overlay.GetAddressOf()), &child)) &&
+        overlay && child &&
+        overlay->GetOverlayIconIndex(child, &image) == S_OK && image > 0 ? image : -1;
 }
 
 DWORD WINAPI IconWorkerProc(LPVOID context) {
@@ -6722,41 +6762,66 @@ DWORD WINAPI IconWorkerProc(LPVOID context) {
         const ULONGLONG began = GetTickCount64();
         IconPixels pixels;
         HRESULT decodeResult = memoryReady ? S_OK : HRESULT_FROM_WIN32(ERROR_RETRY);
-        // Ask the factory for genuine thumbnails only. Some icon-only results
-        // contain a provider-drawn frame around tiny centered artwork; alpha
-        // bounds cannot distinguish that frame from the icon. Prefer HICONs.
-        if (memoryReady && job.allowThumbnail && !job.useAttributes && IconJobCurrent(work, job))
-            pixels = LoadShellItemIcon(factory.Get(), job, lane, &decodeResult, true);
-        SHFILEINFOW info{};
-        bool haveIndex = false;
-        UINT flags = SHGFI_ICON | (job.pixelSize > 32 ? SHGFI_SYSICONINDEX : 0);
-        if (job.useAttributes) flags |= SHGFI_USEFILEATTRIBUTES;
-        if (memoryReady && !pixels.Ready() && IconJobCurrent(work, job))
-            haveIndex = SHGetFileInfoW(job.shellIdentity && !job.useAttributes ?
-                reinterpret_cast<LPCWSTR>(job.shellIdentity.get()) : job.path.c_str(),
-                job.useAttributes ? job.attributes : 0, &info, sizeof(info),
-                flags | (job.shellIdentity && !job.useAttributes ? SHGFI_PIDL : 0)) != 0;
-        std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)> icon(info.hIcon, DestroyIcon);
-        UINT decodeSize=job.pixelSize;
-        if (memoryReady && !pixels.Ready() && haveIndex && job.pixelSize > 32 && IconJobCurrent(work, job)) {
+        std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)> icon(nullptr, DestroyIcon);
+        int overlayImage = -1;
+        if (job.overlayQuery) {
+            decodeResult = S_OK;
+            overlayImage = ShellOverlayImage(job);
+        } else if (job.imageListIndex >= 0) {
+            // Overlay artwork keeps its whole image-list canvas: the corner
+            // placement of the glyph is part of the image, as when composited.
             ComPtr<IImageList> images;
-            HICON large = nullptr;
-            if (SUCCEEDED(SHGetImageList(job.pixelSize > 48 ? SHIL_JUMBO : SHIL_EXTRALARGE,
-                IID_PPV_ARGS(&images))) && SUCCEEDED(images->GetIcon(info.iIcon, ILD_TRANSPARENT, &large))) {
-                icon.reset(large);
-                int width=0,height=0;
-                if(SUCCEEDED(images->GetIconSize(&width,&height)) && width>0 && height>0)
-                    decodeSize=std::max(decodeSize,UINT(std::max(width,height)));
+            HICON raw = nullptr;
+            int width = 0, height = 0;
+            if (memoryReady) decodeResult = SHGetImageList(job.pixelSize > 48 ? SHIL_JUMBO :
+                job.pixelSize > 32 ? SHIL_EXTRALARGE : SHIL_LARGE, IID_PPV_ARGS(&images));
+            if (memoryReady && SUCCEEDED(decodeResult))
+                decodeResult = images->GetIcon(job.imageListIndex, ILD_TRANSPARENT, &raw);
+            icon.reset(raw);
+            if (icon && SUCCEEDED(images->GetIconSize(&width,&height)) && width>0 && height>0)
+                pixels = DecodeShellIcon(factory.Get(), icon.get(), &decodeResult,
+                    std::max(job.pixelSize,UINT(std::max(width,height))));
+        } else {
+            // Ask the factory for genuine thumbnails only. Some icon-only results
+            // contain a provider-drawn frame around tiny centered artwork; alpha
+            // bounds cannot distinguish that frame from the icon. Prefer HICONs.
+            if (memoryReady && job.allowThumbnail && !job.useAttributes && IconJobCurrent(work, job))
+                pixels = LoadShellItemIcon(factory.Get(), job, lane, &decodeResult, true);
+            SHFILEINFOW info{};
+            bool haveIndex = false;
+            // SHGFI_ICON composites the link overlay into its HICON. Base
+            // artwork comes from the image list at every size instead, so the
+            // overlay layer is the only source of item adornments.
+            UINT flags = SHGFI_ICON | SHGFI_SYSICONINDEX;
+            if (job.useAttributes) flags |= SHGFI_USEFILEATTRIBUTES;
+            if (memoryReady && !pixels.Ready() && IconJobCurrent(work, job))
+                haveIndex = SHGetFileInfoW(job.shellIdentity && !job.useAttributes ?
+                    reinterpret_cast<LPCWSTR>(job.shellIdentity.get()) : job.path.c_str(),
+                    job.useAttributes ? job.attributes : 0, &info, sizeof(info),
+                    flags | (job.shellIdentity && !job.useAttributes ? SHGFI_PIDL : 0)) != 0;
+            icon.reset(info.hIcon);
+            UINT decodeSize=job.pixelSize;
+            if (memoryReady && !pixels.Ready() && haveIndex && IconJobCurrent(work, job)) {
+                ComPtr<IImageList> images;
+                HICON large = nullptr;
+                if (SUCCEEDED(SHGetImageList(job.pixelSize > 48 ? SHIL_JUMBO :
+                    job.pixelSize > 32 ? SHIL_EXTRALARGE : SHIL_LARGE,
+                    IID_PPV_ARGS(&images))) && SUCCEEDED(images->GetIcon(info.iIcon, ILD_TRANSPARENT, &large))) {
+                    icon.reset(large);
+                    int width=0,height=0;
+                    if(SUCCEEDED(images->GetIconSize(&width,&height)) && width>0 && height>0)
+                        decodeSize=std::max(decodeSize,UINT(std::max(width,height)));
+                }
+            }
+            if (memoryReady && !pixels.Ready() && IconJobCurrent(work, job))
+                pixels = DecodeShellIcon(factory.Get(), icon.get(), &decodeResult, decodeSize, true);
+            if (memoryReady && !pixels.Ready() && !job.useAttributes && IconJobCurrent(work, job)) {
+                auto fallback=job; fallback.allowThumbnail=false;
+                pixels = LoadShellItemIcon(factory.Get(), fallback, lane, &decodeResult);
             }
         }
-        if (memoryReady && !pixels.Ready() && IconJobCurrent(work, job))
-            pixels = DecodeShellIcon(factory.Get(), icon.get(), &decodeResult, decodeSize, true);
-        if (memoryReady && !pixels.Ready() && !job.useAttributes && IconJobCurrent(work, job)) {
-            auto fallback=job; fallback.allowThumbnail=false;
-            pixels = LoadShellItemIcon(factory.Get(), fallback, lane, &decodeResult);
-        }
         IconResult result{job.hwnd, job.token, job.key, job.requestId, std::move(pixels), job.useAttributes,
-            initializeResult, decodeResult, icon != nullptr};
+            initializeResult, decodeResult, icon != nullptr, job.overlayQuery, overlayImage};
         PipelineEvent(work,{.operation=L"worker.icon.publish[w,h,bytes,decodeHR]",.a=job.requestId,.b=job.token,
             .v={static_cast<double>(result.pixels.width),static_cast<double>(result.pixels.height),
                 static_cast<double>(result.pixels.data.size()),static_cast<double>(decodeResult)}});
@@ -6972,6 +7037,13 @@ std::wstring IconKey(const IconKeyContext& context, const Entry& e, std::wstring
 std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& lookup,
                      bool& useAttrs, bool associationOnly = false, UINT previewLimit = 0) {
     return IconKey(MakeIconKeyContext(state),e,lookup,useAttrs,associationOnly,previewLimit);
+}
+// Shell overlays (cloud sync state, links, shares) belong to one item; their
+// artwork is a system image-list entry shared by all items per size tier.
+// The image list holds at most its 256px jumbo size.
+std::wstring OverlayQueryKey(const Entry& e) { return L"overlay:" + e.path; }
+std::wstring OverlayImageKey(const IconKeyContext& context, int image) {
+    return SizedImageKey(L"overlay-image:" + std::to_wstring(image), std::min(context.size,256u));
 }
 
 int VisibleRows(ViewState& state);
@@ -15942,7 +16014,7 @@ void AccountIconCache(ViewState& state, const std::wstring& key, IconRecord& rec
     const UINT width=record.pixels.width ? record.pixels.width : record.requestedSize;
     const UINT height=record.pixels.height ? record.pixels.height : record.requestedSize;
     const size_t gpu=((static_cast<size_t>(width)*height*4+65535)/65536)*65536;
-    const size_t pixels = record.pending && record.pixels.data.empty() ?
+    const size_t pixels = record.overlayQuery ? 0 : record.pending && record.pixels.data.empty() ?
         4ULL*record.requestedSize*record.requestedSize + gpu :
         record.pixels.data.capacity()+gpu;
     const size_t bytes = sizeof(IconRecord) + 4*sizeof(void*) + 2*key.size()*sizeof(wchar_t) + pixels+RetainedIconBytes(record);
@@ -16031,6 +16103,14 @@ std::vector<int> VisibleDemandRows(const ViewState& state, float overscanRows) {
     return rows;
 }
 
+// This item's resolved Shell overlay artwork at the current size tier, or the
+// nearest tier already available. Null when it has none (or none yet).
+IconRecord* OverlayArtwork(ViewState& state, const Entry& entry, bool bitmapOnly) {
+    const auto* query = FindIconRecord(state, OverlayQueryKey(entry));
+    if (!query || query->overlayImage < 0) return nullptr;
+    return FindIconRecord(state, OverlayImageKey(MakeIconKeyContext(state), query->overlayImage), true, bitmapOnly);
+}
+
 // Only upload what can be drawn. Shared association icons occur once in this
 // list, and a ready per-file icon supersedes its temporary association icon.
 std::vector<IconRecord*> VisibleIconUploads(ViewState& state) {
@@ -16038,6 +16118,11 @@ std::vector<IconRecord*> VisibleIconUploads(ViewState& state) {
     std::unordered_set<IconRecord*> included;
     for (int i : VisibleDemandRows(state)) {
         const Entry& entry = ModelEntry(state,i);
+        if (auto* overlay = OverlayArtwork(state, entry, false); overlay && overlay->pixels.Ready() &&
+            !overlay->bitmapAttempted && (!overlay->bitmap ||
+                overlay->bitmapPixels.data.Identity()!=overlay->pixels.data.Identity()) &&
+            included.insert(overlay).second)
+            pending.push_back(overlay);
         std::wstring path;
         bool attributes = false;
         auto record = FindIconRecord(state, IconKey(state, entry, path, attributes), true);
@@ -16094,6 +16179,9 @@ bool UploadVisibleIcons(ViewState& state) {
     return changed;
 }
 
+bool QueueImageRequest(ViewState& state, IconJob job, IconRecord* record, size_t bytes,
+                       const std::unordered_map<std::wstring, unsigned>& wanted,
+                       std::vector<IconCache::value_type*>* evictions);
 // One request path for real per-file icons and reusable Shell associations.
 // All records are protected by request IDs, including requests surviving a visit.
 bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly,
@@ -16127,6 +16215,28 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
     }
     const size_t bytes = sizeof(IconRecord) + 4*sizeof(void*) +
         2*key.size()*sizeof(wchar_t) + 8*side*side + 65536;
+    IconJob job{state.hwnd, state.iconToken, key, path, 0, attributes,
+        static_cast<DWORD>(entry.folder && attributes ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL)};
+    job.allowThumbnail = thumbnail;
+    job.pixelSize = static_cast<UINT>(side);
+    if (job.allowThumbnail) {
+        job.extension = PathFindExtensionW(entry.name.c_str());
+        std::transform(job.extension.begin(),job.extension.end(),job.extension.begin(),towlower);
+        job.dpi = ViewDpi(state);
+    }
+    if (!attributes) job.shellIdentity = entry.shellIdentity;
+    return QueueImageRequest(state, std::move(job), record, bytes, wanted, evictions);
+}
+
+// Admit one request to this tab's bounded image cache and icon lanes. Item
+// icons, shared associations and Shell overlays share eviction, request IDs,
+// cancellation and pending bookkeeping.
+bool QueueImageRequest(ViewState& state, IconJob job, IconRecord* record, size_t bytes,
+                       const std::unordered_map<std::wstring, unsigned>& wanted,
+                       std::vector<IconCache::value_type*>* evictions) {
+    const auto& key = job.key;
+    job.hwnd = state.hwnd;
+    job.token = state.iconToken;
     const size_t budget = ImageMemoryBudget(state);
     const size_t capacity = std::max(wanted.size()+64, std::min(
         std::max(kMaxIconCache, static_cast<size_t>(std::max(0,state.total)))+wanted.size()+64,
@@ -16163,31 +16273,56 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
             QueueVisibleDataFrame(state); return false;
         }
     }
-    IconJob job{state.hwnd, state.iconToken, key, path, 0, attributes,
-        static_cast<DWORD>(entry.folder && attributes ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL)};
-    job.allowThumbnail = thumbnail;
-    job.pixelSize = static_cast<UINT>(side);
     job.textureLimit = state.imageTextureLimit;
     job.cancelled = std::make_shared<std::atomic<bool>>(false);
-    if (job.allowThumbnail) {
-        job.extension = PathFindExtensionW(entry.name.c_str());
-        std::transform(job.extension.begin(),job.extension.end(),job.extension.begin(),towlower);
-        job.dpi = ViewDpi(state);
-    }
-    if (!attributes) job.shellIdentity = entry.shellIdentity;
     job.requestId = g_nextToken.fetch_add(1, std::memory_order_relaxed);
     if (!QueueIcon(state, job, true)) { QueueVisibleDataFrame(state); return false; }
-    state.pendingImages[key]={job.requestId,attributes,job.cancelled};
+    state.pendingImages[key]={job.requestId,job.useAttributes,job.cancelled};
     if (!record) record = &state.icons.try_emplace(key).first->second;
     record->pending = true;
     record->resolved = false;
-    record->association = attributes;
+    record->association = job.useAttributes;
+    record->overlayQuery = job.overlayQuery;
     record->pendingToken = job.token;
     record->pendingRequestId = job.requestId;
     record->used = ++state.iconTick;
     record->requestedSize = job.pixelSize;
     AccountIconCache(state, key, *record);
     return true;
+}
+
+// The overlay index is resolved first on a provider lane; its shared artwork
+// is then a system image-list read on the association lane. A refreshing
+// query keeps its previous overlay displayed until a replacement is accepted.
+bool RequestEntryOverlay(ViewState& state, const Entry& entry,
+                         const std::unordered_map<std::wstring, unsigned>& wanted,
+                         std::vector<IconCache::value_type*>* evictions = nullptr) {
+    const auto current = [&](const IconRecord* record) {
+        return record && ((!record->needsRefresh && (record->resolved || record->pixels.Ready() || record->bitmap)) ||
+            (record->pending && (record->association || record->pendingToken == state.iconToken)));
+    };
+    const auto queryKey = OverlayQueryKey(entry);
+    auto* query = FindIconRecord(state, queryKey);
+    if (!current(query)) {
+        IconJob job;
+        job.key = queryKey; job.path = entry.path; job.shellIdentity = entry.shellIdentity;
+        job.overlayQuery = true;
+        if (!QueueImageRequest(state, std::move(job), query,
+            sizeof(IconRecord) + 4*sizeof(void*) + 2*queryKey.size()*sizeof(wchar_t), wanted, evictions))
+            return false;
+        query = FindIconRecord(state, queryKey);
+    }
+    if (!query || query->overlayImage < 0) return true;
+    const auto imageKey = OverlayImageKey(MakeIconKeyContext(state), query->overlayImage);
+    auto* image = FindIconRecord(state, imageKey);
+    if (current(image)) return true;
+    IconJob job;
+    job.key = imageKey; job.useAttributes = true;
+    job.imageListIndex = query->overlayImage;
+    job.pixelSize = ImageKeySize(imageKey);
+    const size_t bytes = sizeof(IconRecord) + 4*sizeof(void*) + 2*imageKey.size()*sizeof(wchar_t) +
+        8ULL*job.pixelSize*job.pixelSize + 65536;
+    return QueueImageRequest(state, std::move(job), image, bytes, wanted, evictions);
 }
 
 void RequestVisibleIcons(ViewState& state) {
@@ -16233,6 +16368,17 @@ void RequestVisibleIcons(ViewState& state) {
             if (auto shown = FindIconRecord(state, association, true, true))
                 shown->visibleGeneration = state.iconViewportGeneration;
         }
+        const auto overlay = OverlayQueryKey(entry);
+        wanted.try_emplace(overlay, priority);
+        if (auto* query = FindIconRecord(state, overlay)) {
+            query->visibleGeneration = state.iconViewportGeneration;
+            if (query->overlayImage >= 0) {
+                const auto image = OverlayImageKey(MakeIconKeyContext(state), query->overlayImage);
+                wanted.try_emplace(image, priority);
+                if (auto shown = FindIconRecord(state, image, true, true))
+                    shown->visibleGeneration = state.iconViewportGeneration;
+            }
+        }
     }
     std::erase_if(state.pendingImages,[&](const auto& item) {
         if(wanted.contains(item.first)) return false;
@@ -16266,6 +16412,9 @@ void RequestVisibleIcons(ViewState& state) {
     for (int row : rows)
         if (!RequestEntryIcon(state, state.entries[static_cast<size_t>(row)], false, wanted, &evictions,
             !std::binary_search(visible.begin(),visible.end(),row))) break;
+    // Optional adornments follow every row's artwork in the same lanes.
+    for (int row : rows)
+        if (!RequestEntryOverlay(state, state.entries[static_cast<size_t>(row)], wanted, &evictions)) break;
     if(dragging) for(size_t i=0;i<state.dragPreview->imageCount;++i)
         if(!RequestEntryIcon(state,state.dragPreviewEntries[i],false,wanted,&evictions,false,state.dragPreviewSize,true)) break;
     if (state.firstContentSubmittedAt) QueueVisibleDetails(state);
@@ -16301,6 +16450,15 @@ void ReceiveIcons(ViewState& state, bool requestMore) {
         if(const auto found=state.pendingImages.find(result.key);
             found!=state.pendingImages.end() && found->second.request==result.requestId) state.pendingImages.erase(found);
         if (record && record->pending && record->pendingToken == result.token &&
+            record->pendingRequestId == result.requestId && result.overlayQuery) {
+            // "No overlay" is a resolved answer, not a failed decode.
+            const bool changed = record->overlayImage != result.overlayImage;
+            record->overlayImage = result.overlayImage;
+            record->pending = false; record->resolved = true; record->needsRefresh = false;
+            AccountIconCache(state, result.key, *record);
+            // A removed overlay has no texture upload to repaint the row.
+            if (changed) QueueVisibleDataFrame(state);
+        } else if (record && record->pending && record->pendingToken == result.token &&
             record->pendingRequestId == result.requestId) {
             const bool ready=result.pixels.Ready();
             if(ready) {
@@ -16380,7 +16538,8 @@ D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
 }
 
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
-                    float opacity = 1.f, float angle = 0.f, D2D1_RECT_F* drawn = nullptr) {
+                    float opacity = 1.f, float angle = 0.f, D2D1_RECT_F* drawn = nullptr,
+                    IconRecord* overlay = nullptr) {
     if(!VisibleOpacity(opacity)) return true;
     if (!icon.bitmap) return false;
     if (state.iconDemandStartedAt && (!state.iconFirstDrawLogged ||
@@ -16407,6 +16566,15 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(iconX,y,iconX+width,y+height));
     if(rect.right<=rect.left || rect.bottom<=rect.top) return true;
     if (drawn) *drawn = rect;
+    // Corner adornments (type badge, Shell overlay) scale with the icon slot
+    // but never below Windows' small-icon size, the smallest size icons are
+    // designed for. They may extend past small artwork; damage includes them.
+    const float smallestAdornment = static_cast<float>(GetSystemMetricsForDpi(SM_CXSMICON, ViewDpi(state)));
+    const auto adorn = [&](const D2D1_RECT_F& area) {
+        if (!drawn) return;
+        drawn->left=std::min(drawn->left,area.left); drawn->top=std::min(drawn->top,area.top);
+        drawn->right=std::max(drawn->right,area.right); drawn->bottom=std::max(drawn->bottom,area.bottom);
+    };
     D2D1_MATRIX_3X2_F previous{};
     if (angle != 0.f) {
         state.target->GetTransform(&previous);
@@ -16443,12 +16611,12 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // The reusable brush must not pin an evicted bitmap or obsolete device.
         state.thumbnailBrush->SetBitmap(nullptr);
         if (artwork.badgeSize) {
-            const float badge = std::min({state.gridView ?
-                std::clamp(side*.25f,16*dpi,32*dpi) : side*.25f,width,height});
+            const float badge = std::max(side*.25f, smallestAdornment);
             const float left = state.rtlLayout ? rect.left : rect.right-badge;
             const float top = static_cast<float>(artwork.thumbnailHeight+2);
             const float size = static_cast<float>(artwork.badgeSize);
             const auto badgeRect=SnapDrawRect(state.target.Get(),D2D1::RectF(left,rect.bottom-badge,left+badge,rect.bottom));
+            adorn(badgeRect);
             const auto source=D2D1::RectF(0,top,size,top+size);
             state.target->DrawBitmap(icon.bitmap.Get(),&badgeRect,opacity,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
         }
@@ -16456,6 +16624,33 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         const auto source=D2D1::RectF(0,0,sourceWidth,sourceHeight);
         state.target->DrawBitmap(icon.bitmap.Get(),&rect,opacity,IconInterpolation(
             rect.right-rect.left,rect.bottom-rect.top,sourceWidth,sourceHeight,angle),&source,nullptr);
+    }
+    if (overlay && overlay->bitmap) {
+        // An image-list overlay is a full icon canvas whose glyph sits in its
+        // bottom-left corner. Its canvas is the item's icon slot, so every row
+        // of a view shows one glyph size whatever the artwork's fitted shape
+        // (trimmed icons, thumbnails). Anchor it to the drawn artwork's
+        // corner, mirrored with the type badge for RTL. It shares the
+        // artwork's opacity, zoom and wiggle transform.
+        // A canvas below the small-icon size would shrink the glyph below the
+        // smallest overlay Windows designs.
+        const float edge=std::max(side,smallestAdornment);
+        const float left=state.rtlLayout ? rect.right-edge : rect.left;
+        const auto overlayRect=SnapDrawRect(state.target.Get(),
+            D2D1::RectF(left,rect.bottom-edge,left+edge,rect.bottom));
+        adorn(overlayRect);
+        const auto size=overlay->bitmap->GetSize();
+        D2D1_MATRIX_3X2_F current{};
+        if (state.rtlLayout) {
+            state.target->GetTransform(&current);
+            state.target->SetTransform(D2D1::Matrix3x2F::Scale(-1.f,1.f,
+                D2D1::Point2F((overlayRect.left+overlayRect.right)*.5f,0.f))*current);
+        }
+        const auto source=D2D1::RectF(0,0,size.width,size.height);
+        state.target->DrawBitmap(overlay->bitmap.Get(),&overlayRect,opacity,IconInterpolation(edge,edge,
+            size.width,size.height,angle),&source,nullptr);
+        if (state.rtlLayout) state.target->SetTransform(current);
+        overlay->painted=state.graphicsPaintSerial;
     }
     if (angle != 0.f) state.target->SetTransform(previous);
     return true;
@@ -16491,9 +16686,10 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     const bool pending = state.clipboardPaths.contains(e.path);
     const float angle = pending ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
         state.clipboardIconElapsedMs,SelectionPathHash(e.path)) : 0.f;
+    auto* overlay = OverlayArtwork(state, e, true);
     const auto draw = [&](IconRecord& icon, bool association) {
         D2D1_RECT_F drawn{};
-        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr);
+        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay);
         if (ready && pending && drawn.right>drawn.left && drawn.bottom>drawn.top) RecordClipboardDamage(state,drawn);
         if (ready) icon.painted=state.graphicsPaintSerial;
         if (state.uiTraceDrawItem)
@@ -16639,7 +16835,20 @@ bool UpdateHorizontalScrollbarVisibility(ViewState& state) {
     const bool previous = state.horizontalScrollbarAdmitted;
     if (!settling || needed)
         state.horizontalScrollbarAdmitted = ColumnsPresented(state) && HorizontalHeight(state) > 0.f;
+    // Admission can happen between frames (hit tests, readiness events). If
+    // settling resumes before any frame showed the bar, withdraw it, so its
+    // first published frame is always a settled one.
+    else if (!state.horizontalScrollbarPublished)
+        state.horizontalScrollbarAdmitted = false;
+    if (!state.horizontalScrollbarAdmitted) state.horizontalScrollbarPublished = false;
     return previous != state.horizontalScrollbarAdmitted;
+}
+
+// A frame being presented now shows the current admission.
+void PublishHorizontalScrollbar(ViewState& state) {
+    if (state.presentationOnly) return;
+    UpdateHorizontalScrollbarVisibility(state);
+    state.horizontalScrollbarPublished |= state.horizontalScrollbarAdmitted;
 }
 
 ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
@@ -19082,6 +19291,7 @@ void Paint(ViewState& state) {
     // A cold navigation has no replacement names yet. Keep the accepted image;
     // confirmed empty folders (loaded=true) still replace it immediately.
     if(!state.loaded && !state.total) return;
+    PublishHorizontalScrollbar(state);
     GraphicsContinuation continuation(state);
     // D3D/DComp creation may dispatch nested window messages. A nested paint
     // is pending work, not a device failure or a request to show native view.
@@ -27277,6 +27487,8 @@ void FlushShellChangeHints(ViewState& state, ULONGLONG now) {
             const auto key = IconKey(entry, lookup, useAttrs);
             InvalidateShellIconKey(state, key);
             if (key != entry.path) InvalidateShellIconKey(state, entry.path);
+            // Sync providers report state changes as item updates.
+            InvalidateShellIconKey(state, OverlayQueryKey(entry));
             // A type icon can be shared by many visible rows. The lookup is
             // bounded by the viewport, not by total directory size.
             if (!changedVisible) {
@@ -27566,7 +27778,7 @@ void PulsePresentation(const std::shared_ptr<PresentationLane>& lane,bool active
 
 std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& state) {
     PipelineScope pipeline(state.background,L"presentation.capture");
-    UpdateHorizontalScrollbarVisibility(state);
+    PublishHorizontalScrollbar(state);
     auto model=std::make_shared<PresentationModel>();
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
@@ -27655,6 +27867,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
             found->second.entry && *found->second.entry==source) {
             row=std::move(found->second); reused=true;
         } else row.entry=std::make_shared<const Entry>(source);
+        if(!reused) row.overlayKey=OverlayQueryKey(*row.entry);
         if(!reused || !(row.icons==iconContext)) {
             for(size_t fallback=0;fallback<row.iconKeys.size();++fallback) {
                 std::wstring path; bool attrs=false;
@@ -27682,22 +27895,32 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
         const IconRecord* icon=nullptr;
         if(key==kDefaultFolderIconKey) icon=&state.defaultFolderIcon;
         else if(const auto found=state.icons.find(key);found!=state.icons.end()) icon=&found->second;
-        if(icon && icon->pixels.Ready()) model->images.push_back({key,icon->pixels,icon->requestedSize,icon->association});
+        if(icon && (icon->pixels.Ready() || (icon->overlayQuery && icon->resolved)))
+            model->images.push_back({key,icon->pixels,icon->requestedSize,icon->association,
+                icon->overlayQuery,icon->overlayImage});
     };
-    const auto icons=[&](const Entry& entry,const std::array<std::wstring,2>* cached) {
+    const auto sized=[&](const std::wstring& key) {
+        image(key);
+        std::wstring fallbackKey;
+        if(FindIconRecord(state,key,true,false,&fallbackKey,true)) image(owned.emplace_back(std::move(fallbackKey)));
+    };
+    const auto icons=[&](const Entry& entry,const PresentationRowCache* cached) {
         for(size_t fallback=0;fallback<2;++fallback) {
-            const std::wstring* key=cached ? &(*cached)[fallback] : nullptr;
+            const std::wstring* key=cached ? &cached->iconKeys[fallback] : nullptr;
             if(!key) {
                 std::wstring path; bool attrs=false;
                 key=&owned.emplace_back(IconKey(iconContext,entry,path,attrs,fallback!=0));
             }
-            if(keys.contains(*key)) continue;
-            image(*key);
-            std::wstring fallbackKey;
-            if(FindIconRecord(state,*key,true,false,&fallbackKey,true)) image(owned.emplace_back(std::move(fallbackKey)));
+            if(!keys.contains(*key)) sized(*key);
+        }
+        const auto& overlay=cached ? cached->overlayKey : owned.emplace_back(OverlayQueryKey(entry));
+        image(overlay);
+        if(const auto found=state.icons.find(overlay);found!=state.icons.end() && found->second.overlayImage>=0) {
+            const auto& artwork=owned.emplace_back(OverlayImageKey(iconContext,found->second.overlayImage));
+            if(!keys.contains(artwork)) sized(artwork);
         }
     };
-    for(const auto& item:items->rows) icons(*item.entry,&state.presentationRows.at(item.index).iconKeys);
+    for(const auto& item:items->rows) icons(*item.entry,&state.presentationRows.at(item.index));
     for(const auto& ghost:model->disappearingRows) icons(ghost.entry,nullptr);
     image(owned.emplace_back(kDefaultFolderIconKey));
     return model;
@@ -27882,7 +28105,10 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
                 icon.presentationRecent=state.presentationIconRecent.begin(); icon.presentationListed=true;
             } else state.presentationIconRecent.splice(state.presentationIconRecent.begin(),state.presentationIconRecent,icon.presentationRecent);
         }
-        if(icon.pixels.data.Identity()!=image.pixels.data.Identity()) {
+        if(image.overlayQuery) {
+            icon.overlayQuery=true; icon.overlayImage=image.overlayImage; icon.resolved=true;
+            AccountIconCache(state,image.key,icon);
+        } else if(icon.pixels.data.Identity()!=image.pixels.data.Identity()) {
             icon.pixels=image.pixels; icon.requestedSize=image.requestedSize; icon.association=image.association;
             icon.bitmapAttempted=false; icon.resolved=true; state.iconUploadsPending=true;
             AccountIconCache(state,image.key,icon);
@@ -32490,7 +32716,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     RetireCachedEntries(state, state.entryPathUpdates);
     state.folderPath = path;
     state.deferColumnProviders = true;
-    state.horizontalScrollbarAdmitted = false;
+    state.horizontalScrollbarAdmitted = state.horizontalScrollbarPublished = false;
     state.columnFitPendingEpoch = 0;
     if (!state.columnModeTransition) StopColumnTransition(state);
     state.folder = folder;

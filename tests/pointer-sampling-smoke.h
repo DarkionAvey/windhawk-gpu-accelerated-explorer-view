@@ -45,6 +45,7 @@ static void TestScrollbarPressRouting() {
             OverlayProc(state.hwnd,message,PointerFixture::held ? MK_LBUTTON : 0,MAKELPARAM(point.x,point.y));
         };
         auto bar=geometry(); Check(bar.usable,"scrollbar routing fixture has no bar");
+        PublishHorizontalScrollbar(state); // The pointer targets a bar a presented frame showed.
         const auto track=pointAt(bar,(horizontal ? bar.left : bar.top)+bar.thumbLength*.5f+bar.travel*.55f);
         send(WM_LBUTTONDOWN,track);
         Check((horizontal ? state.horizontalTarget : state.scrollTarget)>0 &&

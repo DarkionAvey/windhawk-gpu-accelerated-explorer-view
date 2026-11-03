@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.343
+
+- Icon overlays (cloud status, shortcut arrows) have one consistent size for
+  every item in a view, whatever the shape of its icon or thumbnail.
+- The app icon on thumbnails scales with the icon size and is extracted at
+  that size. Overlays and app icons never shrink below Windows' small-icon
+  size.
+- The horizontal scrollbar no longer first appears in the middle of a column
+  fitting animation; it waits for the columns to settle.
+
+## 0.9.342
+
+- Show Shell icon overlays on icons and thumbnails, as the native views do:
+  cloud sync status from any provider (OneDrive, Dropbox, Google Drive and
+  others), shortcut arrows and sharing marks. Overlays resolve in the
+  background, update when an item's sync state changes and follow zoom,
+  cut/copy animations and RTL layout.
+- Shortcut arrows now appear at every icon size, not only in small views.
+
 ## 0.9.341
 
 - Keep GPU drag previews moving across frame and screen edges, with Windows'

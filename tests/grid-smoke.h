@@ -120,7 +120,10 @@ static void TestThumbnailDecorations(ViewState& state) {
     const bool listThumbnails=g_listThumbnails.exchange(true);
     state.gridView=false; state.iconPx=32; draw(decorated);
     const int listLeft=state.rtlLayout ? 320-40-32 : 40;
-    Check(pixel(listLeft+16,56)[3]>240 && pixel(listLeft,49)[3]<230 &&
+    // The app badge keeps Windows' small-icon minimum, taller than this short
+    // thumbnail; sample the rounded corner on the leading side, away from it.
+    const int leadingCorner=state.rtlLayout ? listLeft+31 : listLeft;
+    Check(pixel(listLeft+16,56)[3]>240 && pixel(leadingCorner,49)[3]<230 &&
         pixel(listLeft+16,65)[3]>0 && pixel(listLeft+16,65)[3]<80,
         "list thumbnail lost aspect, rounded corners or cheap shadow at icon size");
     // The same opaque 2:1 image isolates small-thumbnail corner geometry from

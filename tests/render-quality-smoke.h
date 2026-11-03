@@ -29,6 +29,13 @@ static void TestRenderQuality() {
     const std::wstring label=L"Explorer Aa 123 flower الملف.txt";
     std::vector<std::vector<DWORD>> samples;
     const bool macType=GetModuleHandleW(L"MacType64.dll") || GetModuleHandleW(L"MacType64.Core.dll");
+    // MacType's forced outline rendering rasterizes identical calls slightly
+    // differently per Direct2D context, so exact direct/cached comparisons
+    // measure MacType rather than the mod.
+    constexpr char kMacTypeMismatch[]="direct and cached text differ in position or coverage (MacType is "
+        "injected into this test process: add background-regression.exe to MacType's process exclusion list)";
+    if(macType) std::cout<<"NOTICE: MacType is injected into background-regression.exe; exclude it in MacType "
+        "for exact text comparisons\n";
     bool customizerOverrides=false;
     for(auto mode:{TextAntialiasing::System,TextAntialiasing::Smooth,TextAntialiasing::Aliased}) {
         g_textAntialiasing=mode; RefreshTextRendering(state,true);
@@ -95,7 +102,7 @@ static void TestRenderQuality() {
                 largest=std::max(largest,std::abs(int((paths[0][i]>>shift)&255)-int((paths[1][i]>>shift)&255)));
             if(largest>1) std::cout<<"DIRECT/CACHED kind="<<kind<<" alignment="<<alignment<<" color="<<std::hex<<color<<std::dec
                 <<" opacity="<<opacity<<" largest="<<largest<<std::endl;
-            Check(largest<=1,"direct and cached text differ in position or coverage");
+            Check(largest<=1,macType ? kMacTypeMismatch : "direct and cached text differ in position or coverage");
         }
         for(auto* format:{state.textFormat.Get(),state.headerFormat.Get(),state.sortedHeaderFormat.Get()})
             format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
