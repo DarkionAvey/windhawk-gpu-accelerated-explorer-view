@@ -174,12 +174,19 @@ inline HRESULT WINAPI CreateItem(PCWSTR path, IBindCtx* context, REFIID iid, voi
 // Delays only explicit synthetic property paths. Real stores and all COM,
 // dispatch, generation checks and result delivery remain the production path.
 namespace PropertyFixture {
+// Observe real property-store requests without replacing the Shell provider.
+inline thread_local PCWSTR observedPath=nullptr;
+inline thread_local unsigned observedCalls=0,observedSlowCalls=0;
 inline thread_local const PROPVARIANT* sortVariant=nullptr;
 inline HANDLE gate = nullptr;
 inline std::atomic<unsigned> blocked{0};
 inline std::atomic<bool> enabled{false};
 inline HRESULT WINAPI Store(PCWSTR path, IBindCtx* context, GETPROPERTYSTOREFLAGS flags,
                             REFIID iid, void** output) {
+    if(observedPath && path && wcscmp(path,observedPath)==0) {
+        ++observedCalls;
+        if(!(flags&GPS_FASTPROPERTIESONLY)) ++observedSlowCalls;
+    }
     if (sortVariant && path && std::wstring_view(path)==L"wh-property-test:nan") {
         IPropertyStore* store=nullptr;
         HRESULT hr=PSCreateMemoryPropertyStore(IID_PPV_ARGS(&store));

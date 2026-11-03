@@ -1992,6 +1992,8 @@ static void TestPreviewInput() {
 #include "native-menu-smoke.h"
 #include "item-tip-smoke.h"
 #include "pixel-snap-smoke.h"
+#include "review-fixes-smoke.h"
+#include "cloud-item-tip-smoke.h"
 
 #include "option-effects-smoke.h"
 #include "regression-manifest.h"

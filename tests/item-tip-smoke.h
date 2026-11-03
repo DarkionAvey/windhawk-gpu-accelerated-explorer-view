@@ -140,6 +140,34 @@ static void ItemTipScenario(const std::wstring& directory) {
     }
     Check(tip.rows.size() <= 4, "standard tooltip unexpectedly included extra properties");
     g_detailedItemTips = true;
+    const auto configuredKeys = [&](const std::filesystem::path& path) {
+        ComPtr<IShellItem2> item; std::vector<PROPERTYKEY> keys;
+        Check(SUCCEEDED(SHCreateItemFromParsingName(path.c_str(),nullptr,IID_PPV_ARGS(&item))),"native tooltip policy item");
+        for(const auto& listKey:{PKEY_PropList_InfoTip,PKEY_PropList_PreviewDetails}) {
+            ComPtr<IPropertyDescriptionList> list; UINT count=0;
+            if(FAILED(item->GetPropertyDescriptionList(listKey,IID_PPV_ARGS(&list))) || FAILED(list->GetCount(&count))) continue;
+            for(UINT i=0;i<count;++i) {
+                ComPtr<IPropertyDescription> description; PROPERTYKEY key{};
+                Check(SUCCEEDED(list->GetAt(i,IID_PPV_ARGS(&description))) && SUCCEEDED(description->GetPropertyKey(&key)),"native tooltip policy key");
+                keys.push_back(key);
+            }
+        }
+        Check(!keys.empty(),"fixture type has no native tooltip/preview policy");
+        return keys;
+    };
+    const auto configured = [&](const std::filesystem::path& path,REFPROPERTYKEY key) {
+        const auto keys=configuredKeys(path);
+        return std::any_of(keys.begin(),keys.end(),[&](const auto& other){return SameKey(key,other);});
+    };
+    const auto checkPolicy = [&](const std::filesystem::path& path) {
+        const auto keys=configuredKeys(path);
+        for(const auto& row:tip.rows) {
+            if(SameKey(row.key,PKEY_Size) || SameKey(row.key,PKEY_ItemTypeText) ||
+                SameKey(row.key,PKEY_DateCreated) || SameKey(row.key,PKEY_DateModified)) continue;
+            Check(std::any_of(keys.begin(),keys.end(),[&](const auto& key){return SameKey(key,row.key);}),
+                "tooltip leaked a property outside the type's InfoTip/PreviewDetails lists");
+        }
+    };
     const auto checkProperty = [&](REFPROPERTYKEY key, const std::filesystem::path& path) {
         ComPtr<IPropertyStore> store;
         Check(SUCCEEDED(EntryPropertyStore(path.wstring(), nullptr, GPS_DEFAULT, &store)), "tooltip fixture property store");
@@ -148,14 +176,19 @@ static void ItemTipScenario(const std::wstring& directory) {
         Check(!expected.empty() && valueOf(key) == expected, "tooltip omitted or reformatted populated file metadata");
     };
     Check(hover(rowOf(L"photo.jpg")), "JPEG tooltip");
-    for (const auto& key : {PKEY_Image_Dimensions, PKEY_Comment, PKEY_Keywords}) checkProperty(key, root / L"photo.jpg");
+    for (const auto& key : {PKEY_Image_Dimensions, PKEY_Comment, PKEY_Keywords}) {
+        if(configured(root/L"photo.jpg",key)) checkProperty(key,root/L"photo.jpg");
+        else Check(valueOf(key).empty(),"unconfigured image property appeared on hover");
+    }
+    checkPolicy(root/L"photo.jpg");
     Check(valueOf(PKEY_Capacity).empty() && valueOf(PKEY_FreeSpace).empty() && valueOf(PKEY_FileOwner).empty(),
         "image tooltip included disk or inherited filesystem context");
     std::unordered_set<std::wstring> uniqueValues;
     for (const auto& row : tip.rows)
         Check(uniqueValues.insert(ItemTipComparison(row.value, row.date)).second, "tooltip worker retained duplicate values");
     Check(hover(rowOf(L"audio.wav")), "audio tooltip");
-    checkProperty(PKEY_Audio_EncodingBitrate, root / L"audio.wav");
+    if(configured(root/L"audio.wav",PKEY_Audio_EncodingBitrate)) checkProperty(PKEY_Audio_EncodingBitrate, root / L"audio.wav");
+    checkPolicy(root/L"audio.wav");
     Check(hover(note), "return to file tooltip");
     // Tab-stop columns: every value starts on one edge after the widest label.
     float widestLabel = 0.f;
@@ -294,8 +327,10 @@ static void ItemTipScenario(const std::wstring& directory) {
     }), "real column cache completion");
     ItemTipHoverMoved(state, -1); state.hovered = photo; ShowItemTip(state, client);
     Check(!shown() && tip.token, "cached tooltip appeared before completion");
-    Check(hover(photo) && valueOf(PKEY_Size) == state.entries[size_t(photo)].size &&
-        !valueOf(PKEY_Comment).empty() && !valueOf(PKEY_Keywords).empty(), "cached JPEG tooltip completion");
+    Check(hover(photo) && valueOf(PKEY_Size) == state.entries[size_t(photo)].size, "cached JPEG tooltip completion");
+    checkPolicy(root/L"photo.jpg");
+    for(const auto& key:{PKEY_Comment,PKEY_Keywords})
+        Check(valueOf(key).empty()!=configured(root/L"photo.jpg",key),"cached columns bypassed the native tooltip policy");
     ItemTipHoverMoved(state, -1); state.hovered = folder; ShowItemTip(state, client);
     Check(!shown() && tip.token, "partial folder tooltip appeared");
     Check(hover(folder) && valueOf(PKEY_Size) == state.entries[size_t(folder)].size,

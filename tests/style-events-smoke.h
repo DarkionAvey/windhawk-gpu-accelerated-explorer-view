@@ -100,6 +100,16 @@ static void TestStyleEvents(const std::wstring& fixture) {
     Check(bubble==RGB(0x18,0xA0,0x60) && alpha>0 && alpha<255 && ColorContrast(blend,bubble)>=4.5,
         "accent event missed the cached bubble or translucent contrasting glyph");
     const auto changed=probes();
+    const auto wheel=g_wheelLines.load();
+    for(UINT action:{UINT(SPI_SETWHEELSCROLLLINES),UINT(SPI_SETWHEELSCROLLCHARS)}) {
+        for(UINT lines:{0u,7u,UINT(WHEEL_PAGESCROLL)}) {
+            StyleFixture::wheel=lines;
+            Check(SystemStyleChangeMask(WM_SETTINGCHANGE,action,0)==kStyleInput,"wheel setting is not an input change");
+            for(auto* state:{&first,&second}) QueueStyleChange(*state,SystemStyleChangeMask(WM_SETTINGCHANGE,action,0));
+            Check(drain()==2 && g_wheelLines==lines && probes()==changed,"queued wheel refresh missed value or queried colors");
+        }
+    }
+    g_wheelLines=wheel;
     for(UINT action:{UINT(SPI_SETWORKAREA),UINT(SPI_SETWHEELSCROLLLINES)})
         SendMessageW(frame,WM_SETTINGCHANGE,action,0);
     SendMessageW(frame,WM_SETTINGCHANGE,0,reinterpret_cast<LPARAM>(L"Environment"));
@@ -125,6 +135,13 @@ static void TestStyleEvents(const std::wstring& fixture) {
     OverlayProc(first.hwnd,kMsgStyleChanged,WPARAM(first.lifetimeToken+1),0);
     Check(drain()==0 && probes()==after,"stale style message queried colors");
     Check(!first.viewToggle && !second.viewToggle,"style events created optional controls");
+    StyleFixture::highContrast=true;
+    QueueStyleChange(first,kStyleColors); drain();
+    Check(g_selectionRgb==RGB(12,110,210) && (g_swipePalette.load()&0xFFFFFF)==RGB(12,110,210),
+        "high contrast selection/badge did not use the system highlight");
+    StyleFixture::highContrast=false;
+    QueueStyleChange(first,kStyleColors); drain();
+    Check(g_selectionRgb==RGB(0x18,0xA0,0x60),"selection failed to restore DWM accent after high contrast");
     // Sent frame broadcasts must reach the same queue as posted/native hints.
     // Inactive tabs keep the hint until they own the active view again.
     struct RestoreHosts {

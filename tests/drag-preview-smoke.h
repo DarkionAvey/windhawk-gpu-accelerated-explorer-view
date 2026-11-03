@@ -89,6 +89,18 @@ static void TestDragPreview(const std::wstring& fixture) {
         if(!state.headerFormat) Check(MakeTextFormats(state),"drag caption fonts");
         DragPreview captionPreview; captionPreview.side=128; captionPreview.dpi=96;
         UpdateDragCaption(state,captionPreview,shellText,600.f);
+        // Independent DirectWrite width expectation in the actual caption face.
+        ComPtr<IDWriteTextLayout> reference; DWRITE_TEXT_METRICS metrics{};
+        Check(SUCCEEDED(g_writeFactory->CreateTextLayout(L"abcdefghijklmnopqrstuvwxyz",26,
+            captionPreview.captionFormat.Get(),100000,100000,&reference)) && SUCCEEDED(reference->GetMetrics(&metrics)),
+            "caption font width reference");
+        const float expectedWidth=std::ceil(metrics.widthIncludingTrailingWhitespace*40.f/26.f);
+        Check(captionPreview.captionAvailable==std::min(600.f,expectedWidth),"caption width did not follow measured font metrics");
+        UpdateDragCaption(state,captionPreview,shellText,50.f);
+        Check(captionPreview.captionAvailable==50.f,"caption exceeded a narrow work area");
+        captionPreview.dpi=192; UpdateDragCaption(state,captionPreview,shellText,6000.f);
+        Check(std::abs(captionPreview.captionAvailable-2*expectedWidth)<=1.f,"caption width failed to scale with monitor DPI");
+        captionPreview.dpi=96; UpdateDragCaption(state,captionPreview,shellText,600.f);
         Check(captionPreview.caption && captionPreview.captionSize.width>0.f && captionPreview.captionSize.height>0.f &&
             !UpdateDragCaption(state,captionPreview,shellText,600.f),"drag caption layout was absent or rebuilt unchanged feedback");
         const auto captionGeometry=LayoutDragPreview(captionPreview);

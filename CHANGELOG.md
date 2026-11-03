@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.348 (unreleased)
+
+- Keep native content below the GPU view without demoting unrelated popups.
+- Apply wheel-settings and high-contrast selection changes without reloading.
+- Follow each file type's tooltip property lists and avoid content reads for
+  dehydrated files, including files dehydrated after their folder was listed.
+- Size drag captions from font metrics and DPI, localize count badges, and
+  clean up preview identities before destroying their windows.
+- Clamp out-of-range DPI and correct empty-frame and compositor diagnostics.
+
 ## 0.9.347
 
 - A collapsed group shows how many of its items are still selected: a check

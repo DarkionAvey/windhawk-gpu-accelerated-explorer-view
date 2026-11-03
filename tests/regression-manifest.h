@@ -88,6 +88,11 @@ static const Regression::Test kRegressions[] = {
     // Touch, gestures and drag.
     REGRESSION("touch-input", PARALLEL, TestTouchInput(fixture)),
     REGRESSION("drag-preview", PARALLEL, TestDragPreview(fixture)),
+    REGRESSION("overlay-stack-filter", PARALLEL, TestOverlayStackFilter()),
+    REGRESSION("compositor-wait-errors", PARALLEL, TestCompositorWaitErrors()),
+    REGRESSION("empty-frame-summary", PARALLEL, TestEmptyFrameSummary()),
+    REGRESSION("drag-count-locale", PARALLEL, TestDragCountLocale()),
+    REGRESSION("drag-preview-lifecycle", PARALLEL, TestDragPreviewLifecycle(fixture)),
     REGRESSION("additional-gestures", PARALLEL, TestAdditionalGestures(fixture)),
     REGRESSION("selection-checkboxes", PARALLEL, TestSelectionCheckboxes(fixture)),
     // Styles, refresh, columns and native views.
@@ -145,6 +150,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("sort-details", PARALLEL, TestSortDetails(fixture)),
     REGRESSION("shell-size-details", PARALLEL, TestShellSizeDetails(fixture)),
     REGRESSION("item-tips", PARALLEL, TestItemTips(fixture)),
+    REGRESSION("cloud-item-tip", PARALLEL, TestCloudItemTip(fixture)),
     // Graphics and native view integration.
     REGRESSION("real-native-viewport", PARALLEL, TestRealNativeViewport(fixture)),
     REGRESSION("private-fixture-release", PARALLEL, TestPrivateFixtureRelease(fixture)),

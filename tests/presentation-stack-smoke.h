@@ -58,7 +58,7 @@ void CheckStable(ViewState& state,bool rename) {
     Check(Ordered(state),"settled owned presentation stack is inconsistent");
     DestroyWindow(hidden);
     probe.positions=probe.sizes=probe.intermediate=0; probe.repairing=true;
-    HWND foreign=CreateWindowExW(0,L"STATIC",L"private visible sibling",WS_CHILD|WS_VISIBLE,
+    HWND foreign=CreateWindowExW(0,L"CtrlNotifySink",L"private native content sibling",WS_CHILD|WS_VISIBLE,
         0,0,320,240,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
     Check(foreign!=nullptr,"visible frame sibling");
     Check(SetWindowPos(foreign,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE),"raise visible frame sibling");
@@ -90,6 +90,18 @@ void CheckStable(ViewState& state,bool rename) {
             "explicit bottom placement of a frame child was altered");
     }
     DestroyWindow(foreign);
+    // An unrelated native surface is entitled to HWND_TOP. Later geometry,
+    // tab maintenance and rename repairs must preserve that decision too.
+    HWND popup=CreateWindowExW(0,L"STATIC",L"private native popup surface",WS_CHILD|WS_VISIBLE,
+        0,0,320,240,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+    const UINT flags=SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE;
+    Check(popup && NativeSetWindowPosHook(popup,HWND_TOP,0,0,0,0,flags),"native popup surface raise");
+    EnsureOverlayStacking(state);
+    Check(!PreviousVisible(popup) && !OverlayStackingNeeded(state),"maintenance demoted unrelated native popup");
+    RECT bounds{}; GetWindowRect(state.hwnd,&bounds);
+    MapWindowPoints(nullptr,frame,reinterpret_cast<POINT*>(&bounds),2);
+    Check(PositionOverlayWindows(state,&bounds) && !PreviousVisible(popup),"layout demoted unrelated native popup");
+    DestroyWindow(popup);
     for(HWND child:{state.rename.editor,state.viewToggle,state.hwnd}) if(child)
         RemoveWindowSubclass(child,Observe,1);
     if(rename) CancelRename(state);

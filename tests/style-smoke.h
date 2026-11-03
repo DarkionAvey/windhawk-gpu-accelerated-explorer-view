@@ -129,10 +129,14 @@ static void TestResolvedStyles() {
     Check(state.viewToggleBackground==RGB(255,255,255) && state.viewToggleForeground==RGB(0,0,0),
         "status chrome accepted transparent palette entries");
     state.ReleaseViewToggle();
-    for(UINT dpi:{0u,1u,71u,769u,UINT_MAX}) {StyleFixture::dpi=dpi; Check(DpiOf(state.hwnd)==96,"invalid window DPI");}
+    for(const auto [dpi,expected]:std::array<std::pair<UINT,int>,7>{{{0,96},{1,72},{71,72},{72,72},{144,144},{769,768},{UINT_MAX,768}}}) {
+        StyleFixture::dpi=dpi; Check(DpiOf(state.hwnd)==expected,"window DPI clamp/default");
+    }
     StyleFixture::dpi=96;
     state.presentationOnly=true;
-    for(int dpi:{0,-1,INT_MAX}) {state.presentationDpi=dpi; Check(ViewDpi(state)==96,"invalid copied DPI");}
+    for(const auto [dpi,expected]:std::array<std::pair<int,int>,7>{{{0,72},{-1,72},{71,72},{72,72},{144,144},{769,768},{INT_MAX,768}}}) {
+        state.presentationDpi=dpi; Check(ViewDpi(state)==expected,"copied DPI clamp");
+    }
     state.presentationDpi=144;
     for(LONG height:{0L,1L,LONG_MIN,LONG_MAX,-2000L}) {
         state.presentationFont=FallbackUiFont(144); state.presentationFont.lfHeight=height;
