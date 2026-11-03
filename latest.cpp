@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.344
+// @version         0.9.345
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -3179,6 +3179,7 @@ struct ViewState {
     bool rowTransitionActive = false;
     bool groupingLayoutTransition = false;
     bool zoomLayoutTransition = false;
+    bool reflowLayoutTransition = false;
     LARGE_INTEGER rowTransitionStartedQpc{};
     float rowTransitionPresentedProgress = 0.f;
     unsigned long long rowSceneRevision = 0;
@@ -3605,6 +3606,7 @@ struct ViewState {
     float touchpadPanY = 0.f;
     float swipeEdgeX = 0.f; // Only displacement left over after column scrolling.
     double touchpadPinchHeight96 = 0.;
+    int pinchRevealRow = -1; // Selection fully visible when a direct pinch began.
     // An intentional horizontal gesture is locked separately from vertical pan.
     // The preview uses compositor redraws only while it is visible or fading.
     bool swipeHorizontal = false;
@@ -3871,7 +3873,7 @@ struct SwipeFeedbackSnapshot {
     X(columnTransitionStartedQpc) X(columnMotion) X(disappearingColumns) X(columnDragArmed) X(columnDragActive) \
     X(columnDragKey) X(columnDragSource) X(columnDragDestination) X(columnDragPointerX) X(columnDragGrabOffset) \
     X(columnWiggleAwaitRelease) X(grouping) X(groupAnimating) X(hotSection) X(sort) \
-    X(rowTransitionActive) X(groupingLayoutTransition) X(zoomLayoutTransition) X(rowTransitionStartedQpc) \
+    X(rowTransitionActive) X(groupingLayoutTransition) X(zoomLayoutTransition) X(reflowLayoutTransition) X(rowTransitionStartedQpc) \
     X(rowTransitionPresentedProgress) X(rowSceneRevision) X(rowMotion) X(rowMotionFirst) X(disappearingRows) \
     X(groupHeaderMotion) X(disappearingHeaders) X(rowTransitionOldScroll) X(zebraExtentAnimating) \
     X(zebraExtentFrom) X(zebraExtentTo) X(zebraExtentPresented) X(zebraExtentStartedQpc) \
@@ -4431,6 +4433,14 @@ bool AdvanceGroupAnimation(ViewState& state, LARGE_INTEGER sampled = {}) {
 }
 
 RowVisual LayoutRowVisual(const ViewState& state, int index, float progress);
+
+// Zoom and grid reflow move cells toward metrics that keep changing under
+// input (zoom clock, pinch, resize). They repaint every frame at live
+// geometry and keep their off-viewport movers; a pre-rasterized compositor
+// row atlas would stretch and clip those cells.
+bool LiveLayoutTransition(const ViewState& state) {
+    return state.zoomLayoutTransition || state.reflowLayoutTransition;
+}
 
 float LayoutTransitionProgress(const ViewState& state, bool active, LARGE_INTEGER started,
                                LARGE_INTEGER sampled = {}) {
@@ -11254,7 +11264,8 @@ void StartRowTransition(ViewState& state, std::vector<CapturedRow>&& captures,
                         int oldTotal, float oldRowPx, float oldScroll);
 void StartGroupingTransition(ViewState& state,
     std::vector<CapturedRow>&& captures,
-    std::vector<CapturedGroupHeader>&& oldHeaders, float oldRowPx, bool zoomLayout = false);
+    std::vector<CapturedGroupHeader>&& oldHeaders, float oldRowPx, bool zoomLayout = false,
+    bool reflow = false);
 
 // A deleted focused row no longer has a path in the new snapshot. Use the
 // worker-matched, bounded OLD viewport to locate its former insertion gap.
@@ -12359,6 +12370,7 @@ void StopRowTransition(ViewState& state) {
     state.rowTransitionPresentedProgress = 0.f;
     state.groupingLayoutTransition = false;
     state.zoomLayoutTransition = false;
+    state.reflowLayoutTransition = false;
     state.rowMotion.clear();
     state.disappearingRows.clear();
     state.groupHeaderMotion.clear();
@@ -12479,15 +12491,18 @@ void StartRowTransition(ViewState& state, std::vector<CapturedRow>&& captures,
 // scroll extent and hit targets switch immediately; only painting interpolates.
 void StartGroupingTransition(ViewState& state,
     std::vector<CapturedRow>&& captures,
-    std::vector<CapturedGroupHeader>&& oldHeaders, float oldRowPx, bool zoomLayout) {
+    std::vector<CapturedGroupHeader>&& oldHeaders, float oldRowPx, bool zoomLayout, bool reflow) {
     StopSelectionFade(state);
+    // Zoom and reflow captures are presented visuals of the same items, so
+    // their row height may differ and cells leaving the viewport keep moving.
+    const bool presented = zoomLayout || reflow;
     if ((state.zoomAnimating && !zoomLayout) || !state.loaded || !state.visible || !state.inScope ||
-        !state.detailsViewActive || (!zoomLayout && oldRowPx != state.rowPx) ||
+        !state.detailsViewActive || (!presented && oldRowPx != state.rowPx) ||
         state.rowPx <= 0 || state.rename.editor || state.marqueePossible ||
         state.marqueeActive) return;
     auto newRows = VisibleItemRows(state,
         static_cast<float>(kRowTransitionOverscan));
-    if (zoomLayout) {
+    if (presented) {
         for (const auto& capture : captures) newRows.push_back(capture.newIndex);
         std::sort(newRows.begin(), newRows.end());
         newRows.erase(std::unique(newRows.begin(), newRows.end()), newRows.end());
@@ -12497,6 +12512,7 @@ void StartGroupingTransition(ViewState& state,
     if (newRows.empty() && oldHeaders.empty() && state.sections.empty() && !removedRows) return;
     state.groupingLayoutTransition = true;
     state.zoomLayoutTransition = zoomLayout;
+    state.reflowLayoutTransition = reflow;
     state.rowMotion.clear();
     state.rowMotion.reserve(newRows.size());
     const float h = static_cast<float>(state.headerPx);
@@ -12615,6 +12631,44 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
         motion.oldOpacity + (opacity - motion.oldOpacity) * progress,
         motion.oldLeft + (DocumentRowLeft(state, index)-motion.oldLeft) * progress,
         motion.oldWidth > 0.f ? motion.oldWidth + (state.itemWidth-motion.oldWidth)*progress : state.itemWidth};
+}
+
+// Samples the grid cells as currently presented, including in-flight motion,
+// so a retargeted layout always starts from the image on screen.
+std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state) {
+    std::vector<CapturedRow> captures;
+    if (!state.gridView || !g_smooth.load(std::memory_order_relaxed)) return captures;
+    auto rows = VisibleItemRows(state, static_cast<float>(kRowTransitionOverscan));
+    if (state.rowTransitionActive && state.groupingLayoutTransition)
+        for (const auto& motion : state.rowMotion) rows.push_back(motion.newIndex);
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    const float progress = LayoutTransitionProgress(state,
+        state.rowTransitionActive, state.rowTransitionStartedQpc);
+    const float pad = kRowTransitionOverscan * state.rowPx;
+    for (int index : rows) {
+        const auto visual = LayoutRowVisual(state, index, progress);
+        if (visual.top+visual.height < -pad || visual.top > ViewHeight(state)+pad) continue;
+        CapturedRow capture;
+        capture.oldIndex = capture.newIndex = index;
+        capture.oldTop = visual.top; capture.oldHeight = visual.height;
+        capture.oldLeft = visual.left; capture.oldWidth = visual.width;
+        capture.oldOpacity = visual.opacity;
+        captures.push_back(std::move(capture));
+    }
+    return captures;
+}
+
+// Window resize and direct pinch repack grid columns under continuous input.
+// Packing, scroll extent and hit testing switch at once; cells glide from
+// their presented slots on the shared row clock. Call after repacking.
+void BeginGridReflow(ViewState& state, std::vector<CapturedRow>&& cells,
+                     std::vector<CapturedGroupHeader>&& headers) {
+    if (cells.empty()) return;
+    // Settle the destination scroll first: the transition translates both
+    // endpoints by any later scroll delta.
+    ClampScroll(state);
+    StartGroupingTransition(state, std::move(cells), std::move(headers), state.rowPx, false, true);
 }
 
 void StopScrollAnimation(ViewState& state) {
@@ -16099,7 +16153,7 @@ IconRecord* FindIconRecord(ViewState& state, const std::wstring& key,
 std::vector<int> VisibleDemandRows(const ViewState& state, float overscanRows) {
     const auto visible = VisibleItemRows(state, 0.f);
     auto rows = VisibleItemRows(state, overscanRows);
-    if (state.zoomLayoutTransition) {
+    if (LiveLayoutTransition(state)) {
         for (const auto& motion : state.rowMotion) rows.push_back(motion.newIndex);
         std::sort(rows.begin(), rows.end());
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
@@ -17912,7 +17966,7 @@ bool PrepareFitComposition(ViewState& state, float w, float h) {
 bool PrepareRowComposition(ViewState& state) {
     if (!state.composition || !state.compTarget || !state.backbuffer || !state.swapChain ||
         state.rename.editor || state.columnTransitionActive || state.zoomAnimating ||
-        state.zoomLayoutTransition || state.groupAnimating) return false;
+        LiveLayoutTransition(state) || state.groupAnimating) return false;
     auto& mode=state.modeComposition;
     RECT client{}; ViewClientRect(state,&client);
     if (mode.rows && mode.root && mode.rowRevision==state.rowSceneRevision &&
@@ -19607,7 +19661,7 @@ void Paint(ViewState& state) {
         visibleItems.clear();
         for(const auto& item:state.modeComposition.items) if(item.key>=0) visibleItems.push_back(item.key);
     }
-    if (state.zoomLayoutTransition) {
+    if (LiveLayoutTransition(state)) {
         for (const auto& motion : state.rowMotion) visibleItems.push_back(motion.newIndex);
         std::sort(visibleItems.begin(), visibleItems.end());
         visibleItems.erase(std::unique(visibleItems.begin(), visibleItems.end()), visibleItems.end());
@@ -20490,6 +20544,28 @@ float RevealScrollTarget(ViewState& state, int index, float desired) {
     // If a cell exceeds the viewport, keep its leading edge visible.
     const float bottom = top + std::min(DisplayRowHeight(state, index), viewport-heading);
     return std::clamp(desired, bottom - viewport, std::max(0.f, top-heading));
+}
+
+// A selected cell the user can fully see stays revealed while pinch or a
+// column reflow moves and grows it. A selection already scrolled away from
+// never pulls the viewport. Returns that row, or -1.
+int FullyVisibleSelection(ViewState& state) {
+    const int index = state.selected;
+    if (index < 0 || static_cast<size_t>(index) >= state.selectedFlags.size() ||
+        !state.selectedFlags[static_cast<size_t>(index)] || !DisplayedRow(state, index)) return -1;
+    const float viewport = std::max(0.f, ViewHeight(state) - ScrollBottomPadding(state));
+    const float heading = state.sections.empty() ? 0.f :
+        std::min(GroupHeadingHeight(state), std::max(0.f, viewport-1.f));
+    const float top = DocumentRowTop(state, index) - state.scrollNow;
+    return top >= heading - .5f && top + DisplayRowHeight(state, index) <= viewport + .5f ? index : -1;
+}
+
+// Keeps a row from FullyVisibleSelection revealed after the layout changed.
+void KeepSelectionRevealed(ViewState& state, int index) {
+    if (index < 0 || index != state.selected || static_cast<size_t>(index) >= state.selectedFlags.size() ||
+        !state.selectedFlags[static_cast<size_t>(index)]) return;
+    state.scrollNow = state.scrollTarget = RevealScrollTarget(state, index, state.scrollNow);
+    ClampScroll(state);
 }
 
 void EnsureVisible(ViewState& state, int index) {
@@ -24292,9 +24368,13 @@ void QueueInputFocusUpdate(HWND overlay, HWND viewControl) {
     if (!state->inputFocusMessageQueued) state->viewControlFocusReturn=nullptr;
 }
 
+void BeginAnimatedZoom(ViewState& state, int height96);
+
 // One GPU layout transaction for cached navigation, initial native mode and
 // explicit user changes. It never interrogates the Shell or publishes rows.
-bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = true) {
+// Only an in-place change of the presented folder may reflow its grid cells.
+bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = true,
+                     bool reflow = false) {
     const UINT mode=requested.mode;
     const bool supported=IsGpuViewMode(mode,state.thisPcGpu), columns=mode==FVM_DETAILS;
     const bool grid=IsIconViewMode(mode,state.thisPcGpu);
@@ -24303,7 +24383,18 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     state.cachedNativeMode=mode;
     const bool changed=state.layoutNativeMode!=mode ||
         (grid && state.layoutIconSize!=state.nativeIconSize) || state.gridView!=grid;
-    if (changed) {
+    // Grid-to-grid icon size or mode changes zoom from the presented cells,
+    // exactly like Ctrl+wheel, while packing and hit testing switch at once.
+    const bool zoom=changed && reflow && animate && state.gridView && grid &&
+        state.detailsViewActive && state.visible && state.inScope && state.loaded &&
+        !state.optimisticStartedAt && !state.pendingNavigationPaint &&
+        g_smooth.load(std::memory_order_relaxed);
+    if (zoom) {
+        TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
+        state.layoutNativeMode=mode; state.layoutIconSize=state.nativeIconSize;
+        BeginAnimatedZoom(state,-1);
+        Redraw(state);
+    } else if (changed) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
         const float header=state.headerPx;
         StopHoverAnimation(state); StopRowTransition(state); StopKeyboardSelectionAnimation(state);
@@ -24401,7 +24492,7 @@ bool ApplyNativePresentation(ViewState& state) {
         }
     }
     const bool wasSupported=state.detailsViewActive;
-    const bool layoutChanged=ApplyViewLayout(state,{shellMode,state.nativeIconSize});
+    const bool layoutChanged=ApplyViewLayout(state,{shellMode,state.nativeIconSize},true,true);
     if (wasSupported != details) {
         StopHoverAnimation(state);
         StopRowTransition(state);
@@ -24422,8 +24513,9 @@ bool ApplyNativePresentation(ViewState& state) {
         // The old scroll offset belongs to a different geometry. Reveal
         // once at the mode boundary; the mode transition already owns its
         // geometry animation. Delayed selection imports animate separately.
-        // Later maintenance must not pull the viewport back here.
-        RevealNativeSelection(state, state.selected, false);
+        // Later maintenance must not pull the viewport back here. A grid
+        // reflow zoom reveals the selection through its own scroll target.
+        if (!state.zoomAnimating) RevealNativeSelection(state, state.selected, false);
         RefreshHoverUnderCursor(state);
         RepositionRenameEdit(state);
         Redraw(state);
@@ -24725,10 +24817,18 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
     RenameZoomUpdate renameZoom(state);
     if (contact) {
         // Direct touch follows each physical scale sample. Preserve the item
-        // and fractional row under the midpoint through grid/group reflow;
-        // a distant selection must not pull the viewport away from the hand.
+        // and fractional row under the midpoint through grid/group reflow,
+        // except that a selection visible when the pinch began stays in
+        // view; a distant selection must not pull the viewport from the hand.
+        const int oldColumns = state.itemsPerRow;
+        const bool zoomLayout = state.zoomLayoutTransition;
+        auto cells = CapturePresentedGridCells(state);
+        auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
+            CaptureVisibleGroupHeaders(state);
         AdvanceRowHeight(state, true);
-        StopRowTransition(state);
+        // A grid reflow already in flight keeps moving under later samples;
+        // only a column change (or a finished wheel zoom) retargets it.
+        if (cells.empty() || zoomLayout) StopRowTransition(state);
         const int index = RowFromPoint(state, contact->y, contact->x);
         const float documentY = contact->y - state.headerPx + state.scrollNow;
         const float fraction = index >= 0 ?
@@ -24747,6 +24847,9 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
             fraction * DisplayRowHeight(state, index) : fraction * state.rowPx;
         state.scrollNow = state.scrollTarget = anchored - (contact->y - state.headerPx);
         ClampScroll(state);
+        KeepSelectionRevealed(state, state.pinchRevealRow);
+        if (state.itemsPerRow != oldColumns || zoomLayout)
+            BeginGridReflow(state, std::move(cells), std::move(headers));
         state.measuredNameIndex = -1;
         state.widthCache.clear();
         if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
@@ -24757,35 +24860,26 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         return bounded96;
     }
     state.preciseRowHeight96[state.gridView] = 0.;
+    BeginAnimatedZoom(state, height96);
+    ScheduleZoomAutoRefit(state, true);
+    Redraw(state);
+    return bounded96;
+}
+
+// Ctrl+wheel, touchpad pinch and in-place grid icon-size/mode changes share
+// one zoom. The destination packs once for hit testing; metrics and cells
+// interpolate from the presented image on the zoom clock. A negative height
+// keeps the zoom preference: the caller already chose a new native layout.
+void BeginAnimatedZoom(ViewState& state, int height96) {
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     if (state.gridView) AdvanceRowHeight(state);
     if (!state.zoomAnimating)
         state.zoomAnchorRow = (state.scrollNow + ViewHeight(state) * .5f) /
             std::max(1.f, state.rowPx) * (state.gridView ? state.itemsPerRow : 1);
-    std::vector<CapturedRow> captures;
+    auto captures = CapturePresentedGridCells(state);
     auto headers = CaptureVisibleGroupHeaders(state);
     const float oldRow = state.rowPx, oldScroll = state.scrollNow;
-    if (state.gridView && g_smooth.load(std::memory_order_relaxed)) {
-        auto rows = VisibleItemRows(state, static_cast<float>(kRowTransitionOverscan));
-        if (state.rowTransitionActive && state.groupingLayoutTransition)
-            for (const auto& motion : state.rowMotion) rows.push_back(motion.newIndex);
-        std::sort(rows.begin(), rows.end());
-        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-        const float progress = LayoutTransitionProgress(state,
-            state.rowTransitionActive, state.rowTransitionStartedQpc);
-        const float pad = kRowTransitionOverscan * state.rowPx;
-        for (int index : rows) {
-            const auto visual = LayoutRowVisual(state, index, progress);
-            if (visual.top+visual.height < -pad || visual.top > ViewHeight(state)+pad) continue;
-            CapturedRow capture;
-            capture.oldIndex = capture.newIndex = index;
-            capture.oldTop = visual.top; capture.oldHeight = visual.height;
-            capture.oldLeft = visual.left; capture.oldWidth = visual.width;
-            capture.oldOpacity = visual.opacity;
-            captures.push_back(std::move(capture));
-        }
-    }
     StopHoverAnimation(state);
     StopRowTransition(state);
     StopKeyboardSelectionAnimation(state);
@@ -24796,9 +24890,11 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
     state.zoomFromFontPx = state.fontPx;
     state.zoomFromIconPx = state.iconPx;
     state.zoomFromScroll = oldScroll;
-    state.rowHeight96[state.gridView] = height96;
-    if (IsWindow(state.activeTabHost))
-        state.tabPresentations[state.activeTabHost].zoomHeight96[state.gridView] = height96;
+    if (height96 >= 0) {
+        state.rowHeight96[state.gridView] = height96;
+        if (IsWindow(state.activeTabHost))
+            state.tabPresentations[state.activeTabHost].zoomHeight96[state.gridView] = height96;
+    }
     if (state.gridView && !captures.empty()) {
         // Discover the final visible cells once. Geometry changes immediately
         // for hit testing; the shared sparse row motion carries both old and
@@ -24820,9 +24916,6 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         RegisterViewAnimation(state);
     else
         AdvanceRowHeight(state, true);
-    ScheduleZoomAutoRefit(state, true);
-    Redraw(state);
-    return bounded96;
 }
 
 // Keep the deliberate history gesture reachable on narrow/high-DPI tabs.
@@ -25053,6 +25146,9 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
             state.zoomAnimating = false;
             StopRowTransition(state);
         }
+        // Decided once per gesture: a cell outgrowing the viewport must not
+        // lose its protection partway through the same pinch.
+        state.pinchRevealRow = contact ? FullyVisibleSelection(state) : -1;
         state.touchpadPinching = true;
         state.swipeHorizontal = state.swipeVertical = false;
         if (state.touch.panningFeedback) {
@@ -27992,7 +28088,8 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     const auto oldRowOrigin=state.rowTransitionStartedQpc;
     const auto oldProgress=state.rowTransitionPresentedProgress;
     const bool sameRows=state.presentationSequence && state.presentationRowRevision==model.rowSceneRevision;
-    const bool oldRows=state.rowTransitionActive,oldGrouping=state.groupingLayoutTransition,oldZoomLayout=state.zoomLayoutTransition;
+    const bool oldRows=state.rowTransitionActive,oldGrouping=state.groupingLayoutTransition,oldZoomLayout=state.zoomLayoutTransition,
+        oldReflowLayout=state.reflowLayoutTransition;
     auto oldMotion=std::move(state.rowMotion); auto oldGhosts=std::move(state.disappearingRows);
     auto oldHeadings=std::move(state.groupHeaderMotion); auto oldDisappearing=std::move(state.disappearingHeaders);
     const bool sameColumns=state.presentationSequence && state.presentationColumnOrigin.QuadPart==model.columnIntentOrigin.QuadPart;
@@ -28027,6 +28124,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     if(sameRows && model.rowTransitionActive) {
         state.rowTransitionActive=oldRows; state.rowSceneRevision=oldRowRevision;
         state.groupingLayoutTransition=oldGrouping; state.zoomLayoutTransition=oldZoomLayout;
+        state.reflowLayoutTransition=oldReflowLayout;
         state.rowMotion=std::move(oldMotion); state.disappearingRows=std::move(oldGhosts);
         state.groupHeaderMotion=std::move(oldHeadings); state.disappearingHeaders=std::move(oldDisappearing);
         state.rowTransitionStartedQpc=oldRowOrigin; state.rowTransitionPresentedProgress=oldProgress;
@@ -30980,9 +31078,23 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->columnFitPendingEpoch = 0;
             StopHoverAnimation(*s);
             StopKeyboardSelectionAnimation(*s);
-            StopRowTransition(*s);
+            // Grid cells glide to their new columns; a reflow in flight keeps
+            // moving across resize steps that do not change the column count.
+            const int oldColumns = s->itemsPerRow;
+            const int revealed = s->gridView ? FullyVisibleSelection(*s) : -1;
+            auto cells = s->zoomAnimating ? std::vector<CapturedRow>{} : CapturePresentedGridCells(*s);
+            auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
+                CaptureVisibleGroupHeaders(*s);
+            if (cells.empty()) StopRowTransition(*s);
             UpdateMetrics(*s);
             UpdateColumns(*s);
+            if (s->itemsPerRow != oldColumns) {
+                // Repacking may carry the selected cell past the viewport.
+                ClampScroll(*s);
+                KeepSelectionRevealed(*s, revealed);
+                StopRowTransition(*s);
+                BeginGridReflow(*s, std::move(cells), std::move(headers));
+            }
             UpdateRefreshRate(*s);
             ResizeTouchpad(*s);
             s->measuredNameIndex = -1; s->widthCache.clear();

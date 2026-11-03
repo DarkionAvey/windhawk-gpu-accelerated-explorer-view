@@ -648,6 +648,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     for (const auto modeAndSize : {std::pair{FVM_SMALLICON,16}, std::pair{FVM_ICON,48},
         std::pair{FVM_ICON,96}, std::pair{FVM_ICON,256}}) {
         SetScrollImmediate(*state,MaxScrollPx(*state));
+        const bool fromGrid=state->gridView;
         state->lastNativeModeProbe=GetTickCount64(); // Fresh safety cache must not delay the event.
         {
             NativeViewInput input(state);
@@ -660,6 +661,11 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         while (PeekMessageW(&hint,overlay,kMsgShellVisibilityChanged,kMsgShellVisibilityChanged,PM_REMOVE))
             DispatchMessageW(&hint);
         FinishColumnTransition(*state);
+        // Grid-to-grid size/mode changes share the zoom transition and reveal
+        // the selection through its scroll target; mode changes snap.
+        const bool zoomed=fromGrid && g_smooth.load(std::memory_order_relaxed);
+        Check(state->zoomAnimating==zoomed,"grid view switch did not share the animated zoom");
+        if (zoomed) AdvanceRowHeight(*state,true);
         Check(state->gridView && state->detailsViewActive && !state->columnsView &&
             state->nativeIconSize == modeAndSize.second && IsWindowVisible(overlay) &&
             !(GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE),

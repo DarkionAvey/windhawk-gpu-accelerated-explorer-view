@@ -599,6 +599,72 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             }
         }
         state.grouping.enabled = false; RebuildGroupSections(state);
+        // Direct pinch and window resize repack columns under continuous
+        // input. A selection fully visible when the gesture began stays in
+        // view although the hand anchor would carry it away; a selection
+        // already scrolled away never pulls the viewport.
+        {
+            const auto userData=SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(&state));
+            const auto inside=[&](int index) {
+                const float top=DocumentRowTop(state,index)-state.scrollNow;
+                return top>=-.5f && top+DisplayRowHeight(state,index)<=ViewHeight(state)+.5f;
+            };
+            const auto reset=[&] {
+                AdvanceRowHeight(state,true); StopRowTransition(state);
+                state.rowHeight96[state.gridView]=34; state.preciseRowHeight96[state.gridView]=0.;
+                UpdateMetrics(state);
+            };
+            reset();
+            state.selectedFlags[state.selected]=1;
+            SetScrollImmediate(state,DocumentRowTop(state,state.selected)-2.f);
+            Check(inside(state.selected),"pinch fixture selection is not visible");
+            // Fingers at the bottom edge: zooming in grows content upward
+            // around them, past the selection near the top edge.
+            const POINT contact{320,static_cast<LONG>(state.headerPx+ViewHeight(state)-10)};
+            const int columns=state.itemsPerRow;
+            bool reflowed=false, live=true;
+            state.touchpadPinching=false;
+            for (int step=0; step<12; ++step) {
+                Regression::Scope scope("pinch step="+std::to_string(step)+" rtl="+std::to_string(rtl));
+                ApplyManipulationPinch(state,.08f,&contact);
+                if (state.rowTransitionActive) {
+                    reflowed |= state.reflowLayoutTransition;
+                    live &= LiveLayoutTransition(state);
+                }
+                Check(inside(state.selected),"direct pinch carried a visible selection off screen");
+            }
+            Check(state.itemsPerRow<columns && reflowed && live,
+                "direct pinch repacked columns without a live reflow");
+            state.touchpadPinching=false;
+            reset();
+            SetScrollImmediate(state,0.f);
+            Check(!inside(state.selected),"pinch fixture selection is not scrolled away");
+            for (int step=0; step<6; ++step) ApplyManipulationPinch(state,.08f,&contact);
+            Check(state.pinchRevealRow<0 && !inside(state.selected),
+                "a scrolled-away selection pulled the pinch viewport");
+            state.touchpadPinching=false;
+            reset();
+            // Narrowing moves the cells at the bottom edge further down.
+            RECT client{}; GetClientRect(state.hwnd,&client);
+            SetScrollImmediate(state,DocumentRowTop(state,state.selected)+
+                DisplayRowHeight(state,state.selected)-ViewHeight(state)+2.f);
+            Check(inside(state.selected),"resize fixture selection is not visible");
+            const int wide=state.itemsPerRow;
+            const auto resize=[&](int width) {
+                SetWindowPos(state.hwnd,nullptr,0,0,width,client.bottom,
+                    SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+                OverlayProc(state.hwnd,WM_SIZE,SIZE_RESTORED,MAKELPARAM(width,client.bottom));
+            };
+            resize(client.right/2);
+            Check(state.itemsPerRow<wide && state.rowTransitionActive && state.reflowLayoutTransition &&
+                inside(state.selected),"window resize lost the visible selection or skipped its reflow");
+            resize(client.right);
+            Check(state.itemsPerRow==wide && inside(state.selected),
+                "restoring the window width lost the visible selection");
+            reset();
+            SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,userData);
+        }
         // A caret without selection must not override the center anchor.
         state.selectedFlags[state.selected] = 0;
         SetScrollImmediate(state,500.f);

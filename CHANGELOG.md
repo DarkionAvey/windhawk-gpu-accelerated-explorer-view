@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.345
+
+- Icons in grid views glide to their new places when the number of columns
+  changes, instead of rearranging instantly: while resizing the window, while
+  pinching to zoom on a touchscreen, and when switching icon size (for example
+  Medium to Large icons).
+- A selected item that is visible when a pinch or window resize starts stays
+  in view, even when zooming in far.
+- Touchscreen pinch zoom no longer stretches, clips or flickers icons while
+  they move between columns.
+
 ## 0.9.344
 
 - Selection checkbox checkmarks use the same accent foreground as the swipe
