@@ -166,8 +166,6 @@ static void TestStyleEvents(const std::wstring& fixture) {
     }
     Check(std::filesystem::weakly_canonical(root).parent_path()==std::filesystem::weakly_canonical(fixture),
         "style fixture cleanup escaped its private parent");
-    Check(Eventually([&] {
-        std::error_code error; std::filesystem::remove_all(root,error); return !error;
-    }),"style fixture cleanup did not settle");
+    Check(ReleasePrivateFixture(root),"style fixture cleanup did not settle");
     std::cout<<"PASS: zero color/visibility polling across six directory jobs/48 maintenance passes; coalesced style and sent settings events, inactive-tab replay, This PC visibility and stale-message guards\n";
 }

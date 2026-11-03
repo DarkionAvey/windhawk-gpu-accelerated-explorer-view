@@ -151,8 +151,6 @@ static void TestInitialSorting(const std::wstring& fixture) {
     }
     Check(std::filesystem::weakly_canonical(root).parent_path()==std::filesystem::weakly_canonical(fixture),
         "initial sort cleanup escaped its private fixture");
-    Check(Eventually([&] {
-        std::error_code error; std::filesystem::remove_all(root,error); return !error;
-    }),"initial sort fixture cleanup did not settle");
+    Check(ReleasePrivateFixture(root),"initial sort fixture cleanup did not settle");
     std::cout<<"PASS: saved/native sorting, cached returns, view switches, instant/grouped header writes, pending replacements, internal animation switch, animated native commands and opt-out\n";
 }

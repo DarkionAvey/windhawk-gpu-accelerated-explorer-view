@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.346
+// @version         0.9.347
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -2806,6 +2806,22 @@ struct IconKeyContext {
 };
 // The owner's last captured viewport row. Unchanged rows are shared by the
 // next model instead of being copied again on Explorer's thread.
+// Selected items hidden inside a collapsed group, keyed by section key. The
+// presentation lane counts a section once when it collapses (and again only
+// if the selection storage changes meanwhile); the owner adopts the same
+// immutable map from receipts for hover/hit geometry. Never counted per frame.
+struct SectionBadge {
+    SelectionFlags selection; // Storage identity the count belongs to.
+    int first = 0, end = 0;
+    size_t count = 0;
+    int firstSelected = -1; // Badge click reveals this row.
+    std::wstring text; // Locale-formatted last nonzero count; kept while sliding out.
+    bool collapsed = false; // Section state at the last assessment.
+    // Every appearance/disappearance animates on the shared UI curve.
+    float from = 0.f, to = 0.f;
+    LARGE_INTEGER started{};
+};
+using SectionBadges = std::map<std::wstring, SectionBadge>;
 struct PresentationRowCache {
     std::shared_ptr<const Entry> entry;
     IconKeyContext icons;
@@ -2993,6 +3009,10 @@ struct ViewState {
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     bool horizontalScrollbarAdmitted = false; // Optional chrome waits for settled column geometry.
     bool horizontalScrollbarPublished = false; // A presented frame has shown the admitted bar.
+    // First model sequence of the current admission run. A receipt reaching
+    // it proves the lane drew the bar; capture alone does not (newer models
+    // can supersede a captured one before it is drawn).
+    unsigned long long horizontalScrollbarAdmittedSequence = 0;
     bool columnVerticalBarVisible = false; // Last layout's scrollbar clearance.
     bool columnTransitionActive = false;
     bool columnTransitionSpring = false;
@@ -3142,6 +3162,11 @@ struct ViewState {
         LARGE_INTEGER started{};
     };
     std::vector<GroupSection> sections;
+    std::shared_ptr<const SectionBadges> sectionBadges;
+    bool sectionBadgeAnimating = false; // Lane paint only: a painted badge is still moving.
+    int groupRevealRow = -1; // Owner: reveal after the expanding group settles.
+    std::wstring groupRevealPath;
+    unsigned long long groupRevealEpoch = 0;
     using GroupIntents=std::map<std::wstring,GroupSection>;
     std::shared_ptr<const GroupIntents> presentationGroupIntents;
     std::vector<int> rowGroup; // O(1) row-to-section lookup
@@ -3873,7 +3898,8 @@ struct SwipeFeedbackSnapshot {
     X(detailsViewActive) X(columnsView) X(gridView) X(nativeIconSize) X(layoutNativeMode) X(layoutIconSize) \
     X(itemsPerRow) X(itemWidth) X(columns) X(columnEpoch) X(propertyEpoch) X(columnContentWidth) \
     X(imageMemoryAllowance) X(imageCacheFloor) \
-    X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(columnTransitionActive) X(columnTransitionSpring) \
+    X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
+    X(columnTransitionActive) X(columnTransitionSpring) \
     X(columnModeTransition) X(columnPresentationPending) X(columnHeaderFrom) X(columnHeaderTo) \
     X(columnTransitionStartedQpc) X(columnMotion) X(disappearingColumns) X(columnDragArmed) X(columnDragActive) \
     X(columnDragKey) X(columnDragSource) X(columnDragDestination) X(columnDragPointerX) X(columnDragGrabOffset) \
@@ -3947,6 +3973,7 @@ struct PresentationReceipt {
     int itemsPerRow=1;
     UINT imageTextureLimit=kPlatformImageDimension;
     unsigned long long clipboardSequence=0,observerAcknowledged=0,styleRevision=0;
+    std::shared_ptr<const SectionBadges> sectionBadges;
     SelectionFlags checkboxSelection;
     size_t checkboxSelectedCount=0;
     int checkboxTotal=-1,checkboxState=-1;
@@ -3973,8 +4000,7 @@ struct PresentationLane {
     HANDLE wake=nullptr;
     HWND hwnd=nullptr;
     unsigned long long lifetime=0;
-    std::atomic<bool> stopping{false},animating{false},release{false};
-    std::atomic<const void*> directory{nullptr};
+    std::atomic<bool> stopping{false},animating{false},release{false};    std::atomic<const void*> directory{nullptr};
     std::atomic<bool> diagnostics{false};
     bool receiptPosted=false;
 };
@@ -4578,6 +4604,8 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
                          bool includeClipboard = true) {
     return LayoutAnimationActive(state) || state.zebraExtentAnimating || state.selectionFadeActive ||
         (state.columnPresentationPending && state.visible && state.inScope && state.detailsViewActive &&
+            PresentationVisible(state) && !PresentationMinimized(state)) ||
+        (state.sectionBadgeAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.itemOpacityAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
@@ -16969,7 +16997,10 @@ bool UpdateHorizontalScrollbarVisibility(ViewState& state) {
     // first published frame is always a settled one.
     else if (!state.horizontalScrollbarPublished)
         state.horizontalScrollbarAdmitted = false;
-    if (!state.horizontalScrollbarAdmitted) state.horizontalScrollbarPublished = false;
+    if (!state.horizontalScrollbarAdmitted) {
+        state.horizontalScrollbarPublished = false;
+        state.horizontalScrollbarAdmittedSequence = 0;
+    }
     return previous != state.horizontalScrollbarAdmitted;
 }
 
@@ -17504,10 +17535,54 @@ D2D1_RECT_F GroupHeadingTextRect(ViewState& state, float top, float height, floa
         top, listEnd - Scale96(8, dpi), top + height);
 }
 
+const SectionBadge* GroupSectionBadge(const ViewState& state, const ViewState::GroupSection& section);
+float SectionBadgeReveal(const ViewState& state, const SectionBadge& badge, LARGE_INTEGER sampled);
+// Logical (LTR) geometry; painting mirrors it for RTL like the checkboxes.
+struct GroupBadgeLayout {
+    const SectionBadge* badge = nullptr;
+    D2D1_RECT_F pill{};
+    float glyph = 0.f, glyphLeft = 0.f, textLeft = 0.f, textWidth = 0.f;
+    float shift = 0.f;  // Title offset after the badge.
+    float reveal = 0.f; // 0 expanded .. 1 collapsed.
+};
+// The badge precedes the title so a long section name cannot push it out of
+// view. It is sized from the body font (zoom-aware). Its slide/fade is its
+// own motion on the shared UI curve; a collapse/expand shares the header's
+// clock, so both move together.
+GroupBadgeLayout LayoutGroupBadge(ViewState& state, const ViewState::GroupSection* section,
+                                  const D2D1_RECT_F& text, LARGE_INTEGER sampled = {}) {
+    GroupBadgeLayout layout;
+    if (!section) return layout;
+    const auto* badge = GroupSectionBadge(state,*section);
+    const float reveal = badge ? std::clamp(SectionBadgeReveal(state,*badge,sampled),0.f,1.f) : 0.f;
+    const float band = text.bottom-text.top;
+    const float height = std::min(band*.8f, std::max(1.f,state.fontPx)*1.45f);
+    if (!badge || reveal <= 0.f || height <= 1.f) return layout;
+    float measured = 0.f;
+    if (auto* number = ResolveTextLayout(state,badge->text,std::max(1.f,text.right-text.left),band)) {
+        DWRITE_TEXT_METRICS metrics{};
+        if (SUCCEEDED(number->GetMetrics(&metrics))) measured = std::ceil(metrics.widthIncludingTrailingWhitespace);
+    }
+    const float padding = height*.36f, glyph = height*.62f, gap = height*.14f, after = height*.4f;
+    const float width = padding*2.f + glyph + gap + measured;
+    // Never squeeze the title out or draw beyond the heading.
+    if (measured <= 0.f || width+after > text.right-text.left) return layout;
+    const float left = text.left - height*(1.f-reveal), center = (text.top+text.bottom)*.5f;
+    layout.badge = badge; layout.reveal = reveal;
+    layout.pill = D2D1::RectF(left,center-height*.5f,left+width,center+height*.5f);
+    layout.glyph = glyph; layout.glyphLeft = left+padding;
+    layout.textLeft = layout.glyphLeft+glyph+gap; layout.textWidth = measured;
+    layout.shift = (width+after)*reveal;
+    return layout;
+}
+
 D2D1_RECT_F GroupHoverRect(ViewState& state, int section, const RowVisual& visual) {
     auto rc = RowHighlightRect(state, visual.top, visual.height);
     if (ViewOptionEnabled(state,g_filenameOnly)) {
-        const auto text = GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state));
+        auto text = GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state));
+        // The highlight starts at the badge and covers the title shifted after it.
+        const float start = text.left;
+        text.left += LayoutGroupBadge(state,&state.sections[size_t(section)],text).shift;
         const float available = std::max(0.f, text.right-text.left);
         float width = 0.f;
         if (auto* layout = ResolveTextLayout(state,state.sections[size_t(section)].title,
@@ -17516,7 +17591,7 @@ D2D1_RECT_F GroupHoverRect(ViewState& state, int section, const RowVisual& visua
             if (SUCCEEDED(layout->GetMetrics(&metrics))) width = std::clamp(metrics.width,0.f,available);
         }
         const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
-        rc.left = std::max(ListStartX(state),text.left-pad);
+        rc.left = std::max(ListStartX(state),start-pad);
         rc.right = std::min(ListEndX(state),text.left+width+pad);
     }
     return rc;
@@ -17725,13 +17800,78 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     return result;
 }
 
+// One filled check path in a 20-unit box, shared by item checkboxes and the
+// collapsed-section badge. Created once per tab D2D factory.
+bool EnsureSelectionCheckGlyph(ViewState& state) {
+    if (!state.selectionCheckGlyph && state.d2dFactory) {
+        ComPtr<ID2D1PathGeometry> path,filled; ComPtr<ID2D1GeometrySink> sink;
+        ComPtr<ID2D1StrokeStyle> stroke;
+        if (SUCCEEDED(state.d2dFactory->CreatePathGeometry(&path)) && SUCCEEDED(path->Open(&sink))) {
+            sink->BeginFigure(D2D1::Point2F(4.5f,10.5f),D2D1_FIGURE_BEGIN_HOLLOW);
+            const D2D1_POINT_2F points[]={{8.5f,14.5f},{15.5f,5.5f}};
+            sink->AddLines(points,ARRAYSIZE(points)); sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            if (SUCCEEDED(sink->Close()) && SUCCEEDED(state.d2dFactory->CreateStrokeStyle(
+                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,
+                    D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,&stroke)) &&
+                SUCCEEDED(state.d2dFactory->CreatePathGeometry(&filled))) {
+                sink.Reset();
+                if (SUCCEEDED(filled->Open(&sink)) && SUCCEEDED(path->Widen(3.2f,stroke.Get(),nullptr,sink.Get())) &&
+                    SUCCEEDED(sink->Close())) state.selectionCheckGlyph = std::move(filled);
+            }
+        }
+    }
+    return state.selectionCheckGlyph != nullptr;
+}
+
+// A checked selection checkbox stretched into a pill: the same accent fill,
+// text-colored outline and contrast-checked check color, plus the count.
+void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opacity) {
+    const float alpha = opacity*badge.reveal;
+    if (!badge.badge || !VisibleOpacity(alpha)) return;
+    const auto mirror = [&](D2D1_RECT_F rect) {
+        if (state.rtlLayout) {
+            const float left = state.paintWidth-rect.right;
+            rect.right = state.paintWidth-rect.left; rect.left = left;
+        }
+        return rect;
+    };
+    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const auto pill = mirror(badge.pill);
+    const float radius = (pill.bottom-pill.top)*.5f;
+    state.brush->SetColor(Packed(ThemeRgb(COLORREF(palette&0xFFFFFF)),alpha));
+    state.target->FillRoundedRectangle(D2D1::RoundedRect(pill,radius,radius),state.brush.Get());
+    // DrawSelectionCheckbox's outline rule, scaled from the same 20-unit box.
+    const float border = std::max(1.f,roundf((pill.bottom-pill.top)/20.f));
+    const unsigned outline = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
+    state.brush->SetColor(Packed(outline,alpha*.8f));
+    state.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left+border*.5f,pill.top+border*.5f,
+        pill.right-border*.5f,pill.bottom-border*.5f),radius-border*.5f,radius-border*.5f),state.brush.Get(),border);
+    const unsigned foreground = ThemeRgb(COLORREF((palette>>24)&0xFFFFFF));
+    const float foregroundAlpha = alpha*float((palette>>48)&255)/255.f;
+    const float center = (badge.pill.top+badge.pill.bottom)*.5f;
+    if (EnsureSelectionCheckGlyph(state)) {
+        const auto glyph = mirror(D2D1::RectF(badge.glyphLeft,center-badge.glyph*.5f,
+            badge.glyphLeft+badge.glyph,center+badge.glyph*.5f));
+        const float unit = badge.glyph/20.f;
+        D2D1_MATRIX_3X2_F previous{}; state.target->GetTransform(&previous);
+        state.brush->SetColor(Packed(foreground,foregroundAlpha));
+        state.target->SetTransform(D2D1::Matrix3x2F::Scale(unit,unit)*
+            D2D1::Matrix3x2F::Translation(glyph.left,glyph.top)*previous);
+        state.target->FillGeometry(state.selectionCheckGlyph.Get(),state.brush.Get());
+        state.target->SetTransform(previous);
+    }
+    // Text mirrors its own logical rectangle for RTL.
+    Text(state, badge.badge->text, badge.textLeft, badge.pill.top,
+        badge.textLeft+badge.textWidth+1.f, badge.pill.bottom, foreground, false, foregroundAlpha);
+}
+
 // Group headings use the SAME body text format as file rows, so pinch and
 // Ctrl+wheel zoom affect their glyph size as well as their row geometry.
 // The themed group-heading color and standard Fill/Text path are unchanged.
 void PaintGroupHeading(ViewState& state, const std::wstring& title,
                        bool collapsed, float top, float height,
                        float opacity, float listEnd, float windowWidth,
-                       unsigned headerColor) {
+                       unsigned headerColor, const ViewState::GroupSection* section = nullptr) {
     if (height <= .01f || opacity <= .01f) return;
     const int dpi = ViewDpi(state);
     const float leading = static_cast<float>(Scale96(14, dpi));
@@ -17757,7 +17897,16 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         StrokeLine(state,D2D1::Point2F(centerX, centerY+unit*.5f),
             D2D1::Point2F(centerX+unit, centerY-unit*.5f), state.brush.Get(), thickness);
     }
-    const auto text = GroupHeadingTextRect(state,top,height,listEnd);
+    auto text = GroupHeadingTextRect(state,top,height,listEnd);
+    // The paint's single clock sample, shared with item opacity motion.
+    const auto badge = LayoutGroupBadge(state,section,text,state.itemOpacityNow);
+    // Keep frames while the motion runs, including its first invisible frame.
+    if (const auto* moving = section ? GroupSectionBadge(state,*section) : nullptr;
+        moving && moving->started.QuadPart &&
+        UiTransitionProgress(state,moving->started,kUiTransitionDurationMs,state.itemOpacityNow) < 1.f)
+        state.sectionBadgeAnimating = true;
+    PaintGroupBadge(state,badge,opacity);
+    text.left += badge.shift;
     Text(state, title, text.left, text.top, text.right, text.bottom,
         headerColor, false, .9f * opacity);
 }
@@ -17786,6 +17935,109 @@ void AssessHeaderCheckboxSelection(ViewState& state) {
     if (state.total<=0) state.checkboxSelectedCount=0;
     state.checkboxSummaryTotal=state.total;
     state.checkboxSummaryState=state.total<=0 ? -1 : state.checkboxSelectedCount==size_t(state.total) ? 1 : 0;
+}
+
+// The user's digit grouping and separators, without decimals.
+std::wstring FormatSelectionCount(size_t count) {
+    const auto digits = std::to_wstring(count);
+    wchar_t grouping[16]{}, thousand[8]{}, decimal[8]{};
+    DWORD negative = 1;
+    if (!GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SGROUPING, grouping, ARRAYSIZE(grouping)) ||
+        !GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_STHOUSAND, thousand, ARRAYSIZE(thousand)) ||
+        !GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SDECIMAL, decimal, ARRAYSIZE(decimal))) return digits;
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_INEGNUMBER | LOCALE_RETURN_NUMBER,
+        reinterpret_cast<LPWSTR>(&negative), sizeof(negative) / sizeof(wchar_t));
+    // NUMBERFMT encodes "3;0" as 3, "3;2;0" as 32 and an unterminated "3" as 30.
+    UINT group = 0;
+    const std::wstring_view pattern(grouping);
+    for (wchar_t ch : pattern) if (ch >= L'0' && ch <= L'9') group = group * 10 + UINT(ch - L'0');
+    if (pattern.ends_with(L";0")) group /= 10; else group *= 10;
+    NUMBERFMTW format{0, 0, group, decimal, thousand, negative};
+    wchar_t text[64]{};
+    return GetNumberFormatEx(LOCALE_NAME_USER_DEFAULT, 0, digits.c_str(), &format, text, ARRAYSIZE(text)) ?
+        std::wstring(text) : digits;
+}
+
+// The badge's displayed reveal: 0 hidden .. 1 shown, on the shared UI curve.
+float SectionBadgeReveal(const ViewState& state, const SectionBadge& badge, LARGE_INTEGER sampled = {}) {
+    if (!badge.started.QuadPart) return badge.to;
+    const float progress = UiTransitionProgress(state, badge.started, kUiTransitionDurationMs, sampled);
+    return progress >= 1.f ? badge.to : badge.from + (badge.to-badge.from)*EaseOutCubic(progress);
+}
+
+// Runs on the presentation lane after adopting a model, like the header
+// checkbox summary above. A section is counted when it collapses; it is
+// counted again only if the shared selection storage changed while it stayed
+// collapsed (Ctrl+A, select none). Every show/hide is a motion: a collapse or
+// expand shares the header's clock, any other change starts now.
+void AssessCollapsedSectionSelection(ViewState& state) {
+    const auto previous = state.sectionBadges;
+    std::shared_ptr<SectionBadges> updated;
+    const auto edit = [&]() -> SectionBadges& {
+        if (!updated) updated = previous ? std::make_shared<SectionBadges>(*previous) : std::make_shared<SectionBadges>();
+        return *updated;
+    };
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    for (const auto& section : state.sections) {
+        const auto* current = previous ? [&]() -> const SectionBadge* {
+            const auto found = previous->find(section.key);
+            return found == previous->end() ? nullptr : &found->second;
+        }() : nullptr;
+        if (!current && !section.collapsed) continue;
+        SectionBadge next = current ? *current : SectionBadge{};
+        bool changed = !current;
+        if (section.collapsed && (!current || current->first != section.first || current->end != section.end ||
+                !current->selection.SharesStorage(state.selectedFlags))) {
+            next.selection = state.selectedFlags;
+            next.first = section.first; next.end = section.end;
+            next.count = 0; next.firstSelected = -1;
+            const size_t end = std::min(size_t(std::max(0, section.end)), state.selectedFlags.size());
+            for (size_t row = size_t(std::max(0, section.first)); row < end; ++row)
+                if (state.selectedFlags[row]) {
+                    if (!next.count++) next.firstSelected = int(row);
+                }
+            // Keep the last nonzero text so a badge leaving at zero still reads.
+            if (next.count && (!current || current->count != next.count || next.text.empty()))
+                next.text = FormatSelectionCount(next.count);
+            changed = true;
+        }
+        const float target = section.collapsed && next.count ? 1.f : 0.f;
+        // Without an entry, the section was last seen expanded.
+        const bool toggled = (current ? current->collapsed : false) != section.collapsed;
+        if (target != next.to) {
+            next.from = current ? SectionBadgeReveal(state, *current, now) : 0.f;
+            next.to = target;
+            next.started = toggled && section.started.QuadPart ? section.started : now;
+            changed = true;
+        }
+        if (next.collapsed != section.collapsed) { next.collapsed = section.collapsed; changed = true; }
+        // An expanded section whose badge has fully left no longer needs it.
+        if (!section.collapsed && !next.to && SectionBadgeReveal(state, next, now) <= 0.f) {
+            if (current) edit().erase(section.key);
+            continue;
+        }
+        if (changed) edit()[section.key] = std::move(next);
+    }
+    // Keys from other folders are inert (validity is rechecked on collapse);
+    // bound them by keeping only the sections this model carries.
+    if (const std::shared_ptr<const SectionBadges> badges = updated ? updated : previous;
+        badges && badges->size() > 512) {
+        auto kept = std::make_shared<SectionBadges>();
+        for (const auto& section : state.sections)
+            if (const auto found = badges->find(section.key); found != badges->end()) kept->insert(*found);
+        updated = std::move(kept);
+    }
+    if (updated) state.sectionBadges = std::move(updated);
+}
+
+// A badge that is shown or still moving. Owner and lane resolve the same
+// immutable map; validity was checked by the lane's assessment.
+const SectionBadge* GroupSectionBadge(const ViewState& state, const ViewState::GroupSection& section) {
+    if (!state.sectionBadges) return nullptr;
+    const auto found = state.sectionBadges->find(section.key);
+    if (found == state.sectionBadges->end()) return nullptr;
+    const auto& badge = found->second;
+    return !badge.text.empty() && (badge.to > 0.f || badge.started.QuadPart) ? &badge : nullptr;
 }
 
 float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = false) {
@@ -17856,24 +18108,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     // at the minimum alpha that keeps 4.5:1 on the accent fill.
     state.brush->SetColor(Packed(ThemeRgb(COLORREF((palette>>24)&0xFFFFFF)),
         opacity*float((palette>>48)&255)/255.f));
-    if (!state.selectionCheckGlyph && state.d2dFactory) {
-        ComPtr<ID2D1PathGeometry> path,filled; ComPtr<ID2D1GeometrySink> sink;
-        ComPtr<ID2D1StrokeStyle> stroke;
-        if (SUCCEEDED(state.d2dFactory->CreatePathGeometry(&path)) && SUCCEEDED(path->Open(&sink))) {
-            sink->BeginFigure(D2D1::Point2F(4.5f,10.5f),D2D1_FIGURE_BEGIN_HOLLOW);
-            const D2D1_POINT_2F points[]={{8.5f,14.5f},{15.5f,5.5f}};
-            sink->AddLines(points,ARRAYSIZE(points)); sink->EndFigure(D2D1_FIGURE_END_OPEN);
-            if (SUCCEEDED(sink->Close()) && SUCCEEDED(state.d2dFactory->CreateStrokeStyle(
-                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,
-                    D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,&stroke)) &&
-                SUCCEEDED(state.d2dFactory->CreatePathGeometry(&filled))) {
-                sink.Reset();
-                if (SUCCEEDED(filled->Open(&sink)) && SUCCEEDED(path->Widen(3.2f,stroke.Get(),nullptr,sink.Get())) &&
-                    SUCCEEDED(sink->Close())) state.selectionCheckGlyph = std::move(filled);
-            }
-        }
-    }
-    if (state.selectionCheckGlyph) {
+    if (EnsureSelectionCheckGlyph(state)) {
         D2D1_MATRIX_3X2_F previous{}; state.target->GetTransform(&previous);
         state.target->SetTransform(D2D1::Matrix3x2F::Scale(unit,unit)*
             D2D1::Matrix3x2F::Translation(rect.left,rect.top)*previous);
@@ -19489,6 +19724,7 @@ void Paint(ViewState& state) {
     ++state.itemOpacityPaint;
     QueryPerformanceCounter(&state.itemOpacityNow);
     state.itemOpacityAnimating = false;
+    state.sectionBadgeAnimating = false;
     state.clipboardIconsVisible = false;
     state.clipboardIconSize96 = 0.f;
     state.clipboardIconElapsedMs = 0.;
@@ -20161,6 +20397,7 @@ void Paint(ViewState& state) {
     state.target->PopAxisAlignedClip(); // selection/hover backgrounds
     struct HeadingPaint {
         const std::wstring* title; bool collapsed; RowVisual visual; int key=0;
+        const ViewState::GroupSection* section=nullptr; // Outgoing headings carry no badge.
     };
     std::vector<HeadingPaint> headings;
     // Outgoing headings stay behind current headings. Reserve every displayed
@@ -20181,7 +20418,7 @@ void Paint(ViewState& state) {
             if (section.documentTop>to) break;
             const auto visual=LayoutGroupHeader(state,i,headerProgress);
             if (visual.top+visual.height>header && visual.top<contentBottom)
-                headings.push_back({&section.title,section.collapsed,visual,int(i)});
+                headings.push_back({&section.title,section.collapsed,visual,int(i),&section});
         }
     }
     if(compositionFrame.Rows()) {
@@ -20189,7 +20426,7 @@ void Paint(ViewState& state) {
         for(const auto& item:state.modeComposition.headings) {
             if(item.key>=0) {
                 const auto& section=state.sections[size_t(item.key)];
-                headings.push_back({&section.title,section.collapsed,item.source,item.key});
+                headings.push_back({&section.title,section.collapsed,item.source,item.key,&section});
             } else {
                 const auto& old=state.disappearingHeaders[size_t(-item.key-1)];
                 headings.push_back({&old.title,old.collapsed,item.source,item.key});
@@ -20222,7 +20459,7 @@ void Paint(ViewState& state) {
     for (const auto& heading:headings) {
         RowSourceScope source(state,heading.key,2,true);
         PaintGroupHeading(state,*heading.title,heading.collapsed,heading.visual.top,
-            heading.visual.height,heading.visual.opacity,listEnd,w,headerColor);
+            heading.visual.height,heading.visual.opacity,listEnd,w,headerColor,heading.section);
     }
     state.target->PopAxisAlignedClip(); // group feedback below all group text
     ClearBodyBand(state,frameTarget,0.f,columnHeader);
@@ -26629,13 +26866,58 @@ int GroupHeaderAtPoint(ViewState& state, int x, int y) {
         CurrentRowProgress(state));
     return y >= visual.top && y < visual.top + visual.height && visual.opacity > .01f ? group : -1;
 }
-void PressGroupHeader(ViewState& state, int group) {
+// The displayed badge of a heading, hit-tested in logical (mirrored) space
+// with the same geometry it is painted with.
+const SectionBadge* GroupBadgeAtPoint(ViewState& state, int group, POINT point) {
+    if (group < 0 || size_t(group) >= state.sections.size()) return nullptr;
+    const auto& section = state.sections[size_t(group)];
+    const auto visual = LayoutGroupHeader(state, size_t(group), CurrentRowProgress(state));
+    const auto badge = LayoutGroupBadge(state, &section,
+        GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state)));
+    const float x = static_cast<float>(LogicalX(state, point.x)), y = static_cast<float>(point.y);
+    return badge.badge && badge.reveal > .01f && x >= badge.pill.left && x < badge.pill.right &&
+        y >= badge.pill.top && y < badge.pill.bottom ? badge.badge : nullptr;
+}
+
+// Scroll a badge's first hidden selected item into view once its group has
+// finished expanding: scrolling clamps to the current document height, which
+// is still growing until the expand settles. Completion, not a timer, runs it.
+void CompleteGroupReveal(ViewState& state) {
+    if (state.groupRevealRow < 0 || state.groupAnimating) return;
+    const int row = std::exchange(state.groupRevealRow, -1);
+    const auto path = std::move(state.groupRevealPath); state.groupRevealPath.clear();
+    if (state.groupRevealEpoch != state.mouseFolderEpoch || row >= state.total ||
+        size_t(row) >= state.entries.size() || state.entries[size_t(row)].path != path) return;
+    EnsureVisible(state, row);
+}
+
+// Without a pointer position (non-pointer callers) this is a plain toggle.
+void PressGroupHeader(ViewState& state, int group, std::optional<POINT> point = std::nullopt) {
     state.zebraExtentAnimating = false;
     ResetMouseClickSequence(state);
     state.mousePressActive = false;
     StopHoverAnimation(state);
     StopKeyboardSelectionAnimation(state);
-    ToggleGroupSection(state, group);
+    const auto* badge = point ? GroupBadgeAtPoint(state, group, *point) : nullptr;
+    int reveal = -1;
+    if (badge) {
+        // The lane's first selected row, revalidated against current selection.
+        const auto& section = state.sections[size_t(group)];
+        const auto selected = [&](int row) {
+            return row >= section.first && row < section.end && size_t(row) < state.selectedFlags.size() &&
+                state.selectedFlags[size_t(row)];
+        };
+        if (selected(badge->firstSelected)) reveal = badge->firstSelected;
+        else for (int row = section.first; row < section.end && reveal < 0; ++row) if (selected(row)) reveal = row;
+    }
+    // A badge click always expands; a plain header click toggles.
+    if (!badge || state.sections[size_t(group)].collapsed) ToggleGroupSection(state, group);
+    if (reveal >= 0 && size_t(reveal) < state.entries.size()) {
+        state.groupRevealRow = reveal;
+        state.groupRevealPath = state.entries[size_t(reveal)].path;
+        state.groupRevealEpoch = state.mouseFolderEpoch;
+        CompleteGroupReveal(state);
+    }
 }
 
 // Multiple Explorer UI threads can create tab-owned overlays concurrently.
@@ -27894,6 +28176,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
         // Recalculate the trailing column edge only if the
         // scrollbar's presence actually changes (no text fitting).
         ReconcileColumnViewportAfterRowCount(state);
+        CompleteGroupReveal(state);
     }
     const bool selectionMoving = state.keyboardSelectionAnimating;
     const bool selectionFading = state.selectionFadeActive;
@@ -27965,13 +28248,17 @@ void PulsePresentation(const std::shared_ptr<PresentationLane>& lane,bool active
 
 std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& state) {
     PipelineScope pipeline(state.background,L"presentation.capture");
-    PublishHorizontalScrollbar(state);
+    // Admission only; the bar becomes published when a receipt shows the lane
+    // drew it (ConsumePresentation). A superseded capture never counts.
+    UpdateHorizontalScrollbarVisibility(state);
     auto model=std::make_shared<PresentationModel>();
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
 #undef CAPTURE_PRESENTATION
     static_cast<SwipeFeedbackSnapshot&>(*model)=CaptureSwipeFeedback(state);
     model->sequence=++state.presentationSequence; model->lifetime=state.lifetimeToken;
+    if(state.horizontalScrollbarAdmitted && !state.horizontalScrollbarAdmittedSequence)
+        state.horizontalScrollbarAdmittedSequence=model->sequence;
     if(state.columnTransitionStartedQpc.QuadPart!=state.presentationColumnActualOrigin.QuadPart)
         state.presentationColumnOrigin=state.columnTransitionStartedQpc;
     model->columnIntentOrigin=state.presentationColumnOrigin;
@@ -28283,6 +28570,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
         state.presentationSectionIndices=model.sectionIndices;
         state.presentationGroupOrigin=state.sections.empty() ? 0.f : state.sections.back().documentEnd;
     }
+    AssessCollapsedSectionSelection(state);
     state.presentationImageWorkingBytes=0;
     for(const auto& image:model.images) {
         auto* slot=image.key==kDefaultFolderIconKey ? nullptr : &*state.icons.try_emplace(image.key).first;
@@ -28328,6 +28616,7 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->checkboxSelectedCount=state.checkboxSelectedCount;
     receipt->checkboxTotal=state.checkboxSummaryTotal;
     receipt->checkboxState=state.checkboxSummaryState;
+    receipt->sectionBadges=state.sectionBadges;
     for(size_t i=0;i<state.swipeComposition.size();++i) {
         receipt->foregroundVisuals[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].visual.Get());
         receipt->foregroundFades[i]=reinterpret_cast<ULONG_PTR>(state.swipeComposition[i].fade.Get());
@@ -28674,6 +28963,8 @@ void ConsumePresentation(ViewState& state) {
         return;
     }
     if(receipt->token!=state.token || receipt->directoryToken!=state.directoryToken) return;
+    // Hover geometry on the owner uses the lane's counts for this directory.
+    if (!receipt->failed) state.sectionBadges=receipt->sectionBadges;
     if (!receipt->failed && receipt->checkboxTotal==state.total && receipt->checkboxSelection.SharesStorage(state.selectedFlags)) {
         state.checkboxSelection=receipt->checkboxSelection;
         state.checkboxSelectedCount=receipt->checkboxSelectedCount;
@@ -28703,6 +28994,9 @@ void ConsumePresentation(ViewState& state) {
     if(InactiveGraphics(state)) standby();
     if(!receipt->accepted) return;
     state.presentationAcceptedSequence=std::max(state.presentationAcceptedSequence,receipt->sequence);
+    // Every model since the run began admitted the bar, so the lane drew it.
+    if(state.horizontalScrollbarAdmitted && state.horizontalScrollbarAdmittedSequence &&
+        receipt->sequence>=state.horizontalScrollbarAdmittedSequence) state.horizontalScrollbarPublished=true;
     state.lastAcceptedPaint=state.presentationAcceptedSequence;
     if(state.rowTransitionActive && state.rowSceneRevision==receipt->rowRevision) {
         if(!receipt->rows) StopRowTransition(state);
@@ -28755,7 +29049,7 @@ void ConsumePresentation(ViewState& state) {
     }
     if(state.presentationGroupIntents==receipt->groupIntents && receipt->groupFrame.QuadPart)
         geometry |= AdvanceGroupAnimation(state,receipt->groupFrame);
-    if(geometry) {LayoutGroupSections(state); ClampScroll(state); RepositionRenameEdit(state);}
+    if(geometry) {LayoutGroupSections(state); ClampScroll(state); RepositionRenameEdit(state); CompleteGroupReveal(state);}
     if(state.zebraExtentAnimating && state.zebraExtentFrom==receipt->zebraFrom && state.zebraExtentTo==receipt->zebraTo) {
         state.zebraExtentStartedQpc=receipt->zebraOrigin; state.zebraExtentPresented=receipt->zebraExtent;
         state.zebraExtentAnimating=receipt->zebra;
@@ -31352,7 +31646,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             // Group headers are GPU-only hit targets, not Shell items.
             if (pressedGroup >= 0) {
-                PressGroupHeader(*s, pressedGroup);
+                PressGroupHeader(*s, pressedGroup, POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)});
                 return 0;
             }
             // Pointer hit testing uses the authoritative new row indexes.
@@ -31870,7 +32164,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // This event is the second press on a stationary group header.
             // Treat it like another click, not a file-open double-click.
             if (pressedGroup >= 0) {
-                PressGroupHeader(*s, pressedGroup);
+                PressGroupHeader(*s, pressedGroup, POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)});
                 return 0;
             }
             // A divider double-click is the same explicit animated refit as
@@ -32937,6 +33231,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.folderPath = path;
     state.deferColumnProviders = true;
     state.horizontalScrollbarAdmitted = state.horizontalScrollbarPublished = false;
+    state.horizontalScrollbarAdmittedSequence = 0;
     state.columnFitPendingEpoch = 0;
     if (!state.columnModeTransition) StopColumnTransition(state);
     state.folder = folder;

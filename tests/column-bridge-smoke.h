@@ -68,9 +68,9 @@ inline void Pump() {
 struct Receipts {
     HWND hwnd;
     std::shared_ptr<const PresentationReceipt> latest;
-    unsigned long long modelSequence=0,navigation=0;
+    unsigned long long modelSequence=0;
     unsigned deferredOverflow=0;
-    bool admitted=false,premature=false;
+    bool premature=false;
     static LRESULT CALLBACK Capture(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR context) {
         auto& self=*reinterpret_cast<Receipts*>(context);
         if(auto* state=State(hwnd); state && state->presenter) {
@@ -82,22 +82,26 @@ struct Receipts {
             std::shared_ptr<const PresentationModel> model;
             {std::lock_guard lock(state->presenter->mutex); model=state->presenter->pending;}
             if(model && model->sequence>self.modelSequence) {
+                const auto previousSequence=self.modelSequence;
                 self.modelSequence=model->sequence;
-                // A revalidation scan preserves already-visible chrome. Only
-                // a real navigation starts another first-admission contract.
-                if(self.navigation!=model->token) {self.navigation=model->token; self.admitted=false;}
                 if(!model->horizontalScrollbarAdmitted && model->columnContentWidth>model->client.right) ++self.deferredOverflow;
-                if(!self.admitted && model->horizontalScrollbarAdmitted && !state->horizontalScroll &&
-                    (state->nativeColumnsDirty || state->deferColumnProviders || state->autoRefitPending ||
+                // Several models can be captured within one dispatch, so this
+                // observer may not see the first admission. Each model records
+                // whether a drawn frame already showed the bar; until one did,
+                // admission requires settled columns. Owner-only readiness flags
+                // describe capture time only for the newest model.
+                const bool latest=model->sequence==state->presentationSequence;
+                if(model->horizontalScrollbarAdmitted && !model->horizontalScrollbarPublished && !model->horizontalScroll &&
+                    ((latest && (state->nativeColumnsDirty || state->deferColumnProviders || state->autoRefitPending)) ||
                      model->columnTransitionActive || model->columnPresentationPending)) {
-                    if(!self.premature) std::cout<<"COLUMN PREMATURE model="<<model->sequence
+                    if(!self.premature) std::cout<<"COLUMN PREMATURE model="<<model->sequence<<" previous="<<previousSequence
+                        <<" published="<<state->horizontalScrollbarPublished
                         <<" folder="<<model->token<<"/"<<state->token<<" scan="<<model->directoryToken<<"/"<<state->directoryToken
                         <<" dirty="<<state->nativeColumnsDirty<<" deferred="<<state->deferColumnProviders
                         <<" fit="<<state->autoRefitPending<<" transition="<<model->columnTransitionActive
                         <<" pending="<<model->columnPresentationPending<<" horizontal-motion="<<model->horizontalAnimating<<std::endl;
                     self.premature=true;
                 }
-                self.admitted|=model->horizontalScrollbarAdmitted;
             }
         }
         return result;
@@ -206,6 +210,13 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
                     <<" ready="<<lastReceipt->ready<<" failed="<<lastReceipt->failed
                     <<" token="<<lastReceipt->token<<"/"<<state->token<<" directory="<<lastReceipt->directoryToken<<"/"<<state->directoryToken
                     <<" rows="<<lastReceipt->modelRows<<std::endl;
+                // The owner paint gate and lane activity: a generation is only
+                // published by a painted model or an unchanged-scan acknowledgement.
+                std::cout<<"COLUMN LANE animating="<<state->presenter->animating.load()
+                    <<" active="<<state->presentationActive<<" inactive="<<InactiveGraphics(*state)
+                    <<" update="<<GetUpdateRect(state->hwnd,nullptr,FALSE)<<" visible="<<state->visible
+                    <<" window="<<IsWindowVisible(state->hwnd)<<" tab="<<TabOwnsActiveView(*state)
+                    <<" iconic="<<IsIconic(state->frameHwnd)<<std::endl;
             }
             Check(done,phase);
         };

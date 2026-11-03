@@ -21,7 +21,11 @@
 #include "style-fixture.h"
 #include "touch-packet-fixture.h"
 #include "tab-activation-fixture.h"
+#include "repaint-fixture.h"
 #include GPU_OVERLAY_SOURCE
+// Only the mod's own repaint requests are recorded; test code calls USER directly.
+#undef InvalidateRect
+#undef RedrawWindow
 #undef ShellExecuteExW
 #undef CreateInteractionContext
 #undef RegisterOutputCallbackInteractionContext2
@@ -107,6 +111,61 @@ static bool Eventually(Predicate predicate, DWORD timeout = 10000) {
         Sleep(1);
     } while (GetTickCount64() < deadline);
     return predicate();
+}
+
+// Paths of this process's open file and directory handles at or below root.
+// Only disk handles are named (GetFileType first), so pipes cannot block.
+static std::vector<std::wstring> ProcessHandlesUnder(const std::filesystem::path& root) {
+    struct Entry { PVOID object; ULONG_PTR process, handle; ULONG access; USHORT trace, type; ULONG attributes, reserved; };
+    struct Table { ULONG_PTR count, reserved; Entry entries[1]; };
+    using Query = LONG (NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    std::vector<std::wstring> held;
+    if (!query) return held;
+    std::vector<BYTE> buffer(1 << 20);
+    LONG status = 0;
+    for (;;) { // SystemExtendedHandleInformation
+        ULONG needed = 0;
+        status = query(64, buffer.data(), ULONG(buffer.size()), &needed);
+        if (status != LONG(0xC0000004)) break; // STATUS_INFO_LENGTH_MISMATCH
+        buffer.resize(std::max<size_t>(buffer.size() * 2, needed + 65536));
+    }
+    if (status < 0) return held;
+    std::error_code error;
+    auto prefix = std::filesystem::weakly_canonical(root, error).wstring();
+    if (error || prefix.empty()) return held;
+    const auto& table = *reinterpret_cast<const Table*>(buffer.data());
+    const ULONG_PTR self = GetCurrentProcessId();
+    for (ULONG_PTR i = 0; i < table.count; ++i) {
+        const auto& entry = table.entries[i];
+        if (entry.process != self) continue;
+        const auto handle = reinterpret_cast<HANDLE>(entry.handle);
+        if (GetFileType(handle) != FILE_TYPE_DISK) continue;
+        wchar_t path[MAX_PATH * 4]{};
+        const DWORD length = GetFinalPathNameByHandleW(handle, path, ARRAYSIZE(path), VOLUME_NAME_DOS);
+        if (!length || length >= ARRAYSIZE(path)) continue;
+        std::wstring_view name(path, length);
+        if (name.starts_with(L"\\\\?\\")) name.remove_prefix(4);
+        if (name.size() >= prefix.size() && !_wcsnicmp(name.data(), prefix.c_str(), prefix.size()) &&
+            (name.size() == prefix.size() || name[prefix.size()] == L'\\')) held.emplace_back(name);
+    }
+    return held;
+}
+
+// Releases a private fixture directory. The assertion is about this process:
+// the mod's watches, workers and Shell bindings must close every handle under
+// it. Other processes on a live PC (antivirus, the search indexer, Explorer's
+// change-notification service) can delay deleting the files themselves; that
+// is retried and reported, and the harness retries its fixture again at exit.
+static bool ReleasePrivateFixture(const std::filesystem::path& root, DWORD timeout = 10000) {
+    std::vector<std::wstring> held;
+    const bool released = Eventually([&] { held = ProcessHandlesUnder(root); return held.empty(); }, timeout);
+    for (const auto& path : held) std::wcout << L"FIXTURE handle held by this process: " << path << L'\n';
+    if (!released) return false;
+    std::error_code error;
+    if (Eventually([&] { error.clear(); std::filesystem::remove_all(root, error); return !error; }, timeout)) return true;
+    std::cout << "FIXTURE deletion deferred, held by another process: " << error.message() << '\n';
+    return true;
 }
 
 static DWORD WINAPI BlockedProvider(LPVOID) {
@@ -867,13 +926,13 @@ static void TestSortDetails(const std::wstring& directory) {
                 "smart refresh changed-file fixture");
             CloseHandle(changed);
         }
-        ValidateRect(state.hwnd,nullptr);
+        const RepaintFixture::Mark invocationRepaint(state.hwnd);
         if(mode==3) ForceRefresh(state); // Canonical background Refresh uses this same entry point.
         else OverlayProc(state.hwnd,WM_KEYDOWN,mode==2 ? 'R' : VK_F5,0);
         Check(state.detailsRefreshEpoch!=refreshEpoch && state.propertyEpoch==propertyEpoch,
             "F5/Ctrl+R/menu refresh did not separate freshness from displayed values");
         checkDisplayed();
-        Check(!GetUpdateRect(state.hwnd,nullptr,FALSE),"smart refresh invalidated unchanged content at invocation");
+        Check(!invocationRepaint.Requested(),"smart refresh invalidated unchanged content at invocation");
         refreshStage = mode*10+1;
         auto refreshed=WaitForComplete(*state.background,state.directoryToken);
         PublishDirectoryResult(*state.background,std::move(refreshed)); ReceiveDirectoryResults(state);
@@ -896,9 +955,9 @@ static void TestSortDetails(const std::wstring& directory) {
         old.cells={{PKEY_Author,L"obsolete result"}}; stale.details.push_back(std::move(old));
         PublishDirectoryResult(*state.background,std::move(stale)); ReceiveDirectoryResults(state);
         checkDisplayed();
-        ValidateRect(state.hwnd,nullptr);
+        const RepaintFixture::Mark identicalRepaint(state.hwnd);
         Check(!seedDetails(true),"identical refreshed values reported a content change");
-        Check(!GetUpdateRect(state.hwnd,nullptr,FALSE),"identical refreshed values scheduled a content repaint");
+        Check(!identicalRepaint.Requested(),"identical refreshed values scheduled a content repaint");
         checkDisplayed();
     }
     SetScrollImmediate(state,MaxScrollPx(state));
@@ -1886,6 +1945,7 @@ static void TestPreviewInput() {
 #include "frame-budget-smoke.h"
 #include "native-viewport-smoke.h"
 #include "native-viewport-cost-benchmark.h"
+#include "fixture-release-smoke.h"
 #include "native-uia-smoke.h"
 #include "pipeline-trace-smoke.h"
 #include "refresh-smoke.h"
@@ -2079,24 +2139,9 @@ int wmain(int argc,wchar_t** argv) {
               std::filesystem::weakly_canonical(std::filesystem::path(temporary)),
               "fixture deletion escaped its temporary directory");
         // Shell releases of a nested bound folder can finish after its files
-        // are deleted, later still on a loaded machine. Retry only this
-        // verified private fixture's cleanup; the deadline is a failure bound.
-        std::error_code cleanupError;
-        const bool cleaned=Eventually([&] {
-            cleanupError.clear();
-            std::filesystem::remove_all(fixture,cleanupError);
-            return !cleanupError;
-        },60000);
-        if (!cleaned) {
-            // Non-throwing walk: a held or pending-delete entry denies access.
-            std::error_code walk;
-            for (std::filesystem::recursive_directory_iterator entry(fixture,
-                     std::filesystem::directory_options::skip_permission_denied,walk), end;
-                 !walk && entry != end; entry.increment(walk))
-                std::wcout << L"FIXTURE still held: " << entry->path().wstring() << L'\n';
-            std::cout << "FIXTURE cleanup error: " << cleanupError.message() << '\n';
-        }
-        Check(cleaned, "private fixture cleanup did not settle");
+        // are deleted, later still on a loaded machine. This process must hold
+        // nothing under its fixture; other processes may only delay deletion.
+        Check(ReleasePrivateFixture(fixture,60000), "private fixture cleanup did not settle");
         if (!menuChild) std::cout << "All selected regressions passed. Explorer visual/ETW validation is separate.\n";
         return 0;
     } catch (const std::exception& error) {

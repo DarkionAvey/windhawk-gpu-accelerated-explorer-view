@@ -446,10 +446,6 @@ static void TestProviderSelection(const std::wstring& fixture) {
     SetFileAttributesW((alias / L"desktop.ini").c_str(), FILE_ATTRIBUTE_NORMAL);
     Check(std::filesystem::weakly_canonical(root).parent_path() ==
         std::filesystem::weakly_canonical(std::filesystem::path(fixture)), "provider cleanup escaped its private fixture");
-    Check(Eventually([&] {
-        std::error_code error;
-        std::filesystem::remove_all(root, error);
-        return !error;
-    }), "provider selection fixture cleanup did not settle");
+    Check(ReleasePrivateFixture(root), "provider selection fixture cleanup did not settle");
     std::cout << "PASS: real provider and filesystem selection/focus, repeated echoes, external selection, Unicode, folders, bulk groups and GPU context menus; no popup or commands\n";
 }

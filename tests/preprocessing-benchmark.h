@@ -135,9 +135,7 @@ static void TestPreprocessingBenchmarks(const std::wstring& fixture, bool extend
         Stop(state.background); DestroyWindow(state.hwnd);
         Check(std::filesystem::weakly_canonical(root).parent_path()==std::filesystem::weakly_canonical(fixture),
             "preprocessing cleanup escaped its private fixture");
-        Check(Eventually([&] {
-            std::error_code error; std::filesystem::remove_all(root,error); return !error;
-        }),"preprocessing fixture cleanup did not settle");
+        Check(ReleasePrivateFixture(root),"preprocessing fixture cleanup did not settle");
     }
     std::cout<<"PASS: private large-directory preprocessing correctness and phase benchmarks (warm component timings)\n";
 }

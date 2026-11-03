@@ -147,6 +147,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("item-tips", PARALLEL, TestItemTips(fixture)),
     // Graphics and native view integration.
     REGRESSION("real-native-viewport", PARALLEL, TestRealNativeViewport(fixture)),
+    REGRESSION("private-fixture-release", PARALLEL, TestPrivateFixtureRelease(fixture)),
     REGRESSION("native-uia-batch", PARALLEL, TestNativeUiaBatch()),
     REGRESSION("real-native-uia-pressure", PARALLEL, TestRealNativeUiaPressure(fixture)),
     REGRESSION("graphics-isolation", PARALLEL, TestGraphicsIsolation(fixture)),

@@ -159,11 +159,12 @@ static void TestSelectionUiWork(const std::wstring& fixture) {
         Check(CaptureNativeSelection(b,true),"small selection capture failed"); WaitForPreparedSelection(b);
         Check(b.selected==count-1 && std::count(b.selectedFlags.begin(),b.selectedFlags.end(),1)==count &&
             !b.nativeSelectionUnsafe,"small worker import changed selection or focus");
-        SelectionUiFixture::Settle(b); ValidateRect(b.hwnd,nullptr);
+        SelectionUiFixture::Settle(b);
+        const RepaintFixture::Mark idleRepaint(b.hwnd);
         b.nativeSelectionLastProbe=0;
         const auto reads=peer->selectionCountReads;
         ProbeNativeSelectionOnIdle(b,GetTickCount64()); WaitForPreparedSelection(b);
-        Check(peer->selectionCountReads==reads+3 && !GetUpdateRect(b.hwnd,nullptr,FALSE) &&
+        Check(peer->selectionCountReads==reads+3 && !idleRepaint.Requested() &&
             !b.nativeSelectionUnsafe,"unchanged idle selection repainted or lost its capture/completion fences");
     }
     SelectionUiFixture::SelectNative(b,*peer,{2});

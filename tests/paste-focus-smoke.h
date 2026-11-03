@@ -276,6 +276,6 @@ static void TestPasteFocus(const std::wstring& fixture) {
     Check(Regression::Activation::Capture() == activation && testClipboard.sequence == sequence && testClipboard.empties == empties,
         "paste test changed user focus or the clipboard");
     Check(std::filesystem::weakly_canonical(root).parent_path() == std::filesystem::weakly_canonical(fixture), "paste cleanup escaped private fixture");
-    Check(Eventually([&] { std::error_code error; std::filesystem::remove_all(root, error); return !error; }), "paste fixture cleanup");
+    Check(ReleasePrivateFixture(root), "paste fixture cleanup");
     std::cout << "PASS: one Paste per frame/GPU key across repeated accelerator tables, dispatch, WndProc and reentrant Shell callbacks; release/repress in one tick, dispatch-only and independent tabs; archive virtual data, loading/selection/focus/stale-view guards; no user clipboard/focus changes\n";
 }

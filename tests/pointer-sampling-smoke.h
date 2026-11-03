@@ -183,15 +183,23 @@ static void TestScrollbarItemSteps(ViewState& state) {
     // The option belongs to grabbing the thumb; a track click and wheel still
     // take the existing smooth path, even with instant item scrubbing enabled.
     const auto bar=Scrollbar(state);
-    Check(BeginScrollbarInteraction(state,int((bar.left+bar.right)*.5f),int(bar.top+bar.travel*.7f)) &&
-        state.scrollbarTrackPending && GetCapture()==state.hwnd && state.animationActive && state.scrollNow<state.scrollTarget,
-        "instant item scrubbing changed vertical track-click animation");
+    {
+        // "Still easing" is observed at one held instant: a descheduled test
+        // thread must not let the real 180 ms curve finish before the check.
+        AnimationClockFixture::Freeze clock;
+        Check(BeginScrollbarInteraction(state,int((bar.left+bar.right)*.5f),int(bar.top+bar.travel*.7f)) &&
+            state.scrollbarTrackPending && GetCapture()==state.hwnd && state.animationActive && state.scrollNow<state.scrollTarget,
+            "instant item scrubbing changed vertical track-click animation");
+    }
     ReleaseCapture();
     SetScrollImmediate(state,0);
     BYTE saved[256]{},plain[256]{}; GetKeyboardState(saved); SetKeyboardState(plain);
-    OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA)),0);
-    SetKeyboardState(saved);
-    Check(state.animationActive && state.scrollNow<state.scrollTarget,"instant item scrubbing disabled smooth wheel scrolling");
+    {
+        AnimationClockFixture::Freeze clock;
+        OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA)),0);
+        SetKeyboardState(saved);
+        Check(state.animationActive && state.scrollNow<state.scrollTarget,"instant item scrubbing disabled smooth wheel scrolling");
+    }
     SetScrollImmediate(state,0);
 }
 
@@ -231,6 +239,9 @@ static void TestSampledPointer() {
         for (int i = 1; i <= 24; ++i) {
             const POINT point{down.x, down.y + (i <= 12 ? i : 24-i) * 12};
             PointerFixture::At(state.hwnd, point);
+            // The first smooth step is checked while still easing, at one held instant.
+            std::optional<AnimationClockFixture::Freeze> clock;
+            if (!snapped && i==1) clock.emplace();
             frame();
             const auto geometry = Scrollbar(state);
             const float raw = ScrollFractionAt(geometry, float(point.y), state.scrollbarGrabY) * geometry.scrollRange;

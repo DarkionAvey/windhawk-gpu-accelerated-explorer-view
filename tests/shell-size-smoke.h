@@ -98,10 +98,6 @@ static void TestShellSizeDetails(const std::wstring& directory) {
     folder.Reset(); item.Reset();
     // Delete only this named child of the shared private test fixture.
     Check(root.parent_path() == std::filesystem::path(directory), "size fixture cleanup boundary");
-    Check(Eventually([&] {
-        std::error_code error;
-        std::filesystem::remove_all(root, error);
-        return !error;
-    }), "size fixture cleanup");
+    Check(ReleasePrivateFixture(root), "size fixture cleanup");
     std::cout << "PASS: actual Shell Size text reaches background detail cells for path/PIDL identities, zero-byte/large files and blank folders\n";
 }

@@ -120,6 +120,7 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
         CloseHandle(file);
         if(SameKey(key,PKEY_FileAttributes))
             Check(SetFileAttributesW(path.c_str(),FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_ARCHIVE),"live Shell-property edit");
+        LARGE_INTEGER followStarted{}; QueryPerformanceCounter(&followStarted);
         hint(path,true);
         const int after=GpuRowForNativePath(state,path);
         Check(after>=0 && after<before && state.selected==after && state.selectedFlags[after] &&
@@ -129,7 +130,11 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
         Check(state.rowTransitionActive &&
             fabsf(LayoutRowVisual(state,after,0).top-oldTop)<.1f,
             "live resort skipped the existing row movement animation");
-        Check(state.animationActive && state.scrollTarget<oldScroll && state.scrollNow>state.scrollTarget &&
+        // The worker's result may be applied after any amount of real time, so
+        // the 180 ms curve can legitimately have finished. Require that this
+        // edit started an eased scroll (not a jump) toward the reveal target.
+        Check(state.smoothStartedQpc.QuadPart>=followStarted.QuadPart && state.scrollTarget<oldScroll &&
+            state.smoothStart>state.scrollTarget && fabsf(state.smoothStart+state.smoothDelta-state.scrollTarget)<.1f &&
             fabsf(RevealScrollTarget(state,after,state.scrollTarget)-state.scrollTarget)<.1f,
             "modified item was not followed with the shared animated scroll");
         StopRowTransition(state); SetScrollImmediate(state,state.scrollTarget);
@@ -169,10 +174,13 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
     HANDLE edit=CreateFileW(unselected.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
     Check(edit!=INVALID_HANDLE_VALUE && SetFilePointer(edit,0,nullptr,FILE_BEGIN)!=INVALID_SET_FILE_POINTER &&
         SetEndOfFile(edit),"watch-only sort edit"); CloseHandle(edit);
+    LARGE_INTEGER followStarted{}; QueryPerformanceCounter(&followStarted);
     ObserveDirectoryWatch(state,GetTickCount64(),true);
     UpdateWatchedDirectory(state,GetTickCount64()); settle();
-    Check(GpuRowForNativePath(state,unselected)==state.total-1 && state.animationActive &&
-        state.scrollTarget>state.scrollNow && state.selected==-1,
+    // As above: an eased scroll toward the new rank started, whatever its progress.
+    Check(GpuRowForNativePath(state,unselected)==state.total-1 &&
+        state.smoothStartedQpc.QuadPart>=followStarted.QuadPart && state.scrollTarget>state.smoothStart &&
+        fabsf(state.smoothStart+state.smoothDelta-state.scrollTarget)<.1f && state.selected==-1,
         "watch-only unselected edit did not animate scrolling to its new rank");
     StopRowTransition(state); SetScrollImmediate(state,state.scrollTarget);
     choose(PKEY_FileName);

@@ -308,20 +308,32 @@ static void TestHighlightLayering(HWND frame) {
         }
         // Focus delivery is coalesced and only invalidates after USER's
         // activation transaction, without importing or clearing selection.
-        ValidateRect(state.hwnd,nullptr); FocusFixture::foreground=nullptr;
+        // Repaints are the mod's own requests: the desktop may invalidate this
+        // top-level window at any time (theme, display or another application).
+        const bool queuedBefore=state.inputFocusMessageQueued;
+        FocusFixture::foreground=nullptr;
+        const RepaintFixture::Mark queueRepaint(state.hwnd);
         QueueInputFocusUpdate(state.hwnd); QueueInputFocusUpdate(state.hwnd);
         MSG message{};
-        Check(state.inputFocusMessageQueued && !GetUpdateRect(state.hwnd,nullptr,FALSE) &&
-            PeekMessageW(&message,state.hwnd,kMsgInputFocusChanged,kMsgInputFocusChanged,PM_REMOVE),
-            "focus callback painted synchronously or failed to queue");
+        const bool queued=state.inputFocusMessageQueued, painted=queueRepaint.Requested();
+        const bool posted=PeekMessageW(&message,state.hwnd,kMsgInputFocusChanged,kMsgInputFocusChanged,PM_REMOVE)!=FALSE;
+        if(!queued || painted || !posted) std::cout<<"FOCUS QUEUE queued-before="<<queuedBefore<<" queued="<<queued
+            <<" painted="<<painted<<" posted="<<posted<<std::endl;
+        Check(queued && !painted && posted,"focus callback painted synchronously or failed to queue");
         OverlayProc(state.hwnd,message.message,message.wParam+1,message.lParam);
         Check(state.inputFocusMessageQueued && state.inputFocusIndicators,
             "stale focus notification changed a different overlay lifetime");
+        const RepaintFixture::Mark deliveredRepaint(state.hwnd);
         OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
-        Check(!state.inputFocusMessageQueued && !state.inputFocusIndicators &&
-            GetUpdateRect(state.hwnd,nullptr,FALSE) &&
-            !PeekMessageW(&message,state.hwnd,kMsgInputFocusChanged,kMsgInputFocusChanged,PM_REMOVE),
-            "focus notifications did not coalesce into one deferred repaint");
+        {
+            const bool stillQueued=state.inputFocusMessageQueued, indicators=state.inputFocusIndicators;
+            const bool repaint=deliveredRepaint.Requested();
+            const bool extra=PeekMessageW(&message,state.hwnd,kMsgInputFocusChanged,kMsgInputFocusChanged,PM_REMOVE)!=FALSE;
+            if(stillQueued || indicators || !repaint || extra) std::cout<<"FOCUS COALESCE queued="<<stillQueued
+                <<" indicators="<<indicators<<" repaint="<<repaint<<" extra="<<extra<<std::endl;
+            Check(!stillQueued && !indicators && repaint && !extra,
+                "focus notifications did not coalesce into one deferred repaint");
+        }
         FocusFixture::foreground=frame;
         state.marqueeActive=state.marqueeFading=state.keyboardCaretVisible=false;
         ApplyViewLayout(state,{FVM_DETAILS,48},false); FinishColumnTransition(state); icon();

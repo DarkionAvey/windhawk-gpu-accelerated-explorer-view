@@ -1094,7 +1094,6 @@ void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
     }
     Check(std::filesystem::weakly_canonical(parent).parent_path()==std::filesystem::weakly_canonical(fixture),
         "history return cleanup escaped its private fixture");
-    std::error_code cleanupError;
     const bool drained=Eventually([&] {
         // Retired workers can release marshaled Shell references on this STA.
         // Sleeping here prevents that real completion from ever being served.
@@ -1102,12 +1101,11 @@ void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
         while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
             TranslateMessage(&message); DispatchMessageW(&message);
         }
-        if(std::any_of(retired.begin(),retired.end(),[](const auto& work) {return !work.expired();})) return false;
-        cleanupError.clear(); std::filesystem::remove_all(parent,cleanupError); return !cleanupError;
+        return std::none_of(retired.begin(),retired.end(),[](const auto& work) {return !work.expired();});
     });
     if(!drained) std::cout<<"HISTORY cleanup retained="<<std::count_if(retired.begin(),retired.end(),
-        [](const auto& work) {return !work.expired();})<<" error="<<cleanupError.message()<<std::endl;
-    Check(drained,
+        [](const auto& work) {return !work.expired();})<<std::endl;
+    Check(drained && ReleasePrivateFixture(parent),
         "history return fixture cleanup did not drain native/watch handles");
     std::cout<<"PASS: real Shell travel log and native LTR/RTL Back swipes publish the parent at its returned child before any visible rows; late native completion preserves the viewport\n";
 }

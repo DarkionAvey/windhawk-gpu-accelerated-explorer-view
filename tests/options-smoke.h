@@ -66,18 +66,26 @@ static void TestOptionConsumers(Set set) {
             Check(state.hoverAnimationActive==enabled,"hover animation toggle did not reach transition creation"); StopHoverAnimation(state);
             set(L"Navigation.showScrollbar",value); UpdateColumns(state);
             Check(Scrollbar(state).usable==enabled,"scrollbar toggle did not reach geometry/hit testing");
-            set(L"Navigation.smoothScrolling",value); SetScrollImmediate(state,0); MoveScroll(state,200);
-            Check(state.scrollTarget==200 && state.animationActive==enabled && (enabled || state.scrollNow==200),
-                "smooth scrolling toggle did not change viewport motion");
+            set(L"Navigation.smoothScrolling",value); SetScrollImmediate(state,0);
+            {
+                // A real 180 ms curve can finish while this thread is descheduled.
+                AnimationClockFixture::Freeze clock;
+                MoveScroll(state,200);
+                Check(state.scrollTarget==200 && state.animationActive==enabled && (enabled || state.scrollNow==200),
+                    "smooth scrolling toggle did not change viewport motion");
+            }
             StopScrollAnimation(state);
         }
         set(L"Navigation.showScrollbar",L"1"); set(L"Navigation.smoothScrolling",L"1"); UpdateColumns(state);
         for(bool instant:{false,true}) {
             set(L"Navigation.instantScrollbarScrub",instant ? L"1" : L"0"); SetScrollImmediate(state,0);
             const auto bar=Scrollbar(state); state.scrollbarGrabY=bar.thumbLength*.5f;
-            ScrubScrollbar(state,bar.top+state.scrollbarGrabY+bar.travel*.31f);
-            Check(state.scrollTarget>0 && state.animationActive==!instant,"vertical scrub ignored instant/smooth setting");
-            Check(!instant || state.scrollNow==state.scrollTarget,"instant vertical scrub retained interpolation");
+            {
+                AnimationClockFixture::Freeze clock;
+                ScrubScrollbar(state,bar.top+state.scrollbarGrabY+bar.travel*.31f);
+                Check(state.scrollTarget>0 && state.animationActive==!instant,"vertical scrub ignored instant/smooth setting");
+                Check(!instant || state.scrollNow==state.scrollTarget,"instant vertical scrub retained interpolation");
+            }
             StopScrollAnimation(state);
         }
         for(int opacity:{0,35,100}) {

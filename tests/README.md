@@ -133,7 +133,12 @@ is not a full-suite coverage baseline. The implementation uses LLVM's
 - Use the existing substitutes: `FocusFixture` (focus/foreground/visibility),
   `ClipboardFixture`, `PointerFixture`/`ModifierFixture` (cursor/keys),
   `StyleFixture` (DPI, theme, Shell settings), `UiLocaleFixture` (UI
-  language), `AnimationClockFixture` (time).
+  language), `AnimationClockFixture` (time), `RepaintFixture` (the mod's own
+  repaint requests; the desktop can invalidate any top-level window, so never
+  assert an empty update region).
+- Assert "still animating" only at a held `AnimationClockFixture` instant, or
+  with a time-independent witness (for example, that a motion started): a busy
+  or in-use PC can deschedule the test for longer than any UI transition.
 - Observe only this process: `Regression::Activation::Capture()` instead of
   comparing the desktop's foreground window, private desktops for real
   popups, `SHCNF_FLUSH`/explicit Shell refresh rather than assuming the

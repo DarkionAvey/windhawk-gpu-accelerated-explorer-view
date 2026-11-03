@@ -336,11 +336,7 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(UnregisterClassW(kItemTipClass, OverlayModuleInstance()), "item tip class release");
     g_writeFactory.Reset();
     Check(root.parent_path() == std::filesystem::path(directory), "item tip fixture cleanup boundary");
-    Check(Eventually([&] {
-        std::error_code error;
-        std::filesystem::remove_all(root, error);
-        return !error;
-    }), "item tip fixture cleanup");
+    Check(ReleasePrivateFixture(root), "item tip fixture cleanup");
 }
 
 static void TestItemTips(const std::wstring& directory) {

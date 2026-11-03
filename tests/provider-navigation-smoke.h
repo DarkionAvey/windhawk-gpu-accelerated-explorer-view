@@ -239,8 +239,7 @@ static void TestProviderNavigation(const std::wstring& fixture) {
     }
     Check(std::filesystem::weakly_canonical(root).parent_path() == std::filesystem::weakly_canonical(fixture),
         "provider navigation cleanup escaped private fixture");
-    Check(Eventually([&] { std::error_code error; std::filesystem::remove_all(root, error); return !error; }),
-        "provider navigation cleanup did not settle");
+    Check(ReleasePrivateFixture(root), "provider navigation cleanup did not settle");
     // SetActive exercises real graphics startup. Restore the process-wide
     // scheduler boundary expected by the following independent fixtures.
     ShutDownFrames(); g_frameStopping = false;

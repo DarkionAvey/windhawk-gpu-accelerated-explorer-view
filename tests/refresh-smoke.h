@@ -45,9 +45,9 @@ static void TestTabResumeRefresh(const std::wstring& directory) {
     auto message=take(*tabs[1]);
     Check(IsWindowVisible(tabs[1]->hwnd) && !tabs[1]->detailsRefreshEpoch && !tabs[1]->directoryPending,
         "resume waited for refresh before presenting cached content");
-    ValidateRect(tabs[1]->hwnd,nullptr); dispatch(message);
+    const RepaintFixture::Mark resumeRepaint(tabs[1]->hwnd); dispatch(message);
     Check(tabs[1]->detailsRefreshEpoch==1 && tabs[1]->directoryPending &&
-        !GetUpdateRect(tabs[1]->hwnd,nullptr,FALSE) && !tabs[0]->detailsRefreshEpoch && !tabs[2]->detailsRefreshEpoch,
+        !resumeRepaint.Requested() && !tabs[0]->detailsRefreshEpoch && !tabs[2]->detailsRefreshEpoch,
         "resume did not use the nonpainting, tab-owned forced refresh path");
     activate(0); activate(1); message=take(*tabs[1]); activate(2);
     dispatch(message);
@@ -115,8 +115,8 @@ static void TestWindowResumeRefresh() {
     second.tabResumeRefreshToken=second.token; QueueResumeRefresh(second);
     const auto message=take(second);
     Check(!second.detailsRefreshEpoch && second.entries[0].driveUsed==400,"activation synchronously queried the volume");
-    ValidateRect(second.hwnd,nullptr); dispatch(message);
-    Check(second.detailsRefreshEpoch==1 && !GetUpdateRect(second.hwnd,nullptr,FALSE),"window refresh repainted retained values at invocation");
+    const RepaintFixture::Mark resumeRepaint(second.hwnd); dispatch(message);
+    Check(second.detailsRefreshEpoch==1 && !resumeRepaint.Requested(),"window refresh repainted retained values at invocation");
     Check(Eventually([&]{ReceiveDirectoryResults(second); return !second.directoryPending;}),"resumed window capacity did not arrive");
     RefreshThisPcRows(second,false);
     Check(second.entries[0].driveUsed==100 && second.nativeRowsNeedCapture &&
@@ -162,25 +162,27 @@ static void TestUnchangedRefreshPresentation() {
         tab.Await([&](const auto& r){return r.directoryToken==s.directoryToken;});
         Check(Eventually([&]{return !s.presenter->animating.load();}),"refresh presenter did not settle");
         const auto before=tab.Receipt();
-        ++s.directoryToken; ValidateRect(s.hwnd,nullptr);
+        ++s.directoryToken;
+        const RepaintFixture::Mark generationRepaint(s.hwnd);
         SynchronizePresentationGeneration(s);
         auto after=tab.Await([&](const auto& r){return r.directoryToken==s.directoryToken;});
         if(!(after->accepted && after->sequence==before->sequence && after->frames==before->frames &&
-            after->device==before->device && after->backbuffer==before->backbuffer && !GetUpdateRect(s.hwnd,nullptr,FALSE)))
+            after->device==before->device && after->backbuffer==before->backbuffer && !generationRepaint.Requested()))
             std::cout<<"REFRESH GENERATION accepted="<<after->accepted<<" sequence="<<before->sequence<<"->"<<after->sequence
                 <<" frames="<<before->frames<<"->"<<after->frames<<" device="<<before->device<<"->"<<after->device
-                <<" buffer="<<before->backbuffer<<"->"<<after->backbuffer<<" update="<<GetUpdateRect(s.hwnd,nullptr,FALSE)<<std::endl;
+                <<" buffer="<<before->backbuffer<<"->"<<after->backbuffer<<" repaint="<<generationRepaint.Requested()<<std::endl;
         Check(after->accepted && after->sequence==before->sequence && after->frames==before->frames &&
-            after->device==before->device && after->backbuffer==before->backbuffer && !GetUpdateRect(s.hwnd,nullptr,FALSE),
+            after->device==before->device && after->backbuffer==before->backbuffer && !generationRepaint.Requested(),
             "identical refresh repainted instead of acknowledging the existing model");
         s.thisPcGpu=true; s.nativeRowsNeedCapture=false; s.nativeRowsComplete=true;
         s.nativeRowsViewToken=s.token; s.nativeRows=s.entries;
         RefreshThisPcRows(s,false); StopRowTransition(s);
-        auto* entries=s.entries.data(); ValidateRect(s.hwnd,nullptr);
+        auto* entries=s.entries.data();
+        const RepaintFixture::Mark rowsRepaint(s.hwnd);
         DirectoryResult rows; rows.kind=DirectoryResult::NativeRows; rows.token=s.nativeRowsToken;
         rows.entries=s.nativeRows; rows.nativeRowsComplete=true;
         PublishDirectoryResult(*s.background,std::move(rows));
-        Check(!ReceiveDirectoryResults(s) && s.entries.data()==entries && !GetUpdateRect(s.hwnd,nullptr,FALSE),
+        Check(!ReceiveDirectoryResults(s) && s.entries.data()==entries && !rowsRepaint.Requested(),
             "identical This PC identities reported a content change or repainted");
         const auto capacity=[&](const wchar_t* caption=L"free space") {
             DirectoryResult result; result.kind=DirectoryResult::DriveSpace; result.token=s.capacityToken;
@@ -192,8 +194,9 @@ static void TestUnchangedRefreshPresentation() {
             return RefreshThisPcRows(s,false);
         };
         Check(capacity(),"changed capacity was not projected");
-        ValidateRect(s.hwnd,nullptr); entries=s.entries.data();
-        Check(!capacity() && s.entries.data()==entries && !GetUpdateRect(s.hwnd,nullptr,FALSE),
+        entries=s.entries.data();
+        const RepaintFixture::Mark capacityRepaint(s.hwnd);
+        Check(!capacity() && s.entries.data()==entries && !capacityRepaint.Requested(),
             "identical capacity replaced or repainted unchanged rows");
         Check(capacity(L"updated formatted space"),"changed formatted capacity was hidden by identical raw bytes");
     }

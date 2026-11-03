@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.347
+
+- A collapsed group shows how many of its items are still selected: a check
+  badge with the count, styled like a checked checkbox, before the group name.
+  It slides in and out with the group's collapse and expand, and also when the
+  selection changes while the group is collapsed (for example Ctrl+A).
+  Clicking the badge expands the group and scrolls to its first selected item.
+  Counting runs off Explorer's UI thread.
+
 ## 0.9.346
 
 - Sorting, switching views, refreshing and resizing the window use less of

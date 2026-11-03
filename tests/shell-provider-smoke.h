@@ -106,10 +106,6 @@ static void TestShellProviderContents(const std::wstring& fixture) {
     Stop(state.background); DestroyWindow(state.hwnd);
     SetFileAttributesW(alias.c_str(), FILE_ATTRIBUTE_NORMAL);
     SetFileAttributesW((alias / L"desktop.ini").c_str(), FILE_ATTRIBUTE_NORMAL);
-    Check(Eventually([&] {
-        std::error_code error;
-        std::filesystem::remove_all(root, error);
-        return !error;
-    }), "provider fixture cleanup did not settle after Shell release");
+    Check(ReleasePrivateFixture(root), "provider fixture cleanup did not settle after Shell release");
     std::cout << "PASS: Shell provider membership, actual paths/metadata, selection, sorted refresh, hidden/empty targets and target change watching\n";
 }
