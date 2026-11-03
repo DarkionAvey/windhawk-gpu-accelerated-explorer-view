@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         0.9.343
+// @version         0.9.344
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -6217,10 +6217,12 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
             // Classic BUTTON/Explorer themes can remain light in dark-mode
             // Explorer. Read Windows' app palette once on creation/theme change,
             // never from paint, input or the periodic maintenance path.
+            // Explorer's light status bar is the page surface itself; only
+            // the dark page black is lifted to Explorer's raised dark surface.
             if (ValidRgb(state.nativeAppBackground)) {
                 background = state.nativeAppBackground;
                 foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
-                background = RaisedSurface(background, foreground);
+                if (DarkerThan(background, foreground)) background = RaisedSurface(background, foreground);
             }
         }
         if (!ValidRgb(background)) background = RGB(255,255,255);
@@ -15405,8 +15407,11 @@ D2D1_POINT_2F SnapDrawPoint(ID2D1RenderTarget* target,D2D1_POINT_2F point,float 
     if(fabsf(m._12)>.00001f || fabsf(m._21)>.00001f || fabsf(m._11)<.00001f || fabsf(m._22)<.00001f)
         return point; // Intentional rotated icon animation is not an axis-aligned edge.
     const float sx=m._11*dx/96.f,sy=m._22*dy/96.f,tx=m._31*dx/96.f,ty=m._32*dy/96.f;
-    return D2D1::Point2F((roundf(point.x*sx+tx-phase)+phase-tx)/sx,
-        (roundf(point.y*sy+ty-phase)+phase-ty)/sy);
+    // Round half up in every quadrant (roundf rounds half away from zero, so
+    // a whole-pixel span straddling 0 at a half pixel would grow by one).
+    const auto snap=[](float v) {return floorf(v+.5f);};
+    return D2D1::Point2F((snap(point.x*sx+tx-phase)+phase-tx)/sx,
+        (snap(point.y*sy+ty-phase)+phase-ty)/sy);
 }
 D2D1_RECT_F SnapDrawRect(ID2D1RenderTarget* target,D2D1_RECT_F rect) {
     const auto a=SnapDrawPoint(target,D2D1::Point2F(rect.left,rect.top));
@@ -15902,8 +15907,10 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                 for (UINT32 i=0; i<count; ++i) {
                     const auto& m = matches[i];
                     if (!m.isText || m.isTrimmed || m.width <= 0.f || m.height <= 0.f) continue;
-                    const auto rc = D2D1::RoundedRect(D2D1::RectF(m.left-1.f, m.top,
-                        m.left+m.width+1.f, m.top+m.height), 2.f, 2.f);
+                    // Hit-test metrics are fractional; fill the same pixels
+                    // that StrokeRoundedRect outlines.
+                    const auto rc = D2D1::RoundedRect(SnapDrawRect(state.target.Get(),D2D1::RectF(m.left-1.f, m.top,
+                        m.left+m.width+1.f, m.top+m.height)), 2.f, 2.f);
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
@@ -16591,11 +16598,13 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
             std::min(width,height)*.2f);
         // Three small translucent fills approximate a soft shadow. No blur
         // effect, offscreen surface, extra texture or per-item geometry exists.
+        // Whole-pixel spreads keep each band's straight edges on the grid.
+        const float drop = roundf(2*dpi);
         for (int spread=3; spread>=1; --spread) {
-            const float out = spread*dpi;
+            const float out = std::max(1.f,roundf(spread*dpi));
             state.brush->SetColor(D2D1::ColorF(0.f,0.f,0.f,opacity*.055f));
             state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(
-                rect.left-out,rect.top-out+2*dpi,rect.right+out,rect.bottom+out+2*dpi),
+                rect.left-out,rect.top-out+drop,rect.right+out,rect.bottom+out+drop),
                 radius+out,radius+out),state.brush.Get());
         }
         state.thumbnailBrush->SetBitmap(icon.bitmap.Get());
@@ -17707,8 +17716,12 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
         const float left = state.paintWidth-rect.right;
         rect.right = state.paintWidth-rect.left; rect.left = left;
     }
+    // Layout centers the box in its row (half pixels); draw on whole pixels
+    // with a whole-pixel border so its straight edges stay crisp at any DPI.
+    rect = SnapDrawRect(state.target.Get(),rect);
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
     const float unit = (rect.right-rect.left)/20.f;
-    const float border = std::min(std::max(1.f,unit),(rect.right-rect.left)*.5f);
+    const float border = std::max(1.f,std::min(roundf(unit),floorf((rect.right-rect.left)*.5f)));
     const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
         rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
     const auto palette = g_swipePalette.load(std::memory_order_relaxed);
@@ -17719,7 +17732,10 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     state.brush->SetColor(Packed(foreground,opacity*.8f));
     state.target->DrawRoundedRectangle(shape,state.brush.Get(),border);
     if (!checked) return;
-    state.brush->SetColor(Packed(ThemeRgb(COLORREF((palette>>24)&0xFFFFFF)),opacity));
+    // Same accent foreground as the swipe chevron: contrast-chosen black/white
+    // at the minimum alpha that keeps 4.5:1 on the accent fill.
+    state.brush->SetColor(Packed(ThemeRgb(COLORREF((palette>>24)&0xFFFFFF)),
+        opacity*float((palette>>48)&255)/255.f));
     if (!state.selectionCheckGlyph && state.d2dFactory) {
         ComPtr<ID2D1PathGeometry> path,filled; ComPtr<ID2D1GeometrySink> sink;
         ComPtr<ID2D1StrokeStyle> stroke;
@@ -18741,14 +18757,16 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     for(size_t layer=std::min(preview.imageCount,kDragPreviewImages);layer-->0;) {
         const auto& image=preview.Image(layer);
         const auto& pixels=image.pixels;
-        const auto destination=DragArtworkRect(pixels,side,center,bottom);
         target->SetTransform(DragStackTransform(preview,layer,square)*original);
+        // The untilted front layer lands on whole pixels; tilted layers are
+        // rotated and left continuous (SnapDrawRect ignores rotations).
+        const auto destination=SnapDrawRect(target,DragArtworkRect(pixels,side,center,bottom));
         if(shadows && (*shadows)[layer].bitmap) {
             const float pad=DragShadowPadding(side),offset=DragShadowOffset(side);
             const auto& shadow=(*shadows)[layer].bitmap;
             const auto size=shadow->GetSize();
-            const auto bounds=D2D1::RectF(destination.left-pad,destination.top-pad+offset,
-                destination.left-pad+size.width,destination.top-pad+offset+size.height);
+            const auto bounds=SnapDrawRect(target,D2D1::RectF(destination.left-pad,destination.top-pad+offset,
+                destination.left-pad+size.width,destination.top-pad+offset+size.height));
             target->DrawBitmap(shadow.Get(),bounds,1.f,D2D1_INTERPOLATION_MODE_LINEAR);
         }
         ComPtr<ID2D1Bitmap> bitmap=existingArtwork ? (*existingArtwork)[layer]:nullptr;
@@ -18784,7 +18802,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         const float width=std::max(height,height*.65f*float(count.size())+height*.4f);
         const float x=std::clamp(preview.rtl ? geometry.artwork.right-width:geometry.artwork.left,
             geometry.edge,float(geometry.extent.width)-geometry.edge-width);
-        const auto bounds=D2D1::RectF(x,geometry.artwork.top,x+width,geometry.artwork.top+height);
+        const auto bounds=SnapDrawRect(target,D2D1::RectF(x,geometry.artwork.top,x+width,geometry.artwork.top+height));
         const auto palette=preview.badgePalette;
         color(COLORREF(palette&0xFFFFFF)); target->FillRoundedRectangle(D2D1::RoundedRect(bounds,height*.5f,height*.5f),brush.Get());
         brush->SetOpacity(float((palette>>48)&255)/255.f);
@@ -18793,13 +18811,16 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         brush->SetOpacity(1.f);
     }
     if(preview.caption) {
-        const auto rect=geometry.caption;
+        // Whole-pixel box, border and text origin, like StrokeRoundedRect.
+        const auto rect=SnapDrawRect(target,geometry.caption);
+        const float border=std::max(1.f,roundf(float(preview.dpi)/96.f)),inset=border*.5f;
         color(preview.background); target->FillRoundedRectangle(D2D1::RoundedRect(rect,geometry.edge,geometry.edge),brush.Get());
         color(BlendColor(preview.background,preview.foreground,20));
-        target->DrawRoundedRectangle(D2D1::RoundedRect(rect,geometry.edge,geometry.edge),brush.Get(),float(preview.dpi)/96.f);
+        target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(rect.left+inset,rect.top+inset,rect.right-inset,rect.bottom-inset),
+            geometry.edge-inset,geometry.edge-inset),brush.Get(),border);
         color(preview.foreground);
-        target->DrawTextLayout(D2D1::Point2F(rect.left+geometry.edge,rect.top+geometry.edge),preview.caption.Get(),brush.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        target->DrawTextLayout(SnapDrawPoint(target,D2D1::Point2F(rect.left+geometry.edge,rect.top+geometry.edge)),
+            preview.caption.Get(),brush.Get(),D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 }
 
@@ -29035,9 +29056,12 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
             // interval as mouse clicks and the shared item hit identity, using
             // packet time rather than dispatch. Each tap's contact movement
             // tolerance remains native; don't impose a mouse-sized touch target.
-            const bool paired = !state.clickPolicy.singleClick && state.mouseClickSource==ClickSource::Touch &&
+            // Empty space is one target, paired in either click mode like a
+            // mouse double-click; rows pair only in double-click mode.
+            const bool paired = state.mouseClickSource==ClickSource::Touch &&
                 state.mouseClickTick && state.mouseClickEpoch == epoch &&
-                state.mouseClickRow == state.touch.row &&
+                (state.touch.row < 0 ? state.mouseClickBackground :
+                    !state.clickPolicy.singleClick && state.mouseClickRow == state.touch.row) &&
                 DWORD(state.touch.time-DWORD(state.mouseClickTick)) <= GetDoubleClickTime();
             const UINT press = paired ? WM_LBUTTONDBLCLK : WM_LBUTTONDOWN;
             ReplayTouchMouse(state, press, point);
@@ -31151,7 +31175,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const int pressX = GET_X_LPARAM(lParam);
             const int pressY = GET_Y_LPARAM(lParam);
             s->mousePressBackground = g_doubleClickUp.load(std::memory_order_relaxed) &&
-                !s->touch.replaying && !(wParam & (MK_CONTROL | MK_SHIFT)) &&
+                !(wParam & (MK_CONTROL | MK_SHIFT)) &&
                 EmptySpaceAt(*s,POINT{pressX,pressY});
             if (pressY >= s->headerPx && InsideListX(*s, pressX) &&
                 !OnScrollbar(*s, pressX, pressY) &&
@@ -31674,11 +31698,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const int row = y >= s->headerPx && InsideListX(*s, x) &&
                 !OnScrollbar(*s, x, y) && !OnHorizontalBar(*s, x, y)
                 ? RowFromPoint(*s, y, x) : -1;
-            const bool up = g_doubleClickUp.load(std::memory_order_relaxed) && !s->touch.replaying &&
+            // Touch pairs were already timed from packet timestamps.
+            const bool up = g_doubleClickUp.load(std::memory_order_relaxed) &&
                 !(wParam & (MK_CONTROL | MK_SHIFT)) && EmptySpaceAt(*s,POINT{x,y}) &&
                 s->mouseClickBackground && s->mouseClickEpoch==s->mouseFolderEpoch &&
-                s->mouseClickSource==CurrentClickSource(*s) &&
-                s->mouseClickTick && GetTickCount64()-s->mouseClickTick<=GetDoubleClickTime();
+                s->mouseClickSource==CurrentClickSource(*s) && s->mouseClickTick &&
+                (s->touch.replaying || GetTickCount64()-s->mouseClickTick<=GetDoubleClickTime());
             if (up) {
                 ResetMouseClickSequence(*s);
                 NavigateCurrentShellTab(*s,SBSP_PARENT | SBSP_SAMEBROWSER);
@@ -35601,6 +35626,66 @@ LRESULT CALLBACK ViewToggleSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     return result;
 }
 
+// The Switch symbol (two opposing arrows, Segoe Fluent Icons U+E8AB's 16-unit
+// design) as pixel-grid geometry. The font is not grid-fitted between its
+// 16-pixel design sizes: at 125% its shafts are 1.25 pixels, a solid row plus
+// a soft one. Shafts sit on whole rows with a whole-pixel stroke, like the
+// native status-bar icons; only the diagonal wings are antialiased (8x8
+// supersampled coverage, no font, theme or DPI-virtualized dependency).
+std::vector<BYTE> ViewToggleGlyphCoverage(int size, int dpi) {
+    std::vector<BYTE> coverage(size_t(std::max(0, size)) * std::max(0, size));
+    if (size <= 0) return coverage;
+    constexpr int kSamples = 8;
+    const int canvas = size * kSamples;
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), canvas, -canvas, 1, 32, BI_RGB};
+    DWORD* samples = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = dc ? CreateDIBSection(dc, &info, DIB_RGB_COLORS,
+        reinterpret_cast<void**>(&samples), nullptr, 0) : nullptr;
+    LOGBRUSH ink{BS_SOLID, RGB(255, 255, 255), 0};
+    const int stroke = std::max(1, Scale96(1, dpi));
+    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+        DWORD(stroke * kSamples), &ink, 0, nullptr);
+    if (bitmap && pen) {
+        const HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
+        const HGDIOBJ previousPen = SelectObject(dc, pen);
+        memset(samples, 0, size_t(canvas) * canvas * sizeof(DWORD));
+        const float unit = size / 16.f;
+        const int edge = int(lroundf(2.f * unit));
+        const int wing = std::max(stroke + 1, int(lroundf(4.f * unit)));
+        const int upper = int(lroundf(4.f * unit)), lower = size - upper - stroke;
+        const HBRUSH fill = reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        // Half-stroke offsets are whole samples (kSamples is even).
+        const auto sample = [](float pixels) { return int(lroundf(pixels * kSamples)); };
+        for (const bool top : {true, false}) {
+            const int row = top ? upper : lower;
+            const RECT shaft{edge * kSamples, row * kSamples, (size - edge) * kSamples, (row + stroke) * kSamples};
+            FillRect(dc, &shaft, fill);
+            // The upper arrow points to the trailing (right) end, the lower
+            // one back; the round join ends exactly at the shaft's end.
+            const float tip = top ? size - edge - stroke * .5f : edge + stroke * .5f;
+            const float back = top ? tip - wing : tip + wing, middle = row + stroke * .5f;
+            const POINT head[]{{sample(back), sample(middle - wing)}, {sample(tip), sample(middle)},
+                {sample(back), sample(middle + wing)}};
+            Polyline(dc, head, ARRAYSIZE(head));
+        }
+        GdiFlush();
+        for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+            unsigned covered = 0;
+            for (int sy = 0; sy < kSamples; ++sy) for (int sx = 0; sx < kSamples; ++sx)
+                covered += (samples[size_t(y * kSamples + sy) * canvas + x * kSamples + sx] & 0xFFFFFF) != 0;
+            coverage[size_t(y) * size + x] = BYTE((covered * 255 + kSamples * kSamples / 2) / (kSamples * kSamples));
+        }
+        SelectObject(dc, previousPen);
+        SelectObject(dc, previousBitmap);
+    }
+    if (pen) DeleteObject(pen);
+    if (bitmap) DeleteObject(bitmap);
+    if (dc) DeleteDC(dc);
+    return coverage;
+}
+
 // A frame child is available independently of XAML focus, template creation,
 // symbols and CommandBar overflow. Each overlay owns its own switch lifetime;
 // frame selection only chooses which tab's child is presented.
@@ -35737,9 +35822,10 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             !state->viewToggleIcons[0]) {
             if (IsWindow(state->viewToggleTooltip))
                 SendMessageW(state->viewToggleTooltip, TTM_SETMAXTIPWIDTH, 0, Scale96(360, dpi));
-            // Rasterize the original Switch glyph once per DPI/palette. Native
-            // paint consumes an HICON, never a private-use character in its DC.
+            // Rasterize the Switch symbol once per DPI/palette. Native paint
+            // consumes an HICON, never a private-use character in its DC.
             const int size = std::max(1, Scale96(16, dpi));
+            const auto coverage = ViewToggleGlyphCoverage(size, dpi);
             BITMAPINFO bitmapInfo{};
             bitmapInfo.bmiHeader = {sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB};
             HDC dc = CreateCompatibleDC(nullptr);
@@ -35747,42 +35833,8 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             HBITMAP color = dc ? CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS,
                 reinterpret_cast<void**>(&pixels), nullptr, 0) : nullptr;
             HBITMAP mask = nullptr;
-            HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH, L"Segoe Fluent Icons");
             HICON fresh[2]{};
-            if (dc && color) {
-                const HGDIOBJ previousBitmap = SelectObject(dc, color);
-                const HGDIOBJ previousFont = font ? SelectObject(dc, font) : nullptr;
-                memset(pixels, 0, size_t(size) * size * sizeof(DWORD));
-                SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(255, 255, 255));
-                RECT glyph{0, 0, size, size}; WORD index = 0xFFFF;
-                if (font && GetGlyphIndicesW(dc, L"\uE8AB", 1, &index, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR && index != 0xFFFF)
-                    DrawTextW(dc, L"\uE8AB", 1, &glyph, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                GdiFlush();
-                auto hasInk = [&] { return std::any_of(pixels, pixels + size_t(size) * size,
-                    [](DWORD pixel) { return (pixel & 0xFFFFFF) != 0; }); };
-                if (!hasInk()) {
-                    // A missing/substituted font must still leave a usable
-                    // switch: two opposing arrows, independent of font files.
-                    const HPEN pen = CreatePen(PS_SOLID, std::max(1, Scale96(1, dpi)), RGB(255, 255, 255));
-                    const HGDIOBJ previousPen = SelectObject(dc, pen);
-                    const int edge = std::max(1, size / 8), head = std::max(2, size / 4);
-                    const int right = size - edge - 1, upper = size / 3, lower = size * 2 / 3;
-                    const POINT upperArrow[]{{edge, upper}, {right, upper}, {right - head, upper - head}};
-                    const POINT upperTip[]{{right, upper}, {right - head, upper + head}};
-                    const POINT lowerArrow[]{{right, lower}, {edge, lower}, {edge + head, lower - head}};
-                    const POINT lowerTip[]{{edge, lower}, {edge + head, lower + head}};
-                    Polyline(dc, upperArrow, ARRAYSIZE(upperArrow)); Polyline(dc, upperTip, ARRAYSIZE(upperTip));
-                    Polyline(dc, lowerArrow, ARRAYSIZE(lowerArrow)); Polyline(dc, lowerTip, ARRAYSIZE(lowerTip));
-                    SelectObject(dc, previousPen); if (pen) DeleteObject(pen);
-                    GdiFlush();
-                }
-                std::vector<BYTE> coverage(size_t(size) * size);
-                for (size_t i = 0; i < coverage.size(); ++i)
-                    coverage[i] = static_cast<BYTE>(std::max({GetRValue(pixels[i]), GetGValue(pixels[i]), GetBValue(pixels[i])}));
-                if (previousFont) SelectObject(dc, previousFont);
-                SelectObject(dc, previousBitmap); // CreateIconIndirect requires deselected bitmaps.
+            if (dc && color && coverage.size() == size_t(size) * size) {
                 const int stride = ((size + 15) / 16) * 2;
                 std::vector<BYTE> andMask(size_t(stride) * size, 0xFF);
                 for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x)
@@ -35800,7 +35852,6 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                     fresh[disabled] = CreateIconIndirect(&iconInfo);
                 }
             }
-            if (font) DeleteObject(font);
             if (mask) DeleteObject(mask);
             if (color) DeleteObject(color);
             if (dc) DeleteDC(dc);

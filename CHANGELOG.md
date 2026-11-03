@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.344
+
+- Selection checkbox checkmarks use the same accent foreground as the swipe
+  gesture chevron.
+- Double-tapping empty space with touch goes up a folder, like double-clicking.
+- The status bar view switch button uses the status bar's own background in
+  light mode instead of a slightly darker shade.
+- Sharper drawing at scaling other than 100%: the view switch arrows,
+  selection checkboxes, search highlights, thumbnail shadows and the drag
+  preview's count and caption now sit on whole pixels instead of blurring
+  across two. Items partly scrolled past the top no longer grow by a pixel.
+
 ## 0.9.343
 
 - Icon overlays (cloud status, shortcut arrows) have one consistent size for

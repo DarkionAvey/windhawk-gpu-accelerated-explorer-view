@@ -1925,6 +1925,7 @@ static void TestPreviewInput() {
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
 #include "item-tip-smoke.h"
+#include "pixel-snap-smoke.h"
 
 #include "option-effects-smoke.h"
 #include "regression-manifest.h"
