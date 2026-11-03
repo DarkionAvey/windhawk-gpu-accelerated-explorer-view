@@ -1,4 +1,78 @@
 #include <thread>
+static void TestItemTipRelativeDates() {
+    const auto fileTime=[](int year,int month,int day,int hour,int minute,bool local=true) {
+        SYSTEMTIME value{}; value.wYear=WORD(year); value.wMonth=WORD(month); value.wDay=WORD(day);
+        value.wHour=WORD(hour); value.wMinute=WORD(minute);
+        SYSTEMTIME utc{};
+        if(local) Check(TzSpecificLocalTimeToSystemTimeEx(nullptr,&value,&utc),"relative date local conversion");
+        else utc=value;
+        FILETIME result{}; Check(SystemTimeToFileTime(&utc,&result),"relative date FILETIME conversion");
+        return result;
+    };
+    const FILETIME now=fileTime(2026,6,15,12,0);
+    struct Case {FILETIME time; double offset; SystemRelativeTime::Unit unit;};
+    const Case cases[]={
+        {fileTime(2026,6,15,11,55),-5,SystemRelativeTime::Minute},
+        {fileTime(2026,6,15,12,5),5,SystemRelativeTime::Minute},
+        {fileTime(2026,6,15,7,0),-5,SystemRelativeTime::Hour},
+        {fileTime(2026,6,14,12,0),-1,SystemRelativeTime::Day},
+        {fileTime(2026,6,16,12,0),1,SystemRelativeTime::Day},
+        {fileTime(2026,6,12,12,0),-3,SystemRelativeTime::Day},
+        {fileTime(2026,6,1,12,0),-2,SystemRelativeTime::Week},
+        {fileTime(2026,5,15,12,0),-1,SystemRelativeTime::Month},
+        {fileTime(2024,6,15,12,0),-2,SystemRelativeTime::Year}
+    };
+    // Independent native ICU calls supply expected localized phrases; never
+    // assert English literals or change the user's regional settings.
+    HMODULE module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    Check(module!=nullptr,"system ICU library");
+    struct Release {HMODULE value; ~Release() {FreeLibrary(value);}} release{module};
+    const auto open=reinterpret_cast<SystemRelativeTime::Open>(GetProcAddress(module,"ureldatefmt_open"));
+    const auto close=reinterpret_cast<SystemRelativeTime::Close>(GetProcAddress(module,"ureldatefmt_close"));
+    const auto format=reinterpret_cast<SystemRelativeTime::Format>(GetProcAddress(module,"ureldatefmt_format"));
+    Check(open && close && format,"native ICU relative date API");
+    struct Locale {const wchar_t* windows; const char* icu;};
+    for(const auto locale:{Locale{L"en-US","en_US"},Locale{L"nl-NL","nl_NL"},
+        Locale{L"ar-SA","ar_SA"},Locale{L"ja-JP","ja_JP"}}) {
+        for(const auto& item:cases) {
+            const auto offset=ItemTipDateOffset(item.time,now);
+            Check(offset && offset->value==item.offset && offset->unit==item.unit,"relative tooltip date chose the wrong unit/offset");
+            int32_t status=0;
+            void* native=open(locale.icu,nullptr,0,0x104,&status);
+            Check(native && status<=0,"native localized relative date formatter");
+            wchar_t phrase[1024]{}; status=0;
+            const auto length=format(native,item.offset,item.unit,phrase,ARRAYSIZE(phrase),&status);
+            close(native);
+            Check(status<=0 && length>0 && length<int32_t(ARRAYSIZE(phrase)),"native relative phrase");
+            SYSTEMTIME utc{},local{};
+            Check(FileTimeToSystemTime(&item.time,&utc) && SystemTimeToTzSpecificLocalTimeEx(nullptr,&utc,&local),"native absolute date conversion");
+            wchar_t date[256]{},time[256]{};
+            Check(GetDateFormatEx(LOCALE_NAME_USER_DEFAULT,DATE_SHORTDATE,&local,nullptr,date,ARRAYSIZE(date),nullptr) &&
+                GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT,TIME_NOSECONDS,&local,nullptr,time,ARRAYSIZE(time)),"native absolute date formatting");
+            const std::wstring absolute=std::wstring(date)+L" "+time;
+            Check(FormatItemTipDate(item.time,now,locale.windows)==absolute+L" \x00B7 "+std::wstring(phrase,size_t(length)),
+                "tooltip lost its exact date, separator or native localized relative phrase");
+            Check(FormatItemTipDate(item.time,now,nullptr)==absolute,"relative formatter failure lost the actual date");
+        }
+    }
+    DYNAMIC_TIME_ZONE_INFORMATION pacific{};
+    bool found=false;
+    for(DWORD i=0;;++i) {
+        DYNAMIC_TIME_ZONE_INFORMATION zone{};
+        const DWORD result=EnumDynamicTimeZoneInformation(i,&zone);
+        if(result==ERROR_NO_MORE_ITEMS) break;
+        Check(result==ERROR_SUCCESS,"read-only time-zone discovery");
+        if(!wcscmp(zone.TimeZoneKeyName,L"Pacific Standard Time")) {pacific=zone; found=true; break;}
+    }
+    Check(found,"OS Pacific time-zone rules");
+    for(const auto pair:{std::pair{fileTime(2026,3,8,8,0,false),fileTime(2026,3,9,7,0,false)},
+        std::pair{fileTime(2026,11,1,7,0,false),fileTime(2026,11,2,8,0,false)}}) {
+        const auto offset=ItemTipDateOffset(pair.first,pair.second,&pacific);
+        Check(offset && offset->unit==SystemRelativeTime::Day && offset->value==-1,
+            "relative calendar date treated a 23/25-hour DST day as elapsed hours");
+    }
+    Check(FormatItemTipDate(FILETIME{},now,L"nl-NL").empty(),"missing timestamp acquired a relative phrase");
+}
 // Hovered-item tooltip: real popup windows, DirectWrite layout, DWM attributes
 // and the tab's Columns lane, on a private desktop that is never displayed.
 // Hover is the production entry point after the system hover time; no input

@@ -8147,21 +8147,89 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
-std::wstring ItemTipDate(REFPROPERTYKEY key, const FILETIME& time) {
+// Windhawk's MinGW headers omit icu.h. Bind the documented, stable Windows
+// ICU C ABI directly; no bundled ICU data, SDK path or extra DLL dependency.
+struct SystemRelativeTime {
+    enum Unit : int32_t {Year,Quarter,Month,Week,Day,Hour,Minute,Second};
+    HMODULE module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    using Open=void*(__cdecl*)(const char*,void*,int32_t,int32_t,int32_t*);
+    using Close=void(__cdecl*)(void*);
+    using Format=int32_t(__cdecl*)(const void*,double,int32_t,wchar_t*,int32_t,int32_t*);
+    using Locale=int32_t(__cdecl*)(const char*,char*,int32_t,int32_t*,int32_t*);
+    Open open=module ? reinterpret_cast<Open>(GetProcAddress(module,"ureldatefmt_open")):nullptr;
+    Close close=module ? reinterpret_cast<Close>(GetProcAddress(module,"ureldatefmt_close")):nullptr;
+    Format format=module ? reinterpret_cast<Format>(GetProcAddress(module,"ureldatefmt_format")):nullptr;
+    Locale locale=module ? reinterpret_cast<Locale>(GetProcAddress(module,"uloc_forLanguageTag")):nullptr;
+    ~SystemRelativeTime() {if(module) FreeLibrary(module);}
+    std::wstring Render(double offset,Unit unit,const wchar_t* localeName) const {
+        if(!open || !close || !format || !locale || !localeName) return {};
+        char tag[LOCALE_NAME_MAX_LENGTH*4]{},id[LOCALE_NAME_MAX_LENGTH*4]{};
+        if(!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,localeName,-1,tag,sizeof(tag),nullptr,nullptr)) return {};
+        int32_t status=0,parsed=0;
+        locale(tag,id,int32_t(sizeof(id)),&parsed,&status);
+        if(status>0 || parsed!=int32_t(strlen(tag))) return {};
+        // ICU UDAT_STYLE_LONG and UDISPCTX_CAPITALIZATION_FOR_STANDALONE.
+        void* formatter=open(id,nullptr,0,0x104,&status);
+        if(!formatter || status>0) {if(formatter) close(formatter); return {};}
+        status=0;
+        const int32_t length=format(formatter,offset,unit,nullptr,0,&status);
+        std::wstring result;
+        constexpr int32_t bufferOverflow=15; // ICU U_BUFFER_OVERFLOW_ERROR.
+        if(length>0 && (status<=0 || status==bufferOverflow)) {
+            result.resize(size_t(length)+1); status=0;
+            const auto written=format(formatter,offset,unit,result.data(),int32_t(result.size()),&status);
+            if(status<=0 && written>=0 && size_t(written)<result.size()) result.resize(size_t(written));
+            else result.clear();
+        }
+        close(formatter);
+        return result;
+    }
+};
+struct ItemTipRelativeOffset {double value=0; SystemRelativeTime::Unit unit=SystemRelativeTime::Second;};
+std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,const FILETIME& now,
+    const DYNAMIC_TIME_ZONE_INFORMATION* zone=nullptr) {
+    if(!time.dwLowDateTime && !time.dwHighDateTime) return {};
+    SYSTEMTIME utc{},utcNow{},local{},localNow{};
+    if(!FileTimeToSystemTime(&time,&utc) || !FileTimeToSystemTime(&now,&utcNow) ||
+        !SystemTimeToTzSpecificLocalTimeEx(zone,&utc,&local) ||
+        !SystemTimeToTzSpecificLocalTimeEx(zone,&utcNow,&localNow)) return {};
+    const auto ticks=[](const FILETIME& value) {return (ULONGLONG(value.dwHighDateTime)<<32)|value.dwLowDateTime;};
+    const double seconds=(double(ticks(time))-double(ticks(now)))/10000000.;
+    // Local calendar dates, represented at fictitious UTC midnight: a day
+    // remains a calendar day through 23/25-hour daylight-saving transitions.
+    const auto midnight=[](SYSTEMTIME value,FILETIME& result) {
+        value.wHour=value.wMinute=value.wSecond=value.wMilliseconds=0;
+        return SystemTimeToFileTime(&value,&result)!=FALSE;
+    };
+    FILETIME day{},dayNow{};
+    if(!midnight(local,day) || !midnight(localNow,dayNow)) return {};
+    const double days=std::round((double(ticks(day))-double(ticks(dayNow)))/864000000000.);
+    if(days==0) {
+        if(std::abs(seconds)<60.) return ItemTipRelativeOffset{std::trunc(seconds),SystemRelativeTime::Second};
+        if(std::abs(seconds)<3600.) return ItemTipRelativeOffset{std::trunc(seconds/60.),SystemRelativeTime::Minute};
+        return ItemTipRelativeOffset{std::trunc(seconds/3600.),SystemRelativeTime::Hour};
+    }
+    if(std::abs(days)<7.) return ItemTipRelativeOffset{days,SystemRelativeTime::Day};
+    const int months=(int(local.wYear)-int(localNow.wYear))*12+int(local.wMonth)-int(localNow.wMonth);
+    if(std::abs(months)>=12) return ItemTipRelativeOffset{std::trunc(months/12.),SystemRelativeTime::Year};
+    if(months) return ItemTipRelativeOffset{double(months),SystemRelativeTime::Month};
+    return ItemTipRelativeOffset{std::trunc(days/7.),SystemRelativeTime::Week};
+}
+std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wchar_t* localeName) {
     std::wstring text = FormatFileTime(time);
     if (text.empty()) return text;
-    PROPVARIANT value{}; value.vt = VT_FILETIME; value.filetime = time;
-    PWSTR relative = nullptr, absolute = nullptr;
-    const auto flags = static_cast<PROPDESC_FORMAT_FLAGS>(PDFF_HIDETIME | PDFF_SHORTDATE);
-    PSFormatForDisplayAlloc(key, value, flags, &absolute);
-    PSFormatForDisplayAlloc(key, value,
-        static_cast<PROPDESC_FORMAT_FLAGS>(flags | PDFF_RELATIVEDATE), &relative);
-    // Windows supplies friendly dates such as Yesterday where supported.
-    // Never invent English age phrases or duplicate an ordinary calendar date.
-    if (relative && *relative && absolute && wcscmp(relative, absolute) != 0)
-        text += L" \x00B7 " + std::wstring(relative);
-    CoTaskMemFree(relative); CoTaskMemFree(absolute);
+    if(const auto offset=ItemTipDateOffset(time,now); offset && localeName && *localeName) {
+        static const SystemRelativeTime formatter;
+        const auto relative=formatter.Render(offset->value,offset->unit,localeName);
+        if(!relative.empty()) text+=L" \x00B7 "+relative;
+    }
     return text;
+}
+std::wstring ItemTipDate(REFPROPERTYKEY, const FILETIME& time) {
+    FILETIME now{}; GetSystemTimeAsFileTime(&now);
+    wchar_t localeName[LOCALE_NAME_MAX_LENGTH]{};
+    GetUserDefaultLocaleName(localeName,ARRAYSIZE(localeName));
+    return FormatItemTipDate(time,now,localeName);
 }
 
 std::wstring ItemTipComparison(std::wstring value, bool date) {

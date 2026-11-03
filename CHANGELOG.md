@@ -2,6 +2,8 @@
 
 ## 0.9.348 (unreleased)
 
+- Show tooltip dates with a localized relative phrase from Windows ICU,
+  alongside the actual date and time.
 - Let keyboard navigation visit section headers; Enter/Space toggles them and
   Left/Right collapses or expands the focused section.
 - Use the normal selection background for focused section headers and preserve
