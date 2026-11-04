@@ -7,7 +7,7 @@ create/layout transactions. Fixtures use private windows/files and substituted
 focus; they do not establish live Explorer presentation timing.
 
 Requires Windows 11 x64 and a Windhawk installation containing its bundled
-Compiler and x64 Engine import library. No Python, Codex runtime, fixed drive
+Compiler and matching x64/ARM64 Engine import libraries. No Python, Codex runtime, fixed drive
 letter or user-specific folder is required by the build or regression scripts.
 
 ## Release command
@@ -74,7 +74,38 @@ background-regression.exe --test option-live-sweep-details            # one test
 `--options`, ...) still select the matching manifest entries. Failure
 preserves binaries, per-test stdout/stderr logs, timing CSVs and any pixel
 evidence (`*.bmp`) in the printed artifact directory; `-KeepArtifacts`
-retains them after success too. No assertion is relaxed or retried.
+retains binaries after success too. Assertions stay unchanged. Once the initial
+parallel and serial phases have finished, each unsuccessful runtime test gets
+three isolated attempts, one process at a time. All three run even after a
+passing retry. Two or three failed isolated attempts fail the test; zero or one
+failed isolated attempts pass it. The initial parallel failure does not count
+toward that threshold. Compiler errors stop at their compile gate and are not
+retried.
+
+Observed injected Windhawk modules, blocked process launches, and incomplete
+process/output cleanup make checks **pending**, rather than proving a test bug.
+Module observation is best effort: the runner cannot identify every injector or
+infer interference from an unexplained failure. It does not change Windhawk
+settings. Pending checks block publication with a nonzero exit, even if other
+checks pass. A process that cannot be reaped prevents further isolated attempts;
+uncompleted checks remain pending. Process termination and output draining have
+bounded cleanup waits instead of waiting forever.
+
+The printed result directory retains `build-report.json` (release command),
+`test-run-report.json`, `regression-report.json`, `regression-summary.csv` and
+`regression-attempts.csv`. Each retry has its own logs/receipt under
+`isolated-<attempt>/<test>/`. Retried runs retain their binaries for investigation,
+even after recovery. Clean runs retain logs/reports and remove binaries unless
+`-KeepArtifacts` or `-Coverage` is used. `-OutputDirectory` selects an artifact
+directory (repository-relative or absolute); it must be empty so earlier results
+cannot be overwritten.
+
+There is no repository build sandbox. A restricted Windows execution token
+(including an AppContainer) is reported as pending before creating a release or
+starting compilers. Launch `build.bat` in an ordinary terminal, or have the
+execution host approve an unrestricted rerun. A child process inherits its
+parent's restrictions; the build cannot restart itself outside an externally
+imposed sandbox. Administrator elevation is not normally required.
 
 Native popup coverage runs filesystem, archive and delegated providers in
 separate processes/private desktops. Each keeps its own failure deadline and

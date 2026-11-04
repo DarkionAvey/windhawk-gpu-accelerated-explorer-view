@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Collect three isolated retries after unsuccessful runtime checks, retain each
+  attempt's diagnostics, and distinguish pending checks from test failures before
+  deciding whether a build can publish.
+
 ## 1.0.4
 
 - Fix ARM64 compilation by restricting the clipboard comparison's SSE2 fast

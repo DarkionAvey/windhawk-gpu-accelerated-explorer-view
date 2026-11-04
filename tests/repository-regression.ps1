@@ -105,6 +105,7 @@ try {
     foreach ($name in @('repository.ps1', 'build.ps1', 'minify.ps1', 'SourceMinifier.cs')) {
         Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) ('scripts\' + $name)) -Destination (Join-Path $scripts $name)
     }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'parallel-runner.ps1') -Destination (Join-Path $tests 'parallel-runner.ps1')
     Write-Utf8 (Join-Path $fakeWindhawk 'Compiler\bin\clang++.exe') ''
     Write-Utf8 (Join-Path $tests 'repository-regression.ps1') '# Isolated orchestration fixture.'
     $runner = Join-Path $tests 'run-regressions.ps1'
@@ -122,6 +123,17 @@ try {
         Assert (!(Test-Path -LiteralPath (Join-Path $archive '0.9.11.cpp'))) 'failed tests archived the candidate'
         foreach ($name in $archiveHashes.Keys) {
             Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'failed tests changed or pruned an archive'
+        }
+        $pendingResults=Join-Path $fixture 'pending-results'
+        Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); throw "PENDING: injected module observed in private test process"'
+        Reject { & $build -WindhawkDirectory $fakeWindhawk -OutputDirectory $pendingResults } 'pending checks published a release'
+        $pendingReport=Get-Content -LiteralPath (Join-Path $pendingResults 'build-report.json') -Raw | ConvertFrom-Json
+        Assert ($pendingReport.Status -eq 'Pending' -and !$pendingReport.Published) 'pending checks were reported as a proven failure or publication'
+        Assert ((Get-SourceHash $latest) -eq $newHash) 'pending checks changed latest'
+        Assert ((Get-SourceHash $export) -eq $newHash) 'pending checks changed the export'
+        Assert ((Get-SourceHash $minified) -eq $minifiedHash) 'pending checks changed the minified export'
+        foreach ($name in $archiveHashes.Keys) {
+            Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'pending checks changed or pruned an archive'
         }
         Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory); [IO.File]::AppendAllText($SourceFile, "changed during testing")'
         Reject { & $build -WindhawkDirectory $fakeWindhawk } 'source changed during testing was published'
