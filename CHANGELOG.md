@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 (unreleased)
+
+- Expand a renamed item's collapsed section before revealing the item and
+  opening its rename field, including newly created files and folders.
+
 ## 1.0.1
 
 - Cap thumbnail app badges and Shell overlay glyphs at twice Windows' DPI-scaled

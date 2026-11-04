@@ -335,9 +335,23 @@ static void TestRenameAppearanceImpl(const std::wstring& directory) {
             if(details) SetHorizontalScroll(state,trailing ? state.columnContentWidth : 0.f);
             const float before=state.horizontalScroll;
             SetScrollImmediate(state,0.f);
-            BeginRename(state,state.selected);
+            if(grouped) {
+                auto& section=state.sections[size_t(state.rowGroup[size_t(state.selected)])];
+                section.collapsed=true; section.from=1.f; section.to=0.f;
+                section.fraction=trailing ? .5f:0.f;
+                section.started={};
+                if(trailing) QueryPerformanceCounter(&section.started);
+                state.groupAnimating=trailing;
+                LayoutGroupSections(state); PublishGroupIntents(state);
+            }
+            BeginRename(state,state.selected,grouped && !trailing);
             Check(state.rename.editor && state.scrollNow>0.f && !state.animationActive &&
                 !state.horizontalAnimating,"rename did not immediately reveal the offscreen row");
+            if(grouped) {
+                const auto& section=state.sections[size_t(state.rowGroup[size_t(state.selected)])];
+                Check(!section.collapsed && section.fraction==1.f && !section.started.QuadPart &&
+                    DisplayedRow(state,state.selected),"rename field opened before its section finished expanding");
+            }
             if(details) {
                 if(!(trailing ? state.horizontalScroll<before : state.horizontalScroll>before))
                     std::cout<<"RENAME horizontal reveal dpi="<<dpi<<" rtl="<<rtl<<" grouped="<<grouped
@@ -378,6 +392,12 @@ static void TestRenameAppearanceImpl(const std::wstring& directory) {
             const auto model=CapturePresentationModel(state);
             Check(model->selectionFeedback && !model->inputFocus && model->renameIndex==state.selected,
                 "rename selection/editor state did not cross the presentation boundary");
+            if(grouped) {
+                const auto& key=state.sections[size_t(state.rowGroup[size_t(state.selected)])].key;
+                Check(std::any_of(model->sections.begin(),model->sections.end(),[&](const auto& section) {
+                    return section.key==key && !section.collapsed && section.fraction==1.f;
+                }),"rename presentation retained the collapsed destination section");
+            }
             if(!trailing) {
                 TouchInputTest::RenderedTouch rendered;
                 FocusFixture::focus=tab.frame;
