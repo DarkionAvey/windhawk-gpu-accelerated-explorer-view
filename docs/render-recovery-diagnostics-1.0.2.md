@@ -35,5 +35,6 @@ receipts; previously these failures could arrive at the owner as S_OK.
 The existing render-quality test gains real A8 and BGRA draws with the observed
 grayscale override, plus the rendering-mode/AA compatibility matrix. Existing
 pixel checks cover the ordinary aliased choice.
-Temporary capture instrumentation has been removed. No build or regression
-suite was run, as requested. Confirmation on the affected PC remains pending.
+Temporary capture instrumentation has been removed. Build and regression
+validation are recorded in `release-validation-1.0.2.md`. Confirmation on the
+affected PC remains pending.

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.0.1
+// @version         1.0.2
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -3908,6 +3908,9 @@ struct ViewState {
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
     ULONGLONG startupStartedAt = 0;
     ULONGLONG firstContentSubmittedAt = 0;
+    // Armed only for a newly attached tab, never by refresh/provider results.
+    // Explicit view input/commands or departure from its first folder ends it.
+    bool startupAnimationsSuppressed = false;
     bool preparingTab = false; // Prepare one hidden first-content surface; then use normal standby.
     bool tabSurfaceWakeQueued = false;
     ComPtr<IDispatch> pendingAutomation;
@@ -4095,6 +4098,7 @@ struct SwipeFeedbackSnapshot {
 #define PRESENTATION_MODEL_FIELDS(X) \
     X(hwnd) X(nativeHwnd) X(frameHwnd) X(activeTabHost) X(rtlLayout) X(inScope) X(thisPcGpu) \
     X(detailsViewActive) X(columnsView) X(gridView) X(nativeIconSize) X(layoutNativeMode) X(layoutIconSize) \
+    X(startupAnimationsSuppressed) \
     X(itemsPerRow) X(itemWidth) X(columns) X(columnEpoch) X(propertyEpoch) X(columnContentWidth) \
     X(imageMemoryAllowance) X(imageCacheFloor) \
     X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
@@ -4280,6 +4284,11 @@ void ReleasePresentation(ViewState& state,bool stop=false);
 void RegisterAnimationWindow(HWND hwnd);
 void QueueVisibleDataFrame(ViewState& state);
 void Redraw(ViewState& state);
+void EndInitialLoading(ViewState& state) {
+    if(!std::exchange(state.startupAnimationsSuppressed,false)) return;
+    // Publish the changed policy even when the input itself needs no repaint.
+    Redraw(state);
+}
 int ViewHeight(ViewState& state);
 void SetActive(HWND hwnd, bool on);
 void RefreshViewToggleForFrame(HWND frame, bool deferred = false, bool invalidateGeometry = true);
@@ -4636,7 +4645,7 @@ float EaseOutCubic(float progress) {
 float UiTransitionProgress(const ViewState& state, LARGE_INTEGER started,
                            ULONGLONG durationMs = kUiTransitionDurationMs,
                            LARGE_INTEGER sampled = {}) {
-    if (!started.QuadPart || state.qpcFrequency <= 0.) return 1.f;
+    if (state.startupAnimationsSuppressed || !started.QuadPart || state.qpcFrequency <= 0.) return 1.f;
     LARGE_INTEGER now=sampled;
     if (!now.QuadPart) QueryPerformanceCounter(&now);
     const double elapsedMs = (now.QuadPart - started.QuadPart) *
@@ -4681,7 +4690,7 @@ float LayoutTransitionProgress(const ViewState& state, bool active, LARGE_INTEGE
                                LARGE_INTEGER sampled = {}) {
     // Start the duration at the first successful submission, not while a row
     // result is still waiting behind Shell work or a full DXGI present queue.
-    if (!active) return 1.f;
+    if (!active || state.startupAnimationsSuppressed) return 1.f;
     return started.QuadPart ? EaseOutCubic(UiTransitionProgress(state, started,
         kUiTransitionDurationMs,sampled)) : 0.f;
 }
@@ -4819,7 +4828,7 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.itemOpacityAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
-        (includeClipboard && state.clipboardIconsVisible && !state.clipboardPaths.empty() && state.visible &&
+        (includeClipboard && !state.startupAnimationsSuppressed && state.clipboardIconsVisible && !state.clipboardPaths.empty() && state.visible &&
             state.inScope && state.detailsViewActive && PresentationVisible(state) && !PresentationMinimized(state)) ||
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
@@ -5067,7 +5076,7 @@ void QueueVisibleDataFrame(ViewState& state) {
 void RetargetZebraExtent(ViewState& state, float previous) {
     const float target = DocumentHeight(state);
     if (state.zebraExtentAnimating && fabsf(target-state.zebraExtentTo) < .01f) return;
-    state.zebraExtentAnimating = previous >= 0.f && state.visible &&
+    state.zebraExtentAnimating = !state.startupAnimationsSuppressed && previous >= 0.f && state.visible &&
         state.detailsViewActive && state.loaded && g_zebra.load(std::memory_order_relaxed) &&
         !g_emptyRows.load(std::memory_order_relaxed) &&
         g_zebraOpacity.load(std::memory_order_relaxed) > 0 && fabsf(target-previous) > .01f;
@@ -6135,6 +6144,19 @@ bool TabOwnsActiveView(const ViewState& state);
 // Tab registry/presentation helpers are implemented after OverlayWndProc.
 // Their declarations must be visible to its kMsgTabActivated handler.
 HWND OverlayUnder(HWND frame);
+// Observe input provenance, not the animation/layout operation it may cause.
+// System-generated traffic during attachment/enrichment must leave startup
+// instant, including a window appearing beneath a stationary pointer.
+void ObserveInitialLoadingInput(HWND window) {
+    if(g_unloading.load(std::memory_order_relaxed)) return;
+    INPUT_MESSAGE_SOURCE source{};
+    if(!GetCurrentInputMessageSource(&source) || source.deviceType==IMDT_UNAVAILABLE ||
+        (source.originId!=IMO_HARDWARE && source.originId!=IMO_INJECTED)) return;
+    const HWND overlay=OverlayUnder(GetAncestor(window,GA_ROOT));
+    if(!overlay || GetWindowThreadProcessId(overlay,nullptr)!=GetCurrentThreadId()) return;
+    if(auto* state=State(overlay); state && state->startupAnimationsSuppressed &&
+        state->visible && TabOwnsActiveView(*state)) EndInitialLoading(*state);
+}
 void SynchronizeTabSurfaces(HWND frame, bool activate = false);
 void ArmTabSwitchProbe(HWND frame, const wchar_t* reason);
 void TraceTabHostSnapshot(HWND frame, const wchar_t* source);
@@ -11270,6 +11292,7 @@ struct NativeViewInput {
     explicit NativeViewInput(ViewState* state, bool explicitMode = false) {
         if (g_unloading.load(std::memory_order_relaxed) || !state || !state->visible ||
             !state->inScope || state->optimisticStartedAt || !TabOwnsActiveView(*state)) return;
+        EndInitialLoading(*state);
         // Canonical View commands are authoritative even if the native view
         // already has that mode and only the GPU differs after a cold preview.
         const HWND owner=state->hwnd, source=state->nativeHwnd;
@@ -11563,6 +11586,7 @@ PROPERTYKEY HeaderSortKey(ViewState& state, int column) {
 void SortByHeader(ViewState& state, int column) {
     if (!state.folderView || column < 0 ||
         column >= static_cast<int>(state.columns.size())) return;
+    EndInitialLoading(state);
     PROPERTYKEY key = HeaderSortKey(state, column);
     // A second click reverses the direction. Dates default to newest first.
     const bool same = state.sortInitialized && SameProperty(key, state.sort.key);
@@ -12921,7 +12945,7 @@ void StartRowTransition(ViewState& state, std::vector<CapturedRow>&& captures,
     // list without exposing any underlying native empty/loading message.
     const bool enteringFromEmpty = oldTotal == 0 && state.total > 0 &&
                                    captures.empty();
-    if (state.zoomAnimating || !state.sections.empty() || !state.loaded || !state.visible || !state.detailsViewActive ||
+    if (state.startupAnimationsSuppressed || state.zoomAnimating || !state.sections.empty() || !state.loaded || !state.visible || !state.detailsViewActive ||
         !state.inScope || (state.emptyNative && !enteringFromEmpty) ||
         (captures.empty() && !enteringFromEmpty) ||
         oldRowPx != state.rowPx || state.rowPx <= 0 ||
@@ -13024,7 +13048,7 @@ void StartGroupingTransition(ViewState& state,
     // Zoom and reflow captures are presented visuals of the same items, so
     // their row height may differ and cells leaving the viewport keep moving.
     const bool presented = zoomLayout || reflow;
-    if ((state.zoomAnimating && !zoomLayout) || !state.loaded || !state.visible || !state.inScope ||
+    if (state.startupAnimationsSuppressed || (state.zoomAnimating && !zoomLayout) || !state.loaded || !state.visible || !state.inScope ||
         !state.detailsViewActive || (!presented && oldRowPx != state.rowPx) ||
         state.rowPx <= 0 || state.rename.editor || state.marqueePossible ||
         state.marqueeActive) return;
@@ -13578,7 +13602,7 @@ void StartColumnTransition(ViewState& state,
     PipelineScope pipeline(state.background,L"columns.transition",previous.size(),state.columns.size());
     const float headerFrom = state.headerPx;
     StopColumnTransition(state);
-    if (!state.visible || !state.detailsViewActive ||
+    if (state.startupAnimationsSuppressed || !state.visible || !state.detailsViewActive ||
         (!state.columnsView && !viewMode) ||
         (!viewMode && (previous.empty() || state.columns.empty()))) return;
     const float headerTo = state.columnsView ?
@@ -13725,6 +13749,7 @@ void FinishColumnTransition(ViewState& state) {
 // Mode intent is immediate. Only the header's extent and existing column
 // rectangles animate; no native layout, fitting, or provider work per frame.
 void SetColumnViewMode(ViewState& state, bool details, bool animate = true) {
+    animate &= !state.startupAnimationsSuppressed;
     if (state.columnsView == details) return;
     const bool reversing = state.columnModeTransition;
     if (state.columnTransitionActive) AdvanceColumnTransition(state);
@@ -16035,8 +16060,11 @@ void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=fa
         D2D1_TEXT_ANTIALIAS_MODE_ALIASED : mode==TextAntialiasing::System ?
         D2D1_TEXT_ANTIALIAS_MODE_DEFAULT : D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
     if(native && mode!=TextAntialiasing::System) {
+        // Let D2D resolve aliased rendering from its effective text AA mode.
+        // Font customizers can override SetTextAntialiasMode to grayscale;
+        // forcing DWrite ALIASED then makes both cached and direct draws invalid.
         const auto rendering=mode==TextAntialiasing::Smooth ? DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED :
-            DWRITE_RENDERING_MODE1_ALIASED;
+            DWRITE_RENDERING_MODE1_DEFAULT;
         const auto fitting=mode==TextAntialiasing::Smooth ? DWRITE_GRID_FIT_MODE_DISABLED : DWRITE_GRID_FIT_MODE_ENABLED;
         ComPtr<IDWriteFactory3> factory;
         ComPtr<IDWriteRenderingParams1> params1;
@@ -16063,10 +16091,36 @@ void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=fa
 void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
     RefreshTextRenderingForWindow(state,state.hwnd,checkMonitor);
 }
+bool CompatibleTextRendering(IDWriteRenderingParams* params,D2D1_TEXT_ANTIALIAS_MODE antialias) {
+    if(!params) return true; // D2D chooses compatible defaults.
+    const auto rendering=params->GetRenderingMode();
+    switch(antialias) {
+    case D2D1_TEXT_ANTIALIAS_MODE_DEFAULT: return true;
+    case D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE:
+        return rendering!=DWRITE_RENDERING_MODE_ALIASED && rendering!=DWRITE_RENDERING_MODE_OUTLINE;
+    case D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE:
+        return rendering!=DWRITE_RENDERING_MODE_ALIASED;
+    case D2D1_TEXT_ANTIALIAS_MODE_ALIASED:
+        return rendering==DWRITE_RENDERING_MODE_DEFAULT || rendering==DWRITE_RENDERING_MODE_ALIASED ||
+            rendering==DWRITE_RENDERING_MODE_OUTLINE;
+    default: return false;
+    }
+}
+void SetCompatibleTextRendering(ID2D1RenderTarget* target,IDWriteRenderingParams* params,
+                                D2D1_TEXT_ANTIALIAS_MODE antialias) {
+    target->SetTextRenderingParams(params);
+    target->SetTextAntialiasMode(antialias);
+    // Inspect the applied pair, not just our request: native parameters and
+    // injected font policies can differ between machines. Validate before any
+    // draw; incompatible parameters poison the target until EndDraw.
+    ComPtr<IDWriteRenderingParams> applied;
+    target->GetTextRenderingParams(&applied);
+    if(!CompatibleTextRendering(applied.Get(),target->GetTextAntialiasMode()))
+        target->SetTextRenderingParams(nullptr);
+}
 template<class Style>
 void ConfigureTextTarget(const Style& state,ID2D1RenderTarget* target) {
-    target->SetTextRenderingParams(state.textRenderingParams.Get());
-    target->SetTextAntialiasMode(state.textAntialiasMode);
+    SetCompatibleTextRendering(target,state.textRenderingParams.Get(),state.textAntialiasMode);
 }
 
 void Fill(ViewState& state, float l, float t, float r, float b,
@@ -17290,7 +17344,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
                     float opacity = 1.f) {
     if(!VisibleOpacity(opacity)) return;
     const bool pending = state.clipboardPaths.contains(e.path);
-    const float angle = pending ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
+    const float angle = pending && !state.startupAnimationsSuppressed ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
         state.clipboardIconElapsedMs,SelectionPathHash(e.path)) : 0.f;
     auto* overlay = OverlayArtwork(state, e, true);
     const auto draw = [&](IconRecord& icon, bool association) {
@@ -18520,7 +18574,7 @@ float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = f
         (g_dimDotFiles.load(std::memory_order_relaxed) && !entry.name.empty() && entry.name.front() == L'.') ||
         IsCutClipboardItem(state,entry.path);
     const float target = dim ? kDimmedItemContentOpacity : 1.f;
-    if (!animated) return target;
+    if (!animated || state.startupAnimationsSuppressed) return target;
     auto [it, inserted] = state.itemOpacityRows.try_emplace(entry.path);
     auto& motion = it->second;
     if (inserted || (motion.seen != state.itemOpacityPaint && motion.seen + 1 != state.itemOpacityPaint)) {
@@ -19444,7 +19498,7 @@ bool RenderedDragInk(ID2D1Factory* factory,IDWriteTextLayout* layout,COLORREF fo
     if(FAILED(factory->CreateDCRenderTarget(&properties,&software)) || FAILED(software->BindDC(dc,&bounds)) ||
         FAILED(software.As(&context)) || FAILED(context->CreateSolidColorBrush(D2D1::ColorF(
             GetRValue(foreground)/255.f,GetGValue(foreground)/255.f,GetBValue(foreground)/255.f),&brush))) return false;
-    context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    SetCompatibleTextRendering(context.Get(),nullptr,D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     context->BeginDraw(); context->Clear(D2D1::ColorF(0,0.f)); context->SetTransform(transform);
     context->DrawTextLayout(D2D1::Point2F(),layout,brush.Get(),D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     if(FAILED(context->EndDraw())) return false;
@@ -19586,10 +19640,9 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     };
     target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if(textStyle) {
-        ConfigureTextTarget(*textStyle,target);
         // Count/caption text is wholly inside its already painted opaque
         // background, so System ClearType is safe on this transparent canvas.
-        target->SetTextAntialiasMode(textStyle->opaqueTextAntialiasMode);
+        SetCompatibleTextRendering(target,textStyle->textRenderingParams.Get(),textStyle->opaqueTextAntialiasMode);
     }
     D2D1_MATRIX_3X2_F original{}; target->GetTransform(&original);
     const float center=(geometry.artwork.left+geometry.artwork.right)*.5f,bottom=geometry.artwork.bottom;
@@ -19724,7 +19777,7 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle,&layer.shadows);
     const HRESULT draw=state.target->EndDraw();
     state.target->SetTarget(previous.Get()); state.target->SetTransform(transform);
-    state.target->SetTextRenderingParams(previousTextParams.Get()); state.target->SetTextAntialiasMode(previousTextMode);
+    SetCompatibleTextRendering(state.target.Get(),previousTextParams.Get(),previousTextMode);
     if(FAILED(draw) || !PublishModePlane(state,layer.plane) || FAILED(layer.visual->SetContent(layer.plane.surface.Get()))) return false;
     // Entry can lift once; changing an operation, caption or thumbnail must
     // never restart scale animation or make pointer movement appear delayed.
@@ -21051,7 +21104,10 @@ void Paint(ViewState& state) {
     if (g_perf.load()) QueryPerformanceCounter(&drawEnd);
     const bool newRowOrigin=compositionFrame.Rows() && state.modeComposition.newRowOrigin;
     bool submitted = SUCCEEDED(hr) && !state.swapChain;
-    if (FAILED(hr)) DropTarget(state);
+    if (FAILED(hr)) {
+        state.graphicsFailure=hr; state.graphicsFailureStage=7; // Frame drawing, including item planes.
+        DropTarget(state);
+    }
     else if (state.swapChain) {
         HRESULT present=S_OK;
         if (compositionFrame.active) {
@@ -24259,6 +24315,30 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     state.horizontalAnimating = false;
     state.horizontalTarget = state.horizontalScroll;
     AdvanceRowHeight(state, true);
+    // Rename now owns the viewport; an earlier badge reveal must not scroll
+    // back to another item when its outstanding expansion receipt arrives.
+    state.groupRevealRow = -1;
+    state.groupRevealPath.clear();
+    if (size_t(index) < state.rowGroup.size()) {
+        const int group = state.rowGroup[size_t(index)];
+        if (group >= 0 && size_t(group) < state.sections.size()) {
+            auto& section = state.sections[size_t(group)];
+            if (section.collapsed || section.fraction != 1.f || section.started.QuadPart) {
+                // Like rename's immediate zoom/scroll reveal, settle only the
+                // destination section before measuring or showing the EDIT.
+                // This also reverses a collapse already in flight.
+                section.collapsed = false;
+                section.fraction = section.from = section.to = 1.f;
+                section.started = {};
+                state.groupAnimating = std::any_of(state.sections.begin(),state.sections.end(),
+                    [](const auto& other) { return other.started.QuadPart != 0; });
+                PublishGroupIntents(state);
+                LayoutGroupSections(state);
+                ReconcileColumnViewportAfterRowCount(state);
+            }
+        }
+    }
+    if (!DisplayedRow(state, index)) return;
     SetScrollImmediate(state, RevealScrollTarget(state, index, state.scrollNow));
     RECT rc = RenameEditorRect(state, index);
     const std::wstring name = state.entries[static_cast<size_t>(index)].name;
@@ -25410,6 +25490,7 @@ void BeginAnimatedZoom(ViewState& state, int height96);
 // Only an in-place change of the presented folder may reflow its grid cells.
 bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = true,
                      bool reflow = false) {
+    animate &= !state.startupAnimationsSuppressed;
     const UINT mode=requested.mode;
     const bool supported=IsGpuViewMode(mode,state.thisPcGpu), columns=mode==FVM_DETAILS;
     const bool grid=IsIconViewMode(mode,state.thisPcGpu);
@@ -26028,6 +26109,7 @@ void NavigateCurrentShellTab(ViewState& state, UINT navigation) {
 void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
     state.lastManipulationActivity = GetTickCount64();
     if (wParam == 1) { // New genuine touchpad contact.
+        EndInitialLoading(state);
         if(g_pipelineTracing.load(std::memory_order_relaxed) || g_uiTransitionLogging.load(std::memory_order_relaxed)) {
             RECT host{}; GetWindowRect(state.hwnd,&host);
             const HWND above=GetWindow(state.hwnd,GW_HWNDPREV);
@@ -27499,8 +27581,8 @@ void PaintItemTip(ItemTip& tip, HWND hwnd) {
     };
     if (dc && tip.target && tip.nameLayout && SUCCEEDED(tip.target->BindDC(dc, &client))) {
         RefreshTextRenderingForWindow(tip.textStyle, hwnd, true);
-        ConfigureTextTarget(tip.textStyle, tip.target.Get());
-        tip.target->SetTextAntialiasMode(tip.textStyle.opaqueTextAntialiasMode);
+        SetCompatibleTextRendering(tip.target.Get(),tip.textStyle.textRenderingParams.Get(),
+            tip.textStyle.opaqueTextAntialiasMode);
         tip.target->BeginDraw();
         tip.target->Clear(color(tip.background));
         ComPtr<ID2D1SolidColorBrush> text, label;
@@ -28316,7 +28398,14 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ReleaseAllFrameShellViewHooks(hwnd);
         return 0;
     }
-    if (msg == WM_ENTERSIZEMOVE) SetPropW(hwnd,kFrameSizingProperty,reinterpret_cast<HANDLE>(1));
+    ObserveInitialLoadingInput(hwnd);
+    if (msg == WM_ENTERSIZEMOVE) {
+        // USER enters its modal sizing loop before the first resize/reflow.
+        // Hidden tabs retain their independent initial-loading policy.
+        if(auto* state=State(OverlayUnder(hwnd)); state && state->visible && TabOwnsActiveView(*state))
+            EndInitialLoading(*state);
+        SetPropW(hwnd,kFrameSizingProperty,reinterpret_cast<HANDLE>(1));
+    }
     if (msg == WM_EXITSIZEMOVE || msg == WM_NCDESTROY) RemovePropW(hwnd,kFrameSizingProperty);
     if (msg == WM_COMMAND && HIWORD(wp) == BN_CLICKED && lp) {
         const HWND button = reinterpret_cast<HWND>(lp);
@@ -30851,6 +30940,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    if(s && s->startupAnimationsSuppressed) ObserveInitialLoadingInput(hwnd);
     if(s && s->keyboardSectionKey &&
         (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
          msg==WM_MBUTTONDOWN || msg==WM_POINTERDOWN)) {
@@ -33745,13 +33835,14 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     if(owns) ObserveNativeSurfaceEvent(event,changed,objectId,childId);
 }
 
-// USER can reject an in-context WinEvent DLL registration. A thread-local
-// message hook needs no DLL registration/injection and still runs before the
-// native host's first show/layout. Queued discovery remains on its own lane.
+// Observe real input across native frame children before their handlers run.
+// When USER rejects the in-context WinEvent registration, this also supplies
+// the native host's first show/layout barrier on the same owner thread.
 LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
     WindowCallbackGuard callback;
     if(code>=0 && lp && !g_unloading.load(std::memory_order_acquire)) {
         const auto& message=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        ObserveInitialLoadingInput(message.hwnd);
         DWORD event=message.message==WM_CREATE ? EVENT_OBJECT_CREATE :
             message.message==WM_SHOWWINDOW ? (message.wParam ? EVENT_OBJECT_SHOW:EVENT_OBJECT_HIDE) :
             message.message==WM_WINDOWPOSCHANGING ? EVENT_OBJECT_LOCATIONCHANGE : 0;
@@ -33759,7 +33850,8 @@ LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
         const HWND frame=event ? GetAncestor(message.hwnd,GA_ROOT):nullptr;
         AcquireSRWLockShared(&g_shellHookLock);
         const auto hook=g_shellViewHooks.find(frame);
-        const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationMessages;
+        const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationMessages &&
+            !hook->second.presentationHandle; // The WinEvent barrier already handles these events.
         ReleaseSRWLockShared(&g_shellHookLock);
         if(owns) {
             auto* position=message.message==WM_WINDOWPOSCHANGING ? reinterpret_cast<WINDOWPOS*>(message.lParam):nullptr;
@@ -35165,13 +35257,14 @@ void InitializeFrameShellEvents(ViewState& state) {
             candidatePresentationHook=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_PARENTCHANGE,
                 module,NativeSurfaceEvent,GetCurrentProcessId(),
                 GetWindowThreadProcessId(state.frameHwnd,nullptr),WINEVENT_INCONTEXT);
-        if (!candidatePresentationHook) {
-            const DWORD error=GetLastError();
-            candidatePresentationMessages=SetWindowsHookExW(WH_CALLWNDPROC,NativeSurfaceMessages,nullptr,
-                GetWindowThreadProcessId(state.frameHwnd,nullptr));
-            if(!candidatePresentationMessages)
-                Wh_Log(L"[GPU host] synchronous presentation barriers unavailable event-error=%lu message-error=%lu",error,GetLastError());
-        }
+    }
+    // Input provenance must be observed even when the WinEvent presentation
+    // barrier succeeded. Reuse this frame-owned hook and its existing teardown.
+    if(!sharedPresentationMessages) {
+        candidatePresentationMessages=SetWindowsHookExW(WH_CALLWNDPROC,NativeSurfaceMessages,nullptr,
+            GetWindowThreadProcessId(state.frameHwnd,nullptr));
+        if(!candidatePresentationMessages)
+            Wh_Log(L"[GPU host] owner input observation unavailable error=%lu",GetLastError());
     }
     if (!sharedHook) {
         DWORD ownerThread = GetWindowThreadProcessId(state.frameHwnd, nullptr);
@@ -35386,6 +35479,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
              _wcsicmp(path.c_str(), s->immediateBackFrom.c_str()) != 0)) {
             ClearImmediateBackHint(*s);
         }
+        if (changedPath && s->firstContentSubmittedAt) EndInitialLoading(*s);
         s->nativeHwnd = native;
         if (s->visible && s->inScope && s->detailsViewActive)
             SuppressNativeContent(*s, native);
@@ -35592,6 +35686,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     if (g_unloading.load(std::memory_order_acquire)) return;
     auto* s = new ViewState();
     s->startupStartedAt = GetTickCount64();
+    s->startupAnimationsSuppressed = true;
     s->nativeHwnd = native;
     s->frameHwnd = frame;
     s->activeTabHost = tabHost;

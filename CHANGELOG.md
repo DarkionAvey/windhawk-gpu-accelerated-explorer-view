@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.2 (unreleased)
+## 1.0.2
 
 - Validate applied text-rendering settings across lists, tooltips and drag
   previews; use compatible defaults when effective antialiasing differs.
