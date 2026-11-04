@@ -2,6 +2,10 @@
 
 ## 1.0.1 (unreleased)
 
+- Reuse first-letter candidates during type-to-select, skipping known nonmatches
+  while preserving flexible matching, Backspace cancellation and cycling.
+- Avoid scanning unused filename tails during flexible type-to-select matching,
+  preserving Unicode matching and the original highlight positions.
 - Defer DirectWrite preparation until a file-manager window requests attachment,
   allocate the composition wake on demand, and release shared font resources
   explicitly on unload instead of during process-exit destruction.

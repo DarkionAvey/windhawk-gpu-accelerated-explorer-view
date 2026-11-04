@@ -1520,6 +1520,59 @@ struct IconResult {
 };
 std::atomic<unsigned long long> g_nextToken{1};
 
+// Two bits per row: retain first-letter candidates and remember examined rows.
+// Learn exclusions while finding the first hit, without forcing an eager scan.
+struct TypeSearchCandidates {
+    std::wstring initial;
+    std::vector<uint64_t> possible,accepted;
+    size_t acceptedCount=0;
+    const void* source=nullptr;
+    size_t count=0;
+    unsigned long long listing=0,revision=0,order=0;
+    bool unicode=false;
+    bool disabled=false;
+    void Reset() {initial.clear(); possible.clear(); accepted.clear(); acceptedCount=0; disabled=false;}
+    void Bind(std::wstring first,const void* rows,size_t size,unsigned long long token,
+              unsigned long long scene,unsigned long long hash,bool icu) {
+        if(initial==first && source==rows && count==size && listing==token &&
+            revision==scene && order==hash && unicode==icu) return;
+        initial=std::move(first); source=rows; count=size;
+        listing=token; revision=scene; order=hash; unicode=icu;
+        possible.clear(); accepted.clear(); acceptedCount=0; disabled=false;
+    }
+    size_t Next(size_t row,size_t end) const {
+        if(possible.empty()) return row;
+        while(row<end) {
+            const auto bits=possible[row/64]&(~uint64_t{}<<(row%64));
+            if(bits) return std::min(end,row/64*64+size_t(std::countr_zero(bits)));
+            row=(row/64+1)*64;
+        }
+        return end;
+    }
+    bool Allocate() {
+        if(disabled) return false;
+        try {
+            if(possible.empty()) {
+                possible.assign(count/64+(count%64!=0),~uint64_t{});
+                accepted.assign(possible.size(),0);
+            }
+        } catch(const std::bad_alloc&) {
+            possible.clear(); accepted.clear(); disabled=true;
+            return false; // Optional acceleration must not prevent searching.
+        }
+        return true;
+    }
+    bool Known(size_t row) const {return disabled || (!accepted.empty() && (accepted[row/64]&(uint64_t{1}<<(row%64))));}
+    void Accept(size_t row,bool allocate=false) {
+        if(allocate && !Allocate()) return;
+        if(!accepted.empty() && !Known(row)) {accepted[row/64]|=uint64_t{1}<<(row%64); ++acceptedCount;}
+    }
+    void Exclude(size_t row) {
+        if(!Allocate()) return;
+        possible[row/64]&=~(uint64_t{1}<<(row%64));
+    }
+};
+
 struct ActiveFrame {
     HWND hwnd = nullptr;
     bool queued = false;
@@ -3470,6 +3523,7 @@ struct ViewState {
     ScrollbarMotion scrollbarMotion[2]; // Vertical and horizontal, independently retargetable.
     int hovered = -1;
     std::wstring typeSearch;
+    TypeSearchCandidates typeSearchCandidates; // Owner-only; never copied to presentation snapshots.
     bool typeSearchWaiting=false;
     unsigned long long typeSearchWaitingListing=0;
     ULONGLONG lastTyped = 0;
@@ -10635,6 +10689,7 @@ bool RestoreCachedFolder(ViewState& state) {
     state.validatedFolderRevision = snapshot.changeRevision;
     state.zebraExtentAnimating = false;
     StopRowTransition(state);
+    state.typeSearchCandidates.Reset();
     state.entries = std::move(snapshot.entries);
     RetireCachedEntries(state,state.presentationEntries);
     state.presentationEntries=std::move(snapshot.presentationEntries);
@@ -11759,6 +11814,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
             // Move that vector here, rather than comparing up to 100k records
             // and assigning strings on Explorer's Shell STA. Offscreen details
             // simply resolve on demand the next time they enter the viewport.
+            state.typeSearchCandidates.Reset();
             state.entries.swap(incoming);
         }
         state.displayedMetadataHash = metadataHash;
@@ -11880,6 +11936,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     const bool stablePreviewAppend = state.namesPreview &&
         (!complete || (!state.sort.explicitOrder && !state.grouping.enabled));
     if (!stablePreviewAppend) ResetMouseGestureForNavigation(state);
+    state.typeSearchCandidates.Reset();
     state.entries.swap(incoming);
     // The lookup follows the full sorted row vector. A provisional viewport
     // preview remains noninteractive and never has a native-selection lookup.
@@ -24439,12 +24496,16 @@ void FinishRename(ViewState& state, bool commit) {
     }
     const bool changed = valid && commit && !newName.empty() && newName != oldName;
     if (changed) {
+        state.typeSearchCandidates.Reset();
         state.renamePreviewPath = oldPath; state.renamePreviewName = newName;
         state.renamePreviewToken = token;
         state.entries[size_t(index)].name = newName;
     }
     if (!CloseRenameEditor(state)) {
-        if (changed) state.entries[size_t(index)].name = oldName;
+        if (changed) {
+            state.typeSearchCandidates.Reset();
+            state.entries[size_t(index)].name = oldName;
+        }
         state.renamePreviewPath.clear(); state.renamePreviewName.clear();
         return;
     }
@@ -24463,6 +24524,7 @@ void FinishRename(ViewState& state, bool commit) {
         int row = GpuRowForNativePath(*live, oldPath);
         if (row < 0 && success) row = GpuRowForNativePath(*live, path);
         if (row >= 0) {
+            live->typeSearchCandidates.Reset();
             live->entries[size_t(row)].name = success ? name : oldName;
             if (success) SetIndexedEntryPath(*live, row, path);
             live->selectedFlags.assign(live->entries.size(), 0);
@@ -25005,6 +25067,18 @@ void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = fals
 size_t TypeSearchCharacterLength(std::wstring_view text,size_t at) {
     return IS_HIGH_SURROGATE(text[at]) && at+1<text.size() && IS_LOW_SURROGATE(text[at+1]) ? 2:1;
 }
+bool TypeSearchSeparator(std::wstring_view text,size_t at) {
+    const auto length=TypeSearchCharacterLength(text,at);
+    if(g_systemRelativeTime.UnicodeReady()) {
+        const int32_t codePoint=length==2 ?
+            0x10000+((int32_t(text[at])-0xD800)<<10)+(int32_t(text[at+1])-0xDC00) : int32_t(text[at]);
+        return g_systemRelativeTime.Separator(codePoint);
+    }
+    WORD basic[2]{},extended[2]{};
+    GetStringTypeW(CT_CTYPE1,text.data()+at,int(length),basic);
+    GetStringTypeW(CT_CTYPE3,text.data()+at,int(length),extended);
+    return (basic[0]&(C1_SPACE|C1_PUNCT))!=0 || (extended[0]&C3_SYMBOL)!=0;
+}
 
 // Search the current display order, wrap around, and retain the prefix briefly.
 bool MatchesTypeSearchPrefix(const std::wstring& name,
@@ -25015,18 +25089,7 @@ UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefi
     if(prefix.empty() || IS_HIGH_SURROGATE(prefix.back())) return 0; // Wait for the second WM_CHAR of a pair.
     if(prefix.size()<=name.size() && CompareStringOrdinal(name.data(),int(prefix.size()),prefix.data(),int(prefix.size()),TRUE)==CSTR_EQUAL)
         return UINT32(prefix.size());
-    const auto separator=[](std::wstring_view text,size_t at) {
-        const auto length=TypeSearchCharacterLength(text,at);
-        if(g_systemRelativeTime.UnicodeReady()) {
-            const int32_t codePoint=length==2 ?
-                0x10000+((int32_t(text[at])-0xD800)<<10)+(int32_t(text[at+1])-0xDC00) : int32_t(text[at]);
-            return g_systemRelativeTime.Separator(codePoint);
-        }
-        WORD basic[2]{},extended[2]{};
-        GetStringTypeW(CT_CTYPE1,text.data()+at,int(length),basic);
-        GetStringTypeW(CT_CTYPE3,text.data()+at,int(length),extended);
-        return (basic[0]&(C1_SPACE|C1_PUNCT))!=0 || (extended[0]&C3_SYMBOL)!=0;
-    };
+    const auto separator=TypeSearchSeparator;
     size_t n=0,p=0;
     bool matched=false;
     // Compare letter/number runs without constructing folded copies for
@@ -25035,8 +25098,10 @@ UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefi
         if(separator(prefix,p)) {p+=TypeSearchCharacterLength(prefix,p); continue;}
         while(n<name.size() && separator(name,n)) n+=TypeSearchCharacterLength(name,n);
         size_t ne=n,pe=p;
-        while(ne<name.size() && !separator(name,ne)) ne+=TypeSearchCharacterLength(name,ne);
         while(pe<prefix.size() && !separator(prefix,pe)) pe+=TypeSearchCharacterLength(prefix,pe);
+        // Only inspect the filename span this query run can consume. Walking
+        // the rest of a long word cannot affect this comparison or its extent.
+        while(ne<name.size() && ne-n<pe-p && !separator(name,ne)) ne+=TypeSearchCharacterLength(name,ne);
         const auto length=std::min(ne-n,pe-p);
         if(!length || CompareStringOrdinal(name.data()+n,int(length),prefix.data()+p,int(length),TRUE)!=CSTR_EQUAL) return 0;
         n+=length; p+=length;
@@ -25044,11 +25109,51 @@ UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefi
     }
     return matched ? UINT32(n) : 0;
 }
+template<class Name,class Displayed>
+int FindTypeSearchCandidate(const std::wstring& prefix,int searchFrom,size_t total,
+                            TypeSearchCandidates* candidates,Name&& nameAt,Displayed&& displayed) {
+    if(prefix.empty() || IS_HIGH_SURROGATE(prefix.back())) return -1;
+    const size_t split=size_t(searchFrom+1);
+    const bool initial=candidates && prefix==candidates->initial;
+    for(const auto [first,end]:{std::pair{split,total},std::pair{size_t{0},split}}) {
+        for(size_t row=first;row<end;) {
+            if(candidates) row=candidates->Next(row,end);
+            if(row==end) break;
+            if(displayed(int(row))) {
+                const auto& name=nameAt(row);
+                if(TypeSearchPrefixLength(name,prefix)) {
+                    if(candidates) candidates->Accept(row);
+                    return int(row);
+                }
+                if(candidates && !candidates->Known(row)) {
+                    if(initial || !TypeSearchPrefixLength(name,candidates->initial)) candidates->Exclude(row);
+                    else candidates->Accept(row,true);
+                }
+            }
+            ++row;
+        }
+    }
+    return -1;
+}
+TypeSearchCandidates* PrepareTypeSearchCandidates(TypeSearchCandidates& cache,const std::wstring& prefix,
+    const void* rows,size_t count,unsigned long long listing,unsigned long long revision,unsigned long long order) {
+    if(!prefix.empty()) {
+        const size_t length=TypeSearchCharacterLength(prefix,0);
+        if(!IS_LOW_SURROGATE(prefix[0]) && (!IS_HIGH_SURROGATE(prefix[0]) || length==2) &&
+            !TypeSearchSeparator(prefix,0)) {
+            cache.Bind(prefix.substr(0,length),rows,count,listing,revision,order,g_systemRelativeTime.UnicodeReady());
+            return cache.disabled || cache.acceptedCount==count ? nullptr:&cache;
+        }
+    }
+    cache.Reset();
+    return nullptr;
+}
 bool TypeSearchActive(const ViewState& state) {
     return !state.typeSearch.empty() && state.lastTyped && GetTickCount64()-state.lastTyped<=kTypeSearchTimeoutMs;
 }
 void ClearTypeSearch(ViewState& state) {
     state.typeSearchWaiting=false;
+    state.typeSearchCandidates.Reset();
     if(state.typeSearch.empty()) return;
     state.typeSearch.clear(); state.lastTyped=0;
     KillTimer(state.hwnd,kTypeSearchTimerId); Redraw(state);
@@ -25072,8 +25177,10 @@ void TypeToSelect(ViewState& state, wchar_t ch) {
     if (ch == L'\b' || (ch >= L' ' && ch != 0x7F))
         SuppressPointerHoverForKeyboard(state);
     const ULONGLONG now = GetTickCount64();
-    if (now - state.lastTyped > kTypeSearchTimeoutMs)
+    if (now - state.lastTyped > kTypeSearchTimeoutMs) {
         state.typeSearch.clear();
+        state.typeSearchCandidates.Reset();
+    }
     state.lastTyped = now;
     if (ch == L'\b') {
         if (!state.typeSearch.empty()) {
@@ -25082,6 +25189,7 @@ void TypeToSelect(ViewState& state, wchar_t ch) {
                 IS_HIGH_SURROGATE(state.typeSearch[length-2]) ? 2:1));
         }
         if (state.typeSearch.empty()) {
+            state.typeSearchCandidates.Reset();
             state.lastTyped = 0;
             KillTimer(state.hwnd, kTypeSearchTimerId);
             Redraw(state);
@@ -25116,16 +25224,14 @@ void TypeToSelect(ViewState& state, wchar_t ch) {
     ApplyTypeSearch(state,ch);
 }
 void ApplyTypeSearch(ViewState& state,wchar_t ch) {
+    if(state.typeSearch.empty() || state.total<=0) return;
     const int start = std::clamp(state.selected, -1, state.total - 1);
     auto findPrefix = [&](const std::wstring& prefix, int searchFrom) -> int {
-        for (int offset = 1; offset <= state.total; ++offset) {
-            const int candidate = (searchFrom + offset + state.total) % state.total;
-            if (!DisplayedRow(state, candidate)) continue;
-            const auto& name = state.entries[static_cast<size_t>(candidate)].name;
-            if (MatchesTypeSearchPrefix(name, prefix))
-                return candidate;
-        }
-        return -1;
+        auto* candidates=PrepareTypeSearchCandidates(state.typeSearchCandidates,prefix,state.entries.data(),
+            state.entries.size(),state.directoryToken,state.rowSceneRevision,state.displayedOrderHash);
+        return FindTypeSearchCandidate(prefix,searchFrom,size_t(state.total),candidates,
+            [&](size_t row)->const std::wstring& {return state.entries[row].name;},
+            [&](int row) {return DisplayedRow(state,row);});
     };
     int found = findPrefix(state.typeSearch,
                            state.typeSearch.size() == 1 ? start : -1);
@@ -25582,6 +25688,7 @@ void SetActive(HWND hwnd, bool on) {
         s->draggingHorizontal = false;
         KillTimer(hwnd, kTypeSearchTimerId);
         s->typeSearch.clear();
+        s->typeSearchCandidates.Reset();
         s->lastTyped = 0;
         SetPresentationVisibility(hwnd, false);
         if (IsWindow(s->nativeHwnd) && ExplorerFrameHasForeground(s->frameHwnd))
@@ -31616,6 +31723,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (elapsed >= kTypeSearchTimeoutMs) {
                     s->typeSearchWaiting=false;
                     s->typeSearch.clear();
+                    s->typeSearchCandidates.Reset();
                     s->lastTyped = 0;
                     Redraw(*s);
                 } else {
@@ -33863,6 +33971,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     ClearPostDeletionCaret(state);
     KillTimer(state.hwnd, kTypeSearchTimerId);
     state.typeSearch.clear();
+    state.typeSearchCandidates.Reset();
     state.lastTyped = 0;
     state.selectedFlags.clear();
     ClearPointerHover(state);
@@ -34871,6 +34980,7 @@ bool RefreshThisPcRows(ViewState& state, bool requestData) {
     if (!unchanged && sameRows) {
         // Enrichment at stable ranks changes values only. Keep an in-flight
         // reorder, hover, viewport and group geometry alive between volumes.
+        state.typeSearchCandidates.Reset();
         state.entries.swap(fresh); RetireCachedEntries(state,fresh);
     } else if (!unchanged) {
         const bool allowSortReveal=!PointerDragActive(state) && !state.marqueeActive &&
