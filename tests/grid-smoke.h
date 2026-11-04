@@ -122,6 +122,7 @@ static void TestThumbnailDecorations(ViewState& state) {
     overlay.pixels.overlayExtent=.5f;
     Check(UploadIconBitmap(state,overlay),"capped overlay upload");
     for(int dpi:{96,144,192}) {
+        Regression::Scope scope(std::string("overlay cap dpi=")+std::to_string(dpi)+" rtl="+std::to_string(state.rtlLayout));
         StyleFixture::Session styleMetrics; StyleFixture::dpi=dpi;
         state.textFormatDpi=dpi; state.iconPx=272;
         const int left=state.rtlLayout ? 8:40;
@@ -132,12 +133,27 @@ static void TestThumbnailDecorations(ViewState& state) {
         draw(decorated,1.f,0.f,&overlay);
         const int appEdge=state.rtlLayout ? left:left+272;
         const int shellEdge=state.rtlLayout ? left+272:left;
-        const int appDirection=state.rtlLayout ? 1:-1, shellDirection=-appDirection;
+        const int appDirection=state.rtlLayout ? 1:-1;
         Check(pixel(appEdge+appDirection*(appSize-4),bottom-8)[0]>230 &&
             pixel(appEdge+appDirection*(appSize+2),bottom-8)[0]<100,
             "large thumbnail app badge exceeded or failed to reach its DPI cap");
-        Check(pixel(shellEdge+shellDirection*(cap-4),bottom-8)[1]>230 &&
-            pixel(shellEdge+shellDirection*(cap+2),bottom-8)[1]<150,
+        // Locate the half-coverage edge in rendered pixels. Magnified native
+        // artwork is filtered, so a near-edge texel need not be solid green.
+        D2D1_MAPPED_RECT capMap{};
+        Check(SUCCEEDED(readback->Map(D2D1_MAP_OPTIONS_READ,&capMap)),"overlay cap readback");
+        int first=320,end=0;
+        const auto* scan=capMap.bits+(bottom-cap/2)*capMap.pitch;
+        for(int x=0;x<320;++x) {
+            const auto* p=scan+x*4;
+            // Half green over the known (40,80,220) thumbnail: G >= 168.
+            if(p[1]>=168 && p[1]>p[0] && p[2]<110) {first=std::min(first,x); end=x+1;}
+        }
+        readback->Unmap();
+        const int expectedFirst=state.rtlLayout ? shellEdge-cap:shellEdge;
+        if(std::abs(first-expectedFirst)>2 || std::abs(end-first-cap)>2)
+            std::cout<<"OVERLAY CAP dpi="<<dpi<<" cap="<<cap<<" first="<<first<<" end="<<end
+                <<" expected-first="<<expectedFirst<<std::endl;
+        Check(std::abs(first-expectedFirst)<=2 && std::abs(end-first-cap)<=2,
             "large thumbnail Shell glyph exceeded its DPI cap or shrank with transparent padding");
     }
     state.iconPx=96; state.textFormatDpi=96;

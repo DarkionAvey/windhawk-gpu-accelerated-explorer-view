@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.1 (unreleased)
+## 1.0.1
 
 - Cap thumbnail app badges and Shell overlay glyphs at twice Windows' DPI-scaled
   large-icon size so increasing thumbnail zoom keeps the preview clear.

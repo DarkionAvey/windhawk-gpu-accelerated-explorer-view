@@ -17,7 +17,7 @@ int ExpectedOverlay(const std::wstring& path) {
     return image;
 }
 // Opaque bounds of a system image-list entry in its own canvas.
-RECT GlyphBounds(int image,UINT width,int& canvas) {
+RECT GlyphBounds(int image,UINT width,int& canvas,BYTE alpha=128) {
     ComPtr<IImageList> chosen;
     for(int kind:{SHIL_LARGE,SHIL_EXTRALARGE,SHIL_JUMBO}) {
         ComPtr<IImageList> list; int cx=0,cy=0;
@@ -36,7 +36,7 @@ RECT GlyphBounds(int image,UINT width,int& canvas) {
     const int lines=GetDIBits(dc,info.hbmColor,0,bitmap.bmHeight,bits.data(),&header,DIB_RGB_COLORS);
     ReleaseDC(nullptr,dc);
     RECT bounds{bitmap.bmWidth,bitmap.bmHeight,0,0};
-    for(int y=0;y<bitmap.bmHeight;++y) for(int x=0;x<bitmap.bmWidth;++x) if(bits[size_t(y)*bitmap.bmWidth+x]>>24>=128) {
+    for(int y=0;y<bitmap.bmHeight;++y) for(int x=0;x<bitmap.bmWidth;++x) if(bits[size_t(y)*bitmap.bmWidth+x]>>24>=alpha) {
         bounds.left=std::min<LONG>(bounds.left,x); bounds.top=std::min<LONG>(bounds.top,y);
         bounds.right=std::max<LONG>(bounds.right,x+1); bounds.bottom=std::max<LONG>(bounds.bottom,y+1);
     }
@@ -127,6 +127,8 @@ static void TestShellOverlays(const std::wstring& fixture) {
 
             int canvas=0;
             const auto glyph=GlyphBounds(expectedLink,artwork->pixels.width,canvas);
+            const auto coverage=GlyphBounds(expectedLink,artwork->pixels.width,canvas,1);
+            const float extent=float(std::max(coverage.right-coverage.left,coverage.bottom-coverage.top))/canvas;
             Check(glyph.right>glyph.left && glyph.bottom>glyph.top,"native overlay has no opaque glyph");
             Check(EnsureTarget(state),"overlay target");
             IconRecord base; base.pixels.width=base.pixels.height=64; base.pixels.stride=256;
@@ -139,6 +141,7 @@ static void TestShellOverlays(const std::wstring& fixture) {
             state.target->SetTarget(surface.Get()); state.paintWidth=400;
             // Adornments never shrink below Windows' small-icon size for the window's DPI.
             const float smallest=float(GetSystemMetricsForDpi(SM_CXSMICON,GetDpiForWindow(state.hwnd)));
+            const float largest=2.f*std::max(smallest,float(GetSystemMetricsForDpi(SM_CXICON,GetDpiForWindow(state.hwnd))));
             bool floored=false;
             for(bool rtl:{false,true}) for(float side:{8.f,32.f,96.f,256.f}) {
                 Regression::Scope scope(std::string("rtl=")+(rtl ? "1" : "0")+" side="+std::to_string(int(side)));
@@ -151,9 +154,10 @@ static void TestShellOverlays(const std::wstring& fixture) {
                 for(int y=0;y<400;++y) for(int x=0;x<400;++x) if(image.data[size_t(y)*image.stride+x*4+3]>=128) {
                     left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
                 }
-                // The overlay canvas is the icon slot (one glyph size for every
-                // row), anchored at the drawn artwork's bottom corner.
-                const float drawn=float(IconPixelSize(state)), edge=std::max(drawn,smallest), scale=edge/float(canvas);
+                // Derive the capped canvas from independent GDI alpha bounds
+                // and OS metrics, keeping its artwork corner anchored.
+                const float drawn=float(IconPixelSize(state));
+                const float edge=std::min(std::max(drawn,smallest),largest/extent),scale=edge/float(canvas);
                 floored|=drawn<smallest;
                 const float origin=rtl ? float(state.paintWidth)-40.f-drawn : 40.f, bottomEdge=40.f+drawn;
                 // RTL mirrors the corner, as the thumbnail type badge does.
@@ -162,7 +166,7 @@ static void TestShellOverlays(const std::wstring& fixture) {
                 Check(right>left && fabsf(left-expectedLeft)<=2.f && fabsf(right-expectedRight)<=2.f &&
                     fabsf(top-(bottomEdge-edge+glyph.top*scale))<=2.f &&
                     fabsf(bottom-(bottomEdge-edge+glyph.bottom*scale))<=2.f,
-                    "overlay glyph is not its slot-sized image-list corner of the drawn icon");
+                    "overlay glyph missed its DPI-capped image-list corner of the drawn icon");
             }
             Check(floored,"no overlay draw exercised the small-icon minimum");
 
@@ -193,7 +197,7 @@ static void TestShellOverlays(const std::wstring& fixture) {
                         left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
                     }
                 }
-                const float drawn=float(IconPixelSize(state)), expected=std::max(drawn*.25f,smallest);
+                const float drawn=float(IconPixelSize(state)), expected=std::clamp(drawn*.25f,smallest,largest);
                 badgeFloored|=drawn*.25f<smallest;
                 const float thumbHeight=drawn*64.f/96.f, thumbBottom=40.f+(drawn-thumbHeight)*.5f+thumbHeight;
                 const float thumbLeft=rtl ? float(state.paintWidth)-40.f-drawn : 40.f;
@@ -217,6 +221,6 @@ static void TestShellOverlays(const std::wstring& fixture) {
     g_writeFactory=fonts;
     Check(DeleteFileW(link.c_str()) && DeleteFileW(target.c_str()),"overlay fixture cleanup");
     std::cout<<"PASS: Shell overlays resolve per item off the UI thread, match Windows' own composition, share "
-        "image-list artwork, reach the presentation lane, draw slot-sized at their corner in LTR/RTL, survive item "
+        "image-list artwork, reach the presentation lane, draw DPI-capped at their corner in LTR/RTL, survive item "
         "refresh and are never doubled by base artwork; overlays and type badges keep the small-icon minimum\n";
 }

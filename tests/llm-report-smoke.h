@@ -1,5 +1,6 @@
 // Synthetic providers/windows only; no commands are launched or desktop input sent.
 static void TestLlmReport() {
+    Check(PrepareTextRuntime(),"report fixture text runtime preparation");
     {
         PROPVARIANT value{};
         struct Reset {~Reset(){PropertyFixture::sortVariant=nullptr;}} reset;
@@ -108,5 +109,6 @@ static void TestLlmReport() {
         ReleaseFrameShellViewHook(first);
     }
     StopTabVisibilityObserver(); g_tabWatchStopping=false;
+    ReleaseTextRuntime();
     std::cout<<"PASS: NaN Shell variants and strict ordering; resolved unsupported-tab scan suppression/retry; unrelated USERDATA and rename accelerators; partial frame-hook upgrade/removal and frame destruction\n";
 }

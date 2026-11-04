@@ -229,7 +229,6 @@ static void TestPresentationOwners() {
     const auto before=g_gpuDevices.load();
     const bool smooth=g_smooth.exchange(true),automatic=g_autoRefitColumns.exchange(false);
     g_frameStopping=false;
-    for(bool rtl:{false,true}) for(bool grid:{false,true}) PresentationFixture::GroupAnimationClock(rtl,grid);
     {
         Check(!g_frameThread && !g_frameEvent,"frame-stop fixture requires an idle scheduler");
         g_frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
@@ -243,6 +242,7 @@ static void TestPresentationOwners() {
         ShutDownFrames(); g_frameStopping=false; DestroyWindow(window);
         Check(stopped,"frame shutdown consumed its stop event and waited forever");
     }
+    for(bool rtl:{false,true}) for(bool grid:{false,true}) PresentationFixture::GroupAnimationClock(rtl,grid);
     {
         PresentationFixture::Tab a(L"A",30000,true),b(L"B",300,false,true);
         FocusFixture::Session focus(a.frame,a.state.hwnd);

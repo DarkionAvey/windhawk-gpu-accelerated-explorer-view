@@ -18366,8 +18366,6 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         headerColor, false, .9f * opacity);
 }
 
-bool MatchesTypeSearchPrefix(const std::wstring& name,
-                             const std::wstring& prefix);
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
 
 void ResetItemContentOpacity(ViewState& state) {
@@ -25166,10 +25164,6 @@ bool TypeSearchSeparator(std::wstring_view text,size_t at) {
 }
 
 // Search the current display order, wrap around, and retain the prefix briefly.
-bool MatchesTypeSearchPrefix(const std::wstring& name,
-                             const std::wstring& prefix) {
-    return TypeSearchPrefixLength(name,prefix)!=0;
-}
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix) {
     if(prefix.empty() || IS_HIGH_SURROGATE(prefix.back())) return 0; // Wait for the second WM_CHAR of a pair.
     if(prefix.size()<=name.size() && CompareStringOrdinal(name.data(),int(prefix.size()),prefix.data(),int(prefix.size()),TRUE)==CSTR_EQUAL)
