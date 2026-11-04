@@ -40,6 +40,10 @@ public:
     bool failSelectionCount=false;
     bool collapseBatches = false, collapseDeselectBatch = false, reenterCapture = true, rejectSelection = false;
     std::function<void()> duringClear;
+    std::function<HRESULT(LPCSTR)> invokeVerbOnSelection;
+    HRESULT STDMETHODCALLTYPE InvokeVerbOnSelection(LPCSTR verb) override {
+        return invokeVerbOnSelection ? invokeVerbOnSelection(verb) : E_NOTIMPL;
+    }
     HRESULT STDMETHODCALLTYPE ItemCount(UINT flags, int* count) override {
         if(flags==SVGIO_SELECTION) ++selectionCountReads;
         if(flags==SVGIO_SELECTION && failSelectionCount) return E_PENDING;

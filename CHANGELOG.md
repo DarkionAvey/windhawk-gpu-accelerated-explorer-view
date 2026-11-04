@@ -1,7 +1,12 @@
 # Changelog
 
-## 1.0.3 (unreleased)
+## 1.0.3
 
+- Delegate ordinary activation of files, folders, drives and Recycle Bin items
+  to the native view's default-action API, waiting for selection preparation.
+  Let Explorer own launch options and navigation notifications drive previews.
+- Preserve the positioned return view when Shell reports equivalent folder
+  identities with different cached metadata.
 - Clear Explorer's previous selection before preparing a large replacement so
   native command-bar actions cannot target the preceding selection.
 - Resolve touch drag promotion by export name only; cancel safely when absent.

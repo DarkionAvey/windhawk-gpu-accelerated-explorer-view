@@ -6,34 +6,32 @@ class SelectionCommandMenu final : public IContextMenu {
 public:
     std::vector<std::pair<std::wstring,DWORD>> calls;
     std::function<void()> duringInvoke;
-    bool defaultSelection=false;
-    std::wstring defaultDirectory;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         *out=nullptr; if(iid!=IID_IUnknown && iid!=IID_IContextMenu) return E_NOINTERFACE;
         *out=static_cast<IContextMenu*>(this); AddRef(); return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
     ULONG STDMETHODCALLTYPE Release() override { const auto n=--refs; if(!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU menu,UINT,UINT first,UINT,UINT flags) override {
-        if (!defaultSelection) return E_NOTIMPL;
-        Check(flags==CMF_DEFAULTONLY,"default activation requested the full popup menu");
-        AppendMenuW(menu,MF_STRING,first+7,L"Edit"); SetMenuDefaultItem(menu,first+7,FALSE);
-        return MAKE_HRESULT(SEVERITY_SUCCESS,0,8);
-    }
+    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU,UINT,UINT,UINT,UINT) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR,UINT,UINT*,LPSTR,UINT) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
         const auto* command=reinterpret_cast<const CMINVOKECOMMANDINFOEX*>(info);
         Check(command->cbSize==sizeof(*command) && (command->fMask&CMIC_MASK_UNICODE),"shortcut lost Unicode command parameters");
-        if (defaultSelection) {
-            Check(IS_INTRESOURCE(command->lpVerbW) && LOWORD(command->lpVerbW)==7,
-                "default activation forced a verb instead of the menu's default offset");
-            defaultDirectory=command->lpDirectoryW ? command->lpDirectoryW : L"";
-            calls.emplace_back(L"default",command->fMask);
-        } else calls.emplace_back(command->lpVerbW,command->fMask);
+        Check(!IS_INTRESOURCE(command->lpVerbW),"ordinary activation bypassed the native view with a menu offset");
+        calls.emplace_back(command->lpVerbW,command->fMask);
         if(duringInvoke) duringInvoke();
         return S_OK;
     }
 };
+// Capture the documented view API, without executing file operations. Default
+// activation must not enter the separate IContextMenu shortcut implementation.
+static void CaptureDefaultActivation(SelectionFolderView& view, const ComPtr<SelectionCommandMenu>& commands) {
+    view.invokeVerbOnSelection=[commands](LPCSTR verb)->HRESULT {
+        Check(!verb,"native default activation forced a canonical verb");
+        commands->calls.emplace_back(L"default",0);
+        return S_OK;
+    };
+}
 class SelectionCommandView final : public IShellView {
     ULONG refs=1;
 public:
@@ -44,6 +42,7 @@ public:
     unsigned resolves=0;
     ViewState* navigateDuringResolve=nullptr;
     std::function<void()> duringResolve;
+    std::function<void()> duringGetWindow;
     explicit SelectionCommandView(IContextMenu* value) : menu(value) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
         *out=nullptr; if(iid!=IID_IUnknown && iid!=IID_IShellView && iid!=IID_IOleWindow) return E_NOINTERFACE;
@@ -51,7 +50,11 @@ public:
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
     ULONG STDMETHODCALLTYPE Release() override { const auto n=--refs; if(!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE GetWindow(HWND* out) override { *out=window; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetWindow(HWND* out) override {
+        *out=window;
+        if(duringGetWindow) duringGetWindow();
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetItemObject(UINT flags,REFIID iid,void** out) override {
         Check(flags==SVGIO_SELECTION || (flags==SVGIO_BACKGROUND && backgroundMenu),"shortcut used an unexpected native command scope");
         ++resolves; objects.push_back(flags);
@@ -138,14 +141,37 @@ static void TestFrameKeyboardReturn(ViewState& state, SelectionFolderView& nativ
                 Check(commands->calls.size()==count+2,"dispatch-only frame key lost its file command");
                 plain[modifier]=0;
             }
-            commands->defaultSelection=true;
+            CaptureDefaultActivation(native,commands);
+            Select(state,7);
+            const auto beforeReentrantDefault=commands->calls.size();
+            commandView->duringGetWindow=[&] { Select(state,6); };
+            Check(InvokeNativeFileKey(state,commandView.Get(),{VK_RETURN,0,false})==HRESULT_FROM_WIN32(ERROR_CANCELLED) &&
+                commands->calls.size()==beforeReentrantDefault && state.selectedFlags[6],
+                "default action activated a replacement selection after a reentrant Shell call");
+            const auto directory=state.directoryToken;
+            commandView->duringGetWindow=[&] { ++state.directoryToken; };
+            Check(InvokeNativeFileKey(state,commandView.Get(),{VK_RETURN,0,false})==HRESULT_FROM_WIN32(ERROR_CANCELLED) &&
+                commands->calls.size()==beforeReentrantDefault,
+                "default action activated a stale directory after a reentrant Shell call");
+            commandView->duringGetWindow=nullptr;
+            state.directoryToken=directory;
             const auto beforeDefault=commands->calls.size();
             state.selectedFlags[6]=state.selectedFlags[7]=1; state.selected=state.anchor=7;
             Check(SyncNativeSelection(state) && native.selected.size()==2,"default-command selected-group fixture");
             Open(state,7);
-            Check(commands->calls.size()==beforeDefault+1 && commands->defaultDirectory==state.folderPath && native.selected.size()==2,
-                "selected-group default command lost its directory or failed to invoke");
-            commands->defaultSelection=false;
+            Check(commands->calls.size()==beforeDefault+1 && native.selected.size()==2,
+                "selected-group default action did not reach the native view");
+            const auto beforePreparedDefault=commands->calls.size();
+            state.selectedFlags.Fill(1);
+            fileModifiers.keys[VK_CONTROL]=fileModifiers.keys[VK_SHIFT]=0x80;
+            Open(state,7);
+            Check(state.pendingNativeSelection && commands->calls.size()==beforePreparedDefault && native.selected.empty(),
+                "default action ran before the complete native selection was prepared");
+            fileModifiers.keys[VK_CONTROL]=fileModifiers.keys[VK_SHIFT]=0;
+            WaitForPreparedSelection(state);
+            Check(commands->calls.size()==beforePreparedDefault+1 && native.selected.size()==state.entries.size(),
+                "prepared default action did not reach the native view with the complete selection");
+            native.invokeVerbOnSelection=nullptr;
             Select(state,7);
             testClipboard.Seed(DROPEFFECT_MOVE,L"C:\\private-frame-cut.txt");
             RefreshClipboardItems(state);

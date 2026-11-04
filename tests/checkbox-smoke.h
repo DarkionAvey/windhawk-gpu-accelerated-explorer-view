@@ -357,7 +357,8 @@ void ItemTargets(const std::wstring& fixture) {
         TouchInputTest::Install(state);
         FocusFixture::Session focus(tab.frame,state.hwnd);
         MenuFixture::Session menus(state.hwnd);
-        ComPtr<SelectionCommandMenu> commands; commands.Attach(new SelectionCommandMenu); commands->defaultSelection=true;
+        ComPtr<SelectionCommandMenu> commands; commands.Attach(new SelectionCommandMenu);
+        CaptureDefaultActivation(*native,commands);
         ComPtr<TouchInputTest::ShellView> shell; shell.Attach(new TouchInputTest::ShellView);
         shell->hwnd=state.nativeHwnd; shell->menu=commands; shell->selection=native; shell->parent=state.directoryFolderIdentity;
         native->commandView=shell;

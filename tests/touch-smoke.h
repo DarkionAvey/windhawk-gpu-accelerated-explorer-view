@@ -1029,7 +1029,23 @@ void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
         Select(state,departed); CenterRow(state,departed);
         Check(state.scrollNow>ViewHeight(state),"history child must be outside the initial viewport");
         host.sink->navigationComplete=false;
-        Open(state,departed); host.Bind(0);
+        const HWND parentNative=state.nativeHwnd;
+        Open(state,departed);
+        Check(Eventually([&] {host.Pump(); return host.sink->navigationComplete;}),
+            "native folder activation did not complete");
+        std::wstring childLocation; ComPtr<IShellFolder> childFolder;
+        Check(GetFolderPath(host.sink->view.Get(),childLocation,childFolder) && childLocation==child.wstring(),
+            "native folder activation reached a different child");
+        // Run the same confirmed-view rebind as Explorer. Bind() deliberately
+        // bypasses attachment and cannot establish production travel history.
+        const HWND childNative=state.nativeHwnd;
+        state.nativeHwnd=parentNative;
+        auto childView=host.sink->view;
+        auto childBrowser=state.shellBrowser;
+        AttachView(childNative,childView,childFolder,childBrowser,childLocation);
+        Check(Eventually([&] {host.Pump(); ReceiveDirectoryResults(state);
+            return state.loaded && !state.directoryPending && state.total==0;}),
+            "confirmed child folder model did not settle");
         Check(state.folderPath==child.wstring() && state.immediateBackTo==parent.wstring(),
             "real folder activation did not establish its known Back return");
         state.rtlLayout=rtl; Install(state); Reset(state,input);
@@ -1079,10 +1095,27 @@ void SwipeAncestorReturn(Device& input,const std::wstring& fixture) {
         state.nativeHwnd=departingNative;
         auto incomingView=host.sink->view;
         auto browser=state.shellBrowser;
+        PIDLIST_ABSOLUTE confirmationRaw=nullptr;
+        SHGetIDListFromObject(folder.Get(),&confirmationRaw);
+        OwnedPidl confirmationIdentity(confirmationRaw);
+        ComPtr<IShellItem> previewItem,confirmedItem;
+        int identityOrder=1;
+        Check(state.directoryFolderIdentity && confirmationIdentity &&
+            SUCCEEDED(SHCreateItemFromIDList(state.directoryFolderIdentity.get(),IID_PPV_ARGS(&previewItem))) &&
+            SUCCEEDED(SHCreateItemFromIDList(confirmationIdentity.get(),IID_PPV_ARGS(&confirmedItem))) &&
+            previewItem->Compare(confirmedItem.Get(),SICHINT_CANONICAL,&identityOrder)==S_OK && identityOrder==0,
+            "native return changed the parent folder's canonical Shell identity");
         AttachView(incoming,incomingView,folder,browser,actual);
         Check(!state.optimisticStartedAt && state.nativeHwnd==incoming,"history production rebind did not confirm");
+        Check(state.total==256 && state.scrollNow==acceptedScroll && state.displayedOrderHash==acceptedOrder,
+            "native return confirmation discarded the already-positioned parent rows");
         Check(Eventually([&] {
             host.Pump(); ReceiveDirectoryResults(state);
+            if(state.scrollNow!=acceptedScroll || state.displayedOrderHash!=acceptedOrder || state.rowTransitionActive)
+                std::cout<<"HISTORY CONFIRM rtl="<<rtl<<" scroll="<<acceptedScroll<<"->"<<state.scrollNow
+                    <<" order="<<acceptedOrder<<"->"<<state.displayedOrderHash<<" rows="<<state.total
+                    <<" transition="<<state.rowTransitionActive<<" pending="<<state.directoryPending
+                    <<" selected="<<state.selected<<std::endl;
             Check(state.scrollNow==acceptedScroll && state.displayedOrderHash==acceptedOrder && !state.rowTransitionActive,
                 "confirmed provider changed the speculative history layout");
             return state.loaded && !state.directoryPending;
@@ -1308,7 +1341,8 @@ static void TestTouchInput(const std::wstring& fixture) {
     Install(state); Install(other);
     FocusFixture::Session focus(tab.frame,state.hwnd);
     MenuFixture::Session menus(state.hwnd);
-    ComPtr<SelectionCommandMenu> commands; commands.Attach(new SelectionCommandMenu); commands->defaultSelection=true;
+    ComPtr<SelectionCommandMenu> commands; commands.Attach(new SelectionCommandMenu);
+    CaptureDefaultActivation(*native,commands);
     ComPtr<ShellView> shell; shell.Attach(new ShellView); shell->hwnd=state.nativeHwnd; shell->menu=commands;
     shell->selection=native; shell->parent=state.directoryFolderIdentity; native->commandView=shell;
     auto* browser=new TimingShellBrowser; browser->view=shell; state.shellBrowser.Attach(browser);

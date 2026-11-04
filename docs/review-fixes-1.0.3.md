@@ -28,5 +28,40 @@ The alternate index-sort algorithms were used only by benchmarks; they now
 live in the benchmark header and share the production permutation helper.
 The working C++ source is saved with CRLF line endings for upstream review.
 
-No build, runtime tests or publication were performed. Published 1.0.2 and its
-archive remain unchanged; the development source is 1.0.3.cpp.
+Ordinary activation now calls IFolderView2::InvokeVerbOnSelection(nullptr)
+for files, filesystem/provider folders, This PC items and Recycle Bin items.
+Removed direct folder PIDL parsing/BrowseObject, the Recycle Bin ShellExecute
+branch and guessed eager navigation previews. Explicit new-tab activation keeps
+its separate user-requested disposition. Activation reuses verified first-click
+selection, waits for asynchronous selection completion and rechecks
+owner/view/directory/item identity after
+reentrant calls. Existing Shell navigation notifications drive previews.
+The earlier unification still manually queried and invoked IContextMenu, which
+the affected-PC report confirms retained the discrepancy for double-click and
+Enter. The remaining manual default-command branch and its supplied working
+directory have now been removed. Explorer's view owns the launch parameters;
+there is no manual menu fallback or synthetic keyboard-state change.
+Extended native view-API capture coverage to ordinary filesystem folders
+and files and asynchronous selected-group activation. Captured test
+commands do not launch associated apps or navigate real user windows.
+
+Default activation also rechecks the captured selection storage and directory
+generation after the Shell window lookup. Reentrant selection replacement,
+directory changes and selection recovery cancel activation. Existing command
+coverage now exercises selection replacement and directory changes during that
+COM call without launching files.
+
+Validation caught a delegated-folder watch regression: SIGDN_FILESYSPATH on the
+alias item names the alias, not its displayed target. A private Shell probe
+confirmed BHID_LinkTargetItem resolves the target; the worker now uses that
+documented handler before requesting its filesystem path. The modifier capture
+uses the existing substituted keyboard API, and the native touch-history case
+runs the real AttachView rebind before asserting confirmed travel history.
+
+The native return check also exposed a repeated-announcement race: binary
+differences between canonically equal folder PIDLs discarded already-positioned
+rows. Announcement and confirmation now ask Shell for canonical identity when
+bytes differ, retaining conservative reset on mismatch or comparison failure.
+Both calls revalidate tab-owned state after COM reentrancy. The real travel-log
+case independently compares native Shell items and requires immediate row,
+order and viewport preservation at confirmation and through refresh.

@@ -23,11 +23,9 @@ public:
         return native->GetCommandString(id, flags, reserved, text, length);
     }
     HRESULT STDMETHODCALLTYPE InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
-        const auto* command = reinterpret_cast<const CMINVOKECOMMANDINFOEX*>(info);
-        Check(command->cbSize == sizeof(*command) && IS_INTRESOURCE(command->lpVerb) &&
-            LOWORD(command->lpVerb) == expected && !command->lpDirectoryW,
-            "provider activation changed the native default or supplied a fictitious disk directory");
-        ++calls; return S_OK;
+        ++calls;
+        Check(false,"default activation bypassed the native view with a manual context-menu invocation");
+        return E_UNEXPECTED;
     }
 };
 class View final : public AttachmentFolderView, public IShellView {
@@ -36,6 +34,8 @@ public:
     ComPtr<IFolderView2> native;
     ComPtr<Menu> menu;
     HWND window = nullptr;
+    unsigned activations = 0;
+    DWORD modifiers = 0;
     explicit View(IFolderView2* value) : native(value) { value->GetFolder(IID_PPV_ARGS(&folder)); menu.Attach(new Menu); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
         if (iid == IID_IShellView || iid == IID_IOleWindow) {
@@ -46,6 +46,24 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return AttachmentFolderView::AddRef(); }
     ULONG STDMETHODCALLTYPE Release() override { return AttachmentFolderView::Release(); }
     HRESULT STDMETHODCALLTYPE GetWindow(HWND* out) override { *out = window; return S_OK; }
+    HRESULT STDMETHODCALLTYPE InvokeVerbOnSelection(LPCSTR verb) override {
+        Check(!verb,"native activation forced a canonical verb");
+        // Resolve Windows' real selected-item default independently, but
+        // capture execution at the view API so no app or user window opens.
+        ComPtr<IContextMenu> context;
+        Check(SUCCEEDED(GetItemObject(SVGIO_SELECTION,IID_PPV_ARGS(&context))),"native default context");
+        const HMENU popup=CreatePopupMenu();
+        Check(popup!=nullptr,"native default menu");
+        const HRESULT hr=context->QueryContextMenu(popup,0,1,0x7FFF,CMF_DEFAULTONLY);
+        const UINT command=GetMenuDefaultItem(popup,FALSE,GMDI_GOINTOPOPUPS);
+        DestroyMenu(popup);
+        Check(SUCCEEDED(hr) && command>=1 && command<=0x7FFF,"native selection has no default action");
+        modifiers=0;
+        if(ModifierFixture::Key(VK_CONTROL)&0x8000) modifiers|=CMIC_MASK_CONTROL_DOWN;
+        if(ModifierFixture::Key(VK_SHIFT)&0x8000) modifiers|=CMIC_MASK_SHIFT_DOWN;
+        ++activations;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetItemObject(UINT flags, REFIID iid, void** out) override {
         ComPtr<IShellView> view;
         Check(SUCCEEDED(native.As(&view)) && SUCCEEDED(view->GetItemObject(flags, IID_PPV_ARGS(&menu->native))),
@@ -83,7 +101,7 @@ SharedPidl Identity(ViewState& state, const wchar_t* name) {
     const auto identity = state.entries[Row(state, name)].shellIdentity;
     Check(bool(identity), "provider navigation lost the item's complete identity"); return identity;
 }
-void Activate(ProviderSelectionFixture::Browser& host, int row, bool selected) {
+void Activate(ProviderSelectionFixture::Browser& host, int row, bool selected, DWORD modifiers=0) {
     auto& state = host.state;
     const auto original = state.folderView;
     ComPtr<View> capture; capture.Attach(new View(original.Get())); capture->window = state.nativeHwnd;
@@ -96,15 +114,17 @@ void Activate(ProviderSelectionFixture::Browser& host, int row, bool selected) {
     if (selected) OverlayProc(state.hwnd, WM_KEYDOWN, VK_RETURN, 0);
     else Open(state, row);
     Check(Eventually([&] { host.Pump(); return !state.pendingNativeSelection; }, 30000), "provider default action preparation stalled");
-    if(capture->menu->calls!=1 || !state.selectedFlags[row] || state.nativeSelectionUnsafe)
+    if(capture->activations!=1 || !state.selectedFlags[row] || state.nativeSelectionUnsafe)
         std::wcout<<L"PROVIDER ACTIVATE folder="<<state.folderPath<<L" row="<<row<<L" selected-route="<<selected
-            <<L" item="<<state.entries[row].name<<L" calls="<<capture->menu->calls<<L" gpu="<<state.selected
+            <<L" item="<<state.entries[row].name<<L" calls="<<capture->activations<<L" gpu="<<state.selected
             <<L" flag="<<int(state.selectedFlags[row])<<L" unsafe="<<state.nativeSelectionUnsafe
             <<L" dirty="<<state.nativeSelectionDirty<<L" importing="<<state.nativeSelectionImportPending
             <<L" recovering="<<state.nativeSelectionRecoveryPending<<L" pending="<<state.pendingNativeSelection
             <<L" keys="<<state.deferredSelectionKeys.size()<<L" provider="<<bool(state.namespaceIdentities)<<std::endl;
-    Check(capture->menu->calls == 1 && state.selectedFlags[row] && !state.nativeSelectionUnsafe,
-        "provider folder/stream activation never reached its selected native default command");
+    Check(capture->activations == 1 && !capture->menu->calls && state.selectedFlags[row] && !state.nativeSelectionUnsafe,
+        "activation never reached the native view or used a manual command fallback");
+    Check(capture->modifiers==modifiers,"native activation changed the current input modifiers");
+    Check(!state.optimisticStartedAt,"captured default command invented a folder navigation");
     Check(CaptureNativeSelection(state, true), "provider activation selection echo");
     Check(Eventually([&] { host.Pump(); return !state.pendingNativeSelection; }, 30000), "provider activation echo stalled");
     Check(state.selectedFlags[row], "provider activation echo lost the selected item");
@@ -227,6 +247,14 @@ static void TestProviderNavigation(const std::wstring& fixture) {
         Activate(host, 0, true);
         const auto target = root / L"target", alias = root / L"alias";
         DiskAndAlias(target, alias);
+        host.Navigate(target.wstring(),99);
+        Check(!host.state.namespaceIdentities,"ordinary-folder activation fixture is not filesystem-backed");
+        Activate(host,Row(host.state,L"one"),false);
+        Activate(host,Row(host.state,L"one"),true);
+        Activate(host,Row(host.state,L"file-0.txt"),false);
+        keyboard.keys[VK_CONTROL]=keyboard.keys[VK_SHIFT]=0x80;
+        Activate(host,Row(host.state,L"one"),false,CMIC_MASK_CONTROL_DOWN|CMIC_MASK_SHIFT_DOWN);
+        keyboard.keys[VK_CONTROL]=keyboard.keys[VK_SHIFT]=0;
         host.Navigate(alias.wstring(), 99);
         Activate(host, Row(host.state, L"one"), false);
         host.NavigateIdentity(Identity(host.state, L"one").get(), 1);
