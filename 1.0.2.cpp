@@ -4284,6 +4284,11 @@ void ReleasePresentation(ViewState& state,bool stop=false);
 void RegisterAnimationWindow(HWND hwnd);
 void QueueVisibleDataFrame(ViewState& state);
 void Redraw(ViewState& state);
+void EndInitialLoading(ViewState& state) {
+    if(!std::exchange(state.startupAnimationsSuppressed,false)) return;
+    // Publish the changed policy even when the input itself needs no repaint.
+    Redraw(state);
+}
 int ViewHeight(ViewState& state);
 void SetActive(HWND hwnd, bool on);
 void RefreshViewToggleForFrame(HWND frame, bool deferred = false, bool invalidateGeometry = true);
@@ -6139,6 +6144,19 @@ bool TabOwnsActiveView(const ViewState& state);
 // Tab registry/presentation helpers are implemented after OverlayWndProc.
 // Their declarations must be visible to its kMsgTabActivated handler.
 HWND OverlayUnder(HWND frame);
+// Observe input provenance, not the animation/layout operation it may cause.
+// System-generated traffic during attachment/enrichment must leave startup
+// instant, including a window appearing beneath a stationary pointer.
+void ObserveInitialLoadingInput(HWND window) {
+    if(g_unloading.load(std::memory_order_relaxed)) return;
+    INPUT_MESSAGE_SOURCE source{};
+    if(!GetCurrentInputMessageSource(&source) || source.deviceType==IMDT_UNAVAILABLE ||
+        (source.originId!=IMO_HARDWARE && source.originId!=IMO_INJECTED)) return;
+    const HWND overlay=OverlayUnder(GetAncestor(window,GA_ROOT));
+    if(!overlay || GetWindowThreadProcessId(overlay,nullptr)!=GetCurrentThreadId()) return;
+    if(auto* state=State(overlay); state && state->startupAnimationsSuppressed &&
+        state->visible && TabOwnsActiveView(*state)) EndInitialLoading(*state);
+}
 void SynchronizeTabSurfaces(HWND frame, bool activate = false);
 void ArmTabSwitchProbe(HWND frame, const wchar_t* reason);
 void TraceTabHostSnapshot(HWND frame, const wchar_t* source);
@@ -11274,13 +11292,13 @@ struct NativeViewInput {
     explicit NativeViewInput(ViewState* state, bool explicitMode = false) {
         if (g_unloading.load(std::memory_order_relaxed) || !state || !state->visible ||
             !state->inScope || state->optimisticStartedAt || !TabOwnsActiveView(*state)) return;
+        EndInitialLoading(*state);
         // Canonical View commands are authoritative even if the native view
         // already has that mode and only the GPU differs after a cold preview.
         const HWND owner=state->hwnd, source=state->nativeHwnd;
         const auto generation=state->token;
         if (!explicitMode && !ReadNativeViewMode(*state,before)) return;
         if (!IsWindow(owner) || State(owner)!=state || state->nativeHwnd!=source || state->token!=generation) return;
-        state->startupAnimationsSuppressed=false;
         overlay=owner; native=source; token=generation;
     }
     struct InputOwner {
@@ -11568,7 +11586,7 @@ PROPERTYKEY HeaderSortKey(ViewState& state, int column) {
 void SortByHeader(ViewState& state, int column) {
     if (!state.folderView || column < 0 ||
         column >= static_cast<int>(state.columns.size())) return;
-    state.startupAnimationsSuppressed=false;
+    EndInitialLoading(state);
     PROPERTYKEY key = HeaderSortKey(state, column);
     // A second click reverses the direction. Dates default to newest first.
     const bool same = state.sortInitialized && SameProperty(key, state.sort.key);
@@ -23374,7 +23392,6 @@ struct NativeFileCommandScope {
     }
     explicit NativeFileCommandScope(ViewState* state, UINT key=0) {
         if (!state || g_unloading.load(std::memory_order_relaxed)) return;
-        state->startupAnimationsSuppressed=false;
         owner=state->hwnd; lifetime=state->lifetimeToken;
         if (key) pipeline.emplace(state->background,L"file.native.key",key,state->token);
         ++state->nativeFileCommandDepth;
@@ -25971,7 +25988,6 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
 // interpolate from the presented image on the zoom clock. A negative height
 // keeps the zoom preference: the caller already chose a new native layout.
 void BeginAnimatedZoom(ViewState& state, int height96) {
-    state.startupAnimationsSuppressed=false;
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     if (state.gridView) AdvanceRowHeight(state);
@@ -26093,7 +26109,7 @@ void NavigateCurrentShellTab(ViewState& state, UINT navigation) {
 void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
     state.lastManipulationActivity = GetTickCount64();
     if (wParam == 1) { // New genuine touchpad contact.
-        state.startupAnimationsSuppressed=false;
+        EndInitialLoading(state);
         if(g_pipelineTracing.load(std::memory_order_relaxed) || g_uiTransitionLogging.load(std::memory_order_relaxed)) {
             RECT host{}; GetWindowRect(state.hwnd,&host);
             const HWND above=GetWindow(state.hwnd,GW_HWNDPREV);
@@ -28382,7 +28398,14 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ReleaseAllFrameShellViewHooks(hwnd);
         return 0;
     }
-    if (msg == WM_ENTERSIZEMOVE) SetPropW(hwnd,kFrameSizingProperty,reinterpret_cast<HANDLE>(1));
+    ObserveInitialLoadingInput(hwnd);
+    if (msg == WM_ENTERSIZEMOVE) {
+        // USER enters its modal sizing loop before the first resize/reflow.
+        // Hidden tabs retain their independent initial-loading policy.
+        if(auto* state=State(OverlayUnder(hwnd)); state && state->visible && TabOwnsActiveView(*state))
+            EndInitialLoading(*state);
+        SetPropW(hwnd,kFrameSizingProperty,reinterpret_cast<HANDLE>(1));
+    }
     if (msg == WM_EXITSIZEMOVE || msg == WM_NCDESTROY) RemovePropW(hwnd,kFrameSizingProperty);
     if (msg == WM_COMMAND && HIWORD(wp) == BN_CLICKED && lp) {
         const HWND button = reinterpret_cast<HWND>(lp);
@@ -30917,6 +30940,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    if(s && s->startupAnimationsSuppressed) ObserveInitialLoadingInput(hwnd);
     if(s && s->keyboardSectionKey &&
         (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
          msg==WM_MBUTTONDOWN || msg==WM_POINTERDOWN)) {
@@ -31053,11 +31077,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->lastPointerInput = lParam;
         s->lastInteractionTick = GetTickCount64();
     } else if (s && msg == WM_POINTERUPDATE) s->lastInteractionTick = GetTickCount64();
-    if (s && (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN ||
-        msg==WM_XBUTTONDOWN || msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL ||
-        msg==WM_KEYDOWN || msg==WM_SYSKEYDOWN || msg==WM_CHAR ||
-        msg==WM_POINTERDOWN || msg==WM_GESTURE))
-        s->startupAnimationsSuppressed=false;
     if (s && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
         msg == WM_MBUTTONDOWN || msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN ||
         msg == WM_MOUSEWHEEL || msg == WM_CANCELMODE || msg == WM_KILLFOCUS))
@@ -33816,13 +33835,14 @@ void CALLBACK NativeSurfaceEvent(HWINEVENTHOOK sourceHook, DWORD event, HWND cha
     if(owns) ObserveNativeSurfaceEvent(event,changed,objectId,childId);
 }
 
-// USER can reject an in-context WinEvent DLL registration. A thread-local
-// message hook needs no DLL registration/injection and still runs before the
-// native host's first show/layout. Queued discovery remains on its own lane.
+// Observe real input across native frame children before their handlers run.
+// When USER rejects the in-context WinEvent registration, this also supplies
+// the native host's first show/layout barrier on the same owner thread.
 LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
     WindowCallbackGuard callback;
     if(code>=0 && lp && !g_unloading.load(std::memory_order_acquire)) {
         const auto& message=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        ObserveInitialLoadingInput(message.hwnd);
         DWORD event=message.message==WM_CREATE ? EVENT_OBJECT_CREATE :
             message.message==WM_SHOWWINDOW ? (message.wParam ? EVENT_OBJECT_SHOW:EVENT_OBJECT_HIDE) :
             message.message==WM_WINDOWPOSCHANGING ? EVENT_OBJECT_LOCATIONCHANGE : 0;
@@ -33830,7 +33850,8 @@ LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
         const HWND frame=event ? GetAncestor(message.hwnd,GA_ROOT):nullptr;
         AcquireSRWLockShared(&g_shellHookLock);
         const auto hook=g_shellViewHooks.find(frame);
-        const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationMessages;
+        const bool owns=hook!=g_shellViewHooks.end() && hook->second.presentationMessages &&
+            !hook->second.presentationHandle; // The WinEvent barrier already handles these events.
         ReleaseSRWLockShared(&g_shellHookLock);
         if(owns) {
             auto* position=message.message==WM_WINDOWPOSCHANGING ? reinterpret_cast<WINDOWPOS*>(message.lParam):nullptr;
@@ -35236,13 +35257,14 @@ void InitializeFrameShellEvents(ViewState& state) {
             candidatePresentationHook=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_PARENTCHANGE,
                 module,NativeSurfaceEvent,GetCurrentProcessId(),
                 GetWindowThreadProcessId(state.frameHwnd,nullptr),WINEVENT_INCONTEXT);
-        if (!candidatePresentationHook) {
-            const DWORD error=GetLastError();
-            candidatePresentationMessages=SetWindowsHookExW(WH_CALLWNDPROC,NativeSurfaceMessages,nullptr,
-                GetWindowThreadProcessId(state.frameHwnd,nullptr));
-            if(!candidatePresentationMessages)
-                Wh_Log(L"[GPU host] synchronous presentation barriers unavailable event-error=%lu message-error=%lu",error,GetLastError());
-        }
+    }
+    // Input provenance must be observed even when the WinEvent presentation
+    // barrier succeeded. Reuse this frame-owned hook and its existing teardown.
+    if(!sharedPresentationMessages) {
+        candidatePresentationMessages=SetWindowsHookExW(WH_CALLWNDPROC,NativeSurfaceMessages,nullptr,
+            GetWindowThreadProcessId(state.frameHwnd,nullptr));
+        if(!candidatePresentationMessages)
+            Wh_Log(L"[GPU host] owner input observation unavailable error=%lu",GetLastError());
     }
     if (!sharedHook) {
         DWORD ownerThread = GetWindowThreadProcessId(state.frameHwnd, nullptr);
@@ -35457,7 +35479,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
              _wcsicmp(path.c_str(), s->immediateBackFrom.c_str()) != 0)) {
             ClearImmediateBackHint(*s);
         }
-        if (changedPath && s->firstContentSubmittedAt) s->startupAnimationsSuppressed=false;
+        if (changedPath && s->firstContentSubmittedAt) EndInitialLoading(*s);
         s->nativeHwnd = native;
         if (s->visible && s->inScope && s->detailsViewActive)
             SuppressNativeContent(*s, native);

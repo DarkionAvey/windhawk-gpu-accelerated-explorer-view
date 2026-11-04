@@ -149,12 +149,17 @@ void GroupAnimationClock(bool rtl,bool grid) {
         RetargetZebraExtent(input,0.f);
         Check(!input.rowTransitionActive && !input.columnTransitionActive && !input.zebraExtentAnimating,
             "startup provider enrichment started layout animation");
+        Check(input.startupAnimationsSuppressed,"layout work ended initial-loading suppression");
         Entry hidden; hidden.path=L"startup-opacity-fixture"; hidden.attributes=FILE_ATTRIBUTE_HIDDEN;
         Check(ItemContentOpacity(input,hidden,true)==kDimmedItemContentOpacity && input.itemOpacityRows.empty(),
             "startup opacity retained an animation instead of its final appearance");
         Check(CapturePresentationModel(input)->startupAnimationsSuppressed,
             "startup policy did not cross the tab's presentation boundary");
-        input.startupAnimationsSuppressed=false;
+        output.startupAnimationsSuppressed=true;
+        EndInitialLoading(input);
+        Check(!CapturePresentationModel(input)->startupAnimationsSuppressed && output.startupAnimationsSuppressed,
+            "interactive animation policy was not published independently for the input tab");
+        output.startupAnimationsSuppressed=false;
         Check(UiTransitionProgress(input,started,kUiTransitionDurationMs,sample)==.25f,
             "startup policy disabled subsequent interactive animation");
     }

@@ -5,7 +5,8 @@
 - Validate applied text-rendering settings across lists, tooltips and drag
   previews; use compatible defaults when effective antialiasing differs.
 - Keep new-tab loading and delayed enrichment instant in every folder and view;
-  enable animations when the user interacts with that tab's view.
+  enable animations immediately on deliberate input, including hover and
+  window-frame resizing before entering the view.
 - Expand a renamed item's collapsed section before revealing the item and
   opening its rename field, including newly created files and folders.
 
