@@ -58,10 +58,10 @@ static void TestThumbnailDecorations(ViewState& state) {
         decorated.pixels.badgeSize==16 && decorated.pixels.width==88 && decorated.pixels.height==58,
         "film/badge atlas lost source aspect or isolated badge band");
     Check(UploadIconBitmap(state,decorated) && UploadIconBitmap(state,plain),"decoration upload");
-    auto draw=[&](IconRecord& record,float opacity=1.f,float angle=0.f) {
+    auto draw=[&](IconRecord& record,float opacity=1.f,float angle=0.f,IconRecord* overlay=nullptr) {
         state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
         const auto transform=D2D1::Matrix3x2F::Identity(); state.target->SetTransform(transform);
-        Check(DrawCachedIcon(state,record,40,40,opacity,angle),"decoration shared draw");
+        Check(DrawCachedIcon(state,record,40,40,opacity,angle,nullptr,overlay),"decoration shared draw");
         D2D1_MATRIX_3X2_F after{}; state.target->GetTransform(&after);
         Check(memcmp(&after,&transform,sizeof(after))==0,"thumbnail wiggle leaked its transform");
         Check(SUCCEEDED(state.target->EndDraw()) &&
@@ -108,6 +108,37 @@ static void TestThumbnailDecorations(ViewState& state) {
         g_thumbnailCornerRadius96=0; draw(decorated);
         Check(pixel(left+1,top+1)[3]>240,"global thumbnail radius did not control film corners");
         g_thumbnailCornerRadius96=oldRadius;
+    }
+    // A transparent Shell canvas must cap its visible glyph, not its padding.
+    IconRecord overlay;
+    overlay.pixels.width=overlay.pixels.height=16; overlay.pixels.stride=64;
+    overlay.pixels.data.assign(16*64,0);
+    for(int y=8;y<16;++y) for(int x=0;x<8;++x) {
+        auto* p=overlay.pixels.data.data()+y*64+x*4; p[1]=255; p[3]=255;
+    }
+    const auto bounds=IconAlphaBounds(overlay.pixels);
+    Check(bounds.left==0 && bounds.top==8 && bounds.right==8 && bounds.bottom==16,
+        "Shell overlay alpha bounds included its transparent canvas");
+    overlay.pixels.overlayExtent=.5f;
+    Check(UploadIconBitmap(state,overlay),"capped overlay upload");
+    for(int dpi:{96,144,192}) {
+        StyleFixture::Session styleMetrics; StyleFixture::dpi=dpi;
+        state.textFormatDpi=dpi; state.iconPx=272;
+        const int left=state.rtlLayout ? 8:40;
+        const int bottom=int(40+(272.f+272.f*40/88)*.5f);
+        // Independent OS metric expectation, rather than the mod's cap helper.
+        const int cap=2*std::max(GetSystemMetricsForDpi(SM_CXICON,dpi),GetSystemMetricsForDpi(SM_CXSMICON,dpi));
+        const int appSize=std::min(272/4,cap);
+        draw(decorated,1.f,0.f,&overlay);
+        const int appEdge=state.rtlLayout ? left:left+272;
+        const int shellEdge=state.rtlLayout ? left+272:left;
+        const int appDirection=state.rtlLayout ? 1:-1, shellDirection=-appDirection;
+        Check(pixel(appEdge+appDirection*(appSize-4),bottom-8)[0]>230 &&
+            pixel(appEdge+appDirection*(appSize+2),bottom-8)[0]<100,
+            "large thumbnail app badge exceeded or failed to reach its DPI cap");
+        Check(pixel(shellEdge+shellDirection*(cap-4),bottom-8)[1]>230 &&
+            pixel(shellEdge+shellDirection*(cap+2),bottom-8)[1]<150,
+            "large thumbnail Shell glyph exceeded its DPI cap or shrank with transparent padding");
     }
     state.iconPx=96; state.textFormatDpi=96;
     draw(plain);

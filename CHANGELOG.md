@@ -2,6 +2,8 @@
 
 ## 1.0.1 (unreleased)
 
+- Cap thumbnail app badges and Shell overlay glyphs at twice Windows' DPI-scaled
+  large-icon size so increasing thumbnail zoom keeps the preview clear.
 - Count elapsed calendar months for tooltip dates, including month ends and
   leap years, and round approximate years instead of truncating them.
 - Keep section badge hit and hover geometry on the accepted paint's clock.

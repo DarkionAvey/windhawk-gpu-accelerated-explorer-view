@@ -1345,6 +1345,8 @@ struct IconPixels {
     // The badge occupies a separate atlas band, never the provider's pixels.
     // Zero dimensions retain the ordinary icon path, including fallbacks.
     UINT thumbnailWidth = 0, thumbnailHeight = 0, badgeSize = 0;
+    // Visible fraction of a Shell overlay's full canvas, measured on its worker.
+    float overlayExtent = 1.f;
     bool Ready() const {
         return width && height && width <= UINT_MAX/4 && stride >= width*4 &&
             data.size()/stride >= height;
@@ -6789,9 +6791,7 @@ IconPixels DecodeIconPixels(IWICImagingFactory* factory, IWICBitmapSource* sourc
     return result;
 }
 
-// Image-list HICONs are unframed, but their canvas can exceed the available
-// resource. Compact visible pixels once on the worker, before GPU upload.
-IconPixels FitShellIconPixels(IconPixels pixels) {
+RECT IconAlphaBounds(const IconPixels& pixels) {
     if (!pixels.Ready()) return {};
     UINT left=pixels.width,top=pixels.height,right=0,bottom=0;
     const BYTE* data=std::as_const(pixels.data).data();
@@ -6800,16 +6800,31 @@ IconPixels FitShellIconPixels(IconPixels pixels) {
             left=std::min(left,x); top=std::min(top,y);
             right=std::max(right,x+1); bottom=y+1;
         }
+    return right>left && bottom>top ? RECT{LONG(left),LONG(top),LONG(right),LONG(bottom)} : RECT{};
+}
+// Image-list HICONs are unframed, but their canvas can exceed the available
+// resource. Compact visible pixels once on the worker, before GPU upload.
+IconPixels FitShellIconPixels(IconPixels pixels) {
+    const auto bounds=IconAlphaBounds(pixels);
+    const UINT left=UINT(bounds.left),top=UINT(bounds.top),right=UINT(bounds.right),bottom=UINT(bounds.bottom);
     // A successfully decoded but empty icon must not suppress its fallback.
     if(right<=left || bottom<=top) return {};
     if(left==0 && top==0 && right==pixels.width && bottom==pixels.height) return pixels;
     IconPixels fitted; fitted.width=right-left; fitted.height=bottom-top; fitted.stride=fitted.width*4;
     try {fitted.data.resize(size_t(fitted.stride)*fitted.height);}
     catch(const std::bad_alloc&) {return pixels;}
+    const BYTE* data=std::as_const(pixels.data).data();
     BYTE* destination=fitted.data.data();
     for(UINT y=0;y<fitted.height;++y)
         memcpy(destination+size_t(y)*fitted.stride,data+size_t(top+y)*pixels.stride+left*4,fitted.stride);
     return fitted;
+}
+
+// Secondary indicators stop at twice Windows' DPI-scaled large-icon size
+// (normally 64 logical pixels). Retain customized system icon metrics.
+UINT IconAdornmentMaxSize(UINT dpi) {
+    return 2u*UINT(std::max({1,GetSystemMetricsForDpi(SM_CXICON,dpi),
+        GetSystemMetricsForDpi(SM_CXSMICON,dpi)}));
 }
 
 IconPixels DecodeShellIcon(IWICImagingFactory* factory, HICON icon, HRESULT* status = nullptr,
@@ -7019,10 +7034,11 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
     if (lane.associationEpoch != epoch) {
         lane.thumbnailStyles.clear(); lane.associationEpoch = epoch;
     }
-    // Match the drawn badge: a quarter of the requested tier, never below the
-    // small-icon size, so it is extracted at its display size, not upscaled.
+    // Match the drawn badge, including its DPI-aware cap. Large thumbnail
+    // requests must not extract increasingly large secondary artwork.
     const UINT badge = std::clamp<UINT>(std::max<UINT>((job.pixelSize+3)/4,
-        static_cast<UINT>(GetSystemMetricsForDpi(SM_CXSMICON, static_cast<UINT>(job.dpi)))),16,256);
+        static_cast<UINT>(GetSystemMetricsForDpi(SM_CXSMICON, static_cast<UINT>(job.dpi)))),
+        1,IconAdornmentMaxSize(static_cast<UINT>(job.dpi)));
     const auto key = job.extension + L"|" + std::to_wstring(badge);
     auto found = lane.thumbnailStyles.find(key);
     if (found == lane.thumbnailStyles.end()) {
@@ -7126,6 +7142,11 @@ DWORD WINAPI IconWorkerProc(LPVOID context) {
             if (icon && SUCCEEDED(images->GetIconSize(&width,&height)) && width>0 && height>0)
                 pixels = DecodeShellIcon(factory.Get(), icon.get(), &decodeResult,
                     std::max(job.pixelSize,UINT(std::max(width,height))));
+            if(pixels.Ready()) {
+                const auto bounds=IconAlphaBounds(pixels);
+                pixels.overlayExtent=std::max(float(bounds.right-bounds.left)/pixels.width,
+                    float(bounds.bottom-bounds.top)/pixels.height);
+            }
         } else {
             // Ask the factory for genuine thumbnails only. Some icon-only results
             // contain a provider-drawn frame around tiny centered artwork; alpha
@@ -17142,10 +17163,10 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(iconX,y,iconX+width,y+height));
     if(rect.right<=rect.left || rect.bottom<=rect.top) return true;
     if (drawn) *drawn = rect;
-    // Corner adornments (type badge, Shell overlay) scale with the icon slot
-    // but never below Windows' small-icon size, the smallest size icons are
-    // designed for. They may extend past small artwork; damage includes them.
+    // Corner adornments grow with the slot only up to the DPI-aware indicator
+    // cap. They may extend past small artwork; damage includes them.
     const float smallestAdornment = static_cast<float>(GetSystemMetricsForDpi(SM_CXSMICON, ViewDpi(state)));
+    const float largestAdornment = static_cast<float>(IconAdornmentMaxSize(ViewDpi(state)));
     const auto adorn = [&](const D2D1_RECT_F& area) {
         if (!drawn) return;
         drawn->left=std::min(drawn->left,area.left); drawn->top=std::min(drawn->top,area.top);
@@ -17189,7 +17210,7 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // The reusable brush must not pin an evicted bitmap or obsolete device.
         state.thumbnailBrush->SetBitmap(nullptr);
         if (artwork.badgeSize) {
-            const float badge = std::max(side*.25f, smallestAdornment);
+            const float badge = std::clamp(side*.25f, smallestAdornment, largestAdornment);
             const float left = state.rtlLayout ? rect.left : rect.right-badge;
             const float top = static_cast<float>(artwork.thumbnailHeight+2);
             const float size = static_cast<float>(artwork.badgeSize);
@@ -17212,7 +17233,14 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // artwork's opacity, zoom and wiggle transform.
         // A canvas below the small-icon size would shrink the glyph below the
         // smallest overlay Windows designs.
-        const float edge=std::max(side,smallestAdornment);
+        const auto& overlayPixels=overlay->bitmapPixels.Ready() &&
+            overlay->bitmapPixels.data.Identity()!=overlay->pixels.data.Identity() ?
+            overlay->bitmapPixels : overlay->pixels;
+        // Cap the glyph, not its transparent canvas. Retain the provider's
+        // corner placement and proportions without scanning pixels on paint.
+        const float extent=overlayPixels.overlayExtent;
+        const float edge=extent>0.f ? std::min(std::max(side,smallestAdornment),
+            largestAdornment/extent) : std::min(side,largestAdornment);
         const float left=state.rtlLayout ? rect.right-edge : rect.left;
         const auto overlayRect=SnapDrawRect(state.target.Get(),
             D2D1::RectF(left,rect.bottom-edge,left+edge,rect.bottom));
