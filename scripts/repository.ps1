@@ -48,7 +48,10 @@ function New-ModVersion([string]$RepositoryRoot, [string]$Version) {
 }
 
 function Sync-ModReadme([string]$SourcePath, [string]$ReadmePath) {
-    $source = [IO.File]::ReadAllText($SourcePath)
+    $original = [IO.File]::ReadAllText($SourcePath)
+    # Normalize the working source before compilation so published sources,
+    # archives and the regular export remain byte-identical CRLF files.
+    $source = $original.Replace("`r`n", "`n").Replace("`n", "`r`n")
     $readme = [IO.File]::ReadAllText($ReadmePath)
     if ($readme.Contains('*/') -or $readme.Contains('// ==/WindhawkModReadme==')) {
         throw 'README.md contains a comment terminator or Windhawk delimiter; it cannot be embedded safely'
@@ -56,15 +59,14 @@ function Sync-ModReadme([string]$SourcePath, [string]$ReadmePath) {
     $blocks = [regex]::Matches($source,
         '(?ms)^// ==WindhawkModReadme==\r?\n/\*\r?\n.*?^\*/\r?\n// ==/WindhawkModReadme==[ \t]*(?=\r?$)')
     if ($blocks.Count -ne 1) { throw "Expected one Windhawk README block in $SourcePath" }
-    $newline = "`n"
-    if ($source.Contains("`r`n")) { $newline = "`r`n" }
+    $newline = "`r`n"
     $readme = $readme.Replace("`r`n", "`n").TrimEnd([char]10).Replace("`n", $newline)
     $replacement = '// ==WindhawkModReadme==' + $newline + '/*' + $newline +
         $readme + $newline + '*/' + $newline + '// ==/WindhawkModReadme=='
     $block = $blocks[0]
     $updated = $source.Substring(0, $block.Index) + $replacement +
         $source.Substring($block.Index + $block.Length)
-    if ($updated -cne $source) {
+    if ($updated -cne $original) {
         [IO.File]::WriteAllText($SourcePath, $updated, [Text.UTF8Encoding]::new($false))
     }
 }

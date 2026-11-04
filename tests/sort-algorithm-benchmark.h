@@ -1,5 +1,16 @@
 #include <random>
 
+// Alternative algorithms belong to this comparison, not the production mod.
+template<class Less>
+static void BenchmarkIndexSort(std::vector<Entry>& entries, Less&& less, bool stable) {
+    std::vector<size_t> order(entries.size());
+    for(size_t i=0;i<order.size();++i) order[i]=i;
+    const auto compare=[&](size_t a,size_t b) {return less(entries[a],entries[b]);};
+    if(stable) std::stable_sort(order.begin(),order.end(),compare);
+    else std::sort(order.begin(),order.end(),compare);
+    ApplyEntryOrder(entries,order);
+}
+
 // Algorithms see the same real Win32-enumerated rows. Copies, fixture creation
 // and validation are outside the timing; sorting and permutation are included.
 static void TestSortAlgorithms(const std::vector<Entry>& enumerated, bool extended) {
@@ -31,8 +42,8 @@ static void TestSortAlgorithms(const std::vector<Entry>& enumerated, bool extend
             const auto compare=[&](const Entry& a,const Entry& b) {++comparisons; return less(a,b);};
             LARGE_INTEGER start{},end{}; QueryPerformanceCounter(&start);
             if (algorithm==0) std::sort(rows.begin(),rows.end(),compare);
-            else if (algorithm==1) SortEntriesByIndex<EntrySortAlgorithm::Intro>(rows,compare);
-            else if (algorithm==2) SortEntriesByIndex<EntrySortAlgorithm::Merge>(rows,compare);
+            else if (algorithm==1) BenchmarkIndexSort(rows,compare,false);
+            else if (algorithm==2) BenchmarkIndexSort(rows,compare,true);
             else SortEntriesByIndex(rows,compare);
             QueryPerformanceCounter(&end);
             Check(rows.size()==expected.size() && DirectoryOrderHash(rows)==orderHash &&

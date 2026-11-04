@@ -53,25 +53,35 @@ static void TestLlmReport() {
         g_dispatchOriginal=+[](const MSG*)->LRESULT{return 0;};
         ReportApiFixture::countShellWindows=true; ReportApiFixture::shellWindowsCalls=0;
         auto* dispatch=CurrentDispatchThreadState(); Check(dispatch!=nullptr,"report dispatch state");
-        dispatch->frames[frame].lastSelectedTab=ActiveExplorerTab(frame);
-        SetPropW(frame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
-        MSG key{}; key.hwnd=frame; key.message=WM_KEYDOWN; key.wParam=VK_F9;
-        for(int i=0;i<12;++i) {dispatch->frames[frame].nextScan=0; DispatchHook(&key);}
-        Check(!ReportApiFixture::shellWindowsCalls,"resolved unsupported tab repeated ShellWindows discovery");
-        RemovePropW(frame,kColdAttachResolvedProperty);
-        dispatch->frames[frame].nextScan=0; DispatchHook(&key);
-        Check(ReportApiFixture::shellWindowsCalls==1,"navigation did not reopen discovery admission");
-        type.lpszClassName=L"SHELLDLL_DefView"; RegisterClassW(&type);
-        HWND unsupported=CreateWindowExW(0,type.lpszClassName,L"unsupported native view",WS_CHILD|WS_VISIBLE,
-            0,0,100,100,frame,nullptr,type.hInstance,nullptr);
-        SetPropW(frame,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
-        key.hwnd=unsupported; key.message=WM_SIZE; DispatchHook(&key);
-        const auto discovered=ReportApiFixture::shellWindowsCalls;
-        Sleep(300); // Exceed the old same-HWND 250 ms recovery threshold.
-        for(int i=0;i<8;++i) {dispatch->frames[frame].nextScan=0; DispatchHook(&key);}
-        Check(ReportApiFixture::shellWindowsCalls==discovered,"same unsupported native HWND restarted periodic discovery on resize");
-        RemovePropW(frame,kColdAttachResolvedProperty);
-        DestroyWindow(unsupported);
+        MSG key{};
+        type.lpszClassName=L"ShellTabWindowClass"; RegisterClassW(&type);
+        for(bool tabbed:{false,true}) {
+            HWND tab=tabbed ? CreateWindowExW(0,type.lpszClassName,L"private unsupported tab",WS_CHILD|WS_VISIBLE,
+                0,0,320,240,frame,nullptr,type.hInstance,nullptr) : frame;
+            Check(tab && ActiveExplorerTab(frame)==tab,"unsupported discovery fixture tab identity");
+            ReportApiFixture::shellWindowsCalls=0;
+            dispatch->frames[frame].lastSelectedTab=ActiveExplorerTab(frame);
+            SetPropW(tab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            key.hwnd=frame; key.message=WM_KEYDOWN; key.wParam=VK_F9;
+            for(int i=0;i<12;++i) {dispatch->frames[frame].nextScan=0; DispatchHook(&key);}
+            Check(!ReportApiFixture::shellWindowsCalls,"resolved unsupported tab repeated ShellWindows discovery");
+            RemovePropW(tab,kColdAttachResolvedProperty);
+            dispatch->frames[frame].nextScan=0; DispatchHook(&key);
+            Check(ReportApiFixture::shellWindowsCalls==1,"navigation did not reopen discovery admission");
+            type.lpszClassName=L"SHELLDLL_DefView"; RegisterClassW(&type);
+            HWND unsupported=CreateWindowExW(0,type.lpszClassName,L"unsupported native view",WS_CHILD|WS_VISIBLE,
+                0,0,100,100,tab,nullptr,type.hInstance,nullptr);
+            SetPropW(tab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            key.hwnd=unsupported; key.message=WM_SIZE; DispatchHook(&key);
+            const auto discovered=ReportApiFixture::shellWindowsCalls;
+            Sleep(300); // Exceed the old same-HWND 250 ms recovery threshold.
+            for(int i=0;i<8;++i) {dispatch->frames[frame].nextScan=0; DispatchHook(&key);}
+            Check(ReportApiFixture::shellWindowsCalls==discovered,"same unsupported native HWND restarted periodic discovery on resize");
+            RemovePropW(tab,kColdAttachResolvedProperty);
+            DestroyWindow(unsupported);
+            if(tabbed) DestroyWindow(tab);
+            type.lpszClassName=L"ShellTabWindowClass";
+        }
         ReportApiFixture::countShellWindows=false;
 
         HWND unrelated=CreateWindowExW(0,L"STATIC",L"unrelated data",WS_CHILD,0,0,1,1,frame,nullptr,type.hInstance,nullptr);

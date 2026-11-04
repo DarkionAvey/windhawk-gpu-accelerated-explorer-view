@@ -298,15 +298,26 @@ static void TestRejectedProviderSelection(const std::filesystem::path& target) {
     state.selected=state.anchor=stale;
     Check(SyncNativeSelection(state) && state.pendingNativeSelection,"prepare stale bulk target");
     int before=-1; state.folderView->ItemCount(SVGIO_SELECTION,&before);
-    Check(before==3,"asynchronous preparation erased the preceding native set");
+    Check(before==0,"native commands could still target the preceding set during bulk preparation");
     WaitForPreparedSelection(state); verify(69);
-    std::cout<<"PASS: real private-file removal rejects only stale single/additive/bulk targets and preserves prior native selection during preparation\n";
+    std::cout<<"PASS: real private-file removal rejects only stale single/additive/bulk targets and clears prior native selection before preparation\n";
 }
 
 static void TestProviderSelection(const std::wstring& fixture) {
     ModifierFixture::Session modifiers;
     const auto root = std::filesystem::path(fixture) / L"provider-selection";
     std::filesystem::create_directory(root);
+    {
+        ComPtr<IShellFolder> folder;
+        ComPtr<IShellItem> item;
+        Check(SUCCEEDED(BindDirectoryProvider(root.wstring(),folder,nullptr,&item)) && item,
+            "provider binding did not retain its Shell item");
+        Check(_wcsicmp(DirectoryProviderPath(item.Get(),{}).c_str(),root.c_str())==0 &&
+            PlainFilesystemProvider(folder.Get(),item.Get(),root.wstring()),
+            "private filesystem provider path differs from its directory");
+        Check(DirectoryProviderPath(nullptr,root.wstring())==root.wstring(),
+            "unavailable provider item lost the watch path fallback");
+    }
     const auto archive = root / L"private.zip";
     const auto target = root / L"target";
     const auto alias = root / L"alias";

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3 (unreleased)
+
+- Clear Explorer's previous selection before preparing a large replacement so
+  native command-bar actions cannot target the preceding selection.
+- Resolve touch drag promotion by export name only; cancel safely when absent.
+- Keep unsupported-location discovery suppression on the owning tab, avoiding
+  repeated Shell window scans in tabbed Explorer.
+- Correct the two-finger touchscreen navigation description, resolve provider
+  filesystem paths through Shell items, and clear stale text visibility stamps
+  when releasing a rendering target.
+
 ## 1.0.2
 
 - Validate applied text-rendering settings across lists, tooltips and drag

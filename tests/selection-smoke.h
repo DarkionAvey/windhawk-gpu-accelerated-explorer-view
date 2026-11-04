@@ -542,6 +542,7 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
               state.selectedFlags == expected, "release/capture reentrancy discarded the scrolled marquee");
         if (frames > 20) {
             Check(count > 64 && state.pendingNativeSelection != 0, "large selection was rejected instead of prepared");
+            Check(native->selected.empty(),"Explorer retained a preceding command target during marquee preparation");
             MSG key{};
             key.hwnd = state.nativeHwnd; key.message = WM_KEYDOWN; key.wParam = VK_DELETE;
             // Own input policy locally; never borrow the desktop user's
@@ -680,9 +681,8 @@ static void TestMarqueeSelection(const std::wstring& directory, bool entireDirec
         const float atEnd=state.scrollNow;
         const bool queued=SyncNativeSelection(state);
         if (large) {
-            Check(queued && state.pendingNativeSelection && native->selected.size()==1,
-                "preparing a bulk selection changed the preceding native selection");
-            WaitForPreparedSelection(state);
+            Check(!queued && !state.pendingNativeSelection && native->selected.size()==1,
+                "bulk preparation proceeded after Explorer refused to clear the preceding selection");
         }
         Check((large || !queued) && !state.pendingNativeSelection && state.visible &&
               state.nativeSelectionRecoveryPending && state.nativeSelectionUnsafe &&

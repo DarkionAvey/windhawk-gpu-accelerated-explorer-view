@@ -212,7 +212,17 @@ static void TestRenderQuality() {
             invisible.textLayouts[0].layouts.empty(),"invisible primitives resolved fonts/icons or built caches");
     }
     state.target->SetTarget(previous.Get());
-    DropTarget(state); DestroyWindow(state.hwnd); DestroyWindow(frame);
+    // Paint stamps belong to the target's frame counter, not the retained
+    // shaped layouts' lifetime. Exercise a real painted layout before reset.
+    state.graphicsPaintSerial=state.lastAcceptedPaint=42;
+    state.target->BeginDraw();
+    Text(state,L"target reset stamp",12.f,15.f,348.f,70.f,0xFFFFFF);
+    Check(SUCCEEDED(state.target->EndDraw()) &&
+        state.textLayouts[0].layouts.at(L"target reset stamp").painted==42,"target reset stamp fixture");
+    DropTarget(state);
+    for(const auto& cache:state.textLayouts) for(const auto& [text,layout]:cache.layouts)
+        Check(!layout.painted,"retained text layout still claims visibility on the released target");
+    DestroyWindow(state.hwnd); DestroyWindow(frame);
     std::cout<<"PASS: native monitor tuning, transparent smooth/aliased glyph pixels and warm masks; exact icon texels, LTR/RTL/transform/DPI snapping, resolution tiers and zero-opacity work elision\n";
 }
 
