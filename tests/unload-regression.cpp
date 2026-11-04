@@ -101,6 +101,7 @@ int wmain(int argc,wchar_t** argv) {
             for(HANDLE event : {entered,released,returned,exitWorker,unloaded}) ResetEvent(event);
             HMODULE module=Load(argv[1]);
             Export<void(*)(int,FARPROC)>(module,"Prepare")(kind,originals[kind]);
+            Check(Export<BOOL(*)()>(module,"RelativeTimeLoaded")(),"relative-time first demand did not load ICU");
             invoke=Export<InvokeFn>(module,"Invoke");
             HANDLE worker=CreateThread(nullptr,0,Worker,reinterpret_cast<void*>(static_cast<INT_PTR>(kind)),0,nullptr);
             Check(worker && WaitForSingleObject(entered,5000)==WAIT_OBJECT_0,"native hook did not enter");
@@ -118,6 +119,8 @@ int wmain(int argc,wchar_t** argv) {
                 FreeLibrary(module); CloseHandle(worker); CloseHandle(unloader);
                 throw std::runtime_error("unload completed while a native hook retained a DLL return address");
             }
+            Check(Export<BOOL(*)()>(module,"RelativeTimeReleased")(),"relative-time ICU survived explicit shutdown");
+            Check(Export<BOOL(*)()>(module,"TextRuntimeReleased")(),"DirectWrite runtime survived explicit shutdown");
             Check(FreeLibrary(module)!=FALSE,"test DLL did not unload");
             MEMORY_BASIC_INFORMATION memory{};
             Check(VirtualQuery(module,&memory,sizeof(memory)) && memory.AllocationBase!=module,

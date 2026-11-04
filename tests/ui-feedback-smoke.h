@@ -1,7 +1,8 @@
 // Count live-view queries while running actual timer, input, projection and
 // startup paths. All windows stay off screen and file access is read-only.
 static void TestTypeSearchPrefix() {
-    Check(g_typeSearchUnicode.Initialize(),"system Unicode classification");
+    g_systemRelativeTime.Initialize();
+    Check(g_systemRelativeTime.UnicodeReady(),"system Unicode classification");
     for(const auto* query:{L"programfil",L"Program fi",L"pro gram f i"})
         Check(MatchesTypeSearchPrefix(L"Program files",query),"type search did not ignore filename/query whitespace");
     Check(TypeSearchPrefixLength(L"Program files",L"programfil")==11 &&
@@ -37,7 +38,7 @@ static void TestTypeSearchPrefix() {
           !MatchesTypeSearchPrefix(L"file.txt", L"files") &&
           !MatchesTypeSearchPrefix(L"file.txt", L""),
           "type-search highlighted a non-prefix or empty query");
-    g_typeSearchUnicode.Reset();
+    g_systemRelativeTime.Reset();
     std::cout << "PASS: visible quick-search highlights share the type-to-select prefix matcher\n";
 }
 

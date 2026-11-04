@@ -1,5 +1,7 @@
 #include <thread>
 static void TestItemTipRelativeDates() {
+    Check(!g_systemRelativeTime.module && !g_systemRelativeTime.attempted.load(),
+        "tooltip ICU loaded before demand");
     const auto fileTime=[](int year,int month,int day,int hour,int minute,bool local=true) {
         SYSTEMTIME value{}; value.wYear=WORD(year); value.wMonth=WORD(month); value.wDay=WORD(day);
         value.wHour=WORD(hour); value.wMinute=WORD(minute);
@@ -10,6 +12,19 @@ static void TestItemTipRelativeDates() {
         return result;
     };
     const FILETIME now=fileTime(2026,6,15,12,0);
+    (void)FormatItemTipDate(now,now,nullptr);
+    (void)FormatItemTipDate(FILETIME{},now,L"en-US");
+    Check(!g_systemRelativeTime.attempted.load(),"missing locale/timestamp unnecessarily loaded ICU");
+    std::array<std::wstring,4> firstUse;
+    std::array<std::thread,4> callers;
+    for(size_t i=0;i<callers.size();++i) callers[i]=std::thread([&,i] {
+        firstUse[i]=FormatItemTipDate(now,now,L"en-US");
+    });
+    for(auto& caller:callers) caller.join();
+    Check(g_systemRelativeTime.module && g_systemRelativeTime.attempted.load() &&
+        firstUse[0].find(L" \x00B7 ")!=std::wstring::npos &&
+        std::all_of(firstUse.begin(),firstUse.end(),[&](const auto& text) {return text==firstUse[0];}),
+        "concurrent tooltip first use did not publish one usable ICU binding");
     struct Case {FILETIME time; double offset; SystemRelativeTime::Unit unit;};
     const Case cases[]={
         {fileTime(2026,6,15,11,55),-5,SystemRelativeTime::Minute},

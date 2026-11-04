@@ -183,10 +183,13 @@ static void TestTypeSearchInput(const std::wstring& fixture) {
     OptionEffects::LiveExplorer live(root.wstring());
     FocusFixture::owner=FocusFixture::foreground=live.frame; FocusFixture::focus=live.native;
     auto& state=*live.state;
+    Check(!g_systemRelativeTime.attempted.load(),"Unicode ICU loaded before first search/tooltip demand");
     const auto original=g_dispatchOriginal; g_dispatchOriginal=::DispatchMessageW;
     const auto type=[&](const wchar_t* query) {
         ClearTypeSearch(state);
         for(const wchar_t* p=query;*p;++p) TypeToSelect(state,*p);
+        Check(Eventually([&] {live.Pump(); return !state.typeSearchWaiting;}),
+            "worker Unicode initialization did not resume the active query");
     };
     type(L"Program");
     MSG space{}; space.hwnd=live.native; space.message=WM_KEYDOWN; space.wParam=VK_SPACE;

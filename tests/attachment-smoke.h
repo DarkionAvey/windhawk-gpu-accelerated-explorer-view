@@ -90,6 +90,8 @@ public:
 // Emulate Explorer retrieving and filtering our private message without ever
 // calling DispatchMessageW. No mouse, keyboard, paint or restore is injected.
 static void TestColdAttachWake() {
+    Check(!g_textRuntimeReady.load() && !g_writeFactory && !g_writeModule && !g_frameEvent && !g_frameThread,
+        "renderer resources were allocated before a file-manager demand");
     Check(SUCCEEDED(OleInitialize(nullptr)), "cold wake STA initialization");
     WNDCLASSW cls{};
     cls.hInstance = GetModuleHandleW(nullptr);
@@ -109,6 +111,8 @@ static void TestColdAttachWake() {
         StartColdAttachObserver();
         Check(Eventually([&] { return GetPropW(frame, kBootstrapQueuedProperty) != nullptr; }),
             "existing idle frame received no startup wake");
+        Check(g_textRuntimeReady.load(std::memory_order_acquire) && g_writeFactory &&
+            !g_frameEvent && !g_frameThread,"cold demand did not prepare fonts independently of the composition pacer");
         MSG msg{};
         Check(PeekMessageW(&msg, frame, g_bootstrapAttachMessage, g_bootstrapAttachMessage, PM_NOREMOVE) &&
             msg.message == g_bootstrapAttachMessage && GetPropW(frame, kBootstrapQueuedProperty),

@@ -19,10 +19,29 @@ static HWINEVENTHOOK WINAPI RegisterFixtureWinEvent(DWORD a,DWORD b,HMODULE m,WI
 #undef SetWinEventHook
 #include "touch-calibration.h"
 
-extern "C" __declspec(dllexport) BOOL PrepareMessages() {return RegisterFrameHookReleaseMessage();}
+extern "C" __declspec(dllexport) BOOL PrepareMessages() {
+    return RegisterFrameHookReleaseMessage() && !g_systemRelativeTime.module &&
+        !g_systemRelativeTime.attempted.load() && !g_textRuntimeReady.load() &&
+        !g_writeFactory && !g_writeModule && !g_frameEvent && !g_frameThread;
+}
+extern "C" __declspec(dllexport) BOOL TextRuntimeReleased() {
+    return !g_textRuntimeReady.load() && !g_writeFactory && !g_writeModule;
+}
+extern "C" __declspec(dllexport) BOOL RelativeTimeReleased() {
+    return !g_systemRelativeTime.module && !g_systemRelativeTime.open &&
+        !g_systemRelativeTime.close && !g_systemRelativeTime.format && !g_systemRelativeTime.locale &&
+        !g_systemRelativeTime.characterType && !g_systemRelativeTime.binaryProperty &&
+        !g_systemRelativeTime.attempted.load();
+}
+extern "C" __declspec(dllexport) BOOL RelativeTimeLoaded() {
+    return g_systemRelativeTime.attempted.load() && g_systemRelativeTime.module &&
+        g_systemRelativeTime.open && g_systemRelativeTime.close && g_systemRelativeTime.format && g_systemRelativeTime.locale;
+}
 
 extern "C" __declspec(dllexport) void Prepare(int kind,FARPROC original) {
     g_perf=false; g_unloading=false; g_backgroundShutdown=false;
+    (void)PrepareTextRuntime();
+    (void)g_systemRelativeTime.Render(-2,SystemRelativeTime::Minute,L"en-US");
     switch(kind) {
     case 0: g_dispatchOriginal=reinterpret_cast<decltype(g_dispatchOriginal)>(original); break;
     case 1: g_translateAcceleratorOriginal=reinterpret_cast<decltype(g_translateAcceleratorOriginal)>(original); break;
@@ -48,6 +67,8 @@ extern "C" __declspec(dllexport) void Before() { Wh_ModBeforeUninit(); }
 extern "C" __declspec(dllexport) void Unload() { Wh_ModUninit(); }
 extern "C" __declspec(dllexport) BOOL BlockedPoolAtProcessExit() {
     g_unloading=false; g_backgroundShutdown=false;
+    if(!PrepareTextRuntime()) return FALSE;
+    if(g_systemRelativeTime.Render(-2,SystemRelativeTime::Minute,L"en-US").empty()) return FALSE;
     if (!CurrentDispatchThreadState()) return FALSE;
     struct ExitFixture {HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr), gate=CreateEventW(nullptr,TRUE,FALSE,nullptr);};
     static ExitFixture fixture;
@@ -84,7 +105,7 @@ extern "C" __declspec(dllexport) BOOL FailedInitialization() {
     conflict.lpfnWndProc=DefWindowProcW; conflict.lpszClassName=kOverlayClass;
     if(!RegisterClassW(&conflict)) return FALSE;
     // A conflicting class in our own module must be rejected, never reused.
-    if(Wh_ModInit() || g_overlayClassRegistered) return FALSE;
+    if(Wh_ModInit() || g_overlayClassRegistered || !RelativeTimeReleased()) return FALSE;
     WNDCLASSW remaining{};
     const bool preserved=GetClassInfoW(module,kOverlayClass,&remaining) && remaining.lpfnWndProc==DefWindowProcW;
     if(!UnregisterClassW(kOverlayClass,module) || !preserved) return FALSE;
@@ -92,7 +113,7 @@ extern "C" __declspec(dllexport) BOOL FailedInitialization() {
     // later API hooks: only the DLL's newly registered class should unwind.
     conflict.hInstance=GetModuleHandleW(nullptr);
     if(!RegisterClassW(&conflict) || Wh_ModInit()) return FALSE;
-    const bool unwound=!g_frameEvent && !g_writeFactory && !g_overlayClassRegistered &&
+    const bool unwound=!g_frameEvent && !g_frameThread && TextRuntimeReleased() && !g_overlayClassRegistered && RelativeTimeReleased() &&
         !GetClassInfoW(module,kOverlayClass,&remaining) &&
         GetClassInfoW(conflict.hInstance,kOverlayClass,&remaining) && remaining.lpfnWndProc==DefWindowProcW;
     return UnregisterClassW(kOverlayClass,conflict.hInstance) && unwound;

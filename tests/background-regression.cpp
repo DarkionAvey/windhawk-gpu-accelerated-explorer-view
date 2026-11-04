@@ -2137,6 +2137,8 @@ int wmain(int argc,wchar_t** argv) {
         Check(g_shellViewHooks.empty(), "frame lifecycle/creation hooks outlived their overlays");
         ShutDownFrames();
         ShutDownBackgroundWorkers();
+        g_systemRelativeTime.Reset();
+        ReleaseTextRuntime();
         Check(!g_backgroundLifetimes && !g_backgroundReaper && !g_backgroundReaperWake,
               "background shutdown leaked lifetime registry/handles");
         Check(std::filesystem::weakly_canonical(fixture).parent_path() ==
@@ -2152,6 +2154,8 @@ int wmain(int argc,wchar_t** argv) {
         if (providerGate) SetEvent(providerGate);
         ShutDownFrames();
         ShutDownBackgroundWorkers();
+        g_systemRelativeTime.Reset();
+        ReleaseTextRuntime();
         std::cerr << "FAIL: " << error.what() << '\n';
         const auto context = Regression::ContextText();
         if (!context.empty()) std::cerr << "CONTEXT: " << context << '\n';

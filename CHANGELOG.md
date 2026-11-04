@@ -2,6 +2,13 @@
 
 ## 1.0.1 (unreleased)
 
+- Defer DirectWrite preparation until a file-manager window requests attachment,
+  allocate the composition wake on demand, and release shared font resources
+  explicitly on unload instead of during process-exit destruction.
+- Release tooltip ICU resources after workers drain, avoiding library unload
+  from static destruction during DLL detach.
+- Load optional ICU on the tab worker only when a tooltip or type-to-select
+  first needs it, keeping library loading out of startup and input handling.
 - Match filenames across emoji in type-to-select searches, preserve highlight
   positions, and remove complete surrogate pairs with Backspace.
 - Use the same Windows native-digit policy for section and drag counts,

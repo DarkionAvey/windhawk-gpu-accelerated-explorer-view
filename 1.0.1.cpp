@@ -6,7 +6,7 @@
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -ldcomp -ld3d11 -ldxgi -ld2d1 -ldwrite -lshell32 -lole32 -loleaut32 -luuid -lshlwapi -luser32 -lgdi32 -lwindowscodecs -ldwmapi -luxtheme -lpropsys -lcomctl32 -lruntimeobject -lninput
+// @compilerOptions -ldcomp -ld3d11 -ldxgi -ld2d1 -lshell32 -lole32 -loleaut32 -luuid -lshlwapi -luser32 -lgdi32 -lwindowscodecs -ldwmapi -luxtheme -lpropsys -lcomctl32 -lruntimeobject -lninput
 // @github          https://github.com/DarkionAvey
 // @license         GPL-2.0
 // ==/WindhawkMod==
@@ -259,6 +259,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <string_view>
 #include <vector>
 #include <utility>
+#include <type_traits>
 #include <optional>
 #include <variant>
 #include <windhawk_utils.h>
@@ -442,6 +443,7 @@ constexpr UINT kMsgTouchDrag = WM_APP + 77;
 constexpr UINT kMsgItemTipReady = WM_APP + 78;
 constexpr UINT kMsgReconcileEmptySnapshot = WM_APP + 79;
 constexpr UINT kMsgNativeInputLayout = WM_APP + 80;
+constexpr UINT kMsgTypeSearchReady = WM_APP + 81;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -613,7 +615,45 @@ TranslateAcceleratorW_t g_translateAcceleratorOriginal = nullptr;
 using RaiseStructureEvent_t = HRESULT(WINAPI*)(IRawElementProviderSimple*,StructureChangeType,int*,int);
 RaiseStructureEvent_t g_raiseStructureEventOriginal = nullptr;
 HMODULE g_uiaModule = nullptr;
-ComPtr<IDWriteFactory> g_writeFactory;
+// DirectWrite cleanup is explicit after tab workers drain. Explorer exit skips
+// Wh_ModUninit, so never release this COM object from CRT/loader-lock teardown.
+[[clang::no_destroy]] ComPtr<IDWriteFactory> g_writeFactory;
+HMODULE g_writeModule=nullptr;
+INIT_ONCE g_textRuntimeOnce=INIT_ONCE_STATIC_INIT;
+std::atomic<bool> g_textRuntimeReady{false};
+BOOL CALLBACK InitializeTextRuntime(PINIT_ONCE,void*,void**) {
+    if(g_unloading.load(std::memory_order_acquire)) return FALSE;
+    if(!g_writeFactory) {
+        const auto module=LoadLibraryExW(L"dwrite.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!module) return FALSE;
+        const auto create=reinterpret_cast<decltype(&DWriteCreateFactory)>(GetProcAddress(module,"DWriteCreateFactory"));
+        ComPtr<IDWriteFactory> factory;
+        const HRESULT result=create ? create(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(factory.GetAddressOf())) : E_NOINTERFACE;
+        if(FAILED(result) || !factory) {
+            factory.Reset(); FreeLibrary(module);
+            return FALSE;
+        }
+        g_writeModule=module;
+        g_writeFactory=std::move(factory);
+    }
+    g_textRuntimeReady.store(true,std::memory_order_release);
+    if(g_perf.load(std::memory_order_relaxed)) Wh_Log(L"[GPU startup] TEXT_READY on cold-window observer");
+    return TRUE;
+}
+bool PrepareTextRuntime() {
+    // Only demand from a real file-manager frame reaches this, on the existing
+    // cold-window observer. No DLL loading or factory creation on Explorer's STA.
+    return !g_unloading.load(std::memory_order_acquire) &&
+        InitOnceExecuteOnce(&g_textRuntimeOnce,InitializeTextRuntime,nullptr,nullptr);
+}
+void ReleaseTextRuntime() {
+    // Observer, API callbacks and tab workers must already have drained.
+    g_textRuntimeReady.store(false,std::memory_order_release);
+    g_writeFactory.Reset();
+    if(const auto module=std::exchange(g_writeModule,nullptr)) FreeLibrary(module);
+    InitOnceInitialize(&g_textRuntimeOnce);
+}
 std::atomic<int> g_instances{0};
 
 // The native view supplies each folder's sort. Opting out of pre-sorting keeps
@@ -1569,6 +1609,7 @@ void RegisterAnimationWindow(HWND hwnd) {
     for (const auto& t : g_activeFrames) if (t.hwnd == hwnd) found = true;
     const bool wakePacer=!found || !g_frameThread;
     if (!found) g_activeFrames.push_back({hwnd, false});
+    if (!g_frameEvent) g_frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if (g_frameEvent && !g_frameThread)
         g_frameThread = CreateThread(nullptr, 0, CompositionFrameProc, g_frameEvent, 0, nullptr);
     if (g_frameEvent && wakePacer) SetEvent(g_frameEvent);
@@ -2293,6 +2334,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<ColumnCatalogJob> columnCatalogJobs;
     std::optional<StatusButtonSnapshot> statusButtonJob,statusButtonResult;
     std::optional<ItemTipJob> itemTipJob, itemTipResult;
+    bool typeSearchUnicodeJob=false; // Protected by directoryLock, consumed on Columns.
     std::atomic<unsigned long long> itemTipGeneration{0};
     // Listing whose parent-folder Size binding the Columns lane may keep.
     std::atomic<unsigned long long> itemTipListing{0};
@@ -3428,6 +3470,8 @@ struct ViewState {
     ScrollbarMotion scrollbarMotion[2]; // Vertical and horizontal, independently retargetable.
     int hovered = -1;
     std::wstring typeSearch;
+    bool typeSearchWaiting=false;
+    unsigned long long typeSearchWaitingListing=0;
     ULONGLONG lastTyped = 0;
     int anchor = -1;
     // Ctrl+arrow moves the keyboard caret without replacing the selection.
@@ -8230,18 +8274,66 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
 // ICU C ABI directly; no bundled ICU data, SDK path or extra DLL dependency.
 struct SystemRelativeTime {
     enum Unit : int32_t {Year,Quarter,Month,Week,Day,Hour,Minute,Second};
-    HMODULE module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE module=nullptr;
     using Open=void*(__cdecl*)(const char*,void*,int32_t,int32_t,int32_t*);
     using Close=void(__cdecl*)(void*);
     using Format=int32_t(__cdecl*)(const void*,double,int32_t,wchar_t*,int32_t,int32_t*);
     using Locale=int32_t(__cdecl*)(const char*,char*,int32_t,int32_t*,int32_t*);
-    Open open=module ? reinterpret_cast<Open>(GetProcAddress(module,"ureldatefmt_open")):nullptr;
-    Close close=module ? reinterpret_cast<Close>(GetProcAddress(module,"ureldatefmt_close")):nullptr;
-    Format format=module ? reinterpret_cast<Format>(GetProcAddress(module,"ureldatefmt_format")):nullptr;
-    Locale locale=module ? reinterpret_cast<Locale>(GetProcAddress(module,"uloc_forLanguageTag")):nullptr;
-    ~SystemRelativeTime() {if(module) FreeLibrary(module);}
-    std::wstring Render(double offset,Unit unit,const wchar_t* localeName) const {
-        if(!open || !close || !format || !locale || !localeName) return {};
+    Open open=nullptr;
+    Close close=nullptr;
+    Format format=nullptr;
+    Locale locale=nullptr;
+    using CharacterType=int8_t(__cdecl*)(int32_t);
+    using BinaryProperty=int8_t(__cdecl*)(int32_t,int32_t);
+    CharacterType characterType=nullptr;
+    BinaryProperty binaryProperty=nullptr;
+    INIT_ONCE once=INIT_ONCE_STATIC_INIT;
+    std::atomic<bool> attempted{false};
+    static BOOL CALLBACK InitializeOnce(PINIT_ONCE,void* context,void**) {
+        auto& self=*static_cast<SystemRelativeTime*>(context);
+        self.Load();
+        self.attempted.store(true,std::memory_order_release);
+        return TRUE; // An unavailable optional library is a completed attempt.
+    }
+    bool Initialize() {
+        InitOnceExecuteOnce(&once,InitializeOnce,this,nullptr);
+        return open && close && format && locale;
+    }
+    void Load() {
+        module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!module) return;
+        open=reinterpret_cast<Open>(GetProcAddress(module,"ureldatefmt_open"));
+        close=reinterpret_cast<Close>(GetProcAddress(module,"ureldatefmt_close"));
+        format=reinterpret_cast<Format>(GetProcAddress(module,"ureldatefmt_format"));
+        locale=reinterpret_cast<Locale>(GetProcAddress(module,"uloc_forLanguageTag"));
+        characterType=reinterpret_cast<CharacterType>(GetProcAddress(module,"u_charType"));
+        binaryProperty=reinterpret_cast<BinaryProperty>(GetProcAddress(module,"u_hasBinaryProperty"));
+    }
+    // Reset only before worker admission or after callback/worker draining.
+    // No destructor: CRT teardown runs under the loader lock at DLL detach.
+    void Reset() {
+        open=nullptr; close=nullptr; format=nullptr; locale=nullptr;
+        characterType=nullptr; binaryProperty=nullptr;
+        if(const auto owned=std::exchange(module,nullptr)) FreeLibrary(owned);
+        InitOnceInitialize(&once);
+        attempted.store(false,std::memory_order_release);
+    }
+    bool UnicodeReady() const {
+        return attempted.load(std::memory_order_acquire) && characterType && binaryProperty;
+    }
+    bool Separator(int32_t codePoint) const {
+        if(!UnicodeReady()) return false;
+        // Stable ICU UCharCategory and UCHAR_DEFAULT_IGNORABLE_CODE_POINT values.
+        constexpr int8_t spaceSeparator=12,paragraphSeparator=14,dashPunctuation=19,finalPunctuation=29;
+        constexpr int32_t defaultIgnorable=5;
+        const auto category=characterType(codePoint);
+        return (category>=spaceSeparator && category<=paragraphSeparator) ||
+            (category>=dashPunctuation && category<=finalPunctuation) || binaryProperty(codePoint,defaultIgnorable);
+    }
+    std::wstring Render(double offset,Unit unit,const wchar_t* localeName) {
+        // Tooltip formatting is worker-owned; concurrent tabs share only this
+        // one-time load, never their formatters, jobs or queues.
+        if(!localeName || !*localeName || !Initialize()) return {};
         char tag[LOCALE_NAME_MAX_LENGTH*4]{},id[LOCALE_NAME_MAX_LENGTH*4]{};
         if(!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,localeName,-1,tag,sizeof(tag),nullptr,nullptr)) return {};
         int32_t status=0,parsed=0;
@@ -8264,6 +8356,8 @@ struct SystemRelativeTime {
         return result;
     }
 };
+static_assert(std::is_trivially_destructible_v<SystemRelativeTime>);
+constinit SystemRelativeTime g_systemRelativeTime;
 struct ItemTipRelativeOffset {double value=0; SystemRelativeTime::Unit unit=SystemRelativeTime::Second;};
 std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,const FILETIME& now,
     const DYNAMIC_TIME_ZONE_INFORMATION* zone=nullptr) {
@@ -8299,8 +8393,7 @@ std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wc
     if (text.empty()) text = FormatFileTime(time);
     if (text.empty()) return text;
     if(const auto offset=ItemTipDateOffset(time,now); offset && localeName && *localeName) {
-        static const SystemRelativeTime formatter;
-        const auto relative=formatter.Render(offset->value,offset->unit,localeName);
+        const auto relative=g_systemRelativeTime.Render(offset->value,offset->unit,localeName);
         if(!relative.empty()) text+=L" \x00B7 "+relative;
     }
     return text;
@@ -9296,7 +9389,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         ColumnCatalogJob catalog;
         std::optional<StatusButtonSnapshot> statusButtons;
         std::optional<ItemTipJob> itemTip;
-        bool haveCatalog = false;
+        bool haveCatalog = false, haveTypeSearchUnicode=false;
         bool haveDirectory = false, haveDetail = false, haveWatch = false;
         TabBackground::RetiredPayload retired;
         {
@@ -9311,6 +9404,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 haveDirectory = true;
             } else if (columnsLane && work.itemTipJob) {
                 itemTip=std::exchange(work.itemTipJob,{}); // Hover feedback precedes chrome probes.
+            } else if (columnsLane && work.typeSearchUnicodeJob) {
+                haveTypeSearchUnicode=std::exchange(work.typeSearchUnicodeJob,false);
             } else if (columnsLane && work.statusButtonJob) {
                 statusButtons=std::move(work.statusButtonJob); work.statusButtonJob.reset();
             } else if (columnsLane && !work.columnCatalogJobs.empty()) {
@@ -9352,6 +9447,11 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         if (columnsLane && !itemTip) {
             const auto listing = work.itemTipListing.load(std::memory_order_acquire);
             if (!listing || sizeBinding.token != listing) sizeBinding.Reset();
+        }
+        if(haveTypeSearchUnicode) {
+            g_systemRelativeTime.Initialize();
+            PostMessageW(work.hwnd,kMsgTypeSearchReady,WPARAM(work.notificationLifetime),0);
+            continue;
         }
         if(itemTip) {
             const auto current=[&] {return !work.stopping.load(std::memory_order_acquire) &&
@@ -22596,6 +22696,7 @@ void TrySyncLastFolderSelection(ViewState& state) {
 }
 
 void Select(ViewState& state, int index, bool keyboardNavigation = false) {
+    state.typeSearchWaiting=false;
     if (state.optimisticStartedAt || index < 0 || index >= state.total ||
         !DisplayedRow(state, index)) return;
     state.keyboardSectionKey.reset();
@@ -22847,6 +22948,7 @@ int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge =
 
 void NavigateKeyboardSelection(ViewState& state, UINT key,
                                bool control, bool shift) {
+    state.typeSearchWaiting=false;
     TraceSelectionIdentity(state, L"key.before-target");
     if (state.optimisticStartedAt) return;
     const bool bulkSelection=!control && !shift && KeyboardFocusedSection(state)<0 &&
@@ -24897,41 +24999,8 @@ void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = fals
 }
 
 // Explorer-style incremental prefix search. No filesystem reads on keystrokes.
-// Read-only system ICU classification, initialized before input hooks and
-// released after callbacks/workers drain. No DLL loading on the input path or
-// loader-lock cleanup in a static destructor. Missing APIs preserve literals.
-struct TypeSearchUnicode {
-    HMODULE module=nullptr;
-    using CharacterType=int8_t(__cdecl*)(int32_t);
-    using BinaryProperty=int8_t(__cdecl*)(int32_t,int32_t);
-    CharacterType characterType=nullptr;
-    BinaryProperty binaryProperty=nullptr;
-    bool Initialize() {
-        if(module) return characterType && binaryProperty;
-        module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if(module) {
-            characterType=reinterpret_cast<CharacterType>(GetProcAddress(module,"u_charType"));
-            binaryProperty=reinterpret_cast<BinaryProperty>(GetProcAddress(module,"u_hasBinaryProperty"));
-        }
-        if(characterType && binaryProperty) return true;
-        Reset(); return false;
-    }
-    void Reset() {
-        characterType=nullptr; binaryProperty=nullptr;
-        if(const auto owned=std::exchange(module,nullptr)) FreeLibrary(owned);
-    }
-    bool Separator(int32_t codePoint) const {
-        if(!characterType || !binaryProperty) return false;
-        // Stable ICU UCharCategory values and UCHAR_DEFAULT_IGNORABLE_CODE_POINT.
-        // Ignore emoji variation selectors/joiners, retaining combining accents
-        // and supplementary letters/numbers rather than treating all pairs as symbols.
-        constexpr int8_t spaceSeparator=12,paragraphSeparator=14,dashPunctuation=19,finalPunctuation=29;
-        constexpr int32_t defaultIgnorable=5;
-        const auto category=characterType(codePoint);
-        return (category>=spaceSeparator && category<=paragraphSeparator) ||
-            (category>=dashPunctuation && category<=finalPunctuation) || binaryProperty(codePoint,defaultIgnorable);
-    }
-} g_typeSearchUnicode;
+// ICU classification shares the tooltip's optional, worker-loaded module.
+// Read immutable exports only after the load attempt has been published.
 
 size_t TypeSearchCharacterLength(std::wstring_view text,size_t at) {
     return IS_HIGH_SURROGATE(text[at]) && at+1<text.size() && IS_LOW_SURROGATE(text[at+1]) ? 2:1;
@@ -24948,10 +25017,10 @@ UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefi
         return UINT32(prefix.size());
     const auto separator=[](std::wstring_view text,size_t at) {
         const auto length=TypeSearchCharacterLength(text,at);
-        if(g_typeSearchUnicode.characterType) {
+        if(g_systemRelativeTime.UnicodeReady()) {
             const int32_t codePoint=length==2 ?
                 0x10000+((int32_t(text[at])-0xD800)<<10)+(int32_t(text[at+1])-0xDC00) : int32_t(text[at]);
-            return g_typeSearchUnicode.Separator(codePoint);
+            return g_systemRelativeTime.Separator(codePoint);
         }
         WORD basic[2]{},extended[2]{};
         GetStringTypeW(CT_CTYPE1,text.data()+at,int(length),basic);
@@ -24979,6 +25048,7 @@ bool TypeSearchActive(const ViewState& state) {
     return !state.typeSearch.empty() && state.lastTyped && GetTickCount64()-state.lastTyped<=kTypeSearchTimeoutMs;
 }
 void ClearTypeSearch(ViewState& state) {
+    state.typeSearchWaiting=false;
     if(state.typeSearch.empty()) return;
     state.typeSearch.clear(); state.lastTyped=0;
     KillTimer(state.hwnd,kTypeSearchTimerId); Redraw(state);
@@ -24996,6 +25066,7 @@ void ObserveTypeSearchPointerInput(const MSG& message) {
     ClearTypeSearch(*state);
 }
 
+void ApplyTypeSearch(ViewState& state,wchar_t ch);
 void TypeToSelect(ViewState& state, wchar_t ch) {
     state.keyboardSectionKey.reset();
     if (ch == L'\b' || (ch >= L' ' && ch != 0x7F))
@@ -25025,6 +25096,26 @@ void TypeToSelect(ViewState& state, wchar_t ch) {
     SetTimer(state.hwnd, kTypeSearchTimerId,
         static_cast<UINT>(kTypeSearchTimeoutMs), nullptr);
     if (!state.total) return;
+    state.typeSearchWaiting=false;
+    if(!g_systemRelativeTime.attempted.load(std::memory_order_acquire)) {
+        auto& work=*state.background;
+        const HWND hwnd=state.hwnd;
+        if(!work.hwnd) work.hwnd=hwnd;
+        if(StartTabWorker(state.background,work.columns,DirectoryWorkerProc,THREAD_PRIORITY_BELOW_NORMAL) &&
+            State(hwnd)==&state) {
+            state.typeSearchWaiting=true;
+            state.typeSearchWaitingListing=state.directoryToken;
+            {ExclusiveSrwLock lock(work.directoryLock); work.typeSearchUnicodeJob=true;}
+            SetEvent(work.columns.wake);
+            Redraw(state);
+            return;
+        }
+        if(State(hwnd)!=&state) return;
+        // A failed optional worker must not prevent native prefix matching.
+    }
+    ApplyTypeSearch(state,ch);
+}
+void ApplyTypeSearch(ViewState& state,wchar_t ch) {
     const int start = std::clamp(state.selected, -1, state.total - 1);
     auto findPrefix = [&](const std::wstring& prefix, int searchFrom) -> int {
         for (int offset = 1; offset <= state.total; ++offset) {
@@ -27765,6 +27856,7 @@ LRESULT CALLBACK ColdAttachGetMessageHook(int code, WPARAM removal, LPARAM data)
 }
 
 void PostColdAttach(HWND frame, HWND requestedTab = nullptr) {
+    if(!PrepareTextRuntime()) return; // Pending cold-attach retries retain demand on failure.
     // The observer is the only writer setting this property; the owner STA
     // clears it after handling the queued scan, including failure paths.
     const HWND key=requestedTab ? requestedTab : frame;
@@ -27861,7 +27953,7 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
 }
 
 BOOL CALLBACK BootstrapExistingFrame(HWND frame, LPARAM) {
-    if (IsWindowVisible(frame)) {
+    if (IsExplorerFrame(frame) && BelongsToThisProcess(frame) && IsWindowVisible(frame)) {
         const HWND first=FindWindowExW(frame,nullptr,L"ShellTabWindowClass",nullptr);
         if(!first) QueueColdAttach(frame,frame);
         for(HWND tab=first;tab;tab=FindWindowExW(frame,tab,L"ShellTabWindowClass",nullptr))
@@ -27929,7 +28021,7 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
     }
     t_bootstrapPending = nullptr;
     EnumWindows(+[](HWND frame,LPARAM)->BOOL {
-        if (BelongsToThisProcess(frame)) {
+        if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
             RemovePropW(frame,kColdAttachResolvedProperty);
             EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
                 RemovePropW(child,kColdAttachResolvedProperty); return TRUE;
@@ -27942,6 +28034,7 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
 }
 
 void StartColdAttachObserver() {
+    if(g_bootstrapThread || g_unloading.load(std::memory_order_acquire)) return;
     g_bootstrapAttachMessage = RegisterWindowMessageW(
         L"Windhawk.ExplorerGPUListOverlay.ColdAttach.v1");
     if (!g_bootstrapAttachMessage) return;
@@ -30680,6 +30773,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         ClearInteractiveCreation(*s);
     if(s && (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN || msg==WM_XBUTTONDOWN))
         ClearTypeSearch(*s);
+    if(s && (msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL || msg==WM_CANCELMODE))
+        s->typeSearchWaiting=false;
     std::optional<PipelineScope> pipelineMessage;
     if (s && s->background) {
         EnsurePipelineTrace(*s);
@@ -30823,6 +30918,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         QueueInputFocusUpdate(hwnd);
         return 0;
     case WM_KILLFOCUS:
+        if(s) s->typeSearchWaiting=false;
         QueueInputFocusUpdate(hwnd);
         return 0;
     case WM_CLIPBOARDUPDATE:
@@ -31518,6 +31614,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 const ULONGLONG now = GetTickCount64();
                 const ULONGLONG elapsed = now - s->lastTyped;
                 if (elapsed >= kTypeSearchTimeoutMs) {
+                    s->typeSearchWaiting=false;
                     s->typeSearch.clear();
                     s->lastTyped = 0;
                     Redraw(*s);
@@ -32916,6 +33013,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case kMsgItemTipReady:
         if (s && wParam==WPARAM(s->lifetimeToken)) ConsumeItemTip(*s);
+        return 0;
+    case kMsgTypeSearchReady:
+        if(s && wParam==WPARAM(s->lifetimeToken) && s->typeSearchWaiting) {
+            s->typeSearchWaiting=false;
+            if(s->directoryToken==s->typeSearchWaitingListing && TypeSearchActive(*s) && s->total)
+                ApplyTypeSearch(*s,s->typeSearch.back());
+        }
         return 0;
     case kMsgReconcileEmptySnapshot:
         if (s && static_cast<unsigned long long>(wParam)==s->directoryToken) ReconcileEmptySnapshot(*s);
@@ -35341,7 +35445,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
 }
 
 void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
-    if (g_unloading.load() || !IsWindow(explorerFrame) ||
+    if (g_unloading.load() || !g_textRuntimeReady.load(std::memory_order_acquire) || !IsWindow(explorerFrame) ||
         GetPropW(explorerFrame, kShellScanProperty)) return;
     struct ScanGuard {
         HWND frame;
@@ -36997,29 +37101,16 @@ BOOL Wh_ModInit() {
         g_unloading.store(true,std::memory_order_release);
         ShutDownFrames();
         ReleaseOverlayClass();
-        g_writeFactory.Reset();
+        ReleaseTextRuntime();
         if(g_uiaModule) { FreeLibrary(g_uiaModule); g_uiaModule=nullptr; }
-        g_typeSearchUnicode.Reset();
+        g_systemRelativeTime.Reset();
         Wh_Log(L"[GPU lifetime] INIT_FAILED core registrations released");
         return FALSE;
     };
     if (!RegisterFrameHookReleaseMessage()) return failedInitialization();
-    HRESULT graphicsHr = S_OK;
-    if (SUCCEEDED(graphicsHr)) graphicsHr = DWriteCreateFactory(
-        DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()));
-    if (FAILED(graphicsHr)) {
-        Wh_Log(L"[GPU overlay] GPU/DirectComposition initialization failed: 0x%08lx", graphicsHr);
-        return failedInitialization();
-    }
-    g_typeSearchUnicode.Initialize();
     g_tabWatchStopping.store(false, std::memory_order_release);
-    AcquireSRWLockExclusive(&g_frameLock);
     g_frameStopping.store(false, std::memory_order_release);
-    g_frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    const bool frameReady=g_frameEvent!=nullptr;
-    ReleaseSRWLockExclusive(&g_frameLock);
-    if (!frameReady || !RegisterOverlayClass()) return failedInitialization();
+    if (!RegisterOverlayClass()) return failedInitialization();
     // Required pre-layout barriers. The subclass also covers native internal
     // layout messages; these hooks cover NOSENDCHANGING and deferred batches.
     if (!WindhawkUtils::SetFunctionHook(ShowWindow, NativeShowWindowHook, &g_showWindowOriginal) ||
@@ -37034,6 +37125,8 @@ BOOL Wh_ModInit() {
     // Optional: keep the ordinary GPU list alive if this hook is unavailable.
     WindhawkUtils::SetFunctionHook(TranslateAcceleratorW,
         TranslateAcceleratorHook, &g_translateAcceleratorOriginal);
+    // Retain this early suppression hook: applying hooks after startup is slow
+    // in Windhawk, and the first owned native dispatch must already be batched.
     // Install last: failure before this point cannot release a module while
     // one of our installed detours still targets its executable pages.
     g_uiaModule=LoadLibraryExW(L"UIAutomationCore.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -37041,7 +37134,7 @@ BOOL Wh_ModInit() {
         GetProcAddress(g_uiaModule,"UiaRaiseStructureChangedEvent")) : nullptr;
     if(!structureEvent || !WindhawkUtils::SetFunctionHook(structureEvent,RaiseStructureEventHook,&g_raiseStructureEventOriginal))
         return failedInitialization();
-    Wh_Log(L"[GPU overlay] initialized; cold-window observer starts after hooks are applied");
+    Wh_Log(L"[GPU overlay] bootstrap initialized; text/GPU work deferred until a file-manager window needs it");
     return TRUE;
 }
 void Wh_ModAfterInit() {
@@ -37089,8 +37182,8 @@ void Wh_ModUninit() {
     ReleaseSRWLockExclusive(&g_tabRegistryLock);
     ShutDownFrames();
     ShutDownBackgroundWorkers();
-    g_typeSearchUnicode.Reset();
-    g_writeFactory.Reset();
+    g_systemRelativeTime.Reset();
+    ReleaseTextRuntime();
     ReleaseOverlayClass();
     if(g_uiaModule) { FreeLibrary(g_uiaModule); g_uiaModule=nullptr; }
     Wh_Log(L"[GPU overlay] unloaded; remaining overlays=%d", g_instances.load());
