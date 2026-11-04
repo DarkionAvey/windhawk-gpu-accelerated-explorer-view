@@ -65,8 +65,19 @@ $hostLibrary = Get-ChildItem -LiteralPath (Join-Path $WindhawkDirectory 'Engine'
     Select-Object -First 1
 if (-not $hostLibrary) { throw 'Installed Windhawk x64 host import library not found' }
 Write-Output "Windhawk host library: $hostLibrary"
+$arm64HostLibrary = Join-Path (Split-Path -Parent (Split-Path -Parent $hostLibrary)) 'arm64\windhawk.lib'
+if (!(Test-Path -LiteralPath $arm64HostLibrary)) {
+    throw 'Matching Windhawk ARM64 host import library not found; install a Windhawk distribution with ARM64 support'
+}
+Write-Output "Windhawk ARM64 host library: $arm64HostLibrary"
 $modFlags = $flags | Where-Object { $_ -notin @('-DWH_EDITING', '-static', '-municode') }
 $modFlags += '-fstack-usage'
+$arm64ModFlags = @($modFlags | ForEach-Object {
+    if ($_ -eq 'x86_64-w64-mingw32') { 'aarch64-w64-mingw32' } else { $_ }
+})
+$arm64ModDll = Join-Path $outputDirectory 'arm64-mod-build.dll'
+$arm64CompileTasks = @([pscustomobject]@{Name='compile-arm64-mod'; FilePath=$compiler; Serial=$false
+    Arguments=$arm64ModFlags+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$arm64ModDll,$arm64HostLibrary)+$libraries})
 $coverageRun = if ($Coverage) { New-RegressionCoverage $sourcePath $outputDirectory $coverageTools } else { $null }
 if ($Coverage) {
     & (Join-Path $testDirectory 'coverage-regression.ps1') -Compiler $compiler `
@@ -89,6 +100,12 @@ if ($MinifiedSourceFile) {
     $minifiedDll = Join-Path $outputDirectory 'minified-mod-build.dll'
     $compileTasks += [pscustomobject]@{Name='compile-minified'; FilePath=$compiler; Serial=$false
         Arguments=@($minifiedFlags)+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$minifiedDll,$hostLibrary)+$libraries}
+    $arm64MinifiedFlags = @($minifiedFlags | ForEach-Object {
+        if ($_ -eq 'x86_64-w64-mingw32') { 'aarch64-w64-mingw32' } else { $_ }
+    })
+    $arm64MinifiedDll = Join-Path $outputDirectory 'arm64-minified-mod-build.dll'
+    $arm64CompileTasks += [pscustomobject]@{Name='compile-arm64-minified'; FilePath=$compiler; Serial=$false
+        Arguments=$arm64MinifiedFlags+@('-shared',(Join-Path $testDirectory 'mod-build.cpp'),'-o',$arm64MinifiedDll,$arm64HostLibrary)+$libraries}
 }
 if ($compileUnload) {
     $unloadDll = Join-Path $outputDirectory 'unload-mod.dll'
@@ -110,6 +127,9 @@ if ($compilePipeline) {
 }
 # The large translation units are memory intensive; cap concurrent compilers
 # at two while allowing the separately isolated test suites to use -Jobs.
+# ARM64 is a mandatory compile/link gate, never executed on this x64 host.
+# Fail before compiling/running the x64 suite or allowing release publication.
+Invoke-RegressionTasks -Tasks $arm64CompileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile-arm64
 Invoke-RegressionTasks -Tasks $compileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile
 if ($MinifiedSourceFile) {
     & (Join-Path $testDirectory 'minification-regression.ps1') -Compiler $compiler -OutputDirectory $outputDirectory
@@ -186,6 +206,8 @@ try {
     if ($testsPassed -and !$KeepArtifacts -and !$Coverage) {
         if (Test-Path -LiteralPath $executable) { Remove-Item -LiteralPath $executable -Force }
         if (Test-Path -LiteralPath $modDll) { Remove-Item -LiteralPath $modDll -Force }
+        Remove-Item -LiteralPath $arm64ModDll -Force
+        if ($arm64MinifiedDll) { Remove-Item -LiteralPath $arm64MinifiedDll -Force }
         if ($minifiedDll) { Remove-Item -LiteralPath $minifiedDll, $minifiedConfiguration -Force }
         foreach ($stackReport in $stackReports) { Remove-Item -LiteralPath $stackReport.FullName }
         Remove-Item -LiteralPath $configuration
@@ -194,11 +216,12 @@ try {
         if ($unloadExe) {
             Remove-Item -LiteralPath (Join-Path $outputDirectory 'libc++.whl'),(Join-Path $outputDirectory 'libunwind.whl') -Force
         }
-        foreach ($task in @($compileTasks)+@($testTasks)) {
+        foreach ($task in @($arm64CompileTasks)+@($compileTasks)+@($testTasks)) {
             Remove-Item -LiteralPath (Join-Path $outputDirectory ($task.Name+'.stdout.log')),
                 (Join-Path $outputDirectory ($task.Name+'.stderr.log')) -Force
         }
-        Remove-Item -LiteralPath (Join-Path $outputDirectory 'compile-results.csv'),
+        Remove-Item -LiteralPath (Join-Path $outputDirectory 'compile-arm64-results.csv'),
+            (Join-Path $outputDirectory 'compile-results.csv'),
             (Join-Path $outputDirectory 'regression-results.csv') -Force
         Remove-Item -LiteralPath $outputDirectory
     }

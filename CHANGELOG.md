@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.4
+
+- Fix ARM64 compilation by restricting the clipboard comparison's SSE2 fast
+  path to x64 and retaining the scalar comparison on other architectures.
+- Verify ARM64 and x64 compilation before publishing updates.
+
 ## 1.0.3
 
 - Delegate ordinary activation of files, folders, drives and Recycle Bin items

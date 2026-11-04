@@ -39,9 +39,12 @@ and code lines, retaining literal contents, token boundaries and preprocessor
 directives. Windhawk metadata and settings remain intact; the embedded README
 becomes a short generated-file notice. This export is marked read-only and is
 never used as an upstream source. Edit the numbered working source and rebuild;
-downstream edits are discarded. Both the regular and minified sources must link
-against the installed Windhawk host API before publication. Compiler fixtures
-also verify minification of macros, comments and string literals.
+downstream edits are discarded. Both the regular and minified sources must first
+compile and link for ARM64, then for x64, against the matching installed Windhawk
+host libraries before publication. A failed ARM64 gate stops before the x64
+compilation/runtime suites; missing ARM64 host libraries also fail the build.
+ARM64 binaries are compile-checked, not executed on the x64 test host. Compiler
+fixtures also verify minification of macros, comments and string literals.
 Conflicting archives and downgrades fail without overwriting history. A failed
 run retains the working source and temporary binaries, and leaves latest.cpp
 unchanged, without pruning archives. Update CHANGELOG.md with the results after
