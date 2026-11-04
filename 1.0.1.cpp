@@ -263,6 +263,13 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <optional>
 #include <variant>
 #include <windhawk_utils.h>
+#if __has_include(<icu.h>)
+#include <icu.h>
+#define GPU_SYSTEM_ICU_DECLARATIONS
+#elif __has_include(<unicode/ureldatefmt.h>)
+#include <unicode/ureldatefmt.h>
+#define GPU_SYSTEM_ICU_DECLARATIONS
+#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -4151,7 +4158,7 @@ struct PresentationReceipt {
     ULONG_PTR device=0,swapchain=0;
     ULONG_PTR sceneRoot=0,backbuffer=0;
     bool scenePublished=false;
-    LARGE_INTEGER sceneOrigin{},columnClock{},compositionTime{};
+    LARGE_INTEGER sceneOrigin{},columnClock{},compositionTime{},paintSample{};
     DWORD thread=0;
     HRESULT failure=S_OK; int failureStage=0;
     bool ready=false,accepted=false,failed=false,rows=false,columns=false,standby=false,standbyPending=false,zoom=false,control=false;
@@ -8324,8 +8331,22 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
-// Windhawk's MinGW headers omit icu.h. Bind the documented, stable Windows
-// ICU C ABI directly; no bundled ICU data, SDK path or extra DLL dependency.
+namespace WindowsIcuAbi {
+#ifdef GPU_SYSTEM_ICU_DECLARATIONS
+using ::UDAT_STYLE_LONG;
+using ::UDISPCTX_CAPITALIZATION_FOR_STANDALONE;
+#else
+// Windows SDK ICU enum declarations for Windhawk's headerless MinGW toolchain.
+// These encode the current C ABI, not runtime-discoverable values. Keep this
+// compatibility declaration in sync if the Windows ICU ABI ever changes.
+enum UDateRelativeDateTimeFormatterStyle : int32_t {UDAT_STYLE_LONG=0};
+enum UDisplayContextType : int32_t {UDISPCTX_TYPE_CAPITALIZATION=1};
+enum UDisplayContext : int32_t {
+    UDISPCTX_CAPITALIZATION_FOR_STANDALONE=(UDISPCTX_TYPE_CAPITALIZATION<<8)+4
+};
+#endif
+}
+// Bind the Windows ICU C ABI lazily; no bundled ICU data or SDK path dependency.
 struct SystemRelativeTime {
     enum Unit : int32_t {Year,Quarter,Month,Week,Day,Hour,Minute,Second};
     HMODULE module=nullptr;
@@ -8393,8 +8414,8 @@ struct SystemRelativeTime {
         int32_t status=0,parsed=0;
         locale(tag,id,int32_t(sizeof(id)),&parsed,&status);
         if(status>0 || parsed!=int32_t(strlen(tag))) return {};
-        // ICU UDAT_STYLE_LONG and UDISPCTX_CAPITALIZATION_FOR_STANDALONE.
-        void* formatter=open(id,nullptr,0,0x104,&status);
+        void* formatter=open(id,nullptr,WindowsIcuAbi::UDAT_STYLE_LONG,
+            WindowsIcuAbi::UDISPCTX_CAPITALIZATION_FOR_STANDALONE,&status);
         if(!formatter || status>0) {if(formatter) close(formatter); return {};}
         status=0;
         const int32_t length=format(formatter,offset,unit,nullptr,0,&status);
@@ -8437,9 +8458,25 @@ std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,cons
         return ItemTipRelativeOffset{std::trunc(seconds/3600.),SystemRelativeTime::Hour};
     }
     if(std::abs(days)<7.) return ItemTipRelativeOffset{days,SystemRelativeTime::Day};
-    const int months=(int(local.wYear)-int(localNow.wYear))*12+int(local.wMonth)-int(localNow.wMonth);
-    if(std::abs(months)>=12) return ItemTipRelativeOffset{std::trunc(months/12.),SystemRelativeTime::Year};
-    if(months) return ItemTipRelativeOffset{double(months),SystemRelativeTime::Month};
+    const bool past=seconds<0.;
+    const auto& earlier=past ? local:localNow;
+    const auto& later=past ? localNow:local;
+    int months=(int(later.wYear)-int(earlier.wYear))*12+int(later.wMonth)-int(earlier.wMonth);
+    // Count elapsed calendar months, clamping anniversaries to the target
+    // month's last valid day (Jan 31 -> Feb 28/29, including leap years).
+    SYSTEMTIME anniversary=earlier;
+    anniversary.wYear=later.wYear; anniversary.wMonth=later.wMonth;
+    FILETIME anniversaryTime{},laterTime{};
+    while(!SystemTimeToFileTime(&anniversary,&anniversaryTime)) {
+        if(anniversary.wDay<=28) return {};
+        --anniversary.wDay;
+    }
+    if(!SystemTimeToFileTime(&later,&laterTime)) return {};
+    if(ticks(laterTime)<ticks(anniversaryTime)) --months;
+    const double direction=past ? -1.:1.;
+    // Years are approximate: round rather than turning almost two into one.
+    if(months>=12) return ItemTipRelativeOffset{direction*std::round(months/12.),SystemRelativeTime::Year};
+    if(months) return ItemTipRelativeOffset{direction*months,SystemRelativeTime::Month};
     return ItemTipRelativeOffset{std::trunc(days/7.),SystemRelativeTime::Week};
 }
 std::wstring FormatItemTipDate(const FILETIME& time,const FILETIME& now,const wchar_t* localeName,
@@ -17934,7 +17971,7 @@ struct GroupBadgeLayout {
 // own motion on the shared UI curve; a collapse/expand shares the header's
 // clock, so both move together.
 GroupBadgeLayout LayoutGroupBadge(ViewState& state, const ViewState::GroupSection* section,
-                                  const D2D1_RECT_F& text, LARGE_INTEGER sampled = {}) {
+                                  const D2D1_RECT_F& text, LARGE_INTEGER sampled) {
     GroupBadgeLayout layout;
     if (!section) return layout;
     const auto* badge = GroupSectionBadge(state,*section);
@@ -17966,7 +18003,7 @@ D2D1_RECT_F GroupHoverRect(ViewState& state, int section, const RowVisual& visua
         auto text = GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state));
         // The highlight starts at the badge and covers the title shifted after it.
         const float start = text.left;
-        text.left += LayoutGroupBadge(state,&state.sections[size_t(section)],text).shift;
+        text.left += LayoutGroupBadge(state,&state.sections[size_t(section)],text,state.itemOpacityNow).shift;
         const float available = std::max(0.f, text.right-text.left);
         float width = 0.f;
         if (auto* layout = ResolveTextLayout(state,state.sections[size_t(section)].title,
@@ -23003,28 +23040,48 @@ int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge =
     return target >= 0 ? target : fromBulk ? origin : -1;
 }
 
+void FocusGroupHeader(ViewState& state,int index) {
+    if(index<0 || size_t(index)>=state.sections.size()) return;
+    state.typeSearchWaiting=false;
+    SuppressPointerHoverForKeyboard(state);
+    state.keyboardSectionKey=state.sections[size_t(index)].key;
+    const auto visual=LayoutGroupHeader(state,size_t(index),CurrentRowProgress(state),false);
+    float target=state.scrollNow;
+    if(visual.top<state.headerPx) target+=visual.top-state.headerPx;
+    else if(visual.top+visual.height>state.headerPx+ViewHeight(state)-ScrollBottomPadding(state))
+        target+=visual.top+visual.height-(state.headerPx+ViewHeight(state)-ScrollBottomPadding(state));
+    MoveScroll(state,target); Redraw(state);
+}
+bool HandleGroupKeyboardDirection(ViewState& state,UINT key,bool control,bool shift) {
+    if(control || shift || state.sections.empty() || (key!=VK_LEFT && key!=VK_RIGHT)) return false;
+    const int focused=KeyboardFocusedSection(state);
+    int group=focused;
+    if(group<0) {
+        const int row=state.selected>=0 ? state.selected:state.restoredKeyboardRow;
+        group=row>=0 && size_t(row)<state.rowGroup.size() ? state.rowGroup[size_t(row)]:0;
+        if(group<0 || size_t(group)>=state.sections.size()) return false;
+        FocusGroupHeader(state,group);
+    }
+    const bool expand=(key==VK_RIGHT)!=state.rtlLayout;
+    // Collapse first focuses/reveals the header, then collapses on the next
+    // press. Expansion is immediate; neither action changes item selection.
+    if((expand || focused>=0) && state.sections[size_t(group)].collapsed==expand)
+        ToggleGroupSection(state,group);
+    return true;
+}
 void NavigateKeyboardSelection(ViewState& state, UINT key,
                                bool control, bool shift) {
     state.typeSearchWaiting=false;
     TraceSelectionIdentity(state, L"key.before-target");
     if (state.optimisticStartedAt) return;
+    if(HandleGroupKeyboardDirection(state,key,control,shift)) return;
     const bool bulkSelection=!control && !shift && KeyboardFocusedSection(state)<0 &&
         KeyboardBulkSelectionEdge(state,key)>=0;
     // First collapse a multi-selection at its existing directional edge;
     // subsequent single-item movement can stop on section headers.
     if(!control && !shift && !bulkSelection && !state.sections.empty()) {
         const int focused=KeyboardFocusedSection(state);
-        const auto focusHeader=[&](int index) {
-            if(index<0 || size_t(index)>=state.sections.size()) return;
-            SuppressPointerHoverForKeyboard(state);
-            state.keyboardSectionKey=state.sections[size_t(index)].key;
-            const auto visual=LayoutGroupHeader(state,size_t(index),CurrentRowProgress(state),false);
-            float target=state.scrollNow;
-            if(visual.top<state.headerPx) target+=visual.top-state.headerPx;
-            else if(visual.top+visual.height>state.headerPx+ViewHeight(state)-ScrollBottomPadding(state))
-                target+=visual.top+visual.height-(state.headerPx+ViewHeight(state)-ScrollBottomPadding(state));
-            MoveScroll(state,target); Redraw(state);
-        };
+        const auto focusHeader=[&](int index) {FocusGroupHeader(state,index);};
         if(key==VK_HOME) {focusHeader(0); return;}
         if(focused>=0 && (key==VK_UP || key==VK_DOWN)) {
             const auto& group=state.sections[size_t(focused)];
@@ -27541,10 +27598,11 @@ int GroupHeaderAtPoint(ViewState& state, int x, int y) {
 // with the same geometry it is painted with.
 const SectionBadge* GroupBadgeAtPoint(ViewState& state, int group, POINT point) {
     if (group < 0 || size_t(group) >= state.sections.size()) return nullptr;
+    if(state.presenter && !state.itemOpacityNow.QuadPart) return nullptr;
     const auto& section = state.sections[size_t(group)];
     const auto visual = LayoutGroupHeader(state, size_t(group), CurrentRowProgress(state));
     const auto badge = LayoutGroupBadge(state, &section,
-        GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state)));
+        GroupHeadingTextRect(state, visual.top, visual.height, ListEndX(state)),state.itemOpacityNow);
     const float x = static_cast<float>(LogicalX(state, point.x)), y = static_cast<float>(point.y);
     return badge.badge && badge.reveal > .01f && x >= badge.pill.left && x < badge.pill.right &&
         y >= badge.pill.top && y < badge.pill.bottom ? badge.badge : nullptr;
@@ -29286,6 +29344,7 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->sequence=state.presentationSequence; receipt->lifetime=lane->lifetime;
     receipt->token=state.token; receipt->directoryToken=state.directoryToken;
     receipt->frames=state.graphicsPaintSerial; receipt->thread=GetCurrentThreadId();
+    receipt->paintSample=state.itemOpacityNow;
     receipt->foregroundFrames=state.swipeCompositionSerial;
     receipt->contentPending=NeedsAnimationPaint(state,true,false) ||
         (state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive);
@@ -29642,9 +29701,13 @@ void ConsumePresentation(ViewState& state) {
     if(receipt->token!=state.token || receipt->directoryToken!=state.directoryToken) return;
     // Counts must also belong to the current group topology/intents: sorting
     // or regrouping can supersede a receipt without changing directoryToken.
-    if (!receipt->failed && state.presentationGroupIntents==receipt->groupIntents &&
-        state.sectionBadges!=receipt->sectionBadges) {
-        RetireSectionBadges(state); state.sectionBadges=receipt->sectionBadges;
+    if (!receipt->failed && receipt->accepted && state.presentationGroupIntents==receipt->groupIntents) {
+        // Input uses the accepted paint's clock, not a fresh QPC reading ahead
+        // of the badge image. The worker's clock was never an owner snapshot.
+        state.itemOpacityNow=receipt->paintSample;
+        if(state.sectionBadges!=receipt->sectionBadges) {
+            RetireSectionBadges(state); state.sectionBadges=receipt->sectionBadges;
+        }
     }
     if (!receipt->failed && receipt->checkboxTotal==state.total && receipt->checkboxSelection.SharesStorage(state.selectedFlags)) {
         state.checkboxSelection=receipt->checkboxSelection;
@@ -32999,15 +33062,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s) {
             const MSG key=NativeFileWindowKey(hwnd,msg,wParam,lParam);
+            if(!(GetKeyState(VK_MENU)&0x8000) && HandleGroupKeyboardDirection(*s,UINT(wParam),
+                (GetKeyState(VK_CONTROL)&0x8000)!=0,(GetKeyState(VK_SHIFT)&0x8000)!=0)) return 0;
             const int focusedSection=KeyboardFocusedSection(*s);
             if(focusedSection>=0 && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) {
                 if(wParam==VK_RETURN || wParam==VK_SPACE) {
                     if(!(lParam&(1LL<<30))) ToggleGroupSection(*s,focusedSection);
-                    return 0;
-                }
-                if(wParam==VK_LEFT || wParam==VK_RIGHT) {
-                    const bool expand=(wParam==VK_RIGHT)!=s->rtlLayout;
-                    if(s->sections[size_t(focusedSection)].collapsed==expand) ToggleGroupSection(*s,focusedSection);
                     return 0;
                 }
             }
@@ -35792,7 +35852,8 @@ void CheckOverlaySize(HWND frame) {
 // The native Shell view retains keyboard focus for Shell-aware preview tools.
 // Only keys that OUR renderer owns are rerouted to our HWND; all other keys,
 // especially Space and unknown extension accelerators, stay native.
-bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching = false, bool sectionFocused = false) {
+bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching = false,
+                              bool sectionFocused = false,bool grouped = false) {
     if (msg.message == WM_CHAR) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         // Ctrl+Space can translate to either U+0020 or NUL. Check its scan
@@ -35807,8 +35868,9 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching 
     }
     if (msg.message != WM_KEYDOWN) return false;
     if (GetKeyState(VK_MENU) & 0x8000) return false;
-    if(sectionFocused && !(GetKeyState(VK_CONTROL)&0x8000) &&
-        (msg.wParam==VK_SPACE || msg.wParam==VK_LEFT || msg.wParam==VK_RIGHT)) return true;
+    if(sectionFocused && !(GetKeyState(VK_CONTROL)&0x8000) && msg.wParam==VK_SPACE) return true;
+    if((grouped || sectionFocused) && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_SHIFT)&0x8000) &&
+        (msg.wParam==VK_LEFT || msg.wParam==VK_RIGHT)) return true;
     if (IsNativeFileKey(msg)) return true;
     if (IsKeyboardMovementKey(static_cast<UINT>(msg.wParam), grid))
         return true; // Includes Shift ranges and Ctrl focus-only movement.
@@ -35877,7 +35939,8 @@ HWND OverlayKeyboardTarget(const MSG& msg, bool frameOnly = false) {
     if (!state || msg.hwnd == overlay || !state->visible ||
         !OverlayHasInputFocus(*state) ||
         !state->detailsViewActive || state->emptyNative ||
-        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView,TypeSearchActive(*state),KeyboardFocusedSection(*state)>=0))
+        !IsWindowVisible(overlay) || !IsOverlayKeyboardCommand(msg, state->gridView,TypeSearchActive(*state),
+            KeyboardFocusedSection(*state)>=0,!state->sections.empty()))
         return nullptr;
     if (frameKey) {
         if (!state->inScope || state->frameHwnd != msg.hwnd ||

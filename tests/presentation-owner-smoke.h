@@ -159,6 +159,7 @@ void GroupAnimationClock(bool rtl,bool grid) {
         for(double progress:{.975,.999,1.,4.}) {
             LARGE_INTEGER sample{};
             sample.QuadPart=1000000+LONGLONG(kUiTransitionDurationMs*1000*progress);
+            output.itemOpacityNow=sample;
             AdvanceGroupAnimation(output,sample); LayoutGroupSections(output);
             PublishPresentationReceipt(output,lane);
             const auto receipt=bridge.Receipt();
@@ -167,6 +168,8 @@ void GroupAnimationClock(bool rtl,bool grid) {
             if(progress==.975) Check(fabsf(receipt->documentHeight-target)<.02f && receipt->groups,
                 "near-terminal frame did not reproduce the old height-only wait race");
             ConsumePresentation(input);
+            Check(input.itemOpacityNow.QuadPart==sample.QuadPart,
+                "accepted receipt lost the badge paint clock");
             Check(input.groupAnimating==output.groupAnimating &&
                 input.sections.back().started.QuadPart==output.sections.back().started.QuadPart &&
                 input.sections.back().fraction==output.sections.back().fraction &&
@@ -175,6 +178,32 @@ void GroupAnimationClock(bool rtl,bool grid) {
             if(progress>=1.) Check(!input.groupAnimating && DocumentHeight(input)==target,
                 "completed group receipt lost final native/input geometry");
         }
+    }
+    {
+        AnimationClockFixture::Freeze clock;
+        AnimationClockFixture::instant.QuadPart=1000000+LONGLONG(kUiTransitionDurationMs*1000);
+        Check(MakeTextFormats(input),"badge input font preparation");
+        auto badges=std::make_shared<SectionBadges>();
+        auto& badge=(*badges)[input.sections.front().key];
+        badge.text=L"20"; badge.from=0.f; badge.to=1.f; badge.started.QuadPart=1000000;
+        input.sectionBadges=badges;
+        input.itemOpacityNow.QuadPart=1000000+LONGLONG(kUiTransitionDurationMs*250);
+        const auto visual=LayoutGroupHeader(input,0,CurrentRowProgress(input));
+        const auto painted=LayoutGroupBadge(input,&input.sections.front(),
+            GroupHeadingTextRect(input,visual.top,visual.height,ListEndX(input)),input.itemOpacityNow);
+        Check(painted.badge && painted.reveal>0.f && painted.reveal<1.f,"badge mid-slide fixture");
+        const POINT point{LONG(LogicalX(input,int(std::ceil(painted.pill.left)))),
+            LONG((painted.pill.top+painted.pill.bottom)*.5f)};
+        Check(GroupBadgeAtPoint(input,0,point)==&badge,
+            "badge hit testing advanced beyond the accepted paint sample");
+        const auto filenameOnly=g_filenameOnly.exchange(ViewOption::AlwaysOn);
+        AnimationClockFixture::instant=input.itemOpacityNow;
+        const auto hover=GroupHoverRect(input,0,visual);
+        AnimationClockFixture::instant.QuadPart+=LONGLONG(kUiTransitionDurationMs*1000);
+        const auto delayed=GroupHoverRect(input,0,visual);
+        g_filenameOnly=filenameOnly;
+        Check(hover.left==delayed.left && hover.right==delayed.right,
+            "badge hover geometry advanced without a new paint");
     }
     input.presenter.reset();
 }
@@ -442,6 +471,23 @@ static void TestPresentationOwners() {
         auto& s=tab.state;
         FocusFixture::Session focus(tab.frame,s.hwnd);
         Check(s.sections.size()==3,"keyboard section fixture grouping");
+        const UINT collapse=rtl ? VK_RIGHT:VK_LEFT, expand=rtl ? VK_LEFT:VK_RIGHT;
+        Select(s,s.sections[0].end-1);
+        s.scrollNow=s.scrollTarget=std::min(MaxScrollPx(s),DocumentRowTop(s,s.selected));
+        const auto directionalSelection=s.selectedFlags;
+        NavigateKeyboardSelection(s,collapse,false,false);
+        Check(KeyboardFocusedSection(s)==0 && !s.sections[0].collapsed &&
+            s.scrollTarget<=s.sections[0].documentTop && s.selectedFlags==directionalSelection,
+            "first collapse-direction key did not reveal/focus the header without collapsing or replacing selection");
+        NavigateKeyboardSelection(s,collapse,false,false);
+        Check(s.sections[0].collapsed,"second collapse-direction key did not collapse the focused header");
+        NavigateKeyboardSelection(s,expand,false,false);
+        Check(!s.sections[0].collapsed && s.selectedFlags==directionalSelection,
+            "expand-direction key did not expand the header while preserving selection");
+        s.sections[0].fraction=s.sections[0].from=s.sections[0].to=1.f;
+        s.sections[0].started={}; s.groupAnimating=false;
+        s.keyboardSectionKey.reset(); s.scrollNow=s.scrollTarget=0.f;
+        LayoutGroupSections(s);
         s.selected=s.sections[0].end-1;
         s.selectedFlags.assign(s.total,0); s.selectedFlags[size_t(s.selected)]=1;
         NavigateKeyboardSelection(s,VK_DOWN,false,false);

@@ -33,7 +33,7 @@ $header=@'
 #include <vector>
 #include <bit>
 '@
-$header+="`n"+(Slice-Source 'struct SystemRelativeTime {' 'struct ItemTipRelativeOffset')
+$header+="`n"+(Slice-Source 'namespace WindowsIcuAbi {' 'struct ItemTipRelativeOffset')
 $header+="`n"+(Slice-Source 'struct TypeSearchCandidates {' 'struct ActiveFrame {')
 $header+="`nnamespace TypeSearchCandidate {`n"
 $header+=Slice-Source 'size_t TypeSearchCharacterLength(' '// Search the current display order'

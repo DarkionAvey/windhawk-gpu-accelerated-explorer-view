@@ -37,6 +37,22 @@ static void TestItemTipRelativeDates() {
         {fileTime(2026,5,15,12,0),-1,SystemRelativeTime::Month},
         {fileTime(2024,6,15,12,0),-2,SystemRelativeTime::Year}
     };
+    struct Boundary {FILETIME time,now; double value; SystemRelativeTime::Unit unit;};
+    const Boundary boundaries[]={
+        {fileTime(2026,8,31,12,0),fileTime(2026,9,8,12,0),-1,SystemRelativeTime::Week},
+        {fileTime(2026,9,8,12,0),fileTime(2026,8,31,12,0),1,SystemRelativeTime::Week},
+        {fileTime(2025,1,31,12,0),fileTime(2025,2,28,12,0),-1,SystemRelativeTime::Month},
+        {fileTime(2024,1,31,12,0),fileTime(2024,2,29,12,0),-1,SystemRelativeTime::Month},
+        {fileTime(2025,1,31,12,0),fileTime(2025,2,28,11,0),-4,SystemRelativeTime::Week},
+        {fileTime(2024,2,29,12,0),fileTime(2025,2,28,12,0),-1,SystemRelativeTime::Year},
+        {fileTime(2024,10,15,12,0),fileTime(2026,9,15,12,0),-2,SystemRelativeTime::Year},
+        {fileTime(2026,9,15,12,0),fileTime(2024,10,15,12,0),2,SystemRelativeTime::Year}
+    };
+    for(const auto& item:boundaries) {
+        const auto offset=ItemTipDateOffset(item.time,item.now);
+        Check(offset && offset->value==item.value && offset->unit==item.unit,
+            "relative date crossed a calendar boundary before its anniversary or truncated a near-two-year span");
+    }
     // Independent native ICU calls supply expected localized phrases; never
     // assert English literals or change the user's regional settings.
     HMODULE module=LoadLibraryExW(L"icu.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -53,7 +69,8 @@ static void TestItemTipRelativeDates() {
             const auto offset=ItemTipDateOffset(item.time,now);
             Check(offset && offset->value==item.offset && offset->unit==item.unit,"relative tooltip date chose the wrong unit/offset");
             int32_t status=0;
-            void* native=open(locale.icu,nullptr,0,0x104,&status);
+            void* native=open(locale.icu,nullptr,WindowsIcuAbi::UDAT_STYLE_LONG,
+                WindowsIcuAbi::UDISPCTX_CAPITALIZATION_FOR_STANDALONE,&status);
             Check(native && status<=0,"native localized relative date formatter");
             wchar_t phrase[1024]{}; status=0;
             const auto length=format(native,item.offset,item.unit,phrase,ARRAYSIZE(phrase),&status);

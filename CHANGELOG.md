@@ -2,6 +2,11 @@
 
 ## 1.0.1 (unreleased)
 
+- Count elapsed calendar months for tooltip dates, including month ends and
+  leap years, and round approximate years instead of truncating them.
+- Keep section badge hit and hover geometry on the accepted paint's clock.
+- Let the collapse-direction arrow reveal/focus a section header before
+  collapsing it on the next press; the opposite arrow expands it, mirrored for RTL.
 - Reuse first-letter candidates during type-to-select, skipping known nonmatches
   while preserving flexible matching, Backspace cancellation and cycling.
 - Avoid scanning unused filename tails during flexible type-to-select matching,
