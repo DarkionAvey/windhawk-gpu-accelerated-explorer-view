@@ -74,6 +74,52 @@ static void TestRenderQuality() {
             return raster.rendering==state.textRenderingSerial;
         }),"raster cache did not include the rendering revision");
     }
+    // The remote recovery loop had DWrite ALIASED with effective D2D GRAYSCALE.
+    // Exercise that external AA override on real A8 and BGRA drawing targets.
+    {
+        g_textAntialiasing=TextAntialiasing::Aliased; RefreshTextRendering(state,true);
+        ComPtr<IDWriteTextLayout> probe;
+        Check(SUCCEEDED(g_writeFactory->CreateTextLayout(label.c_str(),UINT32(label.size()),
+            state.textFormat.Get(),340.f,60.f,&probe)),"overridden text layout");
+        for(auto format:{DXGI_FORMAT_A8_UNORM,DXGI_FORMAT_B8G8R8A8_UNORM}) {
+            ComPtr<ID2D1DeviceContext> context;
+            ComPtr<ID2D1Bitmap1> bitmap;
+            ComPtr<ID2D1SolidColorBrush> brush;
+            const auto properties=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(format,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96);
+            Check(SUCCEEDED(state.d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,&context)) &&
+                SUCCEEDED(context->CreateBitmap(D2D1::SizeU(360,160),nullptr,0,&properties,&bitmap)) &&
+                SUCCEEDED(context->CreateSolidColorBrush(D2D1::ColorF(1.f,1.f,1.f),&brush)),"overridden text target");
+            context->SetTarget(bitmap.Get());
+            ConfigureTextTarget(state,context.Get());
+            context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            context->BeginDraw(); context->Clear(D2D1::ColorF(0,0.f));
+            context->DrawTextLayout(D2D1::Point2F(12.f,15.f),probe.Get(),brush.Get());
+            Check(SUCCEEDED(context->EndDraw()),"grayscale override rejected requested aliased text parameters");
+            // Native monitor params, custom-creation fallback and restored
+            // preview state can supply any of these rendering modes. Vet the
+            // real draw result independently of the compatibility predicate.
+            for(auto rendering:{DWRITE_RENDERING_MODE_DEFAULT,DWRITE_RENDERING_MODE_ALIASED,
+                DWRITE_RENDERING_MODE_GDI_CLASSIC,DWRITE_RENDERING_MODE_GDI_NATURAL,
+                DWRITE_RENDERING_MODE_NATURAL,DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,DWRITE_RENDERING_MODE_OUTLINE}) {
+                ComPtr<IDWriteRenderingParams> parameters;
+                auto* tuning=state.textRenderingParams.Get();
+                Check(tuning && SUCCEEDED(g_writeFactory->CreateCustomRenderingParams(tuning->GetGamma(),
+                    tuning->GetEnhancedContrast(),tuning->GetClearTypeLevel(),tuning->GetPixelGeometry(),
+                    rendering,&parameters)),"text compatibility parameters");
+                for(auto antialias:{D2D1_TEXT_ANTIALIAS_MODE_DEFAULT,D2D1_TEXT_ANTIALIAS_MODE_ALIASED,
+                    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE}) {
+                    if(format==DXGI_FORMAT_A8_UNORM && antialias==D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE) continue;
+                    Regression::Scope scope("rendering="+std::to_string(unsigned(rendering))+
+                        " AA="+std::to_string(unsigned(antialias))+" format="+std::to_string(unsigned(format)));
+                    SetCompatibleTextRendering(context.Get(),parameters.Get(),antialias);
+                    context->BeginDraw(); context->Clear(D2D1::ColorF(0,0.f));
+                    context->DrawTextLayout(D2D1::Point2F(12.f,15.f),probe.Get(),brush.Get());
+                    Check(SUCCEEDED(context->EndDraw()),"vetted text configuration failed a real draw");
+                }
+            }
+        }
+    }
     // The cached-mask and direct DirectWrite paths draw the same pixels at the
     // same place for any alignment, colour and opacity: a value's first (cold)
     // frame must not shift or re-weight when its mask takes over.

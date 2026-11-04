@@ -16042,8 +16042,11 @@ void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=fa
         D2D1_TEXT_ANTIALIAS_MODE_ALIASED : mode==TextAntialiasing::System ?
         D2D1_TEXT_ANTIALIAS_MODE_DEFAULT : D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
     if(native && mode!=TextAntialiasing::System) {
+        // Let D2D resolve aliased rendering from its effective text AA mode.
+        // Font customizers can override SetTextAntialiasMode to grayscale;
+        // forcing DWrite ALIASED then makes both cached and direct draws invalid.
         const auto rendering=mode==TextAntialiasing::Smooth ? DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED :
-            DWRITE_RENDERING_MODE1_ALIASED;
+            DWRITE_RENDERING_MODE1_DEFAULT;
         const auto fitting=mode==TextAntialiasing::Smooth ? DWRITE_GRID_FIT_MODE_DISABLED : DWRITE_GRID_FIT_MODE_ENABLED;
         ComPtr<IDWriteFactory3> factory;
         ComPtr<IDWriteRenderingParams1> params1;
@@ -16070,10 +16073,36 @@ void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=fa
 void RefreshTextRendering(ViewState& state,bool checkMonitor=false) {
     RefreshTextRenderingForWindow(state,state.hwnd,checkMonitor);
 }
+bool CompatibleTextRendering(IDWriteRenderingParams* params,D2D1_TEXT_ANTIALIAS_MODE antialias) {
+    if(!params) return true; // D2D chooses compatible defaults.
+    const auto rendering=params->GetRenderingMode();
+    switch(antialias) {
+    case D2D1_TEXT_ANTIALIAS_MODE_DEFAULT: return true;
+    case D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE:
+        return rendering!=DWRITE_RENDERING_MODE_ALIASED && rendering!=DWRITE_RENDERING_MODE_OUTLINE;
+    case D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE:
+        return rendering!=DWRITE_RENDERING_MODE_ALIASED;
+    case D2D1_TEXT_ANTIALIAS_MODE_ALIASED:
+        return rendering==DWRITE_RENDERING_MODE_DEFAULT || rendering==DWRITE_RENDERING_MODE_ALIASED ||
+            rendering==DWRITE_RENDERING_MODE_OUTLINE;
+    default: return false;
+    }
+}
+void SetCompatibleTextRendering(ID2D1RenderTarget* target,IDWriteRenderingParams* params,
+                                D2D1_TEXT_ANTIALIAS_MODE antialias) {
+    target->SetTextRenderingParams(params);
+    target->SetTextAntialiasMode(antialias);
+    // Inspect the applied pair, not just our request: native parameters and
+    // injected font policies can differ between machines. Validate before any
+    // draw; incompatible parameters poison the target until EndDraw.
+    ComPtr<IDWriteRenderingParams> applied;
+    target->GetTextRenderingParams(&applied);
+    if(!CompatibleTextRendering(applied.Get(),target->GetTextAntialiasMode()))
+        target->SetTextRenderingParams(nullptr);
+}
 template<class Style>
 void ConfigureTextTarget(const Style& state,ID2D1RenderTarget* target) {
-    target->SetTextRenderingParams(state.textRenderingParams.Get());
-    target->SetTextAntialiasMode(state.textAntialiasMode);
+    SetCompatibleTextRendering(target,state.textRenderingParams.Get(),state.textAntialiasMode);
 }
 
 void Fill(ViewState& state, float l, float t, float r, float b,
@@ -19451,7 +19480,7 @@ bool RenderedDragInk(ID2D1Factory* factory,IDWriteTextLayout* layout,COLORREF fo
     if(FAILED(factory->CreateDCRenderTarget(&properties,&software)) || FAILED(software->BindDC(dc,&bounds)) ||
         FAILED(software.As(&context)) || FAILED(context->CreateSolidColorBrush(D2D1::ColorF(
             GetRValue(foreground)/255.f,GetGValue(foreground)/255.f,GetBValue(foreground)/255.f),&brush))) return false;
-    context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    SetCompatibleTextRendering(context.Get(),nullptr,D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     context->BeginDraw(); context->Clear(D2D1::ColorF(0,0.f)); context->SetTransform(transform);
     context->DrawTextLayout(D2D1::Point2F(),layout,brush.Get(),D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     if(FAILED(context->EndDraw())) return false;
@@ -19593,10 +19622,9 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     };
     target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if(textStyle) {
-        ConfigureTextTarget(*textStyle,target);
         // Count/caption text is wholly inside its already painted opaque
         // background, so System ClearType is safe on this transparent canvas.
-        target->SetTextAntialiasMode(textStyle->opaqueTextAntialiasMode);
+        SetCompatibleTextRendering(target,textStyle->textRenderingParams.Get(),textStyle->opaqueTextAntialiasMode);
     }
     D2D1_MATRIX_3X2_F original{}; target->GetTransform(&original);
     const float center=(geometry.artwork.left+geometry.artwork.right)*.5f,bottom=geometry.artwork.bottom;
@@ -19731,7 +19759,7 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle,&layer.shadows);
     const HRESULT draw=state.target->EndDraw();
     state.target->SetTarget(previous.Get()); state.target->SetTransform(transform);
-    state.target->SetTextRenderingParams(previousTextParams.Get()); state.target->SetTextAntialiasMode(previousTextMode);
+    SetCompatibleTextRendering(state.target.Get(),previousTextParams.Get(),previousTextMode);
     if(FAILED(draw) || !PublishModePlane(state,layer.plane) || FAILED(layer.visual->SetContent(layer.plane.surface.Get()))) return false;
     // Entry can lift once; changing an operation, caption or thumbnail must
     // never restart scale animation or make pointer movement appear delayed.
@@ -21058,7 +21086,10 @@ void Paint(ViewState& state) {
     if (g_perf.load()) QueryPerformanceCounter(&drawEnd);
     const bool newRowOrigin=compositionFrame.Rows() && state.modeComposition.newRowOrigin;
     bool submitted = SUCCEEDED(hr) && !state.swapChain;
-    if (FAILED(hr)) DropTarget(state);
+    if (FAILED(hr)) {
+        state.graphicsFailure=hr; state.graphicsFailureStage=7; // Frame drawing, including item planes.
+        DropTarget(state);
+    }
     else if (state.swapChain) {
         HRESULT present=S_OK;
         if (compositionFrame.active) {
@@ -27534,8 +27565,8 @@ void PaintItemTip(ItemTip& tip, HWND hwnd) {
     };
     if (dc && tip.target && tip.nameLayout && SUCCEEDED(tip.target->BindDC(dc, &client))) {
         RefreshTextRenderingForWindow(tip.textStyle, hwnd, true);
-        ConfigureTextTarget(tip.textStyle, tip.target.Get());
-        tip.target->SetTextAntialiasMode(tip.textStyle.opaqueTextAntialiasMode);
+        SetCompatibleTextRendering(tip.target.Get(),tip.textStyle.textRenderingParams.Get(),
+            tip.textStyle.opaqueTextAntialiasMode);
         tip.target->BeginDraw();
         tip.target->Clear(color(tip.background));
         ComPtr<ID2D1SolidColorBrush> text, label;
