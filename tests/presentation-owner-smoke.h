@@ -414,6 +414,28 @@ static void TestPresentationOwners() {
         Check(!adapter || info.CurrentUsage<=256ULL*1024*1024,"closed presentation tabs retained GPU allocations");
         std::cout<<"PRESENTATION MEMORY tabs=20 4K peak-local-MiB="<<peak/1048576.<<" closed-local-MiB="<<info.CurrentUsage/1048576.<<std::endl;
     }
+    {
+        PresentationFixture::Tab tab(L"badge lifetime",12000,false,false,true);
+        auto& s=tab.state;
+        Check(s.sections.size()>512,"badge lifetime fixture must exceed the former pruning threshold");
+        for(auto& section:s.sections) {section.collapsed=true; section.fraction=0.f;}
+        AssessCollapsedSectionSelection(s);
+        const auto badges=s.sectionBadges;
+        Check(badges && badges->size()==s.sections.size(),"collapsed section counts were not captured");
+        AssessCollapsedSectionSelection(s);
+        Check(s.sectionBadges==badges,"unchanged large badge map was copied on assessment");
+        const auto oldSelection=s.selectedFlags.StorageIdentity();
+        s.selectedFlags.assign(s.total,0);
+        Check(oldSelection.expired(),"badges pinned a departed selection snapshot");
+        AssessCollapsedSectionSelection(s);
+        s.selectedFlags[5]=1; AssessCollapsedSectionSelection(s);
+        Check(s.sectionBadges->at(s.sections[0].key).count==1,"badge missed an in-place selection revision");
+        s.sections.resize(1); s.presentationGroups.clear();
+        s.presentationGroups.emplace(s.sections[0].key,0);
+        AssessCollapsedSectionSelection(s,true);
+        Check(s.sectionBadges->size()==1 && s.sectionBadges->contains(s.sections[0].key),
+            "topology change retained departed badge keys");
+    }
     for(bool rtl:{false,true}) for(bool grid:{false,true}) {
         Regression::Scope scope(grid ? "keyboard section grid" : "keyboard section list");
         PresentationFixture::Tab tab(L"keyboard sections",60,rtl,grid,true);
@@ -447,6 +469,27 @@ static void TestPresentationOwners() {
         NavigateKeyboardSelection(s,VK_HOME,false,false);
         TypeToSelect(s,L'N');
         Check(KeyboardFocusedSection(s)<0,"type-to-select retained section header focus");
+        // Header focus owns movement, while the old item remains the Shift
+        // range anchor and Ctrl leaves its selection intact.
+        s.sections[0].collapsed=false; s.sections[0].fraction=1.f; s.sections[0].started={};
+        LayoutGroupSections(s);
+        Select(s,s.total-1); const auto prior=s.selectedFlags;
+        s.keyboardSectionKey=s.sections[0].key;
+        NavigateKeyboardSelection(s,VK_DOWN,true,false);
+        Check(s.selected==s.sections[0].first && s.selectedFlags==prior && KeyboardFocusedSection(s)<0,
+            "Ctrl+Down used an old item instead of the focused first header");
+        Select(s,s.total-1); const int anchor=s.anchor;
+        s.keyboardSectionKey=s.sections[0].key;
+        NavigateKeyboardSelection(s,VK_DOWN,false,true);
+        Check(s.selected==s.sections[0].first && s.anchor==anchor &&
+            s.selectedFlags[0] && s.selectedFlags[size_t(anchor)],"Shift+Down lost header origin or existing range anchor");
+        s.keyboardSectionKey=s.sections[1].key;
+        NavigateKeyboardSelection(s,VK_UP,true,false);
+        Check(s.selected==s.sections[0].end-1,"Ctrl+Up did not move to the item preceding the focused header");
+        s.keyboardSectionKey=s.sections[1].key;
+        const int page=std::clamp(s.sections[1].first+std::max(1,VisibleRows(s)-2)*s.itemsPerRow,0,s.total-1);
+        NavigateKeyboardSelection(s,VK_NEXT,true,false);
+        Check(s.selected==page,"Page movement used the old item instead of the focused header");
     }
     ShutDownFrames(); g_frameStopping=false;
     g_smooth=smooth; g_autoRefitColumns=automatic;

@@ -9,6 +9,11 @@
 - Include localized relative phrases for cached tooltip dates and additional
   timestamp properties, keeping their existing date text and preserving the
   phrases when the completed tooltip receives newer cached column values.
+- Start modified keyboard movement at the focused section header while keeping
+  selection anchors and Ctrl focus-only behavior.
+- Use selection page counts for keyboard edges and badge reveals instead of
+  scanning the folder on input. Retire departed badge state with its groups
+  and folder without retaining old selection snapshots.
 
 ## 1.0.0
 

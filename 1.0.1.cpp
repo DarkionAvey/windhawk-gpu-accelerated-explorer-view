@@ -2213,6 +2213,8 @@ struct PipelineTrace {
 
 struct PresentationLane;
 struct PresentationModel;
+struct SectionBadge;
+using SectionBadges = std::map<std::wstring, SectionBadge>;
 struct TabBackground : std::enable_shared_from_this<TabBackground> {
     enum class Lane { Directory, Layout, Properties, Icons, NativeRows, Selection, Columns, IconProvider, Details, Capacity, Watch, Trace, Presentation };
     struct Pool {
@@ -2299,7 +2301,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
         std::shared_ptr<const NamespaceIdentities>, std::shared_ptr<const std::vector<Entry>>,
         std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates,
-        std::vector<SharedPidl>, std::vector<std::shared_ptr<const Entry>>>;
+        std::vector<SharedPidl>, std::vector<std::shared_ptr<const Entry>>, std::shared_ptr<const SectionBadges>>;
     std::deque<RetiredPayload> retiredEntries;
     bool directoryNotificationQueued = false, detailNotificationQueued = false;
     SRWLOCK iconLock = SRWLOCK_INIT;
@@ -2717,19 +2719,50 @@ void PublishDirectoryResult(TabBackground& work, DirectoryResult&& result) {
 
 LRESULT CALLBACK ViewToggleSubclass(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
 // Immutable selection snapshots share pages. A normal click copies at most
-// the small page table and one 1 KiB page, never the full directory bitmap.
+// the small page tables and one 1 KiB page, never the full directory bitmap.
 class SelectionFlags {
     static constexpr size_t pageSize=1024;
     using Page=std::array<unsigned char,pageSize>;
-    struct Store { size_t size=0; std::vector<std::shared_ptr<Page>> pages; };
+    struct Store {
+        size_t size=0;
+        std::vector<std::shared_ptr<Page>> pages;
+        std::vector<size_t> pageCounts,tree; // Fenwick sums over logical page contents.
+        unsigned long long revision=1;
+    };
     std::shared_ptr<Store> store;
+    void BuildCounts() {
+        store->tree.assign(store->pageCounts.size()+1,0);
+        for(size_t i=1;i<store->tree.size();++i) {
+            store->tree[i]+=store->pageCounts[i-1];
+            const size_t parent=i+(i&(~i+1));
+            if(parent<store->tree.size()) store->tree[parent]+=store->tree[i];
+        }
+    }
+    size_t PrefixCount(size_t end) const {
+        if(!store) return 0;
+        end=std::min(end,size());
+        const size_t pages=end==size() ? store->pages.size() : end/pageSize;
+        size_t count=0;
+        for(size_t i=pages;i;i-=i&(~i+1)) count+=store->tree[i];
+        if(end!=size()) for(size_t i=pages*pageSize;i<end;++i) count+=Get(i)!=0;
+        return count;
+    }
     void Root() { if(!store) store=std::make_shared<Store>(); else if(store.use_count()!=1) store=std::make_shared<Store>(*store); }
     unsigned char Get(size_t i) const { return (*store->pages[i/pageSize])[i%pageSize]; }
     void Set(size_t i,unsigned char value) {
-        if(Get(i)==value) return;
+        const auto old=Get(i);
+        if(old==value) return;
         Root(); auto& page=store->pages[i/pageSize];
         if(page.use_count()!=1) page=std::make_shared<Page>(*page);
         (*page)[i%pageSize]=value;
+        ++store->revision;
+        if(bool(old)!=bool(value)) {
+            const bool add=value!=0;
+            auto& count=store->pageCounts[i/pageSize];
+            if(add) ++count; else --count;
+            for(size_t at=i/pageSize+1;at<store->tree.size();at+=at&(~at+1))
+                if(add) ++store->tree[at]; else --store->tree[at];
+        }
     }
 public:
     static constexpr size_t PageLength=pageSize;
@@ -2764,6 +2797,28 @@ public:
     size_t size() const {return store ? store->size : 0;}
     bool empty() const {return !size();}
     bool SharesStorage(const SelectionFlags& other) const {return store==other.store;}
+    std::weak_ptr<const void> StorageIdentity() const {return store;}
+    unsigned long long Revision() const {return store ? store->revision : 0;}
+    bool SharesStorage(const std::weak_ptr<const void>& identity) const {
+        return !identity.owner_before(store) && !store.owner_before(identity);
+    }
+    // At most two boundary pages plus logarithmic page sums. No folder scan
+    // on keyboard/badge input, even when the selection summary receipt is old.
+    size_t Count(size_t first,size_t end) const {
+        return first<end ? PrefixCount(end)-PrefixCount(first) : 0;
+    }
+    int FindSelected(size_t first,size_t end,bool reverse=false) const {
+        const size_t before=PrefixCount(first),after=PrefixCount(end);
+        if(first>=end || before==after) return -1;
+        size_t rank=reverse ? after : before+1,page=0;
+        for(size_t bit=std::bit_floor(store->pageCounts.size());bit;bit>>=1) {
+            const size_t next=page+bit;
+            if(next<store->tree.size() && store->tree[next]<rank) {rank-=store->tree[next]; page=next;}
+        }
+        for(size_t i=page*pageSize;i<std::min(size(),(page+1)*pageSize);++i)
+            if(Get(i) && !--rank) return int(i);
+        return -1;
+    }
     unsigned char back() const {return Get(size()-1);}
     unsigned char operator[](size_t i) const {return Get(i);}
     Reference operator[](size_t i) {return {this,i};}
@@ -2774,17 +2829,41 @@ public:
         auto next=std::make_shared<Store>(); next->size=n;
         auto page=std::make_shared<Page>(); page->fill(value);
         next->pages.assign((n+pageSize-1)/pageSize,page); store=std::move(next);
+        store->pageCounts.resize(store->pages.size());
+        for(size_t i=0;i<store->pages.size();++i) store->pageCounts[i]=value ? std::min(pageSize,n-i*pageSize) : 0;
+        BuildCounts();
     }
     template<class It> requires (!std::is_integral_v<It>) void assign(It first,It last) {
-        assign(size_t(std::distance(first,last)),0); size_t i=0; for(;first!=last;++first,++i) Set(i,*first);
+        auto next=std::make_shared<Store>(); next->size=size_t(std::distance(first,last));
+        std::shared_ptr<Page> emptyPage;
+        while(first!=last) {
+            auto page=std::make_shared<Page>(); page->fill(0); size_t count=0;
+            for(size_t i=0;i<pageSize && first!=last;++i,++first) {(*page)[i]=*first; count+=(*page)[i]!=0;}
+            if(!count) {if(emptyPage) page=emptyPage; else emptyPage=page;}
+            next->pages.push_back(std::move(page)); next->pageCounts.push_back(count);
+        }
+        store=std::move(next); BuildCounts();
     }
     void Fill(unsigned char value) {assign(size(),value);}
     void resize(size_t n,unsigned char value=0) {
         const size_t old=size(); if(old==n) return;
-        Root(); store->size=n;
+        Root(); const size_t oldPages=store->pages.size(); store->size=n; ++store->revision;
         auto page=std::make_shared<Page>(); page->fill(value);
         store->pages.resize((n+pageSize-1)/pageSize,page);
-        if(n>old && old%pageSize) for(size_t i=old;i<std::min(n,(old/pageSize+1)*pageSize);++i) Set(i,value);
+        store->pageCounts.resize(store->pages.size());
+        for(size_t i=oldPages;i<store->pages.size();++i) store->pageCounts[i]=value ? std::min(pageSize,n-i*pageSize) : 0;
+        if(n>old && old%pageSize) {
+            auto& boundary=store->pages[old/pageSize];
+            if(boundary.use_count()!=1) boundary=std::make_shared<Page>(*boundary);
+            const size_t end=std::min(pageSize,n-old/pageSize*pageSize);
+            std::fill(boundary->begin()+old%pageSize,boundary->begin()+end,value);
+            store->pageCounts[old/pageSize]=std::count_if(boundary->begin(),boundary->begin()+end,[](auto flag){return flag!=0;});
+        }
+        if(n<old && n%pageSize) {
+            const auto& boundary=*store->pages.back();
+            store->pageCounts.back()=std::count_if(boundary.begin(),boundary.begin()+n%pageSize,[](auto flag){return flag!=0;});
+        }
+        BuildCounts();
     }
     void swap(SelectionFlags& other) {store.swap(other.store);}
     operator std::vector<unsigned char>() const {return {begin(),end()};}
@@ -2821,10 +2900,10 @@ struct IconKeyContext {
 // if the selection storage changes meanwhile); the owner adopts the same
 // immutable map from receipts for hover/hit geometry. Never counted per frame.
 struct SectionBadge {
-    SelectionFlags selection; // Storage identity the count belongs to.
+    std::weak_ptr<const void> selection; // Identity only; never pins an old selection's pages.
+    unsigned long long selectionRevision=0; // In-place edits need not replace the root.
     int first = 0, end = 0;
     size_t count = 0;
-    int firstSelected = -1; // Badge click reveals this row.
     std::wstring text; // Locale-formatted last nonzero count; kept while sliding out.
     bool collapsed = false; // Section state at the last assessment.
     bool rtl = false; // Contextual digit substitution used by text.
@@ -2832,7 +2911,6 @@ struct SectionBadge {
     float from = 0.f, to = 0.f;
     LARGE_INTEGER started{};
 };
-using SectionBadges = std::map<std::wstring, SectionBadge>;
 struct PresentationRowCache {
     std::shared_ptr<const Entry> entry;
     IconKeyContext icons;
@@ -4279,10 +4357,11 @@ void PublishGroupIntents(ViewState& state) {
         intents->emplace(section.key,section);
     state.presentationGroupIntents=std::move(intents);
 }
+void RetireSectionBadges(ViewState& state);
 void RebuildGroupSections(ViewState& state, bool preserveCollapse = true) {
     preserveCollapse = preserveCollapse &&
         SameShellGroup(state.displayedGrouping, state.grouping);
-    if(!preserveCollapse) state.keyboardSectionKey.reset();
+    if(!preserveCollapse) {state.keyboardSectionKey.reset(); RetireSectionBadges(state);}
     std::map<std::wstring, ViewState::GroupSection> previous;
     if (preserveCollapse) {
         for (const auto& section : state.sections)
@@ -10008,6 +10087,9 @@ bool RetireCachedEntries(ViewState& state, Entries& entries, bool nonblocking = 
     }
     if (EnsureDirectoryWorker(state, true)) SetEvent(state.background->properties.wake);
     return true;
+}
+void RetireSectionBadges(ViewState& state) {
+    RetireCachedEntries(state,state.sectionBadges);
 }
 
 // Owner-STA slices are bounded by elapsed time. GetTickCount64 advances in
@@ -18081,7 +18163,7 @@ void AssessHeaderCheckboxSelection(ViewState& state) {
         return;
     }
     if (!state.checkboxSelection.SharesStorage(state.selectedFlags)) {
-        state.checkboxSelectedCount=std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1);
+        state.checkboxSelectedCount=state.selectedFlags.Count(0,state.selectedFlags.size());
         state.checkboxSelection=state.selectedFlags;
     }
     if (state.total<=0) state.checkboxSelectedCount=0;
@@ -18148,13 +18230,17 @@ float SectionBadgeReveal(const ViewState& state, const SectionBadge& badge, LARG
 // counted again only if the shared selection storage changed while it stayed
 // collapsed (Ctrl+A, select none). Every show/hide is a motion: a collapse or
 // expand shares the header's clock, any other change starts now.
-void AssessCollapsedSectionSelection(ViewState& state) {
+void AssessCollapsedSectionSelection(ViewState& state,bool topologyChanged=false) {
     const auto previous = state.sectionBadges;
     std::shared_ptr<SectionBadges> updated;
     const auto edit = [&]() -> SectionBadges& {
         if (!updated) updated = previous ? std::make_shared<SectionBadges>(*previous) : std::make_shared<SectionBadges>();
         return *updated;
     };
+    // The complete section index is rebuilt with the directory, not with
+    // viewport captures. Prune departed keys only at that topology change.
+    if(topologyChanged && previous) for(const auto& [key,badge]:*previous)
+        if(!state.presentationGroups.contains(key)) edit().erase(key);
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
     for (const auto& section : state.sections) {
         const auto* current = previous ? [&]() -> const SectionBadge* {
@@ -18165,15 +18251,13 @@ void AssessCollapsedSectionSelection(ViewState& state) {
         SectionBadge next = current ? *current : SectionBadge{};
         bool changed = !current;
         if (section.collapsed && (!current || current->first != section.first || current->end != section.end ||
-                !current->selection.SharesStorage(state.selectedFlags))) {
-            next.selection = state.selectedFlags;
+                !state.selectedFlags.SharesStorage(current->selection) || current->selectionRevision!=state.selectedFlags.Revision())) {
+            next.selection = state.selectedFlags.StorageIdentity();
+            next.selectionRevision=state.selectedFlags.Revision();
             next.first = section.first; next.end = section.end;
-            next.count = 0; next.firstSelected = -1;
+            const size_t first=size_t(std::max(0,section.first));
             const size_t end = std::min(size_t(std::max(0, section.end)), state.selectedFlags.size());
-            for (size_t row = size_t(std::max(0, section.first)); row < end; ++row)
-                if (state.selectedFlags[row]) {
-                    if (!next.count++) next.firstSelected = int(row);
-                }
+            next.count=state.selectedFlags.Count(first,end);
             changed = true;
         }
         // Keep the last nonzero text so a badge leaving at zero still reads.
@@ -18197,15 +18281,6 @@ void AssessCollapsedSectionSelection(ViewState& state) {
             continue;
         }
         if (changed) edit()[section.key] = std::move(next);
-    }
-    // Keys from other folders are inert (validity is rechecked on collapse);
-    // bound them by keeping only the sections this model carries.
-    if (const std::shared_ptr<const SectionBadges> badges = updated ? updated : previous;
-        badges && badges->size() > 512) {
-        auto kept = std::make_shared<SectionBadges>();
-        for (const auto& section : state.sections)
-            if (const auto found = badges->find(section.key); found != badges->end()) kept->insert(*found);
-        updated = std::move(kept);
     }
     if (updated) state.sectionBadges = std::move(updated);
 }
@@ -21312,8 +21387,7 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
 
 bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& selection) {
     if (state.token != selection.viewToken || state.directoryToken != selection.directoryToken || state.nativeHwnd != selection.native ||
-        static_cast<size_t>(std::count_if(state.selectedFlags.begin(), state.selectedFlags.end(),
-            [](unsigned char flag) { return flag != 0; })) != selection.entries.size()) return false;
+        state.selectedFlags.Count(0,state.selectedFlags.size()) != selection.entries.size()) return false;
     for (const Entry& entry : selection.entries) {
         const int row = GpuRowForNativePath(state, entry.path);
         if (row < 0 || static_cast<size_t>(row) >= state.selectedFlags.size() ||
@@ -21975,7 +22049,7 @@ void ReconcileFailedNativeSelection(ViewState& state) {
     // an unrelated file. Use the existing safe reset after input/operations
     // settle, preserving the viewport and blocking unverified file commands.
     RejectNativeSelectionImport(state,L"native selection commit not verified",nativeCount,
-        static_cast<int>(std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)));
+        static_cast<int>(state.selectedFlags.Count(0,state.selectedFlags.size())));
 }
 
 // A background click is a distinct Shell selection operation, not an
@@ -22531,8 +22605,7 @@ void Select(ViewState& state, int index, bool keyboardNavigation = false) {
     if (previous == index &&
         static_cast<size_t>(index) < state.selectedFlags.size() &&
         state.selectedFlags[static_cast<size_t>(index)] &&
-        std::count(state.selectedFlags.begin(), state.selectedFlags.end(),
-                   static_cast<unsigned char>(1)) == 1) {
+        state.selectedFlags.Count(0,state.selectedFlags.size()) == 1) {
         // Home/End must still reveal an already selected boundary row after
         // pointer scrolling moved the viewport away from it.
         EnsureVisible(state, index);
@@ -22663,22 +22736,51 @@ bool IsKeyboardMovementKey(UINT key, bool grid = false) {
 
 // Item/range target resolver. Plain arrows visit section headings separately
 // in NavigateKeyboardSelection; selection ranges remain Shell-item based.
+int SelectedDisplayedRow(const ViewState& state,size_t first,size_t end,bool reverse=false) {
+    while(first<end) {
+        const int row=state.selectedFlags.FindSelected(first,end,reverse);
+        if(row<0 || DisplayedRow(state,row)) return row;
+        const int group=ModelGroup(state,row);
+        if(group<0) return -1;
+        const auto& section=state.sections[size_t(group)];
+        const int boundary=reverse ? section.first-1 : section.end;
+        if(boundary<0 || boundary>=state.total) return -1;
+        // Skip a whole run of collapsed groups through shared geometry before
+        // asking the selection index again; never query each hidden item.
+        const int next=NextDisplayedRow(state,boundary,!reverse);
+        if(next<0) return -1;
+        if(reverse) end=std::min(end,size_t(next)+1);
+        else first=std::max(first,size_t(next));
+    }
+    return -1;
+}
+int KeyboardBulkSelectionEdge(const ViewState& state,UINT key) {
+    if(key!=VK_UP && key!=VK_DOWN) return -1;
+    const size_t end=std::min(state.selectedFlags.size(),size_t(std::max(0,state.total)));
+    const bool reverse=key==VK_DOWN;
+    const int edge=SelectedDisplayedRow(state,0,end,reverse);
+    if(edge<0) return -1;
+    const int other=reverse ? SelectedDisplayedRow(state,0,size_t(edge),true) :
+        SelectedDisplayedRow(state,size_t(edge)+1,end);
+    return other>=0 ? edge : -1;
+}
 int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge = false) {
     if (state.total <= 0) return -1;
+    const int focused=KeyboardFocusedSection(state);
     int origin = state.selected;
-    bool fromBulk = false;
-    if (useSelectionEdge && (key == VK_UP || key == VK_DOWN)) {
-        const bool down = key == VK_DOWN;
-        const int count = static_cast<int>(std::min(state.selectedFlags.size(), static_cast<size_t>(state.total)));
-        int edge = -1;
-        // Only input examines selection flags. Two displayed members establish
-        // a bulk; its first/last member replaces the caret as the move origin.
-        // Stop after the second match, without a Shell query or state mutation.
-        for (int row = down ? count - 1 : 0; row >= 0 && row < count; row += down ? -1 : 1) {
-            if (!state.selectedFlags[static_cast<size_t>(row)] || !DisplayedRow(state, row)) continue;
-            if (edge >= 0) { origin = edge; fromBulk = true; break; }
-            edge = row;
+    if(focused>=0) {
+        const auto& section=state.sections[size_t(focused)];
+        if(key==VK_UP || key==VK_DOWN || key==VK_LEFT || key==VK_RIGHT) {
+            const bool forward=key==VK_DOWN || (key==VK_RIGHT && !state.rtlLayout) || (key==VK_LEFT && state.rtlLayout);
+            const int candidate=section.first-(forward ? 0:1);
+            return candidate>=0 && candidate<state.total ? NextDisplayedRow(state,candidate,forward) : -1;
         }
+        origin=section.first; // Page movement starts here; Home/End remain absolute.
+    }
+    bool fromBulk = false;
+    if (useSelectionEdge && focused<0) {
+        const int edge=KeyboardBulkSelectionEdge(state,key);
+        if(edge>=0) {origin=edge; fromBulk=true;}
     }
     const int base = origin >= 0 ? origin :
         state.restoredKeyboardRow >= 0 ? state.restoredKeyboardRow :
@@ -22747,12 +22849,8 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
                                bool control, bool shift) {
     TraceSelectionIdentity(state, L"key.before-target");
     if (state.optimisticStartedAt) return;
-    bool bulkSelection=false;
-    if(!state.sections.empty() && KeyboardFocusedSection(state)<0 && !control && !shift) {
-        int count=0;
-        for(size_t i=0;i<state.selectedFlags.size();++i)
-            if(state.selectedFlags[i] && DisplayedRow(state,int(i)) && ++count==2) {bulkSelection=true; break;}
-    }
+    const bool bulkSelection=!control && !shift && KeyboardFocusedSection(state)<0 &&
+        KeyboardBulkSelectionEdge(state,key)>=0;
     // First collapse a multi-selection at its existing directional edge;
     // subsequent single-item movement can stop on section headers.
     if(!control && !shift && !bulkSelection && !state.sections.empty()) {
@@ -22794,8 +22892,7 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
             }
         }
     }
-    state.keyboardSectionKey.reset();
-    if ((key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
+    if (KeyboardFocusedSection(state)<0 && (key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
         state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0)
         RefreshHoverUnderCursor(state);
     const int target = KeyboardNavigationTarget(state, key, !control && !shift);
@@ -22807,6 +22904,7 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
         Wh_Log(L"[GPU selection] KEY_TARGET key=0x%X index=%d target=%d restored=%d vacant=%d rows=%d",
             key,state.selected,target,state.restoredKeyboardRow,state.vacantKeyboardRow,state.total);
     if (target < 0) return;
+    state.keyboardSectionKey.reset();
     if (!control && !shift) {
         Select(state, target, true); // Keep the existing single-row animation.
         TraceSelectionIdentity(state, L"key.after-select");
@@ -23894,8 +23992,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
         !state.detailsViewActive || state.emptyNative ||
         index < 0 || index >= state.total || !state.folder ||
         !state.folderView || !PresentationVisible(state)) return;
-    if (std::count(state.selectedFlags.begin(), state.selectedFlags.end(),
-                   static_cast<unsigned char>(1)) != 1 ||
+    if (state.selectedFlags.Count(0,state.selectedFlags.size()) != 1 ||
         index >= static_cast<int>(state.selectedFlags.size()) ||
         !state.selectedFlags[static_cast<size_t>(index)]) return;
     const HWND owner = state.hwnd, native = state.nativeHwnd;
@@ -27277,14 +27374,10 @@ void PressGroupHeader(ViewState& state, int group, std::optional<POINT> point = 
     const auto* badge = point ? GroupBadgeAtPoint(state, group, *point) : nullptr;
     int reveal = -1;
     if (badge) {
-        // The lane's first selected row, revalidated against current selection.
+        // Query the current selection's page sums. A stale receipt never
+        // requires scanning the group on the input STA.
         const auto& section = state.sections[size_t(group)];
-        const auto selected = [&](int row) {
-            return row >= section.first && row < section.end && size_t(row) < state.selectedFlags.size() &&
-                state.selectedFlags[size_t(row)];
-        };
-        if (selected(badge->firstSelected)) reveal = badge->firstSelected;
-        else for (int row = section.first; row < section.end && reveal < 0; ++row) if (selected(row)) reveal = row;
+        reveal=state.selectedFlags.FindSelected(size_t(std::max(0,section.first)),size_t(std::max(0,section.end)));
     }
     // A badge click always expands; a plain header click toggles.
     if (!badge || state.sections[size_t(group)].collapsed) ToggleGroupSection(state, group);
@@ -28839,6 +28932,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     const float oldFont=state.fontPx,oldRow=state.rowPx; const bool oldRtl=state.rtlLayout,oldGrid=state.gridView;
     const int oldItemsPerRow=state.itemsPerRow;
     const auto oldGroupingSpec=state.grouping;
+    if(!sameFolder || !SameShellGroup(oldGroupingSpec,model.grouping)) state.sectionBadges.reset();
     const int oldDpi=state.presentationDpi;
     const bool oldClipboardInitialized=state.clipboardInitialized;
 #define APPLY_PRESENTATION(name) state.name=model.name;
@@ -28880,9 +28974,11 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     state.featureInitializationStep=kOverlayFeatureSteps; state.nativeRowsNeedCapture=false;
     state.directoryModePinned=true;
     state.graphicsStandby=state.graphicsStandbyPending=false;
+    bool badgeTopologyChanged=false;
     if(model.directory) {
         const bool rebuild=oldDirectory!=model.directory || !SameShellGroup(oldGroupingSpec,state.grouping) ||
             (state.grouping.enabled && !state.namesPreview && state.rowGroup.size()!=size_t(state.total));
+        badgeTopologyChanged=rebuild;
         bool geometry=rebuild || oldRow!=state.rowPx || oldGrid!=state.gridView || oldItemsPerRow!=state.itemsPerRow;
         if(rebuild) {
             std::map<std::wstring,ViewState::GroupSection> previous;
@@ -28951,7 +29047,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
         state.presentationSectionIndices=model.sectionIndices;
         state.presentationGroupOrigin=state.sections.empty() ? 0.f : state.sections.back().documentEnd;
     }
-    AssessCollapsedSectionSelection(state);
+    AssessCollapsedSectionSelection(state,badgeTopologyChanged);
     state.presentationImageWorkingBytes=0;
     for(const auto& image:model.images) {
         auto* slot=image.key==kDefaultFolderIconKey ? nullptr : &*state.icons.try_emplace(image.key).first;
@@ -29344,8 +29440,12 @@ void ConsumePresentation(ViewState& state) {
         return;
     }
     if(receipt->token!=state.token || receipt->directoryToken!=state.directoryToken) return;
-    // Hover geometry on the owner uses the lane's counts for this directory.
-    if (!receipt->failed) state.sectionBadges=receipt->sectionBadges;
+    // Counts must also belong to the current group topology/intents: sorting
+    // or regrouping can supersede a receipt without changing directoryToken.
+    if (!receipt->failed && state.presentationGroupIntents==receipt->groupIntents &&
+        state.sectionBadges!=receipt->sectionBadges) {
+        RetireSectionBadges(state); state.sectionBadges=receipt->sectionBadges;
+    }
     if (!receipt->failed && receipt->checkboxTotal==state.total && receipt->checkboxSelection.SharesStorage(state.selectedFlags)) {
         state.checkboxSelection=receipt->checkboxSelection;
         state.checkboxSelectedCount=receipt->checkboxSelectedCount;
@@ -32280,8 +32380,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (g_perf.load(std::memory_order_relaxed) &&
                     s->total > kMaxNativeIndexFallbackItems)
                     Wh_Log(L"[GPU marquee] COMMIT_BEGIN rows=%d desired=%zu", s->total,
-                        static_cast<size_t>(std::count_if(s->selectedFlags.begin(),
-                            s->selectedFlags.end(), [](unsigned char f) { return f != 0; })));
+                        s->selectedFlags.Count(0,s->selectedFlags.size()));
                 s->marqueeFading = true;
                 s->marqueeEndTick = GetTickCount64() + kUiTransitionDurationMs;
                 RegisterAnimationWindow(hwnd);
@@ -33641,6 +33740,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.nativeSelectionObservedPaths.clear();
     state.entryPathIndex.clear();
     RetireCachedEntries(state, state.entryPathUpdates);
+    RetireSectionBadges(state);
     state.folderPath = path;
     state.deferColumnProviders = true;
     state.horizontalScrollbarAdmitted = state.horizontalScrollbarPublished = false;
@@ -35676,8 +35776,7 @@ bool HandleNativeFileKey(const MSG& msg, ViewState* owner) {
         if (GetKeyState(VK_CONTROL)&0x8000) key.modifiers|=CMIC_MASK_CONTROL_DOWN;
         if (GetKeyState(VK_SHIFT)&0x8000) key.modifiers|=CMIC_MASK_SHIFT_DOWN;
         if (!paste && state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(key); return true; }
-        if (!paste && std::none_of(state.selectedFlags.begin(),state.selectedFlags.end(),
-            [](unsigned char flag) { return flag!=0; })) return true;
+        if (!paste && !state.selectedFlags.Count(0,state.selectedFlags.size())) return true;
         ComPtr<IShellView> native;
         const HWND hwnd=state.hwnd, target=state.nativeHwnd;
         const auto lifetime=state.lifetimeToken, viewToken=state.token;

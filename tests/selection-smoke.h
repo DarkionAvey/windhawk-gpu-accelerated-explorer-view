@@ -114,6 +114,43 @@ static void WaitForPreparedSelection(ViewState& state) {
 #include "selection-recovery-smoke.h"
 
 static void TestSelectionGestures(ViewState& state, SelectionFolderView& native) {
+    {
+        // Check page sums/order statistics against an independent dense bitmap,
+        // including COW snapshots and shrinking/regrowing a partial last page.
+        std::vector<unsigned char> dense(SelectionFlags::PageLength*3+17);
+        for(size_t i=0;i<dense.size();++i) dense[i]=i%7==0;
+        SelectionFlags flags(dense);
+        const auto verify=[&](const SelectionFlags& actual,const std::vector<unsigned char>& expected) {
+            Check(actual==expected,"selection page contents changed");
+            for(size_t first=0;first<=expected.size();first+=127) {
+                const size_t end=std::min(expected.size(),first+SelectionFlags::PageLength+19);
+                const auto begin=expected.begin()+first,last=expected.begin()+end;
+                const auto found=std::find(begin,last,1);
+                int reverse=-1;
+                for(size_t i=end;i>first;--i) if(expected[i-1]) {reverse=int(i-1); break;}
+                Check(actual.Count(first,end)==size_t(std::count(begin,last,1)) &&
+                    actual.FindSelected(first,end)==(found==last ? -1:int(found-expected.begin())) &&
+                    actual.FindSelected(first,end,true)==reverse,"selection range count/edge differs from dense expectation");
+            }
+            Check(actual.Count(0,expected.size())==size_t(std::count(expected.begin(),expected.end(),1)),"selection total differs");
+            Check(actual.FindSelected(0,0)==-1 && actual.Count(0,0)==0,"empty selection range is not empty");
+        };
+        verify(flags,dense);
+        auto snapshot=flags; const auto original=dense;
+        flags[SelectionFlags::PageLength]=1; dense[SelectionFlags::PageLength]=1;
+        flags[0]=0; dense[0]=0; verify(flags,dense); verify(snapshot,original);
+        const auto identity=flags.StorageIdentity();
+        const auto revision=flags.Revision(); flags[1]=1; dense[1]=1;
+        Check(flags.SharesStorage(identity) && flags.Revision()!=revision,"in-place selection edit lost revision tracking");
+        flags.resize(SelectionFlags::PageLength+3); dense.resize(SelectionFlags::PageLength+3); verify(flags,dense);
+        flags.resize(SelectionFlags::PageLength*5+11,1); dense.resize(SelectionFlags::PageLength*5+11,1); verify(flags,dense);
+        flags.Fill(0); std::fill(dense.begin(),dense.end(),0); verify(flags,dense);
+        flags.Fill(1); std::fill(dense.begin(),dense.end(),1); verify(flags,dense);
+        flags.resize(0); dense.clear(); verify(flags,dense);
+        flags.resize(SelectionFlags::PageLength,1); dense.resize(SelectionFlags::PageLength,1); verify(flags,dense);
+        snapshot.clear(); flags.clear();
+        Check(identity.expired(),"weak selection identity retained its pages");
+    }
     // Plain clicks must stay plain even if a nested Shell pump refreshes the
     // thread keyboard snapshot from live desktop modifier state.
     ModifierFixture::Session modifiers;
