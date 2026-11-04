@@ -3908,6 +3908,9 @@ struct ViewState {
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
     ULONGLONG startupStartedAt = 0;
     ULONGLONG firstContentSubmittedAt = 0;
+    // Armed only for a newly attached tab, never by refresh/provider results.
+    // Explicit view input/commands or departure from its first folder ends it.
+    bool startupAnimationsSuppressed = false;
     bool preparingTab = false; // Prepare one hidden first-content surface; then use normal standby.
     bool tabSurfaceWakeQueued = false;
     ComPtr<IDispatch> pendingAutomation;
@@ -4095,6 +4098,7 @@ struct SwipeFeedbackSnapshot {
 #define PRESENTATION_MODEL_FIELDS(X) \
     X(hwnd) X(nativeHwnd) X(frameHwnd) X(activeTabHost) X(rtlLayout) X(inScope) X(thisPcGpu) \
     X(detailsViewActive) X(columnsView) X(gridView) X(nativeIconSize) X(layoutNativeMode) X(layoutIconSize) \
+    X(startupAnimationsSuppressed) \
     X(itemsPerRow) X(itemWidth) X(columns) X(columnEpoch) X(propertyEpoch) X(columnContentWidth) \
     X(imageMemoryAllowance) X(imageCacheFloor) \
     X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
@@ -4636,7 +4640,7 @@ float EaseOutCubic(float progress) {
 float UiTransitionProgress(const ViewState& state, LARGE_INTEGER started,
                            ULONGLONG durationMs = kUiTransitionDurationMs,
                            LARGE_INTEGER sampled = {}) {
-    if (!started.QuadPart || state.qpcFrequency <= 0.) return 1.f;
+    if (state.startupAnimationsSuppressed || !started.QuadPart || state.qpcFrequency <= 0.) return 1.f;
     LARGE_INTEGER now=sampled;
     if (!now.QuadPart) QueryPerformanceCounter(&now);
     const double elapsedMs = (now.QuadPart - started.QuadPart) *
@@ -4681,7 +4685,7 @@ float LayoutTransitionProgress(const ViewState& state, bool active, LARGE_INTEGE
                                LARGE_INTEGER sampled = {}) {
     // Start the duration at the first successful submission, not while a row
     // result is still waiting behind Shell work or a full DXGI present queue.
-    if (!active) return 1.f;
+    if (!active || state.startupAnimationsSuppressed) return 1.f;
     return started.QuadPart ? EaseOutCubic(UiTransitionProgress(state, started,
         kUiTransitionDurationMs,sampled)) : 0.f;
 }
@@ -4819,7 +4823,7 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.itemOpacityAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
-        (includeClipboard && state.clipboardIconsVisible && !state.clipboardPaths.empty() && state.visible &&
+        (includeClipboard && !state.startupAnimationsSuppressed && state.clipboardIconsVisible && !state.clipboardPaths.empty() && state.visible &&
             state.inScope && state.detailsViewActive && PresentationVisible(state) && !PresentationMinimized(state)) ||
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
@@ -5067,7 +5071,7 @@ void QueueVisibleDataFrame(ViewState& state) {
 void RetargetZebraExtent(ViewState& state, float previous) {
     const float target = DocumentHeight(state);
     if (state.zebraExtentAnimating && fabsf(target-state.zebraExtentTo) < .01f) return;
-    state.zebraExtentAnimating = previous >= 0.f && state.visible &&
+    state.zebraExtentAnimating = !state.startupAnimationsSuppressed && previous >= 0.f && state.visible &&
         state.detailsViewActive && state.loaded && g_zebra.load(std::memory_order_relaxed) &&
         !g_emptyRows.load(std::memory_order_relaxed) &&
         g_zebraOpacity.load(std::memory_order_relaxed) > 0 && fabsf(target-previous) > .01f;
@@ -11276,6 +11280,7 @@ struct NativeViewInput {
         const auto generation=state->token;
         if (!explicitMode && !ReadNativeViewMode(*state,before)) return;
         if (!IsWindow(owner) || State(owner)!=state || state->nativeHwnd!=source || state->token!=generation) return;
+        state->startupAnimationsSuppressed=false;
         overlay=owner; native=source; token=generation;
     }
     struct InputOwner {
@@ -11563,6 +11568,7 @@ PROPERTYKEY HeaderSortKey(ViewState& state, int column) {
 void SortByHeader(ViewState& state, int column) {
     if (!state.folderView || column < 0 ||
         column >= static_cast<int>(state.columns.size())) return;
+    state.startupAnimationsSuppressed=false;
     PROPERTYKEY key = HeaderSortKey(state, column);
     // A second click reverses the direction. Dates default to newest first.
     const bool same = state.sortInitialized && SameProperty(key, state.sort.key);
@@ -12921,7 +12927,7 @@ void StartRowTransition(ViewState& state, std::vector<CapturedRow>&& captures,
     // list without exposing any underlying native empty/loading message.
     const bool enteringFromEmpty = oldTotal == 0 && state.total > 0 &&
                                    captures.empty();
-    if (state.zoomAnimating || !state.sections.empty() || !state.loaded || !state.visible || !state.detailsViewActive ||
+    if (state.startupAnimationsSuppressed || state.zoomAnimating || !state.sections.empty() || !state.loaded || !state.visible || !state.detailsViewActive ||
         !state.inScope || (state.emptyNative && !enteringFromEmpty) ||
         (captures.empty() && !enteringFromEmpty) ||
         oldRowPx != state.rowPx || state.rowPx <= 0 ||
@@ -13024,7 +13030,7 @@ void StartGroupingTransition(ViewState& state,
     // Zoom and reflow captures are presented visuals of the same items, so
     // their row height may differ and cells leaving the viewport keep moving.
     const bool presented = zoomLayout || reflow;
-    if ((state.zoomAnimating && !zoomLayout) || !state.loaded || !state.visible || !state.inScope ||
+    if (state.startupAnimationsSuppressed || (state.zoomAnimating && !zoomLayout) || !state.loaded || !state.visible || !state.inScope ||
         !state.detailsViewActive || (!presented && oldRowPx != state.rowPx) ||
         state.rowPx <= 0 || state.rename.editor || state.marqueePossible ||
         state.marqueeActive) return;
@@ -13578,7 +13584,7 @@ void StartColumnTransition(ViewState& state,
     PipelineScope pipeline(state.background,L"columns.transition",previous.size(),state.columns.size());
     const float headerFrom = state.headerPx;
     StopColumnTransition(state);
-    if (!state.visible || !state.detailsViewActive ||
+    if (state.startupAnimationsSuppressed || !state.visible || !state.detailsViewActive ||
         (!state.columnsView && !viewMode) ||
         (!viewMode && (previous.empty() || state.columns.empty()))) return;
     const float headerTo = state.columnsView ?
@@ -13725,6 +13731,7 @@ void FinishColumnTransition(ViewState& state) {
 // Mode intent is immediate. Only the header's extent and existing column
 // rectangles animate; no native layout, fitting, or provider work per frame.
 void SetColumnViewMode(ViewState& state, bool details, bool animate = true) {
+    animate &= !state.startupAnimationsSuppressed;
     if (state.columnsView == details) return;
     const bool reversing = state.columnModeTransition;
     if (state.columnTransitionActive) AdvanceColumnTransition(state);
@@ -17290,7 +17297,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
                     float opacity = 1.f) {
     if(!VisibleOpacity(opacity)) return;
     const bool pending = state.clipboardPaths.contains(e.path);
-    const float angle = pending ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
+    const float angle = pending && !state.startupAnimationsSuppressed ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
         state.clipboardIconElapsedMs,SelectionPathHash(e.path)) : 0.f;
     auto* overlay = OverlayArtwork(state, e, true);
     const auto draw = [&](IconRecord& icon, bool association) {
@@ -18520,7 +18527,7 @@ float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = f
         (g_dimDotFiles.load(std::memory_order_relaxed) && !entry.name.empty() && entry.name.front() == L'.') ||
         IsCutClipboardItem(state,entry.path);
     const float target = dim ? kDimmedItemContentOpacity : 1.f;
-    if (!animated) return target;
+    if (!animated || state.startupAnimationsSuppressed) return target;
     auto [it, inserted] = state.itemOpacityRows.try_emplace(entry.path);
     auto& motion = it->second;
     if (inserted || (motion.seen != state.itemOpacityPaint && motion.seen + 1 != state.itemOpacityPaint)) {
@@ -23336,6 +23343,7 @@ struct NativeFileCommandScope {
     }
     explicit NativeFileCommandScope(ViewState* state, UINT key=0) {
         if (!state || g_unloading.load(std::memory_order_relaxed)) return;
+        state->startupAnimationsSuppressed=false;
         owner=state->hwnd; lifetime=state->lifetimeToken;
         if (key) pipeline.emplace(state->background,L"file.native.key",key,state->token);
         ++state->nativeFileCommandDepth;
@@ -25434,6 +25442,7 @@ void BeginAnimatedZoom(ViewState& state, int height96);
 // Only an in-place change of the presented folder may reflow its grid cells.
 bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = true,
                      bool reflow = false) {
+    animate &= !state.startupAnimationsSuppressed;
     const UINT mode=requested.mode;
     const bool supported=IsGpuViewMode(mode,state.thisPcGpu), columns=mode==FVM_DETAILS;
     const bool grid=IsIconViewMode(mode,state.thisPcGpu);
@@ -25931,6 +25940,7 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
 // interpolate from the presented image on the zoom clock. A negative height
 // keeps the zoom preference: the caller already chose a new native layout.
 void BeginAnimatedZoom(ViewState& state, int height96) {
+    state.startupAnimationsSuppressed=false;
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     if (state.gridView) AdvanceRowHeight(state);
@@ -26052,6 +26062,7 @@ void NavigateCurrentShellTab(ViewState& state, UINT navigation) {
 void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
     state.lastManipulationActivity = GetTickCount64();
     if (wParam == 1) { // New genuine touchpad contact.
+        state.startupAnimationsSuppressed=false;
         if(g_pipelineTracing.load(std::memory_order_relaxed) || g_uiTransitionLogging.load(std::memory_order_relaxed)) {
             RECT host{}; GetWindowRect(state.hwnd,&host);
             const HWND above=GetWindow(state.hwnd,GW_HWNDPREV);
@@ -31011,6 +31022,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->lastPointerInput = lParam;
         s->lastInteractionTick = GetTickCount64();
     } else if (s && msg == WM_POINTERUPDATE) s->lastInteractionTick = GetTickCount64();
+    if (s && (msg==WM_LBUTTONDOWN || msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN ||
+        msg==WM_XBUTTONDOWN || msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL ||
+        msg==WM_KEYDOWN || msg==WM_SYSKEYDOWN || msg==WM_CHAR ||
+        msg==WM_POINTERDOWN || msg==WM_GESTURE))
+        s->startupAnimationsSuppressed=false;
     if (s && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
         msg == WM_MBUTTONDOWN || msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN ||
         msg == WM_MOUSEWHEEL || msg == WM_CANCELMODE || msg == WM_KILLFOCUS))
@@ -35410,6 +35426,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
              _wcsicmp(path.c_str(), s->immediateBackFrom.c_str()) != 0)) {
             ClearImmediateBackHint(*s);
         }
+        if (changedPath && s->firstContentSubmittedAt) s->startupAnimationsSuppressed=false;
         s->nativeHwnd = native;
         if (s->visible && s->inScope && s->detailsViewActive)
             SuppressNativeContent(*s, native);
@@ -35616,6 +35633,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     if (g_unloading.load(std::memory_order_acquire)) return;
     auto* s = new ViewState();
     s->startupStartedAt = GetTickCount64();
+    s->startupAnimationsSuppressed = true;
     s->nativeHwnd = native;
     s->frameHwnd = frame;
     s->activeTabHost = tabHost;

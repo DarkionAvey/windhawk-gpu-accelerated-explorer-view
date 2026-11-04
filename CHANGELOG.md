@@ -2,6 +2,8 @@
 
 ## 1.0.2 (unreleased)
 
+- Keep new-tab loading and delayed enrichment instant in every folder and view;
+  enable animations when the user interacts with that tab's view.
 - Expand a renamed item's collapsed section before revealing the item and
   opening its rename field, including newly created files and folders.
 

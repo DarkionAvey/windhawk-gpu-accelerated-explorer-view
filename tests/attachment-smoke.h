@@ -1371,6 +1371,8 @@ static void TestBackgroundTabStartup(const std::wstring& fixture) {
         }
         Check(Eventually([&] {pump();return next->loaded && next->firstContentSubmittedAt && !next->preparingTab;}),
             "background tab did not submit first content without activation or input");
+        Check(next->startupAnimationsSuppressed,
+            "background first content enabled animation before any view interaction");
         Check(IsWindowVisible(current->hwnd),"background preparation hid the current GPU window");
         Check(current->token==token && current->directoryToken==generation,"background preparation changed the current directory generation");
         Check(current->folderPath==directory && current->total==16 && next->folderPath==destination && next->total==3,

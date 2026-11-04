@@ -137,6 +137,27 @@ void GroupAnimationClock(bool rtl,bool grid) {
     // Fixed clock samples reproduce the last subpixel frames and arbitrarily
     // delayed paint/receipt delivery without depending on sleeps or GPU speed.
     input.qpcFrequency=output.qpcFrequency=1000000.;
+    {
+        input.startupAnimationsSuppressed=true;
+        LARGE_INTEGER started{},sample{};
+        started.QuadPart=1000000; sample.QuadPart=1000000+LONGLONG(kUiTransitionDurationMs*250);
+        Check(UiTransitionProgress(input,started,kUiTransitionDurationMs,sample)==1.f &&
+            LayoutTransitionProgress(input,true,{})==1.f,"startup retained partial UI/layout motion");
+        StartRowTransition(input,{},0,input.rowPx,input.scrollNow);
+        StartGroupingTransition(input,{}, {},input.rowPx);
+        StartColumnTransition(input,input.columns);
+        RetargetZebraExtent(input,0.f);
+        Check(!input.rowTransitionActive && !input.columnTransitionActive && !input.zebraExtentAnimating,
+            "startup provider enrichment started layout animation");
+        Entry hidden; hidden.path=L"startup-opacity-fixture"; hidden.attributes=FILE_ATTRIBUTE_HIDDEN;
+        Check(ItemContentOpacity(input,hidden,true)==kDimmedItemContentOpacity && input.itemOpacityRows.empty(),
+            "startup opacity retained an animation instead of its final appearance");
+        Check(CapturePresentationModel(input)->startupAnimationsSuppressed,
+            "startup policy did not cross the tab's presentation boundary");
+        input.startupAnimationsSuppressed=false;
+        Check(UiTransitionProgress(input,started,kUiTransitionDurationMs,sample)==.25f,
+            "startup policy disabled subsequent interactive animation");
+    }
     output.graphicsPaintSerial=output.lastAcceptedPaint=1;
     output.token=input.token; output.directoryToken=input.directoryToken;
     const float expanded=DocumentHeight(input);
