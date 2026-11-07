@@ -31,7 +31,7 @@ void Pump(ProviderSelectionFixture::Browser& host) {
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
         if (const HWND real = ::GetFocus(); real && NativeRenameEditor(state, real)) FocusFixture::focus = real;
         const UINT id = message.message;
-        if (message.hwnd == state.hwnd && ((id == WM_TIMER && message.wParam == kClickRenameTimerId) ||
+        if (message.hwnd == state.hwnd && ((id == WM_TIMER && (message.wParam == kClickRenameTimerId || message.wParam == kTimerId)) ||
             id == kMsgRenameDecision || id == kMsgNativeRenameStep ||
             id == kMsgNativeRenameEditor || id == kMsgCreationRefocus || id == kMsgPreparedSelection ||
             id == kMsgFlushDirectoryChanges || id == kMsgNativeCatalog))
@@ -664,4 +664,419 @@ static void TestRenameTextMetrics(const std::wstring& fixture) {
     Check(!failed, "the rename field's text size, spacing, caret or pointer differs from the list's text");
     std::cout << "PASS: long names in the rename field match the list's text width and height in details and list views, "
         "configured and fractional zoomed sizes, Explorer's and custom font families; caret and clicks follow the shown text\n";
+}
+
+// A new item enters rename immediately, as in Explorer, for each creation
+// route: the background menu's New > Folder, Ctrl+Shift+N (its recorded
+// intent), the command bar (focus on another control when the command runs)
+// and a grouped view. All of them run the Shell's New menu object; the
+// production hook on it, the creation notification and the overlay do the rest.
+static void TestCreatedItemRename(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    enum class Route { Menu, Shortcut, CommandBar, Grouped };
+    const auto label = [](Route route) {
+        return route == Route::Menu ? std::wstring(L"menu") : route == Route::Shortcut ? L"shortcut" :
+            route == Route::CommandBar ? L"command-bar" : L"grouped";
+    };
+    // Stand-in for the Windhawk hook: the production detour on the address
+    // the mod hooks, patched into the New menu object's shared vtable.
+    void* const target = NewMenuInvokeCommandAddress();
+    ComPtr<IContextMenu> newMenu;
+    Check(target && SUCCEEDED(CoCreateInstance(CLSID_NewMenu, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&newMenu))),
+        "Shell New menu object");
+    void** const slot = &(*reinterpret_cast<void***>(newMenu.Get()))[4];
+    Check(*slot == target, "New menu command address differs from its vtable");
+    const auto patch = [&](void* value) {
+        DWORD old = 0; VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old);
+        *slot = value; VirtualProtect(slot, sizeof(void*), old, &old);
+    };
+    g_newMenuInvokeOriginal = reinterpret_cast<NewMenuInvoke_t>(target);
+    patch(reinterpret_cast<void*>(&NewMenuInvokeHook));
+    struct Unpatch { std::function<void()> undo; ~Unpatch() { undo(); } } unpatch{[&] { patch(target); }};
+    bool failed = false;
+    for (Route route : {Route::Menu, Route::Shortcut, Route::CommandBar, Route::Grouped}) {
+        Regression::Scope scope("route=" + std::to_string(int(route)));
+        const auto root = std::filesystem::path(fixture) / (L"created-" + label(route));
+        CreateFiles(root, {L"alpha.txt", L"beta.jpg", L"gamma.txt"});
+        ProviderSelectionFixture::Browser host(true);
+        auto& state = host.state;
+        FocusFixture::Session focus(host.frame, state.hwnd);
+        host.Navigate(root.wstring(), 3);
+        SetTimer(state.hwnd, kTimerId, 250, nullptr); // The active overlay's idle timer.
+        const DWORD thread = GetCurrentThreadId();
+        const HWINEVENTHOOK lifecycle = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_REORDER, nullptr,
+            ShellViewEvent, GetCurrentProcessId(), thread, WINEVENT_OUTOFCONTEXT);
+        const HWINEVENTHOOK focusEvents = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_SELECTIONWITHIN, nullptr,
+            ShellViewEvent, GetCurrentProcessId(), thread, WINEVENT_OUTOFCONTEXT);
+        Check(lifecycle && focusEvents, "created item event hooks");
+        if (route == Route::Grouped) {
+            Check(SUCCEEDED(state.folderView->SetGroupBy(PKEY_ItemTypeText, TRUE)), "group by type");
+            RefreshSortFromExplorer(state, true, true);
+            Check(Eventually([&] { Pump(host); return state.grouping.enabled && !state.directoryPending && state.loaded; }, 30000),
+                "grouped view did not settle");
+        }
+        HWND commandBar = nullptr;
+        ::SetFocus(state.nativeHwnd); FocusFixture::focus = state.nativeHwnd;
+        if (route == Route::CommandBar) {
+            commandBar = CreateWindowExW(0, L"BUTTON", L"New", WS_CHILD | WS_VISIBLE, 0, 0, 60, 24,
+                host.frame, nullptr, GetModuleHandleW(nullptr), nullptr);
+            ::SetFocus(commandBar); FocusFixture::focus = commandBar;
+        }
+        if (route == Route::Shortcut) ArmInteractiveCreation(state, 1, L"Ctrl+Shift+N");
+        // Explorer's own New > Folder command on this view's background.
+        ComPtr<IShellView> view; ComPtr<IContextMenu> menu;
+        Check(SUCCEEDED(state.folderView.As(&view)) &&
+            SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&menu))), "background menu");
+        const HMENU popup = CreatePopupMenu();
+        Check(SUCCEEDED(menu->QueryContextMenu(popup, 0, 1, 0x7FFF, CMF_NORMAL)), "background menu items");
+        CMINVOKECOMMANDINFOEX invoke{sizeof(invoke)};
+        invoke.fMask = CMIC_MASK_UNICODE; invoke.hwnd = host.frame; invoke.nShow = SW_SHOWNORMAL;
+        invoke.lpVerb = CMDSTR_NEWFOLDERA; invoke.lpVerbW = CMDSTR_NEWFOLDERW;
+        const HRESULT created = menu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&invoke));
+        DestroyMenu(popup);
+        Check(SUCCEEDED(created), "New Folder command");
+        const bool opened = Eventually([&] { Pump(host); return state.rename.editor != nullptr; }, 15000);
+        std::wstring createdName;
+        for (const auto& item : std::filesystem::directory_iterator(root))
+            if (item.is_directory()) createdName = item.path().filename().wstring();
+        const HWND nativeEditor = FindWindowExW(FolderContentHost(state.nativeHwnd), nullptr, L"Edit", nullptr);
+        HWND realFocus = ::GetFocus(); wchar_t focusClass[48]{}; if (realFocus) GetClassNameW(realFocus, focusClass, 48);
+        const int row = createdName.empty() ? -1 : GpuRowForNativePath(state, (root / createdName).wstring());
+        std::wcout << L"CREATED route=" << label(route) << L" folder=" << createdName << L" editor=" << opened
+            << L" row=" << row << L" rows=" << state.total << L" loaded=" << state.loaded << L" pending=" << state.directoryPending
+            << L" nativeEditor=" << (nativeEditor != nullptr) << L" focus=" << focusClass
+            << L" nativeFocused=" << NativeRenameEditor(state, realFocus)
+            << L" editingIndex=" << state.rename.index << std::endl;
+        failed |= !opened || createdName.empty() || state.rename.index != row;
+        if (opened) {
+            // The field's item is drawn selected even while focus is elsewhere.
+            const HWND previous = FocusFixture::focus;
+            FocusFixture::focus = nullptr;
+            const bool shownSelected = SelectionFeedbackVisible(state) && state.rename.index >= 0 &&
+                state.selectedFlags[size_t(state.rename.index)];
+            FocusFixture::focus = previous;
+            if (!shownSelected) { int nativeCount = -1; state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount); std::wcout << L"  field item not shown selected: gpuSelected=" << state.selectedFlags.Count(0, state.selectedFlags.size()) << L" caret=" << state.selected << L" index=" << state.rename.index << L" native=" << nativeCount << L" importPending=" << state.nativeSelectionImportPending << L" unsafe=" << state.nativeSelectionUnsafe << std::endl; }
+            failed |= !shownSelected;
+        }
+        if (opened && route == Route::Grouped) {
+            // Toggling the item's section is input outside the field: it commits.
+            SetWindowTextW(state.rename.editor, L"toggled");
+            ToggleGroupSection(state, state.rowGroup[size_t(state.rename.index)]);
+            const bool committed = !state.rename.editor &&
+                Eventually([&] { Pump(host); return std::filesystem::exists(root / L"toggled"); }, 15000);
+            if (!committed) std::wcout << L"  section toggle did not commit the field" << std::endl;
+            failed |= !committed;
+        }
+        CancelRename(state);
+        for (int i = 0; i < 4; ++i) Pump(host);
+        UnhookWinEvent(lifecycle); UnhookWinEvent(focusEvents);
+        if (commandBar) DestroyWindow(commandBar);
+    }
+    Check(!failed, "a newly created item did not enter rename");
+    std::cout << "PASS: New > Folder, Ctrl+Shift+N, the command bar and a grouped view each open the new item's "
+        "rename field\n";
+}
+
+namespace RenameTypingFixture {
+inline thread_local HWND counted = nullptr;
+inline thread_local unsigned directDraws = 0;
+inline HDC WINAPI CountingGetDC(HWND hwnd) { if (hwnd && hwnd == counted) ++directDraws; return ::GetDC(hwnd); }
+// The physical pointer, where a real click on the field is.
+inline thread_local POINT cursor{};
+inline BOOL WINAPI CursorAt(LPPOINT point) { if (!point) return FALSE; *point = cursor; return TRUE; }
+inline DWORD WINAPI MessageAt() { return MAKELONG(static_cast<short>(cursor.x), static_cast<short>(cursor.y)); }
+// Point one module's imported functions at replacements (as a function hook
+// on them would), returning the slots patched so they can be restored.
+inline std::vector<std::pair<void**, void*>> PatchImports(HMODULE module, const std::map<std::string, void*>& replacements) {
+    std::vector<std::pair<void**, void*>> patched;
+    auto base = reinterpret_cast<BYTE*>(module);
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const auto& imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!imports.VirtualAddress) return patched;
+    for (auto d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + imports.VirtualAddress); d->Name; ++d) {
+        if (!d->OriginalFirstThunk) continue;
+        auto names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->OriginalFirstThunk);
+        auto slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            const char* name = reinterpret_cast<const char*>(reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name);
+            const auto found = replacements.find(name);
+            if (found == replacements.end()) continue;
+            void** slot = reinterpret_cast<void**>(&slots->u1.Function);
+            DWORD old = 0; VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old);
+            patched.push_back({slot, *slot}); *slot = found->second;
+            VirtualProtect(slot, sizeof(void*), old, &old);
+        }
+    }
+    return patched;
+}
+inline void Restore(const std::vector<std::pair<void**, void*>>& patched) {
+    for (const auto& [slot, value] : patched) {
+        DWORD old = 0; VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old);
+        *slot = value; VirtualProtect(slot, sizeof(void*), old, &old);
+    }
+}
+}
+
+// Typing in the rename field shows only the list-matched text: Explorer's
+// themed EDIT (COMCTL32 v6) draws typed text and drag selections through
+// GetDC, which goes offscreen while the field paints itself, so no GDI
+// glyphs flash between keystrokes. The hooks are installed on that module's
+// own imports, as Windhawk's hook on GetDC/ReleaseDC intercepts them.
+static void TestRenameTyping(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    const auto root = std::filesystem::path(fixture) / L"rename-typing";
+    CreateFiles(root, {L"Quarterly report draft.txt"});
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 1);
+    const auto factoryBefore = g_writeFactory;
+    struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
+    if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "rename typing fonts");
+    Check(MakeTextFormats(state) && state.textFormat, "rename typing list format");
+    // Explorer's own EDIT class: COMCTL32 v6 through its manifest.
+    const auto manifest = std::filesystem::path(__FILE__).parent_path() / L"rename-native-controls.manifest";
+    ACTCTXW settings{sizeof(settings)}; settings.lpSource = manifest.c_str();
+    const HANDLE context = CreateActCtxW(&settings);
+    ULONG_PTR cookie = 0;
+    Check(context != INVALID_HANDLE_VALUE && ActivateActCtx(context, &cookie), "themed native controls");
+    state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
+    Check(SyncNativeSelection(state), "rename typing selection");
+    BeginRename(state, 0);
+    DeactivateActCtx(0, cookie); ReleaseActCtx(context);
+    const HWND editor = state.rename.editor;
+    Check(editor != nullptr, "rename typing editor");
+    HMODULE editModule = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(GetClassLongPtrW(editor, GCLP_WNDPROC)), &editModule);
+    wchar_t modulePath[MAX_PATH]{}; GetModuleFileNameW(editModule, modulePath, MAX_PATH);
+    Check(StrStrIW(modulePath, L"comctl32") != nullptr, "the rename field is not Explorer's COMCTL32 EDIT");
+    // Stand-in for the Windhawk hooks: production detours, counted originals.
+    RenameTypingFixture::counted = editor;
+    g_getDcOriginal = &RenameTypingFixture::CountingGetDC;
+    g_releaseDcOriginal = &::ReleaseDC;
+    g_renameSinkAvailable = true;
+    const auto patched = RenameTypingFixture::PatchImports(editModule,
+        {{"GetDC", reinterpret_cast<void*>(&GetDcHook)}, {"ReleaseDC", reinterpret_cast<void*>(&ReleaseDcHook)}});
+    struct Unpatch { std::vector<std::pair<void**, void*>> slots; ~Unpatch() {
+        RenameTypingFixture::Restore(slots); g_renameSinkAvailable = false; RenameTypingFixture::counted = nullptr; } }
+        unpatch{patched};
+    Check(patched.size() >= 2, "COMCTL32 GetDC/ReleaseDC imports");
+    ::SetFocus(editor); FocusFixture::focus = editor;
+    SendMessageW(editor, EM_SETSEL, 9, 9);
+    RedrawWindow(editor, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    Check(t_renameSinkWindow == editor && t_renameSink, "the field's paint did not take over the EDIT's drawing");
+    RenameTypingFixture::directDraws = 0;
+    for (wchar_t c : std::wstring(L" final")) SendMessageW(editor, WM_CHAR, c, 0);
+    SendMessageW(editor, WM_KEYDOWN, VK_LEFT, 0); SendMessageW(editor, WM_KEYUP, VK_LEFT, 0);
+    SendMessageW(editor, WM_KEYDOWN, VK_BACK, 0); SendMessageW(editor, WM_CHAR, VK_BACK, 0);
+    const std::wstring typed = Text(editor);
+    std::wcout << L"TYPING text='" << typed << L"' direct EDIT draws=" << RenameTypingFixture::directDraws << std::endl;
+    Check(typed == L"Quarterly finl report draft" || typed == L"Quarterly fina report draft" ||
+        typed.find(L"fin") != std::wstring::npos, "typing did not reach the EDIT");
+    Check(RenameTypingFixture::directDraws == 0, "the EDIT drew GDI text on screen while typing");
+    // The caret still sits on the shown text after typing.
+    DWORD start = 0, end = 0;
+    SendMessageW(editor, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+    POINT caret{}; GetCaretPos(&caret);
+    const auto* line = RenameTextLineAt(state.rename, caret.y);
+    Check(line && std::abs(caret.x - LONG(std::lround(RenameDisplayedX(*line, int(end))))) <= 1,
+        "the caret left the shown text while typing");
+    // Placing and measuring the field inside the EDIT's own drawing (as a
+    // click does) leaves the EDIT's font on the DC it holds.
+    {
+        const HDC held = GetDcHook(editor);
+        const auto editFont = reinterpret_cast<HFONT>(SendMessageW(editor, WM_GETFONT, 0, 0));
+        Check(held == t_renameSink && editFont, "rename typing held DC");
+        SelectObject(held, editFont);
+        RenameEditorRect(state, state.rename.index);
+        state.rename.textLines.clear();
+        BuildRenameTextLines(state, editor);
+        const bool kept = GetCurrentObject(held, OBJ_FONT) == editFont;
+        ReleaseDcHook(editor, held);
+        Check(kept, "a nested field measurement reset the EDIT's font on its DC");
+    }
+    FocusFixture::focus = state.hwnd;
+    CancelRename(state);
+    Check(!t_renameSink, "the EDIT's drawing stayed redirected after the field closed");
+    std::cout << "PASS: typing in the rename field never draws the EDIT's GDI text on screen; the field paints "
+        "each edit and the caret stays on the shown text\n";
+}
+
+// A click in the field past the shown text ends at the text's end, also where
+// GDI advances run wider than the list's layout, with Explorer's EDIT given the
+// real pointer position (GetCursorPos/GetMessagePos) as well as the message's:
+// a real pointer is where the user sees the text, not where GDI lays it out.
+static void TestRenameClickEnd(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    const auto root = std::filesystem::path(fixture) / L"rename-click-end";
+    CreateFiles(root, {L"Quarterly report draft for the regional board meeting.txt"});
+    auto values = OptionCatalog::Defaults();
+    struct RestoreSettings { ~RestoreSettings() { SettingsFixture::values = nullptr; } } restoreSettings;
+    SettingsFixture::values = &values;
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 1);
+    const auto factoryBefore = g_writeFactory;
+    struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
+    if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "rename click fonts");
+    const auto manifest = std::filesystem::path(__FILE__).parent_path() / L"rename-native-controls.manifest";
+    ACTCTXW settings{sizeof(settings)}; settings.lpSource = manifest.c_str();
+    const HANDLE context = CreateActCtxW(&settings);
+    Check(context != INVALID_HANDLE_VALUE, "themed native controls");
+    struct ReleaseContext { HANDLE value; ~ReleaseContext() { ReleaseActCtx(value); } } releaseContext{context};
+    std::vector<std::pair<void**, void*>> patched;
+    struct Unpatch { std::vector<std::pair<void**, void*>>& slots; ~Unpatch() { RenameTypingFixture::Restore(slots); } } unpatch{patched};
+    bool drifted = false, failed = false;
+    for (const wchar_t* family : {L"Calibri", L"Segoe UI", L"Verdana", L"Arial"}) for (const wchar_t* size : {L"100", L"52"}) {
+        values[L"Appearance.fontFamily"] = family;
+        values[L"Appearance.fontSizePercent"] = size;
+        LoadSettings(); UpdateMetrics(state);
+        Check(MakeTextFormats(state) && state.textFormat, "rename click list format");
+        state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
+        Check(SyncNativeSelection(state), "rename click selection");
+        ULONG_PTR cookie = 0;
+        Check(ActivateActCtx(context, &cookie), "themed native controls activation");
+        BeginRename(state, 0);
+        DeactivateActCtx(0, cookie);
+        const HWND editor = state.rename.editor;
+        Check(editor != nullptr, "rename click editor");
+        if (patched.empty()) {
+            HMODULE editModule = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(GetClassLongPtrW(editor, GCLP_WNDPROC)), &editModule);
+            patched = RenameTypingFixture::PatchImports(editModule,
+                {{"GetCursorPos", reinterpret_cast<void*>(&RenameTypingFixture::CursorAt)},
+                 {"GetMessagePos", reinterpret_cast<void*>(&RenameTypingFixture::MessageAt)}});
+            Check(patched.size() >= 2, "COMCTL32 GetCursorPos/GetMessagePos imports");
+        }
+        const int length = GetWindowTextLengthW(editor);
+        if (SendMessageW(editor, EM_GETLINECOUNT, 0, 0) != 1 || !BuildRenameTextLines(state, editor)) {
+            CancelRename(state); continue;
+        }
+        const auto& last = state.rename.textLines.back();
+        const LONG shownEnd = LONG(std::lround(RenameDisplayedX(last, length))), gdiEnd = last.gdiLeft + last.gdiWidth;
+        if (gdiEnd < shownEnd + 4) { CancelRename(state); continue; }
+        drifted = true;
+        ::SetFocus(editor); FocusFixture::focus = editor;
+        const LONG y = last.top + state.rename.textLineHeight / 2;
+        for (LONG x : {shownEnd + 2, (shownEnd + gdiEnd) / 2, gdiEnd - 1}) {
+            SendMessageW(editor, EM_SETSEL, 0, 0);
+            RenameTypingFixture::cursor = {x, y};
+            ClientToScreen(editor, &RenameTypingFixture::cursor);
+            DWORD pressed = 0, start = 0, end = 0; POINT caret{};
+            SendMessageW(editor, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+            SendMessageW(editor, EM_GETSEL, 0, reinterpret_cast<LPARAM>(&pressed));
+            SendMessageW(editor, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+            SendMessageW(editor, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+            GetCaretPos(&caret);
+            std::wcout << L"CLICK-END family=" << family << L" size=" << size << L" shown end=" << shownEnd
+                << L" GDI end=" << gdiEnd << L" x=" << x << L" pressed=" << pressed << L" released=" << start << L"-" << end
+                << L" of " << length << L" caret=" << caret.x << std::endl;
+            failed |= start != DWORD(length) || end != DWORD(length) || std::abs(caret.x - shownEnd) > 1;
+        }
+        FocusFixture::focus = state.hwnd;
+        CancelRename(state);
+    }
+    Check(drifted, "no tested family's GDI advances run wider than the list's layout");
+    Check(!failed, "a click past the shown text did not leave the caret at its end");
+    std::cout << "PASS: a click past the shown text, with the pointer there, leaves the caret at the text's end where "
+        "GDI advances run wider than the list's layout\n";
+}
+
+// The field draws into the Explorer frame's surface beneath the GPU visual,
+// which paints no GDI. Closing or hiding the field puts back what that
+// surface held, so no field text or border shows through the list afterwards.
+static void TestRenameVacatedSurface(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    // A window surface exists only on screen: place the frame there on a
+    // private desktop.
+    wchar_t desktop[256]{}; DWORD length = 0;
+    Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop, sizeof(desktop), &length),
+        "vacated surface desktop identity");
+    if (!std::wstring_view(desktop).starts_with(L"gpu-overlay-vacated-surface-")) {
+        PrivateDesktopFixture::Run(L"vacated-surface", L"--test rename-vacated-surface", 600000);
+        return;
+    }
+    const auto root = std::filesystem::path(fixture) / L"rename-vacated";
+    CreateFiles(root, {L"Quarterly report draft for the regional board meeting.txt"});
+    ProviderSelectionFixture::Browser host(true);
+    SetWindowPos(host.frame, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 1);
+    // Explorer's frame clips its children; the overlay draws only through
+    // DirectComposition and the native view is suppressed.
+    SetWindowLongPtrW(host.frame, GWL_STYLE, GetWindowLongPtrW(host.frame, GWL_STYLE) | WS_CLIPCHILDREN);
+    Check(SetWindowSubclass(state.hwnd, +[](HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR)->LRESULT {
+        if (message == WM_ERASEBKGND) return 1;
+        if (message == WM_PAINT) { ValidateRect(hwnd, nullptr); return 0; }
+        return DefSubclassProc(hwnd, message, wp, lp);
+    }, 2, 0), "GPU overlay paint stand-in");
+    Check(SuppressNativeContent(state), "vacated surface native suppression");
+    const auto factoryBefore = g_writeFactory;
+    struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
+    if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "vacated surface fonts");
+    Check(MakeTextFormats(state) && state.textFormat, "vacated surface list format");
+    // A known surface under the view, read back through the frame's DC. The
+    // fixture's own Shell windows may repaint it after a close, so each field
+    // starts from it again.
+    const COLORREF ground = RGB(23, 117, 61);
+    const RECT view = RenameViewport(state, true);
+    const auto paintGround = [&] {
+        const HDC dc = GetDCEx(host.frame, nullptr, DCX_CACHE);
+        const HBRUSH brush = CreateSolidBrush(ground);
+        FillRect(dc, &view, brush);
+        DeleteObject(brush); ReleaseDC(host.frame, dc);
+    };
+    const auto foreign = [&](const RECT& area) {
+        const int w = area.right - area.left, h = area.bottom - area.top;
+        const HDC dc = GetDCEx(host.frame, nullptr, DCX_CACHE);
+        BITMAPINFO info{}; info.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
+        void* bits = nullptr;
+        const HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        const HDC memory = CreateCompatibleDC(dc);
+        const HGDIOBJ previous = SelectObject(memory, bitmap);
+        BitBlt(memory, 0, 0, w, h, dc, area.left, area.top, SRCCOPY);
+        GdiFlush();
+        const DWORD expected = (DWORD(GetRValue(ground)) << 16) | (DWORD(GetGValue(ground)) << 8) | GetBValue(ground);
+        size_t count = 0;
+        for (int i = 0; bits && i < w * h; ++i) count += (static_cast<const DWORD*>(bits)[i] & 0xFFFFFF) != expected;
+        SelectObject(memory, previous); DeleteDC(memory); DeleteObject(bitmap); ReleaseDC(host.frame, dc);
+        return count;
+    };
+    const auto open = [&] {
+        paintGround();
+        Check(foreign(view) == 0, "the frame surface under the view could not be read back");
+        state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
+        Check(SyncNativeSelection(state), "vacated surface selection");
+        BeginRename(state, 0);
+        Check(state.rename.editor != nullptr, "vacated surface editor");
+        RedrawWindow(state.rename.editor, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+        const RECT field = state.rename.frameRect;
+        const size_t drawn = foreign(field);
+        Check(drawn > 0, "the field did not draw into the frame surface");
+        return std::pair{field, drawn};
+    };
+    // Closing.
+    auto [closed, drawn] = open();
+    CancelRename(state);
+    const size_t afterClose = foreign(closed);
+    // Hiding while the view zooms.
+    auto [hidden, drawnAgain] = open();
+    state.zoomAnimating = true;
+    RepositionRenameEdit(state);
+    const size_t afterHide = foreign(hidden);
+    state.zoomAnimating = false;
+    CancelRename(state);
+    std::wcout << L"VACATED field pixels drawn=" << drawn << L" after close=" << afterClose
+        << L" drawn=" << drawnAgain << L" after hide=" << afterHide << std::endl;
+    Check(afterClose == 0, "the closed field's pixels stayed in the frame surface");
+    Check(afterHide == 0, "the hidden field's pixels stayed in the frame surface");
+    std::cout << "PASS: closing or hiding the rename field restores the frame surface beneath the GPU view\n";
 }

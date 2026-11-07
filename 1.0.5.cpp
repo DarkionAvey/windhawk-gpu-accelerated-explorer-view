@@ -637,6 +637,36 @@ using TranslateAcceleratorW_t = decltype(&TranslateAcceleratorW);
 TranslateAcceleratorW_t g_translateAcceleratorOriginal = nullptr;
 using RaiseStructureEvent_t = HRESULT(WINAPI*)(IRawElementProviderSimple*,StructureChangeType,int*,int);
 RaiseStructureEvent_t g_raiseStructureEventOriginal = nullptr;
+using GetDC_t = decltype(&GetDC);
+using ReleaseDC_t = decltype(&ReleaseDC);
+GetDC_t g_getDcOriginal = nullptr;
+ReleaseDC_t g_releaseDcOriginal = nullptr;
+// The rename EDIT draws typed text and drag selections straight through
+// GetDC. While its field shows list-matched text, that drawing goes to an
+// offscreen DC on the editor's thread; one WM_PAINT shows each edit instead.
+// Each GetDC is a nested save: a measurement inside the EDIT's own drawing
+// (field placement during a click) releases only its own font and clip,
+// never the EDIT's, which would then measure its caret with the system font.
+bool g_renameSinkAvailable = false; // Both hooks installed.
+thread_local HWND t_renameSinkWindow = nullptr;
+thread_local HDC t_renameSink = nullptr;
+HDC WINAPI GetDcHook(HWND hwnd) {
+    if (hwnd && hwnd == t_renameSinkWindow && t_renameSink && SaveDC(t_renameSink)) return t_renameSink;
+    return g_getDcOriginal(hwnd);
+}
+int WINAPI ReleaseDcHook(HWND hwnd, HDC dc) {
+    if (dc && dc == t_renameSink) return RestoreDC(dc, -1) ? 1 : 0;
+    return g_releaseDcOriginal(hwnd, dc);
+}
+void SetRenameTextSink(HWND editor, bool enabled) {
+    if (enabled && (!editor || !g_renameSinkAvailable || (t_renameSinkWindow == editor && t_renameSink))) return;
+    if (!enabled && t_renameSinkWindow != editor) return;
+    if (t_renameSink) DeleteDC(t_renameSink);
+    t_renameSink = nullptr; t_renameSinkWindow = nullptr;
+    if (!enabled) return;
+    t_renameSink = CreateCompatibleDC(nullptr);
+    if (t_renameSink) t_renameSinkWindow = editor;
+}
 HMODULE g_uiaModule = nullptr;
 // DirectWrite cleanup is explicit after tab workers drain. Explorer exit skips
 // Wh_ModUninit, so never release this COM object from CRT/loader-lock teardown.
@@ -3751,6 +3781,11 @@ struct ViewState {
         std::wstring path, folder;
         HWND tab = nullptr, native = nullptr;
         RECT frameRect{}; // Vacated GDI child area; also valid on external destroy.
+        // The frame surface under the rename viewport before the field drew
+        // there (physical frame client coordinates), and the frame client
+        // area that surface had.
+        HBITMAP underlay = nullptr;
+        RECT underlayRect{}, underlayFrame{};
         UINT_PTR epoch = 0;
         bool finishing = false;
         bool positioning = false;
@@ -4853,8 +4888,22 @@ int KeyboardFocusedSection(const ViewState& state) {
             if(state.sections[i].key==*state.keyboardSectionKey) return int(i);
     return -1;
 }
+void FinishRename(ViewState& state, bool commit);
+ViewState* State(HWND hwnd);
 void ToggleGroupSection(ViewState& state, int index) {
     if (index < 0 || index >= static_cast<int>(state.sections.size())) return;
+    // Toggling a section is input outside an open rename field: commit it
+    // first, as a click elsewhere does, before its row can be hidden.
+    if (state.rename.editor) {
+        const HWND owner = state.hwnd;
+        const auto key = state.sections[static_cast<size_t>(index)].key;
+        FinishRename(state, true);
+        if (State(owner) != &state) return;
+        index = -1; // The commit may have republished the sections.
+        for (size_t i = 0; i < state.sections.size(); ++i)
+            if (state.sections[i].key == key) { index = static_cast<int>(i); break; }
+        if (index < 0) return;
+    }
     auto& group = state.sections[static_cast<size_t>(index)];
     group.from = group.fraction;
     group.collapsed = !group.collapsed;
@@ -7775,10 +7824,11 @@ bool NativeContextMenuHasFeedback(const ViewState& state) {
         GetWindowThreadProcessId(popup, nullptr) == GetCurrentThreadId();
 }
 
+// The item whose rename field is open is always shown selected, including
+// while a new item's field is still taking keyboard focus from Shell.
 bool SelectionFeedbackVisible(const ViewState& state) {
     if (state.presentationOnly) return state.selectionFeedbackVisible;
-    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state) ||
-        (state.rename.editor && InputFocusOwner(state) == ViewInputOwner::RenameEditor);
+    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state) || state.rename.editor;
 }
 
 // All list-focus returns use the same ownership boundary. Native Shell focus
@@ -7801,8 +7851,14 @@ bool ReturnListInputFocus(ViewState& state, HWND previousOwner) {
     return State(owner) == &state && OverlayHasInputFocus(state);
 }
 
+// A New command may come from the list, its context menu or the command bar,
+// so input only has to stay in this foreground Explorer window until the new
+// item's field opens; switching to another window abandons the creation.
 bool CreationHasInputFocus(const ViewState& state) {
-    return OverlayHasInputFocus(state) || InputFocusOwner(state) == ViewInputOwner::NativeEditor;
+    if (OverlayHasInputFocus(state) || InputFocusOwner(state) == ViewInputOwner::NativeEditor) return true;
+    const HWND focus = GetFocus();
+    return ExplorerFrameHasForeground(state.frameHwnd) &&
+        (!focus || focus == state.frameHwnd || IsChild(state.frameHwnd, focus));
 }
 
 void RefreshInputFocusIndicators(ViewState& state) {
@@ -24137,6 +24193,83 @@ bool RenameSessionValid(const ViewState& state) {
 // Finalize ONLY after the physical EDIT HWND has been destroyed. Clearing
 // rename.editor earlier lost the sole reference if DestroyWindow failed,
 // leaking a visible FRAME child across tabs/directories indefinitely.
+// The field is a FRAME child: it draws into Explorer's frame surface beneath
+// the GPU visual, which paints no GDI, so nothing repaints what the field
+// leaves behind and it shows through the transparent list. Keep that
+// surface's content under the rename viewport from before the field, and put
+// it back wherever the field stops covering (close, move or hide).
+bool FramePhysicalRect(HWND frame, HWND from, RECT& rect) {
+    RECT client{};
+    if (!GetClientRect(frame, &client)) return false;
+    MapWindowPoints(frame, nullptr, reinterpret_cast<POINT*>(&client), 2);
+    MapWindowPoints(from, nullptr, reinterpret_cast<POINT*>(&rect), 2);
+    OffsetRect(&rect, -std::min(client.left, client.right), -std::min(client.top, client.bottom));
+    return true;
+}
+
+void ReleaseRenameUnderlay(ViewState::RenameSession& r) {
+    if (r.underlay) DeleteObject(r.underlay);
+    r.underlay = nullptr;
+    r.underlayRect = r.underlayFrame = {};
+}
+
+void CaptureRenameUnderlay(ViewState& state) {
+    auto& r = state.rename;
+    ReleaseRenameUnderlay(r);
+    RECT area = RenameViewport(state, false);
+    if (IsRectEmpty(&area) || !FramePhysicalRect(state.frameHwnd, state.hwnd, area)) return;
+    const HDC frame = GetDCEx(state.frameHwnd, nullptr, DCX_CACHE); // Children included.
+    if (!frame) return;
+    SetLayout(frame, 0);
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), area.right - area.left, -(area.bottom - area.top), 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(frame, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool copied = false;
+    if (const HDC memory = bitmap ? CreateCompatibleDC(frame) : nullptr) {
+        const HGDIOBJ previous = SelectObject(memory, bitmap);
+        copied = BitBlt(memory, 0, 0, area.right - area.left, area.bottom - area.top,
+            frame, area.left, area.top, SRCCOPY) != FALSE;
+        SelectObject(memory, previous);
+        DeleteDC(memory);
+    }
+    ReleaseDC(state.frameHwnd, frame);
+    if (!copied) { if (bitmap) DeleteObject(bitmap); return; }
+    r.underlay = bitmap;
+    r.underlayRect = area;
+    GetClientRect(state.frameHwnd, &r.underlayFrame);
+}
+
+// `vacated` is in frame client coordinates (frameRect). A visible field keeps
+// its current pixels; GDI siblings repaint over the restored area on their
+// own invalidation.
+void RestoreRenameUnderlay(ViewState& state, RECT vacated) {
+    auto& r = state.rename;
+    RECT frameClient{}, area{};
+    if (!r.underlay || IsRectEmpty(&vacated) || !IsWindow(state.frameHwnd) || !GetClientRect(state.frameHwnd, &frameClient))
+        return;
+    // A resized frame has a new surface, repainted by its owners.
+    if (!EqualRect(&frameClient, &r.underlayFrame)) { ReleaseRenameUnderlay(r); return; }
+    if (!FramePhysicalRect(state.frameHwnd, state.frameHwnd, vacated) ||
+        !IntersectRect(&area, &vacated, &r.underlayRect)) return;
+    const HDC frame = GetDCEx(state.frameHwnd, nullptr, DCX_CACHE);
+    if (!frame) return;
+    SetLayout(frame, 0);
+    IntersectClipRect(frame, area.left, area.top, area.right, area.bottom);
+    RECT live{};
+    if (r.editor && IsWindowVisible(r.editor) && GetWindowRect(r.editor, &live) &&
+        FramePhysicalRect(state.frameHwnd, nullptr, live))
+        ExcludeClipRect(frame, live.left, live.top, live.right, live.bottom);
+    if (const HDC memory = CreateCompatibleDC(frame)) {
+        const HGDIOBJ previous = SelectObject(memory, r.underlay);
+        BitBlt(frame, area.left, area.top, area.right - area.left, area.bottom - area.top,
+            memory, area.left - r.underlayRect.left, area.top - r.underlayRect.top, SRCCOPY);
+        SelectObject(memory, previous);
+        DeleteDC(memory);
+    }
+    ReleaseDC(state.frameHwnd, frame);
+}
+
 void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     auto& r = state.rename;
     if (r.editor != editor) return;
@@ -24146,6 +24279,7 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.notificationHost = nullptr;
     ++r.epoch; // Invalidate any queued Enter/Escape/focus messages.
     r.editor = nullptr;
+    SetRenameTextSink(editor, false);
     r.textTarget.Reset(); r.textLines.clear(); r.textLinesText.clear(); r.textLinesGdiFont = nullptr;
     r.caretShown = {-32768, -32768};
     if (r.font) { DeleteObject(r.font); r.font = nullptr; }
@@ -24167,6 +24301,8 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     // Every destruction path (Enter, Escape, tab close, Shell lifecycle, or
     // external HWND deletion) invalidates the same vacated FRAME rectangle.
     // The GDI editor was never part of the DirectComposition swapchain.
+    RestoreRenameUnderlay(state, r.frameRect);
+    ReleaseRenameUnderlay(r);
     if (IsWindow(state.frameHwnd))
         RedrawWindow(state.frameHwnd, &r.frameRect, nullptr,
             RDW_INVALIDATE | RDW_ALLCHILDREN);
@@ -24380,6 +24516,7 @@ bool RenameTextFallback(ViewState::RenameSession& r, const char* reason) {
         Wh_Log(L"[GPU rename] field keeps GDI text: %S", reason);
     r.textFallback = reason;
     r.textLines.clear(); r.textLinesText.clear();
+    SetRenameTextSink(r.editor, false); // The EDIT draws its own text again.
     return false;
 }
 
@@ -24446,7 +24583,6 @@ bool BuildRenameTextLines(ViewState& state, HWND edit) {
     r.textLinesRect = format;
     r.textLinesFont = state.fontPx; r.textLinesFace = state.textFaceSerial; r.textLinesGdiFont = r.font;
     r.textLineHeight = metrics.tmHeight;
-    r.textFallback = nullptr;
     return true;
 }
 
@@ -24509,7 +24645,11 @@ void RenameCaretToDisplay(ViewState& state, HWND edit) {
 
 bool PaintRenameText(ViewState& state, HWND edit, HDC dc, const RECT& clip) {
     auto& r = state.rename;
-    if (clip.right <= clip.left || clip.bottom <= clip.top || !BuildRenameTextLines(state, edit)) return false;
+    if (!BuildRenameTextLines(state, edit)) return false;
+    if (clip.right <= clip.left || clip.bottom <= clip.top) { // Nothing to draw; still the field's text path.
+        SetRenameTextSink(edit, true);
+        return true;
+    }
     if (!r.textFactory && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, r.textFactory.GetAddressOf())))
         return RenameTextFallback(r, "D2D factory");
     if (!r.textTarget) {
@@ -24559,6 +24699,8 @@ bool PaintRenameText(ViewState& state, HWND edit, HDC dc, const RECT& clip) {
     const HRESULT drawn = target->EndDraw();
     if (drawn == D2DERR_RECREATE_TARGET) target.Reset();
     if (FAILED(drawn)) return RenameTextFallback(r, "draw");
+    r.textFallback = nullptr;
+    SetRenameTextSink(edit, true); // This paint path now shows every edit.
     return true;
 }
 
@@ -24674,12 +24816,20 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (current && (msg==WM_SETFONT || msg==WM_SETTEXT)) state->rename.layoutValid=false;
     // The pointer addresses the displayed (list-matched) text; give the EDIT
     // the same character boundary in its own GDI coordinates.
+    if (current && msg == WM_POINTERDOWN && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] pointer-message press pointer=%u at=(%d,%d)", GET_POINTERID_WPARAM(wp),
+            GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
     const bool pointer = msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_LBUTTONDBLCLK ||
         msg == WM_MOUSEMOVE || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP;
     if (current && pointer && !state->rename.textMapping && !state->rename.finishing) {
         ScopedFlag mapping(state->rename.textMapping);
         POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        if (RenamePointerToEdit(*state, hwnd, point)) lp = MAKELPARAM(point.x, point.y);
+        const bool mapped = RenamePointerToEdit(*state, hwnd, point);
+        if (msg == WM_LBUTTONDOWN && g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU rename] press shown=(%d,%d) edit=(%ld,%ld) mapped=%d lines=%zu text=%S",
+                GET_X_LPARAM(lp), GET_Y_LPARAM(lp), point.x, point.y, mapped, state->rename.textLines.size(),
+                state->rename.textFallback ? state->rename.textFallback : "list");
+        if (mapped) lp = MAKELPARAM(point.x, point.y);
     }
     if (current) ++state->rename.nativeDispatchDepth;
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
@@ -24711,6 +24861,13 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         !state->rename.nativeDispatchDepth) {
         ScopedFlag mapping(state->rename.textMapping);
         RenameCaretToDisplay(*state, hwnd);
+        if ((msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) && g_perf.load(std::memory_order_relaxed)) {
+            DWORD start = 0, end = 0; POINT caret{};
+            SendMessageW(hwnd, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+            GetCaretPos(&caret);
+            Wh_Log(L"[GPU rename] %s selection=%lu-%lu of %d caret=(%ld,%ld)",
+                msg == WM_LBUTTONDOWN ? L"press" : L"release", start, end, GetWindowTextLengthW(hwnd), caret.x, caret.y);
+        }
     }
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
@@ -24743,7 +24900,17 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
     if (confirmed && GpuSelectionMatches(state, *confirmed)) state.confirmedNativeSelection = std::move(confirmed);
     // Establish the file identity in both models before the editor takes HWND
     // focus. Cancelling a native editor can clear Shell's selected/focused PIDL.
-    SyncNativeSelection(state);
+    // A just-created item can reach these rows before Explorer's view adds it
+    // (grouped views add it later); Explorer selects it itself when it does,
+    // so keep it selected here instead of rejecting it as a stale row.
+    bool nativeHasItem = true;
+    if (createdItem && state.folderView) {
+        PITEMID_CHILD child = nullptr;
+        nativeHasItem = SUCCEEDED(EntryChildPidl(state, state.entries[size_t(index)], &child)) && child &&
+            NativeSelectionTarget(state.folderView.Get(), child);
+        CoTaskMemFree(child);
+    }
+    if (nativeHasItem) SyncNativeSelection(state);
     // Shell calls can navigate/rebind the view while dispatching callbacks.
     // The old input owner must never open an editor in the new context.
     if (State(owner) != &state || state.lifetimeToken != lifetime || state.token != token ||
@@ -24838,6 +25005,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
     r.tab = state.activeTabHost;
     r.native = state.nativeHwnd;
     r.frameRect = rc;
+    CaptureRenameUnderlay(state); // The EDIT is still hidden.
     EnsurePipelineTrace(state);
     RefreshRenamePalette(state);
     // Buffered paint is per-thread; this session holds one balanced reference
@@ -25050,6 +25218,7 @@ void RepositionRenameEdit(ViewState& state) {
             rename.zoomHidden = true;
             rename.restoreZoomFocus = GetFocus() == rename.editor;
             SetPresentationVisibility(rename.editor, false);
+            RestoreRenameUnderlay(state, rename.frameRect);
             Redraw(state);
         }
         return; // No native sizing/font/painting work during compositor zoom.
@@ -25072,6 +25241,7 @@ void RepositionRenameEdit(ViewState& state) {
     RECT overlayArea = RenameViewport(state, false);
     if (IsRectEmpty(&overlayArea)) {
         SetPresentationVisibility(state.rename.editor, false);
+        RestoreRenameUnderlay(state, state.rename.frameRect);
         return;
     }
     RECT local = RenameEditorRect(state, state.rename.index, false);
@@ -25101,9 +25271,10 @@ void RepositionRenameEdit(ViewState& state) {
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
-    if (PositionOverlayWindows(state,nullptr,&local))
+    if (PositionOverlayWindows(state,nullptr,&local)) {
+        if (!EqualRect(&state.rename.frameRect, &local)) RestoreRenameUnderlay(state, state.rename.frameRect);
         state.rename.frameRect = local;
-    else {
+    } else {
         state.nativePresentationPending=true;
         RegisterViewAnimation(state);
         return; // Keep zoom suspension/focus intent until placement succeeds.
@@ -31438,6 +31609,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         ++s->inputSerial;
         CancelClickRename(*s);
     }
+    // A press anywhere on the view is outside the rename field: commit it
+    // before headers, scrollbars or rows handle the press.
+    const bool pressEndedRename = s && s->rename.editor && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+        msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN);
+    if (pressEndedRename) {
+        FinishRename(*s, true);
+        s = State(hwnd);
+    }
     if(s && s->startupAnimationsSuppressed) ObserveInitialLoadingInput(hwnd);
     if(s && s->keyboardSectionKey &&
         (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
@@ -33052,7 +33231,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             FinishColumnTransition(*s); // no moving divider during mouse drag
             // As in Explorer, a click that activates the window or ends an
             // edit is not the slow second click on an item.
-            const bool listHadInput = !s->rename.editor && OverlayHasInputFocus(*s) &&
+            const bool listHadInput = !pressEndedRename && !s->rename.editor && OverlayHasInputFocus(*s) &&
                 ExplorerFrameHasForeground(s->frameHwnd);
             if (s->rename.editor) FinishRename(*s, true);
             SetFocus(IsWindow(s->nativeHwnd) ? s->nativeHwnd : hwnd);
@@ -36671,6 +36850,55 @@ void NoteNativeNewFolderShortcut(const MSG& msg) {
     ArmInteractiveCreation(*state, 1, L"Ctrl+Shift+N");
 }
 
+// The context menu's New submenu, the command bar's New and Ctrl+Shift+N all
+// run the Shell's New menu object. Its command records the creation intent
+// for the view it creates into: one path for every route, matched by the
+// Shell's creation notification and opened as the GPU rename field.
+using NewMenuInvoke_t = HRESULT (STDMETHODCALLTYPE*)(IContextMenu*, LPCMINVOKECOMMANDINFO);
+NewMenuInvoke_t g_newMenuInvokeOriginal = nullptr;
+
+void ObserveNewItemCommand(IContextMenu* menu, LPCMINVOKECOMMANDINFO info) {
+    if (g_unloading.load(std::memory_order_acquire) || !menu || !info || info->cbSize < sizeof(CMINVOKECOMMANDINFO))
+        return;
+    // The view the menu was built for, else the window that invoked it.
+    HWND native = nullptr;
+    ComPtr<IObjectWithSite> site; ComPtr<IServiceProvider> services; ComPtr<IShellView> view;
+    if (SUCCEEDED(menu->QueryInterface(IID_PPV_ARGS(&site))) && SUCCEEDED(site->GetSite(IID_PPV_ARGS(&services))) &&
+        SUCCEEDED(services->QueryService(SID_SFolderView, IID_PPV_ARGS(&view))))
+        view->GetWindow(&native);
+    ViewState* state = native ? State(reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty))) : nullptr;
+    if (!state && info->hwnd) {
+        const HWND frame = GetAncestor(info->hwnd, GA_ROOT);
+        state = IsExplorerFrame(frame) ? State(OverlayUnder(frame)) : nullptr;
+    }
+    if (!state || (native && state->nativeHwnd != native)) return;
+    // The named verb creates a folder; the indexed entries are file templates.
+    const bool unicode = info->cbSize >= sizeof(CMINVOKECOMMANDINFOEX) && (info->fMask & CMIC_MASK_UNICODE) &&
+        reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info)->lpVerbW;
+    const bool folder = unicode ? !IS_INTRESOURCE(reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info)->lpVerbW) &&
+            !_wcsicmp(reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info)->lpVerbW, CMDSTR_NEWFOLDERW) :
+        !IS_INTRESOURCE(info->lpVerb) && !_stricmp(info->lpVerb, CMDSTR_NEWFOLDERA);
+    ArmInteractiveCreation(*state, folder ? 1u : 2u, L"New menu");
+}
+
+HRESULT STDMETHODCALLTYPE NewMenuInvokeHook(IContextMenu* menu, LPCMINVOKECOMMANDINFO info) {
+    ObserveNewItemCommand(menu, info);
+    return g_newMenuInvokeOriginal(menu, info);
+}
+
+// The Shell's New menu implementation, shared by all of its instances.
+void* NewMenuInvokeCommandAddress() {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    void* address = nullptr;
+    {
+        ComPtr<IContextMenu> menu;
+        if (SUCCEEDED(CoCreateInstance(CLSID_NewMenu, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&menu))))
+            address = (*reinterpret_cast<void***>(menu.Get()))[4]; // IContextMenu::InvokeCommand
+    }
+    if (SUCCEEDED(apartment)) CoUninitialize();
+    return address;
+}
+
 // Native-owned shortcuts remain native. Frame/GPU shortcuts use the active
 // view's selected group or folder, without moving focus or reading clipboard
 // formats. The Shell retains deferred/virtual data such as archive contents.
@@ -37987,6 +38215,16 @@ BOOL Wh_ModInit() {
     // Optional: keep the ordinary GPU list alive if this hook is unavailable.
     WindhawkUtils::SetFunctionHook(TranslateAcceleratorW,
         TranslateAcceleratorHook, &g_translateAcceleratorOriginal);
+    // Keeps the rename EDIT's direct GDI drawing off screen while its field
+    // shows list-matched text. Optional: without it, edits briefly show GDI text.
+    const bool getDcHooked = WindhawkUtils::SetFunctionHook(GetDC, GetDcHook, &g_getDcOriginal);
+    g_renameSinkAvailable = getDcHooked &&
+        WindhawkUtils::SetFunctionHook(ReleaseDC, ReleaseDcHook, &g_releaseDcOriginal);
+    // Every New command reaches the Shell's New menu object. Optional: without
+    // it, Ctrl+Shift+N and Explorer's own editor still start the rename.
+    if (void* invoke = NewMenuInvokeCommandAddress())
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<NewMenuInvoke_t>(invoke),
+            NewMenuInvokeHook, &g_newMenuInvokeOriginal);
     // Retain this early suppression hook: applying hooks after startup is slow
     // in Windhawk, and the first owned native dispatch must already be batched.
     // Install last: failure before this point cannot release a module while

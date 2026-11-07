@@ -16,10 +16,19 @@
 - Clicking the selected item's name again, slower than a double-click, starts
   renaming it after your double-click speed, as in Explorer. Only a click on
   the filename text itself counts, not the rest of the Name column.
+- A new folder or file starts renaming right away, as in Explorer, whether it
+  comes from the context menu's New, the command bar's New or Ctrl+Shift+N,
+  in grouped views too. The item being renamed always shows as selected;
+  toggling a section or clicking anywhere in the view finishes the rename,
+  and typing no longer flickers.
 - The rename field shows its text exactly like the list: the same font, size,
   letter spacing and weight (also with a custom font family or zoom), and the
   Text antialiasing option as the list applies it. Long names no longer
   appear wider or narrower; the caret and clicks follow the shown text.
+- Finishing, moving or zoom-hiding the rename field no longer leaves its text
+  or border showing through the list.
+- Clicking in the rename field no longer snaps the caret back or resizes the
+  field when the button is released, also with a zoomed list.
 
 - Collect three isolated retries after unsuccessful runtime checks, retain each
   attempt's diagnostics, and distinguish pending checks from test failures before

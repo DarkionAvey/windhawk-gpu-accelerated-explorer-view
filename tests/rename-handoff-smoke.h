@@ -259,11 +259,11 @@ static void TestRenameHandoff(const std::wstring& directory) {
         folder->probe=[&] {
             entered=true;
             Check(!IsWindow(oldEditor) && !state.rename.editor,"Shell rename started with a live field");
-            Check(lane->pending && !lane->pending->renameEditor && lane->pending->items->Find(0)->entry->name==L"new folder",
+            Check(lane->pending && !lane->pending->renameEditor && EntryLabel(*lane->pending->items->Find(0)->entry)==L"new folder",
                 "replacement label waited for SetNameOf/directory notification");
             state.entries[0].name=L"old folder"; // Reentrant stale names delivery.
             auto packet=CapturePresentationModel(state);
-            Check(packet->items->Find(0)->entry->name==L"new folder","reentrant old snapshot covered the pending new label");
+            Check(EntryLabel(*packet->items->Find(0)->entry)==L"new folder","reentrant old snapshot covered the pending new label");
         };
         OverlayProc(state.hwnd,WM_LBUTTONDOWN,0,MAKELPARAM(700,450));
         Check(entered && state.renamePreviewPath.empty() && state.entries[0].name==L"new folder" &&
