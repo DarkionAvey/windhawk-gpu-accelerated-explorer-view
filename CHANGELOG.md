@@ -13,6 +13,9 @@
   the click changes the selection. For large selections the field opens once
   Explorer holds the whole set; a rename that cannot be handed to Explorer is
   reported instead of being dropped.
+- Clicking the selected item's name again, slower than a double-click, starts
+  renaming it after your double-click speed, as in Explorer. Only a click on
+  the filename text itself counts, not the rest of the Name column.
 
 - Collect three isolated retries after unsuccessful runtime checks, retain each
   attempt's diagnostics, and distinguish pending checks from test failures before

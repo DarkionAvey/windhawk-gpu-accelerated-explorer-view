@@ -401,6 +401,7 @@ constexpr UINT_PTR kTimerId = 101;
 constexpr UINT_PTR kTypeSearchTimerId = 105;
 constexpr UINT_PTR kZoomAutoRefitTimerId = 106;
 constexpr UINT_PTR kTouchHoldTimerId = 107;
+constexpr UINT_PTR kClickRenameTimerId = 108;
 // Input batching only: expiry never substitutes for gesture/animation/data completion.
 constexpr UINT kZoomAutoRefitDebounceMs = 200;
 constexpr UINT kMsgDispose = WM_APP + 31;
@@ -3799,6 +3800,18 @@ struct ViewState {
     ULONGLONG dividerClickEpoch = 0;
     ULONGLONG dividerClickTick = 0;
     bool mousePressActive = false;
+    // Explorer's slow second click on the selected filename. The press
+    // records eligibility; the release arms a GetDoubleClickTime() wait that
+    // only proposes the rename: the timer revalidates every identity below.
+    bool mousePressRenameEligible = false;
+    unsigned long long inputSerial = 0; // Presses, keys, wheels and menus on this view.
+    struct ClickRename {
+        bool armed = false;
+        int row = -1;
+        std::wstring path;
+        unsigned long long token = 0, directory = 0, input = 0;
+        ULONGLONG epoch = 0, due = 0;
+    } clickRename;
     bool releasingPointerCapture = false;
     // Preserve click modifiers until release: an unselected row only becomes
     // selected after mouse-up, so that the same press cannot authorize OLE drag.
@@ -5175,6 +5188,7 @@ ClickSource CurrentClickSource(const ViewState& state) {
 
 void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
     state.mousePressBackground = false;
+    state.mousePressRenameEligible = false;
     if (folderChanged) {++state.mouseFolderEpoch; state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
     state.checkboxPress = -1;
     state.checkboxPressItem.clear();
@@ -17953,15 +17967,19 @@ float FilenameSelectionPadding(const ViewState& state) {
 // All normal and moving selection backgrounds use the SAME bounds and fill.
 // Interpolating this rectangle also handles filename-only pills with different
 // text widths, rather than jumping to the next filename's width.
+// `filenameText` requests the filename-only shape regardless of the option
+// (the slow-click rename target); otherwise Selection.filenameOnlySelection decides.
 D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
                           float nameLeft, float nameRight, float listRight,
                           float itemLeft = -1.f, float itemWidth = 0.f,
-                          SelectionShape* shape = nullptr, const Entry* entry = nullptr) {
+                          SelectionShape* shape = nullptr, const Entry* entry = nullptr,
+                          bool filenameText = false) {
     if (shape) *shape = {};
+    const bool filenameOnly = filenameText || ViewOptionEnabled(state,g_filenameOnly);
     if (state.gridView) {
         const auto geometry = LayoutItem(state, {top, row, 1.f,
             itemLeft >= 0.f ? itemLeft : DocumentRowLeft(state, index), itemWidth});
-        if (!ViewOptionEnabled(state,g_filenameOnly)) return geometry.cell;
+        if (!filenameOnly) return geometry.cell;
         if (!entry && index >= 0 && index < state.total)
             entry = &ModelEntry(state,index);
         if (!entry || EntryLabel(*entry).empty()) return {};
@@ -18049,7 +18067,7 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         return result.bounds;
     }
     D2D1_RECT_F rc = RowHighlightRect(state, top, row);
-    if (ViewOptionEnabled(state,g_filenameOnly)) {
+    if (filenameOnly) {
         const auto usage=LayoutDriveBar(state,index,LayoutItem(state,{top,row,1.f}));
         if (usage.visible) nameRight=std::min(nameRight,usage.labelRight);
         const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
@@ -18106,18 +18124,36 @@ void InterpolateSelectionBounds(const ViewState& state, D2D1_RECT_F& rc,
 
 // Derive the same logical X bounds as Paint. Used only on keyboard input to
 // capture the currently visible shape before a rapid-arrow retarget.
-D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = true) {
+D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = true,
+                                 SelectionShape* shape = nullptr, bool filenameText = false) {
     const float listRight = ListEndX(state);
     const float left = static_cast<float>(NameTextOrigin(state));
     const float nameEnd = ColumnsPresented(state) ? NameColumnEnd(state) : listRight;
     const float right = std::min(nameEnd - 8.f, listRight - 8.f);
     D2D1_RECT_F rc = SelectionRect(state, index,
         state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
-        DisplayRowHeight(state, index), left, right, listRight);
+        DisplayRowHeight(state, index), left, right, listRight, -1.f, 0.f, shape, nullptr, filenameText);
     if (animated && state.keyboardSelectionAnimating) {
         InterpolateSelectionBounds(state, rc, KeyboardSelectionProgress(state));
     }
     return rc;
+}
+
+int RowFromPoint(ViewState& state, int y, int x);
+// The slow-click rename target is the filename text itself: the shape that
+// Selection.filenameOnlySelection highlights (wrapped grid labels per line),
+// not Explorer's whole Name column. `point` is in client pixels.
+bool PointOnFilenameText(ViewState& state, int index, POINT point) {
+    if (index < 0 || index >= state.total || static_cast<size_t>(index) >= state.entries.size() ||
+        !InsideListX(state, point.x) || RowFromPoint(state, point.y, point.x) != index) return false;
+    SelectionShape shape;
+    const auto bounds = CurrentSelectionRect(state, index, false, &shape, true);
+    const float x = static_cast<float>(LogicalX(state, point.x)), y = static_cast<float>(point.y);
+    const auto inside = [&](const D2D1_RECT_F& rc) { return x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom; };
+    if (!shape.count) return inside(bounds);
+    for (unsigned i = 0; i < shape.count; ++i)
+        if (inside(shape.lines[i])) return true;
+    return false;
 }
 
 // Pointer hover and keyboard selection use the same SelectionRect geometry,
@@ -24827,6 +24863,59 @@ void RepositionRenameEdit(ViewState& state) {
     }
 }
 
+void CancelClickRename(ViewState& state) {
+    if (!state.clickRename.armed) return;
+    state.clickRename = {};
+    if (IsWindow(state.hwnd)) KillTimer(state.hwnd, kClickRenameTimerId);
+}
+
+// Explorer starts its label edit GetDoubleClickTime() after the release of a
+// slow second click on the selected item (measured against DefView). The
+// user's current Mouse setting is read for each click, never cached.
+void ArmClickRename(ViewState& state, int row) {
+    CancelClickRename(state);
+    if (row < 0 || row >= state.total || static_cast<size_t>(row) >= state.entries.size()) return;
+    const UINT wait = GetDoubleClickTime();
+    auto& click = state.clickRename;
+    click.row = row;
+    click.path = state.entries[static_cast<size_t>(row)].path;
+    click.token = state.token; click.directory = state.directoryToken;
+    click.epoch = state.mouseFolderEpoch; click.input = state.inputSerial;
+    click.due = GetTickCount64() + wait;
+    click.armed = SetTimer(state.hwnd, kClickRenameTimerId, wait, nullptr) != 0;
+    if (!click.armed) state.clickRename = {};
+}
+
+// The timer only proposes. KillTimer leaves an already queued WM_TIMER, so a
+// wake is honored solely for the armed click it belongs to, after its full
+// wait, while the same tab, folder, item and single selection still own
+// input and nothing was pressed, typed or wheeled since the release.
+void FireClickRename(ViewState& state) {
+    KillTimer(state.hwnd, kClickRenameTimerId);
+    auto& click = state.clickRename;
+    if (!click.armed) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < click.due) {
+        // An older wake queued before this arm; keep waiting for this one.
+        SetTimer(state.hwnd, kClickRenameTimerId, static_cast<UINT>(click.due - now), nullptr);
+        return;
+    }
+    const auto armed = std::exchange(click, ViewState::ClickRename{});
+    const int row = armed.row;
+    if (g_unloading.load(std::memory_order_acquire) || armed.token != state.token ||
+        armed.directory != state.directoryToken || armed.epoch != state.mouseFolderEpoch ||
+        armed.input != state.inputSerial || row < 0 || row >= state.total ||
+        static_cast<size_t>(row) >= state.entries.size() || state.entries[static_cast<size_t>(row)].path != armed.path ||
+        state.selected != row || static_cast<size_t>(row) >= state.selectedFlags.size() ||
+        !state.selectedFlags[static_cast<size_t>(row)] || state.selectedFlags.Count(0, state.selectedFlags.size()) != 1 ||
+        state.rename.editor || state.mousePressActive || GetCapture() == state.hwnd || state.marqueePossible ||
+        state.shellDragRunning || state.pendingNativeSelection || state.optimisticStartedAt ||
+        (state.nativeRenameHold && state.nativeRenameHold == state.token) || !state.visible || !state.inScope ||
+        !state.detailsViewActive || !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd) ||
+        !OverlayHasInputFocus(state)) return;
+    BeginRename(state, row);
+}
+
 // A committed name is never dropped silently; the single-item path reports
 // its Shell failure the same way.
 void ReportMultipleRenameFailure(ViewState& state, const wchar_t* reason, HRESULT hr = S_OK) {
@@ -25851,6 +25940,7 @@ void SetActive(HWND hwnd, bool on) {
         s->columnMenuPending = false;
         s->zebraExtentAnimating = false;
         CancelRename(*s);
+        CancelClickRename(*s);
         CancelAutoRefit(*s);
         CancelColumnDrag(*s);
         ResetMouseGestureForNavigation(*s);
@@ -25972,6 +26062,7 @@ void SetActive(HWND hwnd, bool on) {
         s->swipeEdgeX = 0.f;
         ClearSwipeFeedback(*s);
         CancelRename(*s);
+        CancelClickRename(*s);
         RestoreNativeContent(*s);
         StopScrollAnimation(*s);
         s->marqueeFading = false;
@@ -31085,6 +31176,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    // Any newer press, double-click, key, wheel or menu request on this view
+    // supersedes a pending slow-click rename (validated again when it fires).
+    if (s && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN ||
+        msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN || msg == WM_POINTERDOWN || msg == WM_KEYDOWN ||
+        msg == WM_SYSKEYDOWN || msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL || msg == WM_CONTEXTMENU ||
+        msg == WM_CANCELMODE)) {
+        ++s->inputSerial;
+        CancelClickRename(*s);
+    }
     if(s && s->startupAnimationsSuppressed) ObserveInitialLoadingInput(hwnd);
     if(s && s->keyboardSectionKey &&
         (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
@@ -32015,6 +32115,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             BeginTouchDrag(*s);
         return 0;
     case WM_TIMER:
+        if (wParam == kClickRenameTimerId) {
+            if (s) FireClickRename(*s);
+            else KillTimer(hwnd, kClickRenameTimerId);
+            return 0;
+        }
         if (wParam == kTouchHoldTimerId) {
             if (s) TouchHoldDeadline(*s);
             return 0;
@@ -32083,6 +32188,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!TabOwnsActiveView(*s)) {
                 s->tabResumeRefreshToken = s->token;
                 if (s->rename.editor) CancelRename(*s);
+                CancelClickRename(*s);
                 if (IsWindowVisible(hwnd)) SetPresentationVisibility(hwnd, false);
                 // Preserve the original inactive-tab frame shutdown except
                 // for the short HWND-only switch probe. Otherwise a hidden
@@ -32691,6 +32797,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 !OnHorizontalBar(*s, pressX, pressY))
                 s->mousePressRow = RowFromPoint(*s, pressY, pressX);
             FinishColumnTransition(*s); // no moving divider during mouse drag
+            // As in Explorer, a click that activates the window or ends an
+            // edit is not the slow second click on an item.
+            const bool listHadInput = !s->rename.editor && OverlayHasInputFocus(*s) &&
+                ExplorerFrameHasForeground(s->frameHwnd);
             if (s->rename.editor) FinishRename(*s, true);
             SetFocus(IsWindow(s->nativeHwnd) ? s->nativeHwnd : hwnd);
             const int y = GET_Y_LPARAM(lParam);
@@ -32749,6 +32859,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         s->shellDragStart = POINT{x, y};
                         s->shellDragCollapseOnClick = !control && !shift;
                         s->shellDragToggleOnClick = control && !shift;
+                        // Only the sole selected, focused item, pressed on its
+                        // filename text by a mouse button (not a touch tap),
+                        // may become a rename.
+                        s->mousePressRenameEligible = listHadInput && !control && !shift &&
+                            !s->clickPolicy.singleClick && s->mousePressSource != ClickSource::Touch &&
+                            s->selected == index && s->selectedFlags.Count(0, s->selectedFlags.size()) == 1 &&
+                            PointOnFilenameText(*s, index, POINT{x, y});
                     } else {
                         // An unselected row is a possible marquee origin.
                         // Defer ordinary click/Shift/Ctrl selection until UP;
@@ -32850,6 +32967,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool pressControl = s->mousePressControl;
         const bool pressShift = s->mousePressShift;
         const auto pressSource = s->mousePressSource;
+        const bool renameEligible = s->mousePressRenameEligible; // Capture release resets press state.
         if (s->shellDragRow >= 0) {
             const int pressed = s->shellDragRow;
             const bool sameItem = s->mousePressRow == pressed &&
@@ -32879,6 +32997,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->mouseClickEpoch = epoch;
                 s->mouseClickTick = GetTickCount64();
                 if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,pressed);
+                // Released on the same filename text: Explorer's slow-click
+                // rename, unless a double-click or other input supersedes it.
+                else if (renameEligible && s->mouseFolderEpoch == epoch &&
+                    PointOnFilenameText(*s, pressed, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}))
+                    ArmClickRename(*s, pressed);
             }
             return 0;
         }
@@ -33830,6 +33953,7 @@ void SynchronizeTabSurfaces(HWND frame, bool activate) {
             if (state->manipulationFrameActive || state->touch.active) StopTouchpad(*state, false);
             state->columnMenuPending = false;
             if (state->rename.editor) CancelRename(*state);
+            CancelClickRename(*state);
             const bool wasVisible = IsWindowVisible(hwnd) != FALSE;
             if (wasVisible) {
                 const ULONGLONG startHide = GetTickCount64();
@@ -34254,6 +34378,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.renamePreviewPath.clear(); state.renamePreviewName.clear(); state.renamePreviewToken = 0;
     state.nativeRenameText.clear(); state.nativeRenameToken = 0;
     state.nativeRenameHold = 0; state.nativeRenameSelectionDeferred = false;
+    CancelClickRename(state);
     if (state.manipulationFrameActive || state.touch.active) StopTouchpad(state, false);
     state.background->capacityGeneration.store(0, std::memory_order_release);
     state.capacityToken = 0;

@@ -31,7 +31,8 @@ void Pump(ProviderSelectionFixture::Browser& host) {
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
         if (const HWND real = ::GetFocus(); real && NativeRenameEditor(state, real)) FocusFixture::focus = real;
         const UINT id = message.message;
-        if (message.hwnd == state.hwnd && (id == kMsgRenameDecision || id == kMsgNativeRenameStep ||
+        if (message.hwnd == state.hwnd && ((id == WM_TIMER && message.wParam == kClickRenameTimerId) ||
+            id == kMsgRenameDecision || id == kMsgNativeRenameStep ||
             id == kMsgNativeRenameEditor || id == kMsgCreationRefocus || id == kMsgPreparedSelection ||
             id == kMsgFlushDirectoryChanges || id == kMsgNativeCatalog))
             OverlayProc(state.hwnd, id, message.wParam, message.lParam);
@@ -262,4 +263,110 @@ static void TestNativeMultipleRename(const std::wstring& fixture) {
     std::cout << "PASS: group rename by DefView's hidden editor for 3 items and for 50 files + 50 folders, each "
         "committed by Enter, a row click and an empty-space click; large sets open the editor after Explorer "
         "holds them, whole set renamed, kinds and extensions kept, selection held then applied, native view never shown\n";
+}
+
+// Explorer's slow second click on the selected item's name. The production
+// window procedure receives the press/release, a real overlay timer delivers
+// the wake, and the hit target is the filename text, not the Name column.
+static void TestClickRename(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    const auto root = std::filesystem::path(fixture) / L"click-rename";
+    CreateFiles(root, {L"alpha.txt", L"beta.txt", L"gamma.txt"});
+    ProviderSelectionFixture::Browser host, other;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 3);
+    other.Navigate(root.wstring(), 3);
+    const auto select = [&](std::initializer_list<int> rows, int caret) {
+        CancelRename(state);
+        state.selectedFlags.Fill(0);
+        for (int row : rows) state.selectedFlags[size_t(row)] = 1;
+        state.selected = state.anchor = caret;
+        Check(SyncNativeSelection(state), "click rename selection");
+        FocusFixture::focus = state.nativeHwnd; FocusFixture::foreground = host.frame;
+    };
+    // Independent geometry: the filename-only highlight's own bounds.
+    const auto textPoint = [&](int row) {
+        SelectionShape shape;
+        const auto rc = CurrentSelectionRect(state, row, false, &shape, true);
+        const LONG x = LONG((rc.left + rc.right) / 2), y = LONG((rc.top + rc.bottom) / 2);
+        return POINT{state.rtlLayout ? LogicalX(state, x) : x, y};
+    };
+    const auto click = [&](POINT point) {
+        OverlayProc(state.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(point.x, point.y));
+        OverlayProc(state.hwnd, WM_LBUTTONUP, 0, MAKELPARAM(point.x, point.y));
+    };
+    const auto settle = [&] { for (int i = 0; i < 4; ++i) Pump(host); };
+    const int alpha = Row(state, L"alpha.txt"), beta = Row(state, L"beta.txt");
+
+    // A slow second click on the filename text arms exactly the system
+    // double-click time from its release, then opens the editor.
+    select({alpha}, alpha);
+    const ULONGLONG before = GetTickCount64();
+    click(textPoint(alpha));
+    const ULONGLONG after = GetTickCount64();
+    const UINT wait = GetDoubleClickTime();
+    Check(state.clickRename.armed && state.clickRename.row == alpha && !state.rename.editor,
+        "slow click on the selected filename did not arm a rename");
+    Check(state.clickRename.due >= before + wait && state.clickRename.due <= after + wait,
+        "rename wait differs from the double-click time");
+    // A wake queued before this arm (KillTimer keeps queued WM_TIMERs) must not open it early.
+    if (GetTickCount64() < state.clickRename.due) {
+        OverlayProc(state.hwnd, WM_TIMER, kClickRenameTimerId, 0);
+        Check(state.clickRename.armed && !state.rename.editor, "an early timer wake opened the rename");
+    }
+    // Another tab's overlay owns its own timer; its wake renames nothing here.
+    OverlayProc(other.state.hwnd, WM_TIMER, kClickRenameTimerId, 0);
+    Check(state.clickRename.armed && !other.state.rename.editor, "another tab's timer affected this click");
+    Check(Eventually([&] { Pump(host); return state.rename.editor != nullptr; }, 30000),
+        "slow click did not open the rename editor");
+    Check(state.rename.index == alpha && Text(state.rename.editor) == EntryLabel(state.entries[size_t(alpha)]),
+        "slow click renamed a different item");
+    CancelRename(state); settle();
+
+    // The Name column outside the filename text selects but never renames.
+    select({alpha}, alpha);
+    SelectionShape shape;
+    const auto text = CurrentSelectionRect(state, alpha, false, &shape, true);
+    const int dpi = ViewDpi(state);
+    const LONG outsideLogical = LONG(text.right) + Scale96(24, dpi);
+    const POINT outside{state.rtlLayout ? LogicalX(state, outsideLogical) : outsideLogical, LONG((text.top + text.bottom) / 2)};
+    Check(outsideLogical < LONG(NameColumnEnd(state)) && RowFromPoint(state, outside.y, outside.x) == alpha &&
+        !PointOnFilenameText(state, alpha, outside), "fixture point is not in the Name column beside the text");
+    click(outside);
+    Check(!state.clickRename.armed, "a click beside the filename armed a rename");
+
+    // Any later input supersedes the pending rename.
+    select({alpha}, alpha);
+    click(textPoint(alpha));
+    Check(state.clickRename.armed, "second slow click did not arm");
+    OverlayProc(state.hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 0), MAKELPARAM(textPoint(alpha).x, textPoint(alpha).y));
+    Check(!state.clickRename.armed, "wheel input left the rename armed");
+
+    // Identity checked at the wake: a changed selection or lost focus renames nothing.
+    for (int scenario = 0; scenario < 2; ++scenario) {
+        select({alpha}, alpha);
+        click(textPoint(alpha));
+        Check(state.clickRename.armed, "slow click did not arm for the stale-identity check");
+        if (scenario == 0) { state.selectedFlags.Fill(0); state.selectedFlags[size_t(beta)] = 1; state.selected = state.anchor = beta; }
+        else FocusFixture::focus = nullptr;
+        const ULONGLONG due = state.clickRename.due;
+        Check(Eventually([&] { Pump(host); return GetTickCount64() >= due && !state.clickRename.armed; }, 30000),
+            "the pending rename never resolved");
+        Check(!state.rename.editor, scenario == 0 ? "a stale selection was renamed" : "a rename opened without input focus");
+    }
+
+    // A multiple selection, or a click that only gives the list focus, never renames.
+    select({alpha, beta}, alpha);
+    click(textPoint(alpha));
+    Check(!state.clickRename.armed, "a click in a multiple selection armed a rename");
+    select({alpha}, alpha);
+    FocusFixture::focus = nullptr;
+    click(textPoint(alpha));
+    Check(!state.clickRename.armed, "a click that focused the list armed a rename");
+    settle();
+    Check(!state.rename.editor, "an editor opened without a valid slow click");
+    std::cout << "PASS: slow click on the selected filename text opens rename after GetDoubleClickTime() (" << wait
+        << " ms) from release; Name column beside the text, multiple selections, focusing clicks, later input, "
+        "stale selection/focus, early and foreign-tab timer wakes never rename\n";
 }
