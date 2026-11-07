@@ -149,6 +149,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("shell-file-labels", PARALLEL, TestShellFileLabels(fixture)),
     REGRESSION("native-multiple-rename", PARALLEL, TestNativeMultipleRename(fixture)),
     REGRESSION("click-rename", PARALLEL, TestClickRename(fixture)),
+    REGRESSION("rename-text-weight", PARALLEL, TestRenameTextWeight(fixture)),
     REGRESSION("burst-row-continuity", PARALLEL, TestBurstRowContinuity(fixture)),
     REGRESSION("sort-details", PARALLEL, TestSortDetails(fixture)),
     REGRESSION("shell-size-details", PARALLEL, TestShellSizeDetails(fixture)),

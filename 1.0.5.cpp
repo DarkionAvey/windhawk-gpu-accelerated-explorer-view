@@ -3769,6 +3769,14 @@ struct ViewState {
         bool refocusQueued = false;
         ULONGLONG startedAt = 0;
         ULONGLONG lastRefocusAt = 0;
+        // The field draws its text like the list (DirectWrite, the view's
+        // rendering parameters and antialias mode); the EDIT keeps editing.
+        ComPtr<ID2D1Factory> textFactory;
+        ComPtr<ID2D1DCRenderTarget> textTarget;
+        ComPtr<IDWriteTextFormat> textFormat;
+        HFONT textFormatFont = nullptr;
+        const char* textFallback = nullptr; // Why the last paint kept GDI text (diagnostics).
+
     } rename;
     // A label handoff while the owner STA is inside SetNameOf. A reentrant
     // directory delivery must not put the old name back above the closed EDIT.
@@ -24117,6 +24125,7 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.notificationHost = nullptr;
     ++r.epoch; // Invalidate any queued Enter/Escape/focus messages.
     r.editor = nullptr;
+    r.textTarget.Reset(); r.textFormat.Reset(); r.textFormatFont = nullptr;
     if (r.font) { DeleteObject(r.font); r.font = nullptr; }
     if (r.background) { DeleteObject(r.background); r.background = nullptr; }
     r.backgroundColor = CLR_INVALID;
@@ -24336,6 +24345,126 @@ void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) 
     rename.layoutSize={rect.right-rect.left,rect.bottom-rect.top}; rename.layoutValid=true;
 }
 
+// Draw the field's text as the list draws filenames: DirectWrite with this
+// view's rendering parameters and the antialias mode the Text antialiasing
+// option resolves to on the list's transparent surface (Windows default is
+// grayscale there). GDI's rasterizer is heavier at the same weight. Glyphs use
+// GDI-compatible metrics and must land where the EDIT reports each character,
+// so its caret and selection stay exact; otherwise its own GDI text is kept.
+bool RenameTextFallback(ViewState::RenameSession& r, const char* reason) {
+    if (r.textFallback != reason && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] field keeps GDI text: %S", reason);
+    r.textFallback = reason;
+    return false;
+}
+bool PaintRenameText(ViewState& state, HWND edit, HDC dc, const RECT& clip) {
+    auto& r = state.rename;
+    if (!g_writeFactory || !r.font || edit != r.editor || clip.right <= clip.left || clip.bottom <= clip.top) return RenameTextFallback(r, "unavailable");
+    const int length = GetWindowTextLengthW(edit);
+    if (length < 0 || length >= 32768) return RenameTextFallback(r, "text length");
+    std::wstring text(size_t(length) + 1, L'\0');
+    text.resize(GetWindowTextW(edit, text.data(), length + 1));
+    TEXTMETRICW metrics{};
+    const HGDIOBJ selected = SelectObject(dc, r.font);
+    const bool measured = GetTextMetricsW(dc, &metrics) != FALSE;
+    SelectObject(dc, selected);
+    if (!measured) return RenameTextFallback(r, "GDI metrics");
+    if (r.textFormatFont != r.font || !r.textFormat) {
+        r.textFormat.Reset(); r.textFormatFont = nullptr;
+        LOGFONTW logical{};
+        ComPtr<IDWriteGdiInterop> interop; ComPtr<IDWriteFont> font; ComPtr<IDWriteFontFamily> family;
+        ComPtr<IDWriteLocalizedStrings> names; ComPtr<IDWriteFontCollection> collection;
+        if (!GetObjectW(r.font, sizeof(logical), &logical) || FAILED(g_writeFactory->GetGdiInterop(&interop)) ||
+            FAILED(interop->CreateFontFromLOGFONT(&logical, &font)) || FAILED(font->GetFontFamily(&family)) ||
+            FAILED(family->GetFamilyNames(&names)) || FAILED(family->GetFontCollection(&collection))) return RenameTextFallback(r, "font");
+        UINT32 index = 0, nameLength = 0; BOOL exists = FALSE;
+        if (FAILED(names->FindLocaleName(L"en-us", &index, &exists)) || !exists) index = 0;
+        if (FAILED(names->GetStringLength(index, &nameLength))) return RenameTextFallback(r, "font name");
+        std::wstring name(size_t(nameLength) + 1, L'\0');
+        if (FAILED(names->GetString(index, name.data(), nameLength + 1))) return RenameTextFallback(r, "font name");
+        name.resize(nameLength);
+        // The EDIT's em size, from its own GDI font, keeps both metrics equal.
+        if (FAILED(g_writeFactory->CreateTextFormat(name.c_str(), collection.Get(), font->GetWeight(), font->GetStyle(),
+                font->GetStretch(), static_cast<float>(metrics.tmHeight - metrics.tmInternalLeading), L"", &r.textFormat)))
+            return RenameTextFallback(r, "text format");
+        r.textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        r.textFormatFont = r.font;
+    }
+    struct Line { ComPtr<IDWriteTextLayout> layout; float x = 0.f, baselineTop = 0.f; int top = 0, start = 0, length = 0; };
+    std::vector<Line> lines;
+    const bool rtl = (GetWindowLongPtrW(edit, GWL_EXSTYLE) & WS_EX_RTLREADING) != 0;
+    const int count = static_cast<int>(SendMessageW(edit, EM_GETLINECOUNT, 0, 0));
+    for (int i = 0; i < count; ++i) {
+        const int start = static_cast<int>(SendMessageW(edit, EM_LINEINDEX, i, 0));
+        const int size = start < 0 ? 0 : static_cast<int>(SendMessageW(edit, EM_LINELENGTH, start, 0));
+        if (size <= 0 || start + size > static_cast<int>(text.size())) continue;
+        Line line; line.start = start; line.length = size;
+        DWRITE_LINE_METRICS lineMetrics{}; UINT32 lineCount = 0;
+        if (FAILED(g_writeFactory->CreateGdiCompatibleTextLayout(text.data() + start, UINT32(size), r.textFormat.Get(),
+                32767.f, static_cast<float>(metrics.tmHeight), 1.f, nullptr, FALSE, &line.layout)) ||
+            (rtl && FAILED(line.layout->SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT))) ||
+            FAILED(line.layout->GetLineMetrics(&lineMetrics, 1, &lineCount)) || lineCount != 1) return RenameTextFallback(r, "layout");
+        for (int k = 0; k < size; ++k) {
+            DWRITE_HIT_TEST_METRICS hit{}; FLOAT hitX = 0.f, hitY = 0.f;
+            if (FAILED(line.layout->HitTestTextPosition(UINT32(k), FALSE, &hitX, &hitY, &hit))) return RenameTextFallback(r, "hit test");
+            const LRESULT at = SendMessageW(edit, EM_POSFROMCHAR, WPARAM(start + k), 0);
+            const float x = static_cast<float>(static_cast<short>(LOWORD(at)));
+            if (!k) { line.x = x - hitX; line.top = static_cast<short>(HIWORD(at)); }
+            else if (std::fabs(hitX + line.x - x) > 1.f) return RenameTextFallback(r, "character positions differ from the EDIT"); // E.g. GDI font fallback.
+        }
+        line.baselineTop = static_cast<float>(line.top + metrics.tmAscent) - lineMetrics.baseline;
+        lines.push_back(std::move(line));
+    }
+    if (!r.textFactory && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, r.textFactory.GetAddressOf())))
+        return RenameTextFallback(r, "D2D factory");
+    if (!r.textTarget) {
+        const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.f, 96.f);
+        if (FAILED(r.textFactory->CreateDCRenderTarget(&properties, &r.textTarget))) return RenameTextFallback(r, "render target");
+    }
+    if (FAILED(r.textTarget->BindDC(dc, &clip))) return RenameTextFallback(r, "bind DC");
+    RefreshTextRendering(state);
+    LOGBRUSH fill{};
+    const COLORREF background = r.background && GetObjectW(r.background, sizeof(fill), &fill) ? fill.lbColor : GetBkColor(dc);
+    const auto color = [](COLORREF value) {
+        return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f);
+    };
+    ComPtr<ID2D1SolidColorBrush> ink, highlight, highlightInk;
+    auto& target = r.textTarget;
+    if (FAILED(target->CreateSolidColorBrush(color(GetTextColor(dc)), &ink)) ||
+        FAILED(target->CreateSolidColorBrush(color(GetSysColor(COLOR_HIGHLIGHT)), &highlight)) ||
+        FAILED(target->CreateSolidColorBrush(color(GetSysColor(COLOR_HIGHLIGHTTEXT)), &highlightInk))) return RenameTextFallback(r, "brushes");
+    DWORD selectionStart = 0, selectionEnd = 0;
+    SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+    const bool showSelection = selectionEnd > selectionStart && GetFocus() == edit; // EDIT hides it unfocused.
+    target->BeginDraw();
+    target->SetTransform(D2D1::Matrix3x2F::Translation(-static_cast<float>(clip.left), -static_cast<float>(clip.top)));
+    const auto antialias = state.textAntialiasMode == D2D1_TEXT_ANTIALIAS_MODE_DEFAULT ?
+        D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE : state.textAntialiasMode;
+    SetCompatibleTextRendering(target.Get(), state.textRenderingParams.Get(), antialias);
+    target->Clear(color(background));
+    for (auto& line : lines) {
+        const int first = std::max<int>(line.start, int(selectionStart));
+        const int last = std::min<int>(line.start + line.length, int(selectionEnd));
+        if (showSelection && first < last) {
+            DWRITE_HIT_TEST_METRICS runs[64]{}; UINT32 runCount = 0;
+            const DWRITE_TEXT_RANGE range{UINT32(first - line.start), UINT32(last - first)};
+            if (SUCCEEDED(line.layout->HitTestTextRange(range.startPosition, range.length, 0.f, 0.f,
+                    runs, ARRAYSIZE(runs), &runCount)))
+                for (UINT32 i = 0; i < runCount; ++i)
+                    target->FillRectangle(D2D1::RectF(line.x + runs[i].left, float(line.top),
+                        line.x + runs[i].left + runs[i].width, float(line.top + metrics.tmHeight)), highlight.Get());
+            line.layout->SetDrawingEffect(highlightInk.Get(), range);
+        }
+        target->DrawTextLayout(D2D1::Point2F(line.x, line.baselineTop), line.layout.Get(), ink.Get());
+    }
+    const HRESULT drawn = target->EndDraw();
+    if (drawn == D2DERR_RECREATE_TARGET) target.Reset();
+    if (FAILED(drawn)) return RenameTextFallback(r, "draw");
+    r.textFallback = nullptr;
+    return SUCCEEDED(drawn);
+}
+
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                 UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
@@ -24382,7 +24511,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // A native EDIT erases its whole client, then draws text. This frame child
     // paints into a surface DWM can compose between the two, flashing an empty
     // field. Fill the same parent-provided brush and text off-screen, then copy
-    // once. Typing's direct line updates never erase and stay native.
+    // once. Typing and drag selection draw GDI text directly; those messages
+    // repaint synchronously below, so the list-matched text is what DWM shows.
     if (msg == WM_ERASEBKGND && current) return 1;
     if (msg == WM_PAINT && current && !wp) {
         PAINTSTRUCT paint{};
@@ -24395,7 +24525,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             reinterpret_cast<WPARAM>(dc), reinterpret_cast<LPARAM>(hwnd)));
         if (!brush) brush = GetSysColorBrush(COLOR_WINDOW);
         FillRect(dc, &paint.rcPaint, brush);
-        DefSubclassProc(hwnd, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+        if (!PaintRenameText(*state, hwnd, dc, paint.rcPaint))
+            DefSubclassProc(hwnd, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
         if (painting) EndBufferedPaint(painting, TRUE);
         EndPaint(hwnd, &paint);
         return 0;
@@ -24459,6 +24590,13 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         state->rename.textLayoutDirty = false;
         RepositionRenameEdit(*state);
     }
+    if (state && state->rename.editor == hwnd && !state->rename.finishing &&
+        (msg == WM_CHAR || msg == WM_KEYDOWN || msg == WM_IME_CHAR || msg == WM_IME_COMPOSITION ||
+         msg == WM_PASTE || msg == WM_CUT || msg == WM_CLEAR || msg == WM_UNDO || msg == EM_UNDO ||
+         msg == EM_REPLACESEL || msg == EM_SETSEL || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+         msg == WM_LBUTTONUP || msg == WM_SETFOCUS || msg == WM_KILLFOCUS ||
+         ((msg == WM_MOUSEMOVE || msg == WM_TIMER) && GetCapture() == hwnd)))
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;

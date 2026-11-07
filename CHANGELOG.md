@@ -16,6 +16,9 @@
 - Clicking the selected item's name again, slower than a double-click, starts
   renaming it after your double-click speed, as in Explorer. Only a click on
   the filename text itself counts, not the rest of the Name column.
+- The rename field draws its text like the list, with the same weight and the
+  Text antialiasing option as the list applies it, instead of heavier GDI
+  ClearType text.
 
 - Collect three isolated retries after unsuccessful runtime checks, retain each
   attempt's diagnostics, and distinguish pending checks from test failures before

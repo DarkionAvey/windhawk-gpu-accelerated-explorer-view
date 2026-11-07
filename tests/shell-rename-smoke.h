@@ -370,3 +370,154 @@ static void TestClickRename(const std::wstring& fixture) {
         << " ms) from release; Name column beside the text, multiple selections, focusing clicks, later input, "
         "stale selection/focus, early and foreign-tab timer wakes never rename\n";
 }
+
+namespace RenameTextFixture {
+struct Canvas {
+    HDC dc = nullptr; HBITMAP bitmap = nullptr; HGDIOBJ previous = nullptr; DWORD* bits = nullptr; int width = 0, height = 0;
+    Canvas(int w, int h) : width(w), height(h) {
+        BITMAPINFO info{}; info.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
+        dc = CreateCompatibleDC(nullptr);
+        bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, reinterpret_cast<void**>(&bits), nullptr, 0);
+        Check(dc && bitmap && bits, "rename text canvas");
+        previous = SelectObject(dc, bitmap);
+    }
+    ~Canvas() { SelectObject(dc, previous); DeleteObject(bitmap); DeleteDC(dc); }
+    // Summed distance from the background colour: what reads as weight.
+    double Ink(COLORREF background) const {
+        double ink = 0;
+        for (int i = 0; i < width * height; ++i) {
+            const DWORD c = bits[i];
+            ink += std::abs(int((c >> 16) & 255) - int(GetRValue(background))) +
+                std::abs(int((c >> 8) & 255) - int(GetGValue(background))) + std::abs(int(c & 255) - int(GetBValue(background)));
+        }
+        return ink / (3.0 * 255.0);
+    }
+    // Colour spread per pixel: ClearType's subpixel fringes, absent from
+    // grayscale text of a neutral colour.
+    double Fringe() const {
+        double spread = 0;
+        for (int i = 0; i < width * height; ++i) {
+            const DWORD c = bits[i];
+            const int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+            spread += std::max({r, g, b}) - std::min({r, g, b});
+        }
+        return spread / 255.0;
+    }
+};
+}
+
+// The rename field draws its text like the list: same weight, rasterizer and
+// antialiasing (the Text antialiasing option as the list resolves it). The
+// expectation is an independent Direct2D rendering with the list's font
+// family and rendering parameters, not the mod's own drawing helper.
+static void TestRenameTextWeight(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    using RenameTextFixture::Canvas;
+    const auto root = std::filesystem::path(fixture) / L"rename-text-weight";
+    const std::wstring name = L"Quarterly report draft (final) 2026.txt";
+    CreateFiles(root, {name});
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 1);
+    // The renderer creates the shared DirectWrite factory; this fixture has no renderer.
+    const auto factoryBefore = g_writeFactory;
+    struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
+    if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "rename text fonts");
+    Check(MakeTextFormats(state) && state.textFormat, "list text format");
+    RefreshTextRendering(state);
+    state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
+    Check(SyncNativeSelection(state), "rename text selection");
+    BeginRename(state, 0);
+    const HWND editor = state.rename.editor;
+    Check(editor != nullptr, "rename text editor");
+    FocusFixture::focus = state.hwnd; // Unfocused: the EDIT shows no selection highlight.
+    RECT client{}; GetClientRect(editor, &client);
+    const std::wstring text = Text(editor);
+    const auto colours = [&](HDC dc) {
+        const auto brush = reinterpret_cast<HBRUSH>(SendMessageW(GetParent(editor), WM_CTLCOLOREDIT,
+            reinterpret_cast<WPARAM>(dc), reinterpret_cast<LPARAM>(editor)));
+        LOGBRUSH fill{}; GetObjectW(brush, sizeof(fill), &fill);
+        return std::pair{fill.lbColor, GetTextColor(dc)};
+    };
+    // The field's own drawing, and the EDIT's GDI text for comparison.
+    Canvas field(client.right, client.bottom), gdi(client.right, client.bottom);
+    const auto [background, foreground] = colours(field.dc);
+    colours(gdi.dc);
+    HBRUSH fill = CreateSolidBrush(background);
+    FillRect(field.dc, &client, fill); FillRect(gdi.dc, &client, fill);
+    const bool directWrite = PaintRenameText(state, editor, field.dc, client);
+    if (!directWrite) std::cout << "FALLBACK " << (state.rename.textFallback ? state.rename.textFallback : "?") << std::endl;
+    Check(directWrite, "the field did not draw its text with DirectWrite");
+    SendMessageW(editor, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(gdi.dc), PRF_CLIENT); // The EDIT's own GDI text.
+    // Independent list-style rendering of the same text at the EDIT's em size.
+    TEXTMETRICW metrics{};
+    const HGDIOBJ previousFont = SelectObject(gdi.dc, state.rename.font);
+    GetTextMetricsW(gdi.dc, &metrics); SelectObject(gdi.dc, previousFont);
+    std::wstring family(state.textFormat->GetFontFamilyNameLength() + 1, L'\0');
+    state.textFormat->GetFontFamilyName(family.data(), UINT32(family.size()));
+    family.resize(wcslen(family.c_str()));
+    ComPtr<IDWriteTextFormat> format;
+    Check(SUCCEEDED(g_writeFactory->CreateTextFormat(family.c_str(), nullptr, state.textFormat->GetFontWeight(),
+        state.textFormat->GetFontStyle(), state.textFormat->GetFontStretch(),
+        float(metrics.tmHeight - metrics.tmInternalLeading), L"", &format)), "reference list format");
+    ComPtr<ID2D1Factory> factory; ComPtr<ID2D1DCRenderTarget> target; ComPtr<ID2D1SolidColorBrush> ink;
+    const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.f, 96.f);
+    Canvas reference(client.right, client.bottom);
+    Check(SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.GetAddressOf())) &&
+        SUCCEEDED(factory->CreateDCRenderTarget(&properties, &target)) && SUCCEEDED(target->BindDC(reference.dc, &client)) &&
+        SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(GetRValue(foreground) / 255.f, GetGValue(foreground) / 255.f,
+            GetBValue(foreground) / 255.f), &ink)), "reference list target");
+    // The list's transparent surface resolves Windows default to grayscale.
+    const auto antialias = state.textAntialiasMode == D2D1_TEXT_ANTIALIAS_MODE_DEFAULT ?
+        D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE : state.textAntialiasMode;
+    target->BeginDraw();
+    target->SetTextRenderingParams(state.textRenderingParams.Get());
+    target->SetTextAntialiasMode(antialias);
+    target->Clear(D2D1::ColorF(GetRValue(background) / 255.f, GetGValue(background) / 255.f, GetBValue(background) / 255.f));
+    target->DrawText(text.c_str(), UINT32(text.size()), format.Get(), D2D1::RectF(4.f, 2.f, 32767.f, float(client.bottom)), ink.Get());
+    Check(SUCCEEDED(target->EndDraw()), "reference list rendering");
+    DeleteObject(fill);
+    const double list = reference.Ink(background), drawn = field.Ink(background), native = gdi.Ink(background);
+    const double listFringe = reference.Fringe(), drawnFringe = field.Fringe(), nativeFringe = gdi.Fringe();
+    std::cout << "PROFILE rename ink: list=" << list << " field=" << drawn << " gdi=" << native
+        << "; colour fringe: list=" << listFringe << " field=" << drawnFringe << " gdi=" << nativeFringe << std::endl;
+    Check(std::fabs(drawn - list) <= list * 0.03, "rename text weight differs from the list's");
+    Check(drawnFringe <= listFringe * 1.1 + 1.0, "rename text uses different antialiasing than the list");
+
+    // WM_PAINT draws through a buffered-paint DC for an arbitrary update
+    // rectangle. Repaint only an offset part that way and compare it with
+    // the same pixels of the whole rendering.
+    Check(SUCCEEDED(BufferedPaintInit()), "buffered paint");
+    Canvas crop(client.right, client.bottom);
+    HBRUSH cropFill = CreateSolidBrush(background);
+    FillRect(crop.dc, &client, cropFill);
+    const RECT part{client.right / 3, 1, client.right - 2, client.bottom - 1};
+    HDC buffer = nullptr;
+    const HPAINTBUFFER painting = BeginBufferedPaint(crop.dc, &part, BPBF_COMPATIBLEBITMAP, nullptr, &buffer);
+    Check(painting && buffer, "buffered field paint");
+    colours(buffer);
+    FillRect(buffer, &part, cropFill);
+    const bool partDrawn = PaintRenameText(state, editor, buffer, part);
+    EndBufferedPaint(painting, TRUE);
+    BufferedPaintUnInit();
+    DeleteObject(cropFill);
+    Check(partDrawn, "buffered field paint kept GDI text");
+    double partDifference = 0, partInk = 0;
+    for (int y = part.top; y < part.bottom; ++y) for (int x = part.left; x < part.right; ++x) {
+        const DWORD a = crop.bits[y * crop.width + x], b = field.bits[y * field.width + x];
+        for (int shift : {0, 8, 16}) {
+            partDifference += std::abs(int((a >> shift) & 255) - int((b >> shift) & 255));
+            partInk += std::abs(int((b >> shift) & 255) - int((background >> (16 - shift)) & 255));
+        }
+    }
+    const double painted = crop.Ink(background);
+    std::cout << "PROFILE rename buffered part: difference=" << partDifference / 765.0 << " of ink " << partInk / 765.0 << std::endl;
+    Check(partInk > 0 && partDifference <= partInk * 0.02 && painted > 0,
+        "a buffered partial repaint misplaced the field's text");
+    CancelRename(state);
+    std::cout << "PASS: rename field text matches the list's DirectWrite weight (ink within 3%) and antialiasing "
+        "(no ClearType fringes), including buffered partial repaints\n";
+}
