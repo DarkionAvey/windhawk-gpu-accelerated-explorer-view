@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Follow Explorer's Folder Options "Hide extensions for known file types" and
+  per-type extension rules (such as shortcuts) as reported by the Shell, live
+  when the option changes. Name sorting, type-to-select, tooltips and rename
+  use the displayed name; rename keeps a hidden extension.
+
 - Collect three isolated retries after unsuccessful runtime checks, retain each
   attempt's diagnostics, and distinguish pending checks from test failures before
   deciding whether a build can publish.
