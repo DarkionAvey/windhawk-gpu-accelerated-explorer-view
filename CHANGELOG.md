@@ -1,945 +1,367 @@
 # Changelog
 
 ## Unreleased
+- **ADDED** Support for Explorer's file extension visibility settings, including live updates.
+- **ADDED** Batch renaming of multiple selected files and folders, with native numbering and undo support.
+- **ADDED** Click-to-rename behavior, matching native Explorer.
+- **ADDED** Automatic renaming when creating new files or folders.
+- **IMPROVED** Rename field appearance to match the list's font, scaling, and text rendering.
+- **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
+- **FIXED** Selection and interaction issues when finishing a rename.
+- **IMPROVED** Build validation reliability with additional retries and diagnostics.
 
-- Follow Explorer's Folder Options "Hide extensions for known file types" and
-  per-type extension rules (such as shortcuts) as reported by the Shell, live
-  when the option changes. Name sorting, type-to-select, tooltips and rename
-  use the displayed name; rename keeps a hidden extension.
-- Rename several selected items at once with F2 or Explorer's Rename command.
-  Explorer itself names and numbers the items, keeping each extension, and
-  the rename can be undone as in native views; the native view stays hidden.
-  Clicking another item or empty space to finish renames the whole set before
-  the click changes the selection. For large selections the field opens once
-  Explorer holds the whole set; a rename that cannot be handed to Explorer is
-  reported instead of being dropped.
-- Clicking the selected item's name again, slower than a double-click, starts
-  renaming it after your double-click speed, as in Explorer. Only a click on
-  the filename text itself counts, not the rest of the Name column.
-- A new folder or file starts renaming right away, as in Explorer, whether it
-  comes from the context menu's New, the command bar's New or Ctrl+Shift+N,
-  in grouped views too. The item being renamed always shows as selected;
-  toggling a section or clicking anywhere in the view finishes the rename,
-  and typing no longer flickers.
-- The rename field shows its text exactly like the list: the same font, size,
-  letter spacing and weight (also with a custom font family or zoom), and the
-  Text antialiasing option as the list applies it. Long names no longer
-  appear wider or narrower; the caret and clicks follow the shown text.
-- Finishing, moving or zoom-hiding the rename field no longer leaves its text
-  or border showing through the list.
-- Clicking in the rename field no longer snaps the caret back or resizes the
-  field when the button is released, also with a zoomed list.
-
-- Collect three isolated retries after unsuccessful runtime checks, retain each
-  attempt's diagnostics, and distinguish pending checks from test failures before
-  deciding whether a build can publish.
-
-## 1.0.4
-
-- Fix ARM64 compilation by restricting the clipboard comparison's SSE2 fast
-  path to x64 and retaining the scalar comparison on other architectures.
-- Verify ARM64 and x64 compilation before publishing updates.
+## 1.0.4 — Public release
+- **FIXED** ARM64 compatibility.
 
 ## 1.0.3
-
-- Delegate ordinary activation of files, folders, drives and Recycle Bin items
-  to the native view's default-action API, waiting for selection preparation.
-  Let Explorer own launch options and navigation notifications drive previews.
-- Preserve the positioned return view when Shell reports equivalent folder
-  identities with different cached metadata.
-- Clear Explorer's previous selection before preparing a large replacement so
-  native command-bar actions cannot target the preceding selection.
-- Resolve touch drag promotion by export name only; cancel safely when absent.
-- Keep unsupported-location discovery suppression on the owning tab, avoiding
-  repeated Shell window scans in tabbed Explorer.
-- Correct the two-finger touchscreen navigation description, resolve provider
-  filesystem paths through Shell items, and clear stale text visibility stamps
-  when releasing a rendering target.
+- **FIXED** File and folder opening, selection handling, and navigation reliability.
+- **FIXED** Touch drag-and-drop issues.
 
 ## 1.0.2
-
-- Validate applied text-rendering settings across lists, tooltips and drag
-  previews; use compatible defaults when effective antialiasing differs.
-- Keep new-tab loading and delayed enrichment instant in every folder and view;
-  enable animations immediately on deliberate input, including hover and
-  window-frame resizing before entering the view.
-- Expand a renamed item's collapsed section before revealing the item and
-  opening its rename field, including newly created files and folders.
+- **FIXED** Text rendering inconsistencies across views.
+- **IMPROVED** New-tab loading and animation responsiveness.
+- **FIXED** Renaming items inside collapsed groups.
 
 ## 1.0.1
-
-- Cap thumbnail app badges and Shell overlay glyphs at twice Windows' DPI-scaled
-  large-icon size so increasing thumbnail zoom keeps the preview clear.
-- Count elapsed calendar months for tooltip dates, including month ends and
-  leap years, and round approximate years instead of truncating them.
-- Keep section badge hit and hover geometry on the accepted paint's clock.
-- Let the collapse-direction arrow reveal/focus a section header before
-  collapsing it on the next press; the opposite arrow expands it, mirrored for RTL.
-- Reuse first-letter candidates during type-to-select, skipping known nonmatches
-  while preserving flexible matching, Backspace cancellation and cycling.
-- Avoid scanning unused filename tails during flexible type-to-select matching,
-  preserving Unicode matching and the original highlight positions.
-- Defer DirectWrite preparation until a file-manager window requests attachment,
-  allocate the composition wake on demand, and release shared font resources
-  explicitly on unload instead of during process-exit destruction.
-- Release tooltip ICU resources after workers drain, avoiding library unload
-  from static destruction during DLL detach.
-- Load optional ICU on the tab worker only when a tooltip or type-to-select
-  first needs it, keeping library loading out of startup and input handling.
-- Match filenames across emoji in type-to-select searches, preserve highlight
-  positions, and remove complete surrogate pairs with Backspace.
-- Use the same Windows native-digit policy for section and drag counts,
-  preserving section grouping and the drag count overflow suffix.
-- Include localized relative phrases for cached tooltip dates and additional
-  timestamp properties, keeping their existing date text and preserving the
-  phrases when the completed tooltip receives newer cached column values.
-- Start modified keyboard movement at the focused section header while keeping
-  selection anchors and Ctrl focus-only behavior.
-- Use selection page counts for keyboard edges and badge reveals instead of
-  scanning the folder on input. Retire departed badge state with its groups
-  and folder without retaining old selection snapshots.
+- **IMPROVED** Type-to-select performance and Unicode support.
+- **FIXED** Relative date calculations in tooltips.
+- **IMPROVED** Keyboard navigation and group selection behavior.
+- **FIXED** Thumbnail overlay scaling at large icon sizes.
 
 ## 1.0.0
-
-- Show tooltip dates with a localized relative phrase from Windows ICU,
-  alongside the actual date and time.
-- Let keyboard navigation visit section headers; Enter/Space toggles them and
-  Left/Right collapses or expands the focused section.
-- Use the normal selection background for focused section headers and preserve
-  moving selection feedback across header bands.
-- Rotate section header chevrons with the expand/collapse animation.
-- Give column sort chevrons shallower proportions while retaining their bold stroke.
-- Match the section selection-counter border to its checkmark color and the
-  item checkbox's DPI-scaled border thickness.
-- Give the drag icon pile a stronger scale entrance and an 80 ms fade-in.
-- Restore native Explorer visibility on toggle and unload when the fallback
-  presentation hook is active.
-- Keep Space in active type-to-select searches and match names with or without
-  whitespace, punctuation or symbols.
-- Keep type-to-select highlight borders intact at text edges and in narrow labels.
-- Let Backspace correct active type-to-select searches instead of navigating away.
-- Keep the view toggle visible during unsupported-folder or layout fallback,
-  with an explanation when GPU presentation is unavailable.
-- Keep the unavailable toggle enabled for hover hints, dim its icon, and block
-  its action internally.
-- Keep native content below the GPU view without demoting unrelated popups.
-- Apply wheel-settings and high-contrast selection changes without reloading.
-- Follow each file type's tooltip property lists and avoid content reads for
-  dehydrated files, including files dehydrated after their folder was listed.
-- Size drag captions from font metrics and DPI, localize count badges, and
-  clean up preview identities before destroying their windows.
-- Clamp out-of-range DPI and correct empty-frame and compositor diagnostics.
+- **ADDED** Localized relative dates to file tooltips.
+- **ADDED** Keyboard navigation and expand/collapse controls for group headers.
+- **IMPROVED** Type-to-select with flexible matching and Backspace support.
+- **IMPROVED** Group animations, drag previews, and selection visuals.
+- **FIXED** View toggle behavior when GPU rendering is unavailable.
+- **FIXED** Compatibility with native Explorer tooltips and accessibility settings.
 
 ## 0.9.347
-
-- A collapsed group shows how many of its items are still selected: a check
-  badge with the count, styled like a checked checkbox, before the group name.
-  It slides in and out with the group's collapse and expand, and also when the
-  selection changes while the group is collapsed (for example Ctrl+A).
-  Clicking the badge expands the group and scrolls to its first selected item.
-  Counting runs off Explorer's UI thread.
+- **ADDED** Selection counters on collapsed groups, with click-to-reveal functionality.
 
 ## 0.9.346
-
-- Sorting, switching views, refreshing and resizing the window use less of
-  Explorer's UI thread: the hidden native list no longer lays out its rows
-  while the GPU view is shown. It regains its real size only while a native
-  context menu is open, so right-click menus keep working.
+- **IMPROVED** Responsiveness when sorting, switching views, refreshing, and resizing.
 
 ## 0.9.345
-
-- Icons in grid views glide to their new places when the number of columns
-  changes, instead of rearranging instantly: while resizing the window, while
-  pinching to zoom on a touchscreen, and when switching icon size (for example
-  Medium to Large icons).
-- A selected item that is visible when a pinch or window resize starts stays
-  in view, even when zooming in far.
-- Touchscreen pinch zoom no longer stretches, clips or flickers icons while
-  they move between columns.
+- **ADDED** Smooth icon rearrangement animations when resizing or zooming.
+- **FIXED** Touchscreen pinch-zoom flickering and clipping.
 
 ## 0.9.344
-
-- Selection checkbox checkmarks use the same accent foreground as the swipe
-  gesture chevron.
-- Double-tapping empty space with touch goes up a folder, like double-clicking.
-- The status bar view switch button uses the status bar's own background in
-  light mode instead of a slightly darker shade.
-- Sharper drawing at scaling other than 100%: the view switch arrows,
-  selection checkboxes, search highlights, thumbnail shadows and the drag
-  preview's count and caption now sit on whole pixels instead of blurring
-  across two. Items partly scrolled past the top no longer grow by a pixel.
+- **ADDED** Double-tap on empty space to navigate up a folder.
+- **IMPROVED** Visual sharpness at non-default display scaling.
 
 ## 0.9.343
-
-- Icon overlays (cloud status, shortcut arrows) have one consistent size for
-  every item in a view, whatever the shape of its icon or thumbnail.
-- The app icon on thumbnails scales with the icon size and is extracted at
-  that size. Overlays and app icons never shrink below Windows' small-icon
-  size.
-- The horizontal scrollbar no longer first appears in the middle of a column
-  fitting animation; it waits for the columns to settle.
+- **IMPROVED** Icon overlay and thumbnail badge scaling.
+- **FIXED** Scrollbar flickering during column resizing.
 
 ## 0.9.342
-
-- Show Shell icon overlays on icons and thumbnails, as the native views do:
-  cloud sync status from any provider (OneDrive, Dropbox, Google Drive and
-  others), shortcut arrows and sharing marks. Overlays resolve in the
-  background, update when an item's sync state changes and follow zoom,
-  cut/copy animations and RTL layout.
-- Shortcut arrows now appear at every icon size, not only in small views.
+- **ADDED** Cloud sync, shortcut, and sharing overlays to icons and thumbnails.
 
 ## 0.9.341
+- **IMPROVED** Drag-and-drop previews, animations, and touch compatibility.
+- **FIXED** Select All occasionally clearing selections.
+- **FIXED** Text rendering inconsistencies and rename-field alignment.
 
-- Keep GPU drag previews moving across frame and screen edges, with Windows'
-  forbidden cursor for rejected drops.
-- Yield the GPU preview to Windows' WinUI drag visual while it is visible,
-  then restore it at the current pointer position.
-- Resume deferred native selection and view updates when GPU animations finish.
-- Preserve native-view suppression if Windows rejects the visibility observer.
-- Finish rename zooms when the editor covers the GPU surface and a font refresh
-  needs another compositor frame.
-- Retire pending animation wakes while the GPU window is hidden, and resume
-  them when it is shown.
-- Add optional source coverage reports for regression runs.
-- Center rename text vertically in list rows, including wrapped names and
-  changes to row/font size.
-- Start held touch drags from Windows' promoted mouse input so the operation
-  does not immediately end with its button still reported as released.
-- Remove the ineffective touch-drag movement workaround. Keep bounded Windhawk
-  diagnostics for troubleshooting native input handoff.
-- Keep drag captions above the icon pile for mouse and touch, with stable
-  positioning when captions change. Remove scale pulses on operation changes
-  and add cached soft shadows to separate stacked icons.
-- Use the navigation bubble's accent/foreground palette for drag item counts
-  and size them through an internal `dragBadgeScaling=0.75f` factor. Counts use
-  the configured mod font family and resolved face.
-- Publish cached native-row identities for selection imports, so held drags
-  in This PC can proceed when provider name resolution fails.
-- Fix the Name header checkbox sometimes clearing every selection instead of
-  selecting all when Explorer was busy: a late selection event no longer
-  turns a correct Select All into a selection reset.
-- Grid filename highlights: Small icons keep equal padding on both sides of
-  the name, and two-line captions no longer leave descenders uncovered or a
-  faint line between the lines.
-- Fix two diagnostic log lines that passed 64-bit values to 32-bit format
-  specifiers when **Enable logging** is on.
-- Drag preview operation symbols (prohibited, copy, link, move) are drawn at
-  their intended size and centred, also without a font customizer such as
-  MacType (they were about 9% too small).
-- Text no longer changes weight or shifts slightly between its first frame and
-  later frames: dark text (light themes), right-aligned and centred values, and
-  translucent text such as column headers, Date/type/size and dimmed items now
-  render identically whether freshly drawn or cached.
 ## 0.9.340
-
-- Show the contents of cloud and virtual drives (such as the Google Drive root)
-  that previously appeared as "This folder is empty": when the fast file listing
-  finds nothing, the folder is confirmed with Windows' own Shell listing.
-- If Explorer still shows items in a folder the GPU view sees as empty, hand that
-  folder back to Explorer's own view instead of reporting it as empty, and leave
-  Explorer's selection untouched.
-- Show items marked only as "system" (for example customized folders), as
-  Explorer does; hidden protected system files still follow Explorer's options.
+- **FIXED** Empty cloud and virtual folders incorrectly appearing empty.
+- **FIXED** Missing system-marked items.
 
 ## 0.9.339
-
-- Keep Ctrl+wheel and touchpad zoom smooth on large displays: visible labels
-  scale their already drawn text during the animation instead of re-laying out
-  every filename on each frame, then settle to crisp text at the final size.
+- **IMPROVED** Zoom smoothness and responsiveness in large folders.
 
 ## 0.9.338
-
-- Localize tooltip labels and friendly dates through Windows, use system date
-  and time formats, and reuse cached Details column values, including folder sizes.
-- Add **Detailed tooltips** under **Mouse hover**, on by default, to show
-  properties carried by the file such as dimensions, bitrate, comments and tags.
-  Extra rows fit the screen space around the pointer; long values are shortened.
-- Omit duplicate tooltip values, including repeated dates under different properties.
-- Show the tooltip once its selected details are ready, avoiding jumps as data arrives.
-- Reuse the folder binding across tooltips in the same folder, so tooltips no
-  longer rebind the folder on every hover and appear with consistent timing.
-- Apply the selected text antialiasing mode to tooltip text, including Windows
-  subpixel rendering on the opaque popup.
+- **ADDED** Detailed file tooltips with additional metadata.
+- **IMPROVED** Tooltip localization, formatting, and appearance.
 
 ## 0.9.337
-
-- Show one larger, transparent drag preview instead of both Shell and GPU images.
-- Anchor the artwork to the pointer, keep touch previews above the contact point,
-  and recalculate placement immediately when crossing monitor DPI boundaries.
-- Load available drag thumbnails in the background even when thumbnails are off
-  in Details/List views, keeping the displayed icon until the thumbnail arrives.
-- Stack up to five selected icons, keeping the front icon upright and gently
-  tilting those behind it. Show Windows' localized transaction description
-  beneath the stack using the view's font and theme.
-- Restore rounded operation emoji by avoiding synthesized bold, and smooth
-  their animation sampling.
-- Apply the mod's text antialiasing choice to drag captions and item counts,
-  including Windows subpixel rendering on their opaque backgrounds.
+- **ADDED** Custom drag-and-drop previews with stacked icons, thumbnails, and operation indicators.
 
 ## 0.9.336
-
-- Resting the pointer on an item shows a tooltip with its full name, size,
-  type, and created/modified dates (with how long ago), in aligned columns.
-  It uses the view's font and follows dark, light and high contrast themes.
-  Clicking, the mouse wheel or typing hides it until another item is hovered,
-  and Folder Options' "Show pop-up description" setting turns it off.
+- **ADDED** File information tooltips with names, sizes, types, and dates.
 
 ## 0.9.335
-
-- Limit memory held by measured text to a per-tab budget instead of thousands
-  of entries per cache, which could reach tens of megabytes in large folders.
-  Text on screen is never discarded to meet the budget.
-- Text, icon and row-detail caches no longer store a second copy of every key.
+- **IMPROVED** Memory usage in large folders.
 
 ## 0.9.334
-
-- Visiting an empty folder no longer discards the cached text layouts of
-  filenames, so the next folder's names appear without being re-measured.
+- **IMPROVED** Folder switching performance through better text caching.
 
 ## 0.9.333
-
-- Keep two-finger swipes on their chosen action until release or cancellation.
-- Start held-item touch drags at Windows' drag threshold through the same Shell
-  drag-and-drop path used by mouse and touchpad.
-- Refresh drag previews with smooth edges, theme-aware tiles, uncropped images,
-  equally wide, centered emoji operation symbols without backplates, and subtle
-  animations. Show cached artwork immediately and sharpen it using the tab's
-  existing background image workers.
+- **IMPROVED** Touch drag-and-drop and gesture reliability.
+- **IMPROVED** Drag preview appearance and animations.
 
 ## 0.9.332
-
-- Make group headers share the list's hover background and smooth movement,
-  including text-sized highlights with "Highlight filename only" enabled.
-
-## 0.9.331
-
-- Speed up build validation by running independent regression groups and compiler
-  jobs in parallel, with separate processes and logs for each group.
+- **IMPROVED** Group header hover effects and animations.
 
 ## 0.9.330
-
-- Keep item selections when collapsing or expanding sections, including selected
-  items inside collapsed sections and selections still being synchronized with Explorer.
+- **FIXED** Selections being lost when collapsing or expanding groups.
 
 ## 0.9.329
-
-- Fix brief flashes of the list while resizing: Explorer's own window layout
-  no longer rises above the GPU view, even for a single frame.
-- Fix flicker inside the rename field: it now repaints off-screen and appears
-  in one step instead of being erased first.
+- **FIXED** Flickering during window resizing and file renaming.
 
 ## 0.9.328
-
-- While dragging a window edge, keep one set of grown GPU buffers instead of
-  rebuilding them at every intermediate size; the exact size is restored when
-  the drag ends.
+- **IMPROVED** Window resizing performance.
 
 ## 0.9.327
-
-- Cache rendered text in shared GPU texture pages instead of one texture per
-  string, so far more text stays cached in less graphics memory and fewer
-  textures are created while scrolling.
+- **IMPROVED** GPU memory efficiency and scrolling performance.
 
 ## 0.9.326
-
-- While copied or cut items wiggle in an otherwise still view, redraw and
-  present only the area around those icons instead of the whole list,
-  reducing GPU and desktop composition work.
+- **IMPROVED** GPU efficiency during cut-and-copy animations.
 
 ## 0.9.325
-
-- Reduce Explorer UI-thread work during scrolling and animations: each frame
-  now reuses unchanged nearby rows and their image keys instead of copying
-  them again, and the renderer shares that row list without another copy.
+- **IMPROVED** Scrolling and animation responsiveness.
 
 ## 0.9.324
-
-- Read Shell-formatted sizes without rebinding the parent folder and
-  rescanning its columns for every row.
-- Bound provider-folder catalog and selection validation slices by real
-  elapsed time, and fall back to background enumeration if Explorer's
-  message queue rejects a continuation instead of leaving a folder empty.
-- Track drags correctly with swapped primary and secondary mouse buttons.
+- **IMPROVED** File size loading and large-folder responsiveness.
+- **FIXED** Dragging with swapped mouse buttons.
 
 ## 0.9.323
-
-- Keep Details column text and headers at their full column width while
-  horizontally scrolling, clipping at the window edge without changing ellipses.
+- **FIXED** Text clipping while horizontally scrolling Details view.
 
 ## 0.9.322
-
-- Fix stale filename-only highlight widths after folder, sort, rename and font
-  changes, keeping selection and hover animation bounds matched to the label.
+- **FIXED** Filename highlight sizing after sorting, renaming, or changing fonts.
 
 ## 0.9.321
-
-- Read Size column text through the Shell on the existing background workers,
-  allowing Better file sizes in Explorer details to supply folder sizes and
-  size formatting without duplicating its calculations or Everything support.
-  Size sorting and grouping retain the overlay's existing behavior.
+- **ADDED** Compatibility with Better file sizes in Explorer for folder size display.
 
 ## 0.9.320
-
-- Keep the file view, rename editor and view button in one stable window order.
-  Ignore hidden siblings and apply necessary placement changes together.
-- Preserve rename-field pixels during layout updates and avoid redundant tab
-  activation repaints when the view button is correctly above the file view.
+- **FIXED** Rename-field and view-button flickering.
 
 ## 0.9.319
-
-- Use expanding, wrapping native rename fields in list views too, so narrow
-  Name columns show the beginning while preserving the selected basename.
-- Avoid repeated native reformatting and shrink/expand measurements when a
-  rename field's text, font and available space have not changed.
-- Add drag-selection, repaint, focus and placement records to UI transition
-  diagnostics for investigating the remaining live rename-field blinking.
+- **IMPROVED** Rename fields in List and Details views.
 
 ## 0.9.318
-
-- Expand grid rename fields to show long names, using more window width when
-  needed. Preserve native editing and selection while resizing.
-- Hide rename fields during wheel and pinch zoom, then restore them with the
-  current font size when the gesture and zoom animation finish.
-- Follow the chosen text smoothing policy and remove layout work from rename
-  painting. Narrow-name scrolling and drag-selection blinking persisted in
-  live Explorer testing.
+- **IMPROVED** Rename fields for long filenames and zoom changes.
 
 ## 0.9.317
-
-- Center grid rename text on the label and preserve its wrapping position.
-  Cover the original label's selection background so it cannot spill above
-  or beside the rename field.
+- **FIXED** Rename-field alignment and selection backgrounds.
 
 ## 0.9.316
-
-- Prevent selection-background flicker when right-clicking an unselected item
-  to open its context menu.
+- **FIXED** Selection flickering when opening context menus.
 
 ## 0.9.315
-
-- Reject unavailable selection targets without clearing the other selected items.
-- Use the native view's item identities for provider folders, avoiding entries
-  that the provider enumerates but Explorer excludes or replaces.
+- **FIXED** Selection handling in provider-managed folders.
 
 ## 0.9.314
-
-- Extend list-item checkbox targets across the full row height and reserved
-  checkbox gutter. Double grid checkbox targets for mouse and touch, bounded
-  to each item's leading half so the remaining area still opens the item.
+- **IMPROVED** Checkbox hit targets for mouse and touch.
 
 ## 0.9.313
-
-- Prepare new tabs' GPU content in the background so activation can show their
-  own cached surface without waiting for interaction.
-- Preserve the current list's bounds and stacking while Explorer creates a new
-  tab, including layouts with a navigation pane.
+- **IMPROVED** New-tab loading and switching performance.
 
 ## 0.9.312
-
-- Use Explorer's native tab navigation for middle-clicked folders, bypassing
-  context-menu loading that could show a busy cursor without opening a tab.
+- **FIXED** Middle-clicking folders sometimes failing to open new tabs.
 
 ## 0.9.311
-
-- Route folder middle-clicks through the owning Explorer tab's native command
-  instead of Shell activation, which could open a separate window.
+- **FIXED** Middle-clicking folders opening separate windows instead of tabs.
 
 ## 0.9.310
-
-- Add three default-enabled options under **Additional mouse and touch gestures**: double-click
-  empty space or side margins to go up, middle-click folders to open in a new
-  tab, and tap with two fingers on a touchscreen for the same item or folder
-  context menu as right-click.
+- **ADDED** Double-click empty space to navigate up.
+- **ADDED** Middle-click folders to open new tabs.
+- **ADDED** Two-finger tap to open context menus.
 
 ## 0.9.309
-
-- Show and hide item checkboxes instantly. Use the same size and normal theme
-  border in both states, with a larger, bolder, centered tick when checked.
+- **IMPROVED** Checkbox appearance and responsiveness.
 
 ## 0.9.308
-
-- Keep checked item boxes visible after mouse hover ends and when switching
-  from touch to mouse. Add a Windows-background-colored border to checked boxes
-  so their boundaries remain clear on selected items.
+- **FIXED** Checked boxes disappearing after hover or input changes.
 
 ## 0.9.307
-
-- Honor Explorer's item-checkbox setting with modern rounded checkboxes, mouse
-  hover and touch visibility, and 80 ms fades without shifting item contents.
-- Add a Name-header checkbox to select or clear all items. Assess its state on
-  the tab's background presentation worker, follow item and native selection
-  changes, and hide it in empty folders. Mirror grid checkboxes in RTL.
-- Enlarge touch hit targets for grid checkboxes within each item's leading half,
-  preserving a separate opening area and Explorer's single-click preference.
-
-## 0.9.306
-
-- Generate a read-only `gpu-accelerated-explorer-view.minified.wh.cpp` for
-  test-device installs, removing ordinary comments and collapsing code lines
-  while retaining Windhawk metadata and settings. Validate it before publishing.
+- **ADDED** Modern selection checkboxes with touch support.
+- **ADDED** Select All checkbox in the Name column header.
 
 ## 0.9.305
-
-- Apply column-header sorting without item movement animation; native context-menu
-  sorting remains animated. Keep an internal disabled item-interaction animation
-  switch for a future user option.
+- **IMPROVED** Sorting behavior by removing unnecessary item animations.
 
 ## 0.9.304
-
-- Speed up folder preprocessing with adaptive sorting of row indices, compact
-  refresh baselines, shared-prefix path hashing and reuse of unchanged baselines.
-  Preserve Windows natural names, secondary keys and stable grouping order.
-- Add repeatable sort-algorithm comparisons over real large-directory fixtures,
-  including shuffled, sorted and reversed inputs and comparison counts.
+- **IMPROVED** Sorting performance in large folders.
 
 ## 0.9.303
-
-- Use Explorer's folder sort order by default, with an option to keep early
-  unsorted loading. Synchronize sorting, including secondary keys, on folder
-  returns and view switches. New installations use Explorer's folder placement.
-- Complete name, date, size and extension sorts on the names worker, without
-  waiting for older property providers or showing an unsorted first batch.
-- Reuse preprocessing fingerprints instead of calculating them twice. Add
-  repeatable large-directory correctness and preprocessing benchmarks.
-
-- Ignore stationary mouse hover during keyboard/controller selection, including
-  single-click point-to-select. Hover resumes when the pointer moves or receives
-  a mouse action. The first Up/Down key still starts from the hovered item,
-  or the first item when nothing is hovered.
+- **IMPROVED** Compatibility with Explorer's native sorting preferences.
+- **IMPROVED** Large-folder sorting and keyboard selection behavior.
 
 ## 0.9.302
-
-- Restore animated Group by changes in Details, List and icon grids, including
-  changing the grouping property, reversing groups and choosing None. Items
-  retain their previous positions while section headings move, appear or fade.
+- **FIXED** Missing animations when changing folder grouping.
 
 ## 0.9.301
-
-- Restore Explorer context-menu sorting, view and icon-size changes in GPU
-  lists and grids, including sorting before any column header has been clicked.
-- Revalidate GPU content and cached details when Explorer finishes a native
-  Refresh, including folder views without a browser automation document.
-- Draw selection marquees above file/folder content and group headings, while
-  keeping scrollbars and navigation gestures in the foreground.
-- Match rename fields to dark, light and high contrast themes, and center text
-  using the selected font's metrics.
-- Reveal rename fields vertically and horizontally, keep them inside the list
-  during resizing, and retain the renamed item's selection background.
+- **FIXED** Native sorting, view switching, and refresh behavior.
+- **IMPROVED** Rename fields and selection marquee rendering.
 
 ## 0.9.300
-
-- Restore Back/Forward bubbles on repeated swipes by detaching completed fade
-  effects during tracking and retraction. Successful gestures retain the 80 ms fade.
-
-## 0.9.299
-
-- Add targeted gesture diagnostics for missing bubbles: drawing bounds and
-  opacity, overlay placement, composition lifetime and graphics failures.
+- **FIXED** Back/Forward gesture indicators sometimes disappearing.
 
 ## 0.9.298
-
-- Keep early folder navigation on its known Shell binding. Wait for the actual
-  destination identity when needed, avoiding a second layout after rebind.
+- **IMPROVED** Folder navigation transitions.
 
 ## 0.9.297
-
-- Prepare swipe Back returns before native navigation and position the returned
-  child before displaying parent rows, avoiding a top-of-folder flash or scroll.
+- **FIXED** Scroll position briefly jumping during Back navigation.
 
 ## 0.9.296
-
-- Retire hidden tabs' foreground gestures so restoring a tab or window cannot
-  replay an old animation from an unchanged content snapshot.
+- **FIXED** Old gesture animations replaying after switching tabs.
 
 ## 0.9.295
-
-- Keep navigation feedback on persistent foreground surfaces across metadata,
-  scroll and view-layout updates. Successful fades run on the compositor.
-- Reuse file-list pixels for foreground-only animation frames and avoid
-  repainting while waiting for metadata that has not arrived.
-
-## 0.9.294
-
-- Write frame diagnostic summaries on the tab's logging worker so a slow log
-  consumer cannot hold up those frames.
+- **IMPROVED** Navigation animation smoothness and rendering efficiency.
 
 ## 0.9.293
-
-- Pace animations with Windows' compositor clock to avoid excess redraws when
-  the older flush call returns immediately.
+- **IMPROVED** Animation frame pacing.
 
 ## 0.9.292
-
-- Keep Back/Forward bubbles animating through folder resets, native view
-  replacement and delayed folder loading, independently of the UI thread.
+- **FIXED** Swipe animations being interrupted during folder navigation.
 
 ## 0.9.291
-
-- Center touchscreen Back/Forward bubbles between the fingers and animate both
-  bubbles when reversing direction.
-- Fade successful swipe bubbles out over 80 ms; canceled gestures retract to
-  their edge without fading the bubble.
+- **IMPROVED** Touchscreen Back/Forward gesture animations.
 
 ## 0.9.290
-
-- Preserve selection highlighting when successive native menus transfer focus
-  after the context-menu request returns.
+- **FIXED** Selection highlights disappearing between context menus.
 
 ## 0.9.289
-
-- Keep selected items highlighted while Explorer's native context menu owns
-  focus, including the WinUI menu, without changing keyboard input ownership.
+- **FIXED** Selection highlights disappearing while context menus are open.
 
 ## 0.9.288
-
-- Route mouse and keyboard context requests through Explorer's complete native
-  handler, preserving its menu presentation and Show more options behavior.
-- Retain the hidden native view's input geometry so right-clicks work for items
-  and folder backgrounds, including special namespaces.
+- **IMPROVED** Compatibility with Explorer's native context menus.
 
 ## 0.9.287
-
-- Open item and folder background menus through Explorer's native view, so
-  Windows chooses the modern menu and handles Show more options and commands.
-- Restore native Rename availability and retain Shift menu requests while
-  large selections are being prepared.
+- **FIXED** Context menus and Rename commands in native Explorer integration.
 
 ## 0.9.286
-
-- Keep two-finger Back/Forward swipes active through finger-spacing drift.
-  Distinguish same-direction scrolling from opposed pinch movement while
-  retaining responsive unequal pinches and late pinch acquisition.
+- **IMPROVED** Two-finger swipe and pinch gesture recognition.
 
 ## 0.9.285
-
-- Recognize touch pinches with unequal finger movement or shared drift without
-  requiring large travel. Let a late second finger and an existing two-finger
-  pan acquire zoom, while preserving swipe, rotation and contact-change guards.
+- **IMPROVED** Pinch-to-zoom recognition with uneven finger movement.
 
 ## 0.9.284
-
-- Keep scrollbar track presses captured so the same held press can drag the
-  thumb after scrolling to the pointer, on both axes.
-- Limit touch scrollbar menus to a stationary hold starting on the thumb,
-  using Windows gesture recognition to cancel menus during scrolling.
+- **FIXED** Scrollbar dragging and accidental touch context menus.
 
 ## 0.9.283
-
-- Draw Back/Forward swipe bubbles and glyphs above both scrollbars.
+- **FIXED** Swipe indicators being obscured by scrollbars.
 
 ## 0.9.282
-
-- Match the horizontal thumb's end padding and rounded caps to its track.
-- Make scrollbar clearance scroll with the end of the list, letting items draw
-  behind the horizontal bar until the final rows scroll above its touch target.
+- **IMPROVED** Horizontal scrollbar appearance and layout.
 
 ## 0.9.281
-
-- Reserve bottom space above the horizontal scrollbar's full touch hit area,
-  keeping the last item reachable while the bar is idle or enlarged.
+- **FIXED** Last items being obscured by the horizontal scrollbar.
 
 ## 0.9.280
-
-- Pad the vertical scrollbar thumb's top and bottom to match its side inset,
-  aligning its rounded caps with the track without changing scrolling behavior.
+- **IMPROVED** Vertical scrollbar appearance.
 
 ## 0.9.279
-
-- Hide inline storage bars in This PC when there is not enough room for full
-  drive labels and a bar, preventing bars from returning as labels ellipsize.
+- **FIXED** Storage bars overlapping truncated drive labels.
 
 ## 0.9.278
-
-- Join the navigation chevron into one continuous stroke, removing the gap and
-  uneven opacity where its segments meet during stretching and scaling.
+- **IMPROVED** Swipe navigation indicator appearance.
 
 ## 0.9.277
-
-- Replace the outlined swipe arrows with an accent-colored bubble and flexible
-  chevron using Android's spring/stretch behavior, with distinct commit and
-  cancel motion. Cache translucent contrasting glyph colors on accent changes.
-- Cap navigation distance at one third of the tab width and retain column-first
-  scrolling. Honor the touch recognizer's horizontal intent without a second
-  direction test, and let the commit animation finish through folder changes.
-- Restore cached visible properties before trying the worker queue lock,
-  preventing temporary blank cells when metadata work is busy.
+- **ADDED** Redesigned, animated Back/Forward swipe indicators.
+- **IMPROVED** Gesture feedback and navigation behavior.
 
 ## 0.9.276
-
-- Drive touch flings from Windows' measured release velocity and system
-  deceleration, independently of drag distance and animation frame cadence.
-- Add remaining momentum to successive flings in the same direction. A new
-  touch catches the list immediately; reversal or an axis change starts fresh.
+- **IMPROVED** Touch scrolling momentum and inertia.
 
 ## 0.9.275
-
-- Let swipe arrows track horizontal drag 1:1 through the navigation threshold,
-  then keep traveling with increasing logarithmic resistance and no distance cap.
-- Use constant linear resistance for vertical arrow movement.
-- Wake a touch scrollbar only when the gesture's original DOWN starts on it.
-  Multi-finger gestures and their remaining contact cannot acquire a scrollbar.
+- **IMPROVED** Swipe navigation responsiveness.
 
 ## 0.9.274
-
-- Give Back/Forward swipe arrows a 1:1 start and progressive logarithmic
-  resistance, stopping their travel at the navigation threshold.
-- Let arrows follow vertical finger movement within half a circle height
-  above or below center, without affecting an established horizontal swipe.
+- **IMPROVED** Swipe indicator movement and gesture feedback.
 
 ## 0.9.273
-
-- Keep the accepted list image visible through resizing and cold navigation
-  until its replacement is ready; confirmed empty folders still update normally.
-- Retain icons, thumbnails and property text during Shell refreshes and failed
-  provider reads. Replace GPU artwork only after its new texture uploads.
-- Preserve usable fonts and rendering resources when replacement allocation
-  fails, and retry through the existing presentation path.
+- **FIXED** Blank content flashes during navigation, resizing, and refreshes.
 
 ## 0.9.272
-
-- Automatically refit columns when switching from grid or List view to Details,
-  using the existing readiness and clipping checks.
+- **IMPROVED** Automatic column fitting when entering Details view.
 
 ## 0.9.271
-
-- Fix folders failing to open and selections being cleared in user profile
-  directories when Windows exposes different Shell providers for the same path.
-- Preserve the active Explorer folder's identity through background refresh,
-  change watching and cached returns.
+- **FIXED** Folders failing to open and selections being cleared in certain locations.
 
 ## 0.9.270
-
-- Keep the view-toggle button aligned with native status controls during touch
-  overscroll and ordinary window moves, without repeatedly falling back to an
-  estimated position while native control measurements reload.
+- **FIXED** View toggle button alignment during window movement and touch scrolling.
 
 ## 0.9.269
-
-- Keep idle scrollbars small, retaining the full touch hit area. Enlarge only
-  the bar a finger engages, animate back on release/leave, and preserve thumb
-  capture outside the track. Prevent a first-touch scroll jump at high DPI.
-- Defer new horizontal scrollbars until column discovery, fitting and layout
-  settle, avoiding temporary overflow flashes. Keep vertical scrolling immediate
-  and reveal horizontal scrolling when actively needed.
+- **IMPROVED** Touch-friendly scrollbar animations.
+- **FIXED** Temporary scrollbar flashes and initial touch scroll jumps.
 
 ## 0.9.268
-
-- Give touch marquee selection the same list-focus handoff as mouse input,
-  so its outline appears without first clicking an item. Draw a visible line
-  for perfectly vertical or horizontal marquee drags.
-- Start pinch scaling from the contacts' span when recognition commits,
-  preventing the initial zoom jump. Subsequent scaling follows the measured
-  span without inheriting old scale from replaced contacts.
+- **FIXED** Touch selection and pinch-zoom jumping.
 
 ## 0.9.267
-
-- Distinguish two-finger scrolling from pinch using both contacts' movement
-  relative to their initial center and radius. Allow staggered fingers,
-  unequal swipe paths and spacing variation without switching into zoom.
-- Commit touch gestures to scrolling or zooming. Pinch keeps its initial
-  anchor; contact changes cannot reopen a committed scroll as pinch.
-- Use one-finger vertical movement for marquee selection when the whole
-  directory fits vertically; retain scrolling and overscroll in longer views.
+- **IMPROVED** Touch gesture detection and selection behavior.
 
 ## 0.9.266
-
-- Use vertical touch movement for scrolling with any finger count, one-finger
-  horizontal movement for marquee selection, and two-finger horizontal movement
-  for column scrolling.
-- Start Back/Forward previews only after available column scrolling is consumed.
-  Reverse through the preview before returning to columns, commit on release,
-  and clear canceled previews from the rendered view.
-- Pair taps using Windows' configured double-click speed and item identity,
-  including varied contact positions and delayed dispatch.
-- Keep touch ownership between contacts so a resting mouse cannot steal
-  hover or selection. Resume mouse/pen input on deliberate movement or clicks.
-- Resolve pinch and pan intent separately, keeping spacing variation from
-  turning two-finger scrolling into zoom.
-- Preserve hold-to-drag when movement arrives before a delayed hold timer.
-- Honor Explorer's single-click activation, point-to-select and both title
-  underline preferences without adding mod settings.
+- **IMPROVED** Touch scrolling, selection, and swipe navigation.
+- **ADDED** Support for Explorer's single-click activation preferences.
 
 ## 0.9.265
-
-- Replace the blocked touch gesture path with direct pointer input and Windows'
-  native recognizer for scrolling, inertia, pinch, taps and hold menus.
-- Add hold-then-move Shell file dragging, preserving multi-selection and
-  canceling deferred drags when the finger lifts or the tab changes.
-- Support touch scrollbar dragging and divider double-tap fitting; preserve
-  animated touch sizing, boundary feedback and optional Back/Forward swipes.
+- **ADDED** Native touchscreen gesture handling and hold-to-drag functionality.
+- **IMPROVED** Touch scrollbars and pinch-to-zoom.
 
 ## 0.9.264
-
-- Handle touchscreen swipes as scrolling, with Windows gesture recognition,
-  inertia and boundary feedback. Preserve tap selection, double-tap activation
-  and press-and-hold Shell menus.
-- Follow pinch distance directly, keeping the touched item anchored through
-  list/grid resizing. Support the existing optional Back/Forward swipes on touch.
-- Animate larger touch scrollbar targets without reflowing file layouts;
-  restore mouse sizing on mouse or touchpad input.
+- **ADDED** Touchscreen scrolling, pinch-to-zoom, and gesture navigation.
+- **ADDED** Touch-friendly scrollbar targets.
 
 ## 0.9.263
-
-- Also refresh the active tab when returning to an Explorer window, including
-  side-by-side windows. Coalesce window activation with tab resume, and skip
-  control-only focus changes and departed windows.
+- **IMPROVED** Automatic refresh when returning to Explorer windows.
 
 ## 0.9.262
-
-- Refresh a background tab when returning to it, using the same asynchronous
-  refresh as F5 and the context menu after showing its cached contents.
-- Keep unchanged names, values, selection and viewport in place; avoid content
-  repaint for identical refresh results, including This PC devices and capacity.
+- **ADDED** Background refresh when returning to inactive tabs.
+- **IMPROVED** Refresh behavior without unnecessary flickering.
 
 ## 0.9.261
-
-- Reduce compositor work during streamed file insertions, deletions and grid
-  reflow by sharing identical motion across layers and items.
-- Avoid animation objects for stationary properties and opacity effects for
-  fully opaque items. Preserve animation timing, layer order and image quality.
+- **IMPROVED** Animation efficiency during folder content changes.
 
 ## 0.9.260
-
-- Speed up file feedback in dense views by comparing long shared identity
-  prefixes in bounded vector blocks, preserving native case comparison.
-- Reuse native text layouts during font-size-only zoom to reduce layout
-  allocation and preparation while retaining full-resolution text and trimming.
+- **IMPROVED** Large-folder responsiveness and text zoom performance.
 
 ## 0.9.259
-
-- Reduce frame preparation and drawing overhead for long Shell-provider
-  identities, including dense Recycle Bin grids, without raising cache budgets.
-- Avoid repeated identity copies and comparisons during icon lookup and
-  snapshot capture. Preserve image quality and case-insensitive file feedback.
+- **IMPROVED** Rendering performance in large virtual folders.
 
 ## 0.9.258
-
-- Reuse grid label shapes and cached text while scrolling at fractional row
-  sizes, avoiding extra glyph surfaces caused by screen-position rounding.
-- Reduce temporary allocation work when finding cached icons at another zoom
-  size, including long Shell-provider identities. Keep existing cache budgets.
+- **IMPROVED** Text and icon caching during scrolling and zooming.
 
 ## 0.9.257
-
-- Replace the withdrawn 0.9.256 sizing change. Load unframed Shell icons and
-  fit their artwork to grid/list slots, using cached GPU scaling when zooming.
-- Fix missing list icons when reusing a cached image at another zoom size,
-  including after the GPU target is recreated. Preserve thumbnail framing.
+- **FIXED** Missing icons when zooming or recreating the GPU view.
+- **IMPROVED** Icon scaling and image quality.
 
 ## 0.9.255
-
-- Resolve small native selections on the existing per-tab selection worker,
-  with identity checks before applying results or continuing file commands.
-- Avoid an extra initial selection-count query and duplicate successful
-  post-command view-mode reads. Keep empty selection immediate and unchanged
-  idle selections free of extra repaint.
+- **IMPROVED** Selection responsiveness and reduced unnecessary repaints.
 
 ## 0.9.254
-
-- Replace periodic hidden/protected-item settings checks with coalesced settings
-  and native-view notifications, including sent Explorer frame broadcasts.
-- Keep periodic This PC capacity updates on the background volume lane. Device
-  identities use drive/media and native reorder events; retain discovery
-  recovery only when the native reorder subscription is unavailable.
+- **IMPROVED** Settings synchronization and This PC drive updates.
 
 ## 0.9.253
-
-- Refresh colors at attachment and on relevant mod settings, theme, system
-  color, dark-mode and accent events. Remove periodic color checks while browsing.
-- Coalesce related notifications per tab and update tabs even when the native
-  view toggle button is disabled. Font-only and unrelated settings skip color checks.
+- **IMPROVED** Theme and accent color updates without periodic checks.
 
 ## 0.9.252
-
-- Fix 0.9.251 changing correct text and control colors when theme background
-  resources disagree with Explorer's visible background.
-- Preserve valid native foreground colors and retain them through temporary
-  lookup failures. Apply fallbacks only when native colors are unavailable.
+- **FIXED** Incorrect text and control colors in certain themes.
 
 ## 0.9.251
-
-- Keep text and matching controls visible when theme colors are invalid or
-  indistinguishable from the resolved background. Preserve usable theme colors
-  and Windows high-contrast colors.
-- Fall back safely for missing fonts, malformed font metrics and invalid text
-  sizes; keep existing text formats if replacement creation fails.
-- Restore a system accent when accent lookup fails, and validate DPI, scrolling
-  and display timing values.
+- **FIXED** Invisible text and controls caused by invalid theme colors or font settings.
 
 ## 0.9.250
-
-- Prevent repeated Paste commands when Ctrl+V is handled with Explorer frame
-  focus. Repeated accelerator checks and dispatch share one command per keypress.
-- Apply the same input ownership to recovered Cut, Copy and Delete shortcuts.
+- **FIXED** Ctrl+V occasionally pasting multiple times.
 
 ## 0.9.249
-
-- Restore Ctrl+V when the Explorer frame or GPU list owns focus, including
-  empty destinations and files copied from archives or other Shell providers.
-- Paste into the active folder without requiring an item selection or changing focus.
+- **FIXED** Ctrl+V not working in some folders or focus states.
 
 ## 0.9.248
-
-- Use the native default action for Shell-provider items, including nested
-  archives and folders inside containers.
-- Keep the GPU view available in provider subfolders without filesystem paths,
-  including after switching to native view and back.
-- Preserve provider folder identities through refresh, columns and change watching.
+- **IMPROVED** Support for ZIP archives and Shell-provider folders.
 
 ## 0.9.247
-
-- Keep selection and focus stable in ZIP and other Shell-provider folders
-  when Explorer reports the selected items back to the GPU view.
-- Restore item context menus by matching provider identities instead of
-  assuming every item has a filesystem path.
+- **FIXED** Selection and context menus inside ZIP and provider folders.
 
 ## 0.9.246
-
-- Show the Shell provider's contents for folders that delegate their view,
-  instead of listing the physical wrapper directory's files.
-- Preserve native item identities and watch the delegated target for changes.
+- **FIXED** Incorrect contents appearing in delegated Shell folders.
 
 ## 0.9.245
-
-- Fix rapid scrollbar track clicks followed by thumb dragging, including
-  presses that Windows reports as double-clicks.
-- Keep scrollbar presses and captured releases responsive while directory
-  names are loading.
+- **FIXED** Scrollbar dragging becoming unresponsive during folder loading.
 
 ## 0.9.244
-
-- Size the shared storage-bar label area from the visible labels instead of
-  the window width. Bars fill the remaining Name-column space while keeping
-  their alignment, fixed gaps and smooth column transitions.
+- **IMPROVED** Drive storage bar sizing in This PC.
 
 ## 0.9.243
-
-- Keep storage bars aligned across This PC Details rows, using shared label
-  and track space regardless of drive-label length.
-- Preserve the current column bounds for width-dependent contents during
-  navigation and view transitions, avoiding a size jump when animation settles.
+- **IMPROVED** Drive storage bar alignment and column transitions.
 
 ## 0.9.242
+- **IMPROVED** Refresh behavior by keeping existing file details visible while updates load.
 
-- Keep existing metadata visible during F5, Ctrl+R and right-click Refresh
-  while checking for changes in the background. Identical property results
-  no longer request a repaint; changed values replace their previous text
-  directly, including properties that become empty.
-
-## 0.9.240
-
-- Correct Shell image-factory bitmap transparency before GPU upload, removing
-  bright edge fringes and jagged-looking outlines on icons and transparent
-  thumbnails.
-- Preserve the existing icon sizes, zoom, filtering and large-tile drawing
-  optimizations; alpha conversion remains on the image worker.
+## 0.9.240 — Public release
+- **FIXED** Bright edges and jagged outlines on transparent icons and thumbnails.
 
 ## 0.9.239
-
-- Skip ordinary tile drawing while a tab's swap chain is busy, retaining the
-  latest input/model without blocking Explorer or another tab's rendering.
-- Use cheaper sampling for large magnified icons while preserving native-size
-  sampling, high-quality downscaling, image resolution and pinch/zoom behavior.
-- Keep deferred frame acknowledgments, transition handoff, resize and GPU handle
-  cleanup consistent with the new readiness check.
-
+- **IMPROVED** GPU rendering responsiveness and large-icon scaling performance.
