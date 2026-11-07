@@ -9,9 +9,10 @@
 - Rename several selected items at once with F2 or Explorer's Rename command.
   Explorer itself names and numbers the items, keeping each extension, and
   the rename can be undone as in native views; the native view stays hidden.
-  Clicking another item to finish renames the whole set before selecting it.
-- Leaving a rename field by clicking elsewhere, tapping a touchpad or switching
-  to another app commits the new name, as in Explorer; only Escape cancels.
+  Clicking another item or empty space to finish renames the whole set before
+  the click changes the selection. For large selections the field opens once
+  Explorer holds the whole set; a rename that cannot be handed to Explorer is
+  reported instead of being dropped.
 
 - Collect three isolated retries after unsuccessful runtime checks, retain each
   attempt's diagnostics, and distinguish pending checks from test failures before

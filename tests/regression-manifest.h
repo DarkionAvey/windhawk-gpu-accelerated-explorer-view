@@ -146,6 +146,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("selection-ui-work", PARALLEL, TestSelectionUiWork(fixture)),
     REGRESSION("provider-navigation", PARALLEL, TestProviderNavigation(fixture)),
     REGRESSION("paste-focus", PARALLEL, TestPasteFocus(fixture)),
+    REGRESSION("shell-file-labels", PARALLEL, TestShellFileLabels(fixture)),
+    REGRESSION("native-multiple-rename", PARALLEL, TestNativeMultipleRename(fixture)),
     REGRESSION("burst-row-continuity", PARALLEL, TestBurstRowContinuity(fixture)),
     REGRESSION("sort-details", PARALLEL, TestSortDetails(fixture)),
     REGRESSION("shell-size-details", PARALLEL, TestShellSizeDetails(fixture)),

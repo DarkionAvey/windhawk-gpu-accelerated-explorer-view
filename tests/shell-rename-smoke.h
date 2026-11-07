@@ -1,0 +1,265 @@
+// Explorer-owned naming through the production overlay: Shell file labels
+// (Folder Options extension hiding) and multiple-item rename by DefView's own
+// editor. Private folders in an offscreen ExplorerBrowser; the user's Folder
+// Options are read, never written. Rename error dialogs are substituted.
+namespace ShellRenameFixture {
+void CreateFiles(const std::filesystem::path& root, const std::vector<std::wstring>& names) {
+    std::filesystem::create_directories(root);
+    for (const auto& name : names) {
+        HANDLE file = CreateFileW((root / name).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, 0, nullptr);
+        Check(file != INVALID_HANDLE_VALUE, "private rename fixture file");
+        CloseHandle(file);
+    }
+}
+int Row(const ViewState& state, const std::wstring& name) {
+    for (size_t i = 0; i < state.entries.size(); ++i)
+        if (state.entries[i].name == name) return int(i);
+    Check(false, "private rename fixture row");
+    return -1;
+}
+std::wstring Text(HWND window) {
+    std::wstring text(size_t(GetWindowTextLengthW(window)) + 1, L'\0');
+    text.resize(GetWindowTextW(window, text.data(), int(text.size())));
+    return text;
+}
+// The rename transaction posts these to the overlay; the fixture's static
+// overlay HWND forwards them to the production window procedure. The mod
+// reads focus through FocusFixture, so DefView's real editor focus is mirrored.
+void Pump(ProviderSelectionFixture::Browser& host) {
+    auto& state = host.state;
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        if (const HWND real = ::GetFocus(); real && NativeRenameEditor(state, real)) FocusFixture::focus = real;
+        const UINT id = message.message;
+        if (message.hwnd == state.hwnd && (id == kMsgRenameDecision || id == kMsgNativeRenameStep ||
+            id == kMsgNativeRenameEditor || id == kMsgCreationRefocus || id == kMsgPreparedSelection ||
+            id == kMsgFlushDirectoryChanges || id == kMsgNativeCatalog))
+            OverlayProc(state.hwnd, id, message.wParam, message.lParam);
+        else { TranslateMessage(&message); DispatchMessageW(&message); }
+    }
+    ReceiveDirectoryResults(state);
+}
+bool HostHidden(const ViewState& state) {
+    const HWND host = FolderContentHost(state.nativeHwnd);
+    return host && !(GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE);
+}
+std::wstring Extension(const std::wstring& name) {
+    const wchar_t* ext = PathFindExtensionW(name.c_str());
+    return ext ? ext : L"";
+}
+struct Item { std::wstring name; bool folder = false; };
+std::vector<Item> Listing(const std::filesystem::path& root) {
+    std::vector<Item> items;
+    for (const auto& entry : std::filesystem::directory_iterator(root))
+        items.push_back({entry.path().filename().wstring(), entry.is_directory()});
+    return items;
+}
+std::wstring SelectedPath(IFolderView2* view) {
+    ComPtr<IShellItemArray> items; ComPtr<IShellItem> item; DWORD count = 0; PWSTR path = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(view->GetSelection(FALSE, &items)) && items && SUCCEEDED(items->GetCount(&count)) && count == 1 &&
+        SUCCEEDED(items->GetItemAt(0, &item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path)
+        result = path;
+    CoTaskMemFree(path);
+    return result;
+}
+
+enum class Commit { Enter, Row, Empty };
+
+// One F2 group rename through the production overlay. `renamed` files and
+// folders form the selection; `kept` items stay unselected. The commit is
+// followed by the click's own selection work before DefView's queued commit.
+void RenameSet(const std::filesystem::path& root, const std::vector<Item>& renamed,
+               const std::vector<std::wstring>& kept, Commit commit) {
+    std::vector<std::wstring> files;
+    for (const auto& item : renamed) {
+        if (item.folder) std::filesystem::create_directories(root / item.name);
+        else files.push_back(item.name);
+    }
+    files.insert(files.end(), kept.begin(), kept.end());
+    CreateFiles(root, files);
+    {
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), int(renamed.size() + kept.size()));
+    Check(HostHidden(state), "native host visible before rename");
+    state.selectedFlags.Fill(0);
+    for (const auto& item : renamed) state.selectedFlags[size_t(Row(state, item.name))] = 1;
+    const int focused = Row(state, renamed.front().name);
+    state.selected = state.anchor = focused;
+    const bool large = renamed.size() > kMaxDirectNativeSelectionItems;
+    BeginRename(state, focused, false, true);
+    const auto beganGeneration = state.pendingNativeSelection;
+    // A large set reaches Explorer on the selection lane; F2 waits for it.
+    Check(!large || !state.rename.editor, "large set opened the editor before Explorer held it");
+    const bool opened = Eventually([&] { Pump(host); return state.rename.editor != nullptr; }, 30000);
+    if (!opened) {
+        int nativeCount = -1; state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount);
+        std::cout << "EDITOR WAIT pending=" << state.pendingNativeSelection << " keys=" << state.deferredSelectionKeys.size()
+            << " unsafe=" << state.nativeSelectionUnsafe << " import=" << state.nativeSelectionImportPending
+            << " awaiting=" << state.nativeSelectionAwaitingRefresh << " confirmed=" << bool(state.confirmedNativeSelection)
+            << " gpu=" << state.selectedFlags.Count(0, state.selectedFlags.size()) << " native=" << nativeCount
+            << " focused=" << focused << " began=" << beganGeneration << std::endl;
+    }
+    Check(opened, "F2 did not open the editor for the selected set");
+    int nativeSelected = 0;
+    Check(state.rename.multiple && SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeSelected)) &&
+        nativeSelected == int(renamed.size()), "editor opened before Explorer held the whole set");
+    const std::wstring initial = Text(state.rename.editor);
+    Check(initial == EntryLabel(state.entries[size_t(focused)]), "editor did not show Explorer's label");
+    const bool hidden = !state.entries[size_t(focused)].label.empty();
+    SetWindowTextW(state.rename.editor, (L"x" + initial.substr(1)).c_str());
+    FinishRename(state, true);
+    if (commit == Commit::Row) Select(state, Row(state, kept.front()));
+    if (commit == Commit::Empty) ClearSelectionForFolderMenu(state);
+    bool alwaysHidden = true;
+    std::vector<Item> items;
+    const bool done = Eventually([&] {
+        Pump(host); alwaysHidden &= HostHidden(state);
+        items = Listing(root);
+        const size_t xs = std::count_if(items.begin(), items.end(), [](const Item& i) { return i.name.starts_with(L"x"); });
+        return !state.nativeRenameHold && xs == renamed.size() && items.size() == renamed.size() + kept.size();
+    }, 60000);
+    if (!done) for (const auto& item : items) std::wcout << L"RESULT " << item.name << L"\n";
+    Check(done, "Explorer did not rename the whole selected set");
+    for (const auto& name : kept)
+        Check(std::any_of(items.begin(), items.end(), [&](const Item& i) { return i.name == name; }),
+            "unselected item was renamed");
+    const auto count = [&](bool folder) {
+        return std::count_if(renamed.begin(), renamed.end(), [&](const Item& i) { return i.folder == folder; });
+    };
+    Check(std::count_if(items.begin(), items.end(), [](const Item& i) { return i.folder && i.name.starts_with(L"x"); }) ==
+        count(true), "renamed folders changed kind or count");
+    if (hidden) {
+        std::vector<std::wstring> before, after;
+        for (const auto& item : renamed) if (!item.folder) before.push_back(Extension(item.name));
+        for (const auto& item : items) if (!item.folder && item.name.starts_with(L"x")) after.push_back(Extension(item.name));
+        std::sort(before.begin(), before.end()); std::sort(after.begin(), after.end());
+        Check(before == after, "hidden extensions were not kept");
+    }
+    Check(alwaysHidden && HostHidden(state), "native view was exposed for the rename");
+    if (commit == Commit::Row)
+        Check(Eventually([&] {
+            Pump(host);
+            return !_wcsicmp(SelectedPath(state.folderView.Get()).c_str(), (root / kept.front()).c_str());
+        }, 30000), "the commit click's selection did not reach Explorer after the rename");
+    if (commit == Commit::Empty)
+        Check(Eventually([&] {
+            Pump(host); int selected = -1;
+            return SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &selected)) && selected == 0 &&
+                !state.selectedFlags.Count(0, state.selectedFlags.size());
+        }, 30000), "the empty-space click did not clear Explorer's selection after the rename");
+    Check(!state.rename.editor && !NativeRenameEditor(state, ::GetFocus()), "an editor was left open after the rename");
+    }
+    // Shell objects of the destroyed view release their folder handles from
+    // this thread's queue; the renamed set must not stay open.
+    Check(Eventually([&] {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+        return ProcessHandlesUnder(root).empty();
+    }, 30000), "the renamed folder stayed open after its view closed");
+}
+}
+
+// Labels come from the names worker; the expectation is the Shell folder's
+// own in-folder display name for each item, bound independently of the view.
+static void TestShellFileLabels(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    const auto root = std::filesystem::path(fixture) / L"shell-file-labels";
+    const std::wstring unknown = L"unknown.zq" + std::to_wstring(GetCurrentProcessId()) + L"q";
+    CreateFiles(root, {L"report.txt", L"second.txt", L"UPPER.TXT", L"photo.jpg", L"multi.part.name.txt",
+        L"archive.tar.gz", L".gitignore", L"noextension", unknown});
+    std::filesystem::create_directory(root / L"folder.txt");
+    {
+        ComPtr<IShellLinkW> link; ComPtr<IPersistFile> persist;
+        Check(SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link))) &&
+            SUCCEEDED(link->SetPath((root / L"report.txt").c_str())) && SUCCEEDED(link.As(&persist)) &&
+            SUCCEEDED(persist->Save((root / L"shortcut.lnk").c_str(), TRUE)), "private shortcut fixture");
+    }
+    ComPtr<IShellItem> item; ComPtr<IShellFolder> folder;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(root.c_str(), nullptr, IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder))), "independent label folder");
+    const auto shellLabel = [&](const std::wstring& name) {
+        std::wstring parse = name; ULONG eaten = 0; PIDLIST_RELATIVE raw = nullptr;
+        Check(SUCCEEDED(folder->ParseDisplayName(nullptr, nullptr, parse.data(), &eaten, &raw, nullptr)) && raw,
+            "independent label item");
+        OwnedPidl child(reinterpret_cast<PITEMID_CHILD>(raw));
+        STRRET value{}; PWSTR text = nullptr;
+        Check(SUCCEEDED(folder->GetDisplayNameOf(child.get(), SHGDN_INFOLDER, &value)) &&
+            SUCCEEDED(StrRetToStrW(&value, child.get(), &text)) && text, "independent Shell label");
+        std::wstring result = text; CoTaskMemFree(text);
+        return result;
+    };
+    // Folder Options' stored choice, read independently of SHGetSetSettings.
+    DWORD hide = 1, bytes = sizeof(hide);
+    if (SHRegGetUSValueW(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"HideFileExt",
+        nullptr, &hide, &bytes, FALSE, nullptr, 0) != ERROR_SUCCESS || bytes != sizeof(hide)) hide = 1;
+    Check(ReadShellVisibilityPolicy().showExtensions == (hide == 0), "visibility policy ignored HideFileExt");
+
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 11);
+    size_t trimmed = 0;
+    for (const auto& entry : state.entries) {
+        Regression::Scope scope("item=" + std::string(entry.name.begin(), entry.name.end()));
+        const std::wstring expected = shellLabel(entry.name);
+        Check(EntryLabel(entry) == expected, "GPU label differs from the Shell's in-folder name");
+        Check(entry.label.empty() == (expected == entry.name), "label stored although it equals the filename");
+        Check(!entry.folder || entry.label.empty(), "folder name was trimmed like a file extension");
+        trimmed += !entry.label.empty();
+    }
+    // Rows whose only change is their label are a new presentation.
+    std::vector<Entry> plain(1), labelled(1);
+    plain[0].name = labelled[0].name = L"report.txt";
+    plain[0].path = labelled[0].path = (root / L"report.txt").wstring();
+    labelled[0].label = L"report";
+    Check(DirectoryOrderHash(plain) != DirectoryOrderHash(labelled), "relabelled rows reuse the old snapshot");
+    std::cout << "PASS: " << state.entries.size() << " names-worker labels equal Shell in-folder names (" << trimmed
+        << " trimmed, HideFileExt=" << hide << "), folders untouched, relabel changes the order hash\n";
+}
+
+// F2 on several items: the production editor hands its text to DefView's own
+// hidden editor. Each commit (Enter, a click on another row, a click on empty
+// space) renames the whole set before the click's selection reaches Explorer.
+// The bulk set of 50 files and 50 folders exceeds the direct selection limit,
+// so F2 opens the editor only after the selection lane gave Explorer the set.
+// Explorer may show its own progress or error UI for a group rename; it runs
+// on a private desktop, never on the user's input desktop.
+static void TestNativeMultipleRename(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    wchar_t desktop[256]{}; DWORD length = 0;
+    Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop, sizeof(desktop), &length),
+        "multiple rename desktop identity");
+    if (!std::wstring_view(desktop).starts_with(L"gpu-overlay-multiple-rename-")) {
+        PrivateDesktopFixture::Run(L"multiple-rename", L"--test native-multiple-rename", 600000);
+        return;
+    }
+    ReportApiFixture::suppressRenameError = true; ReportApiFixture::renameErrors = 0;
+    const auto label = [](Commit commit) {
+        return commit == Commit::Enter ? std::wstring(L"enter") : commit == Commit::Row ? L"row" : L"empty";
+    };
+    for (Commit commit : {Commit::Enter, Commit::Row, Commit::Empty}) {
+        Regression::Scope scope("small commit=" + std::to_string(int(commit)));
+        RenameSet(std::filesystem::path(fixture) / (L"multiple-rename-" + label(commit)),
+            {{L"a.txt"}, {L"b.txt"}, {L"c.jpg"}}, {L"d.txt"}, commit);
+    }
+    std::vector<Item> bulk;
+    for (int i = 0; i < 50; ++i) {
+        wchar_t file[32], folder[32];
+        swprintf_s(file, L"file%02d%s", i, i % 2 ? L".jpg" : L".txt");
+        swprintf_s(folder, L"folder%02d", i);
+        bulk.push_back({file}); bulk.push_back({folder, true});
+    }
+    for (Commit commit : {Commit::Enter, Commit::Row, Commit::Empty}) {
+        Regression::Scope scope("bulk commit=" + std::to_string(int(commit)));
+        RenameSet(std::filesystem::path(fixture) / (L"bulk-rename-" + label(commit)), bulk,
+            {L"keep.txt", L"keep two.txt"}, commit);
+    }
+    Check(ReportApiFixture::renameErrors == 0, "a rename was reported as failed");
+    ReportApiFixture::suppressRenameError = false;
+    std::cout << "PASS: group rename by DefView's hidden editor for 3 items and for 50 files + 50 folders, each "
+        "committed by Enter, a row click and an empty-space click; large sets open the editor after Explorer "
+        "holds them, whole set renamed, kinds and extensions kept, selection held then applied, native view never shown\n";
+}

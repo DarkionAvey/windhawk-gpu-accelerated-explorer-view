@@ -3781,7 +3781,7 @@ struct ViewState {
     // (view token while held) GPU selection changes wait for the release.
     unsigned long long nativeRenameHold = 0;
     bool nativeRenameSelectionDeferred = false;
-    HWND nativeRenameFocusReturn = nullptr; // Where input was before DoRename.
+    HWND nativeRenameCommitEditor = nullptr; // DefView's editor that received the commit.
     // CS_DBLCLKS is scoped to the persistent GPU HWND, not the Shell folder.
     // Track a completed first row-click explicitly so Windows cannot pair a
     // click in one folder with a double-click in the next folder.
@@ -22525,7 +22525,17 @@ bool ClearNativeSelection(ViewState& state) {
     return verified;
 }
 
+// A multiple rename's set must not change before DefView's queued commit
+// reads it. Every GPU-to-native selection writer asks here; the GPU view
+// updates at once and the release applies its final selection.
+bool NativeSelectionHeldForRename(ViewState& state) {
+    if (state.nativeRenameHold != state.token || !state.nativeRenameHold) return false;
+    state.nativeRenameSelectionDeferred = true;
+    return true;
+}
+
 void MaybeRecoverNativeSelection(ViewState& state) {
+    if (NativeSelectionHeldForRename(state)) return;
     if (state.nativeSelectionRecoveryPending && NativeSelectionRestorePending(state)) {
         TraceSelectionIdentity(state, L"recovery.defer-identity");
         return;
@@ -22744,11 +22754,7 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
     const auto view=state.folderView;
     const auto token=state.token, directory=state.directoryToken;
     TraceSelectionIdentity(state, L"native.sync.before");
-    if (state.nativeRenameHold == state.token) {
-        // A multiple rename's set must not change before DefView reads it.
-        state.nativeRenameSelectionDeferred = true;
-        return false;
-    }
+    if (NativeSelectionHeldForRename(state)) return false;
     // A fresh explicit selection supersedes an older queued recovery. Failed
     // commits still use the normal verified import/recovery path.
     state.nativeSelectionRecoveryPending = false;
@@ -23102,7 +23108,7 @@ void SelectWithModifiers(ViewState& state, int index, bool control, bool shift) 
 // only gestures for the GPU-rendered list are handled here.
 void SyncNativeKeyboardCaret(ViewState& state) {
     const int index = state.selected;
-    if (!state.folderView || index < 0 || index >= state.total) return;
+    if (!state.folderView || index < 0 || index >= state.total || NativeSelectionHeldForRename(state)) return;
     constexpr DWORD flags = SVSI_FOCUSED | SVSI_SELECTIONMARK | SVSI_NOTAKEFOCUS;
     PITEMID_CHILD item = nullptr;
     if (SUCCEEDED(EntryChildPidl(state, state.entries[static_cast<size_t>(index)], &item)) && item) {
@@ -23527,7 +23533,7 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor);
 // made meanwhile (a commit click, keyboard movement) through the normal path.
 void ReleaseNativeRenameHold(ViewState& state) {
     state.nativeRenameText.clear(); state.nativeRenameToken = 0;
-    state.nativeRenameFocusReturn = nullptr;
+    state.nativeRenameCommitEditor = nullptr;
     if (!state.nativeRenameHold) return;
     state.nativeRenameHold = 0;
     if (std::exchange(state.nativeRenameSelectionDeferred, false)) SyncNativeSelection(state);
@@ -23606,13 +23612,13 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
             live->optimisticStartedAt || !TabOwnsActiveView(*live) || g_unloading.load(std::memory_order_acquire))
             return HRESULT_FROM_WIN32(ERROR_CANCELLED);
         if (key.key==VK_F2) {
+            if (key.renameText.empty()) return E_INVALIDARG;
             // DefView's own label editor renames and numbers the whole
             // selection (per-item extensions, conflicts, undo). Its host stays
             // suppressed. DoRename queues the editor and DefView's commit later
             // reads the selection, so hold the native set until step 1.
             live->nativeRenameText=key.renameText; live->nativeRenameToken=viewToken;
             live->nativeRenameHold=viewToken; live->nativeRenameSelectionDeferred=false;
-            live->nativeRenameFocusReturn=GetFocus();
             const HRESULT hr=view->DoRename();
             live=State(owner);
             if (!live || live->lifetimeToken!=lifetime || live->nativeRenameHold!=viewToken) return hr;
@@ -24369,14 +24375,9 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;
     if (msg == WM_KILLFOCUS && current && !state->rename.finishing &&
         !(state->rename.zoomHidden && state->rename.positioning)) {
-        // As in native Explorer, losing focus commits; only Escape cancels.
-        // The receiving window identifies Shell's own transient claim.
-        const HWND next = reinterpret_cast<HWND>(wp);
-        const bool shellClaim = next && IsWindow(state->nativeHwnd) &&
-            (next == state->nativeHwnd || IsChild(state->nativeHwnd, next));
-        if (state->rename.creationSticky && shellClaim) {
+        if (state->rename.creationSticky) {
             // Shell's hidden native editor can transiently steal focus after
-            // New Folder. Don't end the user's GPU editing session for it.
+            // New Folder. Don't cancel the user's GPU editing session for it.
             const bool pointerDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ||
                 (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
                 (GetAsyncKeyState(VK_MBUTTON) & 0x8000);
@@ -24389,10 +24390,10 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                     kMsgCreationRefocus, 0,
                     static_cast<LPARAM>(state->rename.epoch)) != FALSE;
             }
-        } else if (!(shellClaim && NativeRenameEditor(*state, next))) {
-            // A duplicate native editor is cancelled by adoption, which
-            // returns focus here; it is not the user leaving the field.
-            PostMessageW(overlay, kMsgRenameDecision, 1,
+        } else {
+            PostMessageW(overlay, kMsgRenameDecision,
+                ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                  GetAsyncKeyState(VK_MBUTTON)) & 0x8000) ? 1 : 0,
                 static_cast<LPARAM>(state->rename.epoch));
         }
     }
@@ -24436,7 +24437,8 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
         state.optimisticStartedAt || !TabOwnsActiveView(state) ||
         !state.detailsViewActive || state.emptyNative ||
         index < 0 || index >= state.total || !state.folder ||
-        !state.folderView || !PresentationVisible(state)) return;
+        !state.folderView || !PresentationVisible(state) ||
+        (state.nativeRenameHold && state.nativeRenameHold == state.token)) return; // DefView still renames a set.
     const size_t selectedCount = state.selectedFlags.Count(0,state.selectedFlags.size());
     if (!selectedCount || (selectedCount != 1 && !multiple) ||
         index >= static_cast<int>(state.selectedFlags.size()) ||
@@ -24445,7 +24447,11 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
     const auto lifetime = state.lifetimeToken, token = state.token;
     const std::wstring path = state.entries[size_t(index)].path;
     NativeFileCommandScope inputOwnership(&state);
+    // A set Explorer already confirmed stays the commit source: re-preparing
+    // a large set here would restart the selection lane on every attempt.
+    auto confirmed = state.confirmedNativeSelection;
     InvalidateNativeSelectionObservation(state);
+    if (confirmed && GpuSelectionMatches(state, *confirmed)) state.confirmedNativeSelection = std::move(confirmed);
     // Establish the file identity in both models before the editor takes HWND
     // focus. Cancelling a native editor can clear Shell's selected/focused PIDL.
     SyncNativeSelection(state);
@@ -24455,6 +24461,22 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
         state.nativeHwnd != native || state.rename.editor || !state.visible || !state.inScope ||
         !TabOwnsActiveView(state) || index >= state.total || size_t(index) >= state.entries.size() ||
         state.entries[size_t(index)].path != path) return;
+    if (selectedCount > 1) {
+        // A set over kMaxDirectNativeSelectionItems reaches Explorer through
+        // the selection lane. Open the editor once Explorer holds the whole
+        // set, so the commit never waits on (or races) that preparation.
+        if (state.pendingNativeSelection) {
+            const bool queued = std::any_of(state.deferredSelectionKeys.begin(), state.deferredSelectionKeys.end(),
+                [](const auto& key) { return key.key == VK_F2 && key.renameText.empty(); });
+            if (!queued) {
+                ViewState::DeferredSelectionKey key;
+                key.key = VK_F2;
+                state.deferredSelectionKeys.push_back(std::move(key));
+            }
+            return;
+        }
+        if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending) return; // Explorer's set unverified.
+    }
     StopKeyboardSelectionAnimation(state);
     // The frame-child EDIT must be revealed before it is ever shown. An
     // animated scroll can otherwise expose it over unrelated Explorer chrome.
@@ -24578,35 +24600,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
 // Never infer a filename from a caption or adopt address/search controls.
 bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
     if (g_unloading.load(std::memory_order_acquire) || !NativeRenameEditor(state, editor) ||
-        GetFocus() != editor) return false;
-    // Our committed multiple-item rename. Enter ends DefView's label edit like
-    // a native commit, without changing focus or activation, so a click into
-    // another app commits too. Step 1 is queued behind DefView's commit.
-    if (state.nativeRenameToken == state.token && !state.nativeRenameText.empty() && !state.rename.editor) {
-        const HWND owner = state.hwnd, focusReturn = state.nativeRenameFocusReturn;
-        const auto lifetime = state.lifetimeToken, token = state.token;
-        const std::wstring text = std::exchange(state.nativeRenameText, std::wstring{});
-        state.nativeRenameToken = 0;
-        NativeFileCommandScope inputOwnership(&state);
-        SetWindowTextW(editor, text.c_str());
-        SendMessageW(editor, WM_KEYDOWN, VK_RETURN, 0);
-        if (State(owner) != &state || state.lifetimeToken != lifetime || state.token != token) return true;
-        if (!PostMessageW(owner, kMsgNativeRenameStep, 1, static_cast<LPARAM>(token)))
-            ReleaseNativeRenameHold(state);
-        // Input returns to the control the commit click focused, else the list.
-        if (ExplorerFrameHasForeground(state.frameHwnd)) {
-            if (focusReturn && IsWindow(focusReturn) && IsWindowVisible(focusReturn) &&
-                GetAncestor(focusReturn, GA_ROOT) == state.frameHwnd &&
-                GetWindowThreadProcessId(focusReturn, nullptr) == GetCurrentThreadId() &&
-                !(IsWindow(state.nativeHwnd) && (focusReturn == state.nativeHwnd || IsChild(state.nativeHwnd, focusReturn))))
-                SetFocus(focusReturn);
-            else ReturnListInputFocus(state, editor);
-        }
-        if (g_perf.load(std::memory_order_relaxed))
-            Wh_Log(L"[GPU rename] NATIVE_MULTIPLE_COMMIT native-edit=%p", editor);
-        return true;
-    }
-    if (!state.visible || !state.inScope || !state.detailsViewActive ||
+        GetFocus() != editor || !state.visible || !state.inScope || !state.detailsViewActive ||
         state.thisPcGpu || state.optimisticStartedAt || !state.folderView || !state.folder ||
         !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd)) return false;
     const HWND owner = state.hwnd, native = state.nativeHwnd;
@@ -24617,6 +24611,22 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
             live->nativeHwnd == native && !g_unloading.load(std::memory_order_acquire);
     };
     NativeFileCommandScope inputOwnership(&state);
+    // Our committed multiple-item rename. Enter ends DefView's label edit as
+    // a native commit does; step 1 is queued behind DefView's commit.
+    if (state.nativeRenameToken == token && !state.nativeRenameText.empty() && !state.rename.editor) {
+        const std::wstring text = std::exchange(state.nativeRenameText, std::wstring{});
+        state.nativeRenameToken = 0;
+        SetWindowTextW(editor, text.c_str());
+        state.nativeRenameCommitEditor = editor;
+        SendMessageW(editor, WM_KEYDOWN, VK_RETURN, 0);
+        if (!current()) return true;
+        if (!PostMessageW(owner, kMsgNativeRenameStep, 1, static_cast<LPARAM>(token)))
+            ReleaseNativeRenameHold(state);
+        ReturnListInputFocus(state, editor);
+        if (g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU rename] NATIVE_MULTIPLE_COMMIT native-edit=%p", editor);
+        return true;
+    }
     // A context-menu creation may already have opened our field before Shell
     // subsequently focuses its duplicate. Cancel only the duplicate session.
     if (state.rename.editor) {
@@ -24817,9 +24827,18 @@ void RepositionRenameEdit(ViewState& state) {
     }
 }
 
+// A committed name is never dropped silently; the single-item path reports
+// its Shell failure the same way.
+void ReportMultipleRenameFailure(ViewState& state, const wchar_t* reason, HRESULT hr = S_OK) {
+    Wh_Log(L"[GPU rename] multiple rename not performed: %s hr=0x%08X", reason, static_cast<unsigned>(hr));
+    if (IsWindow(state.hwnd) && !g_unloading.load(std::memory_order_acquire))
+        MessageBoxW(state.hwnd, L"Explorer could not rename the selected items.", L"Rename", MB_OK | MB_ICONWARNING);
+}
+
 // Explorer's multiple-item rename belongs to DefView. Hand the committed label
 // to its own editor for the verified native selection, as Open() does for the
-// default action; a large selection still being prepared defers the request.
+// default action. BeginRename opened the editor only once Explorer held the
+// set, so this never queues behind a selection preparation a click can cancel.
 void RenameSelectionNatively(ViewState& state, const std::wstring& text) {
     ViewState::DeferredSelectionKey key;
     key.key = VK_F2; key.renameText = text;
@@ -24830,9 +24849,9 @@ void RenameSelectionNatively(ViewState& state, const std::wstring& text) {
         return live == &state && live->lifetimeToken == lifetime && live->token == token &&
             live->directoryToken == directory && !g_unloading.load(std::memory_order_acquire);
     };
-    if (state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(std::move(key)); return; }
-    if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending || state.nativeSelectionAwaitingRefresh) {
-        Wh_Log(L"[GPU rename] multiple rename skipped: native selection unverified");
+    if (state.pendingNativeSelection || state.nativeSelectionUnsafe || state.nativeSelectionImportPending ||
+        state.nativeSelectionAwaitingRefresh) {
+        ReportMultipleRenameFailure(state, L"Explorer's selection is not verified");
         return;
     }
     const bool verified = state.verifiedSelectionToken == token && state.verifiedSelectionDirectory == directory &&
@@ -24840,15 +24859,17 @@ void RenameSelectionNatively(ViewState& state, const std::wstring& text) {
     if (!verified) {
         const bool synced = SyncNativeSelection(state);
         if (!current()) return;
-        if (state.pendingNativeSelection) { state.deferredSelectionKeys.push_back(std::move(key)); return; }
-        if (!synced) return;
+        if (!synced || state.pendingNativeSelection) {
+            ReportMultipleRenameFailure(state, L"Explorer's selection could not be confirmed");
+            return;
+        }
     }
     ComPtr<IShellView> native;
     if (FAILED(state.folderView.As(&native)) && state.shellBrowser)
         state.shellBrowser->QueryActiveShellView(&native);
     if (!current()) return;
     const HRESULT hr = InvokeNativeFileKey(state, native.Get(), key);
-    if (FAILED(hr)) Wh_Log(L"[GPU rename] native multiple rename failed hr=0x%08X", static_cast<unsigned>(hr));
+    if (FAILED(hr) && current()) ReportMultipleRenameFailure(state, L"DefView did not start renaming", hr);
 }
 
 void FinishRename(ViewState& state, bool commit) {
@@ -25303,8 +25324,9 @@ void ClearSelectionForFolderMenu(ViewState& state) {
     CancelNativeSelectionPreparation(state);
     // First commit the native transaction. The status bar, Delete and other
     // apps observe this view, so never fade out the GPU selection before
-    // Explorer acknowledges a real empty selection.
-    if (!ClearNativeSelection(state)) {
+    // Explorer acknowledges a real empty selection. A held multiple rename
+    // clears Explorer's selection after its commit instead.
+    if (!NativeSelectionHeldForRename(state) && !ClearNativeSelection(state)) {
         ReconcileFailedNativeSelection(state);
         return;
     }
@@ -31722,6 +31744,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (!native || !IsWindow(target) || !live ||
                         live->token != viewToken || live->nativeHwnd != target ||
                         !GpuSelectionMatches(*live, *prepared)) break;
+                    if (key.key == VK_F2 && key.renameText.empty()) {
+                        // F2 on a large set: Explorer now holds it; open the editor.
+                        BeginRename(*live, live->selected, false, true);
+                        continue;
+                    }
                     const HRESULT hr = InvokeNativeFileKey(*live,native.Get(),key);
                     if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred %s command failed hr=0x%08X",
                         key.newTab ? L"new-tab" : L"native",static_cast<unsigned>(hr));
@@ -33080,9 +33107,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 const HWND focus = GetFocus();
                 if (NativeRenameEditor(*s, focus) && AdoptNativeRenameEditor(*s, focus)) return 0;
                 if (NativeRenameEditor(*s, focus)) SendMessageW(focus, WM_KEYDOWN, VK_ESCAPE, 0);
-                Wh_Log(L"[GPU rename] multiple rename ended without Explorer's editor");
-                if (auto* live = State(hwnd)) ReleaseNativeRenameHold(*live);
-            } else if (wParam == 1) ReleaseNativeRenameHold(*s);
+                if (auto* live = State(hwnd)) {
+                    ReleaseNativeRenameHold(*live);
+                    ReportMultipleRenameFailure(*live, L"Explorer's editor could not be used");
+                }
+            } else if (wParam == 1) {
+                // Explorer ends its edit on commit, including when it rejects
+                // the name with its own message. Never leave a hidden editor
+                // holding the keyboard.
+                const HWND editor = s->nativeRenameCommitEditor;
+                if (editor && IsWindow(editor) && NativeRenameEditor(*s, editor)) {
+                    SendMessageW(editor, WM_KEYDOWN, VK_ESCAPE, 0);
+                    if (!State(hwnd)) return 0;
+                    ReturnListInputFocus(*s, editor);
+                }
+                ReleaseNativeRenameHold(*s);
+            }
         }
         return 0;
     case kMsgCreationRefocus:
@@ -34214,7 +34254,6 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.renamePreviewPath.clear(); state.renamePreviewName.clear(); state.renamePreviewToken = 0;
     state.nativeRenameText.clear(); state.nativeRenameToken = 0;
     state.nativeRenameHold = 0; state.nativeRenameSelectionDeferred = false;
-    state.nativeRenameFocusReturn = nullptr;
     if (state.manipulationFrameActive || state.touch.active) StopTouchpad(state, false);
     state.background->capacityGeneration.store(0, std::memory_order_release);
     state.capacityToken = 0;
