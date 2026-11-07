@@ -47,11 +47,25 @@ void CheckStable(ViewState& state,bool rename) {
         0,0,1,1,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
     Check(hidden!=nullptr,"hidden frame sibling");
     Check(SetWindowPos(hidden,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE),"raise hidden frame sibling");
+    // Settled refreshes (status chrome events) neither re-send the switch's
+    // tooltip text, which re-measures and moves a showing tip, nor repaint it.
+    unsigned tipUpdates=0;
+    const SUBCLASSPROC tipObserver=[](HWND hwnd,UINT message,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data)->LRESULT {
+        if(message==TTM_UPDATETIPTEXTW) ++*reinterpret_cast<unsigned*>(data);
+        return DefSubclassProc(hwnd,message,wp,lp);
+    };
+    Check(state.viewToggleTooltip && SetWindowSubclass(state.viewToggleTooltip,tipObserver,2,reinterpret_cast<DWORD_PTR>(&tipUpdates)),
+        "switch tooltip observer");
+    ValidateRect(state.viewToggle,nullptr);
     for(int n=0;n<3;++n) {
         RefreshViewToggleForFrame(frame);
         EnsureOverlayStacking(state);
         if(rename) RepositionRenameEdit(state);
     }
+    RECT dirty{};
+    const bool repainted=GetUpdateRect(state.viewToggle,&dirty,FALSE)!=FALSE;
+    RemoveWindowSubclass(state.viewToggleTooltip,tipObserver,2);
+    Check(!tipUpdates && !repainted,"settled refreshes re-sent the switch tooltip or repainted the switch");
     if(probe.positions || probe.sizes) std::cout<<"STACK settled rename="<<rename
         <<" positions="<<probe.positions<<" sizes="<<probe.sizes<<std::endl;
     Check(!probe.positions && !probe.sizes,"settled owned windows fought over Z order or reacted to a hidden sibling");

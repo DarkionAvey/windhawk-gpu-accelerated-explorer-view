@@ -3170,6 +3170,7 @@ struct ViewState {
     bool viewToggleLayoutQueued = false;
     bool viewToggleHot = false, viewTogglePaletteDirty = true;
     COLORREF viewToggleBackground = CLR_INVALID, viewToggleForeground = CLR_INVALID;
+    std::wstring viewToggleHint; // Last text given to the tooltip.
     void ReleaseViewToggle() {
         for (HWND child : {viewToggleTooltip, viewToggle}) {
             if (IsWindow(child) && GetPropW(child, kViewToggleOwnerProperty) == hwnd) {
@@ -3192,6 +3193,7 @@ struct ViewState {
         viewToggleDpi = 0;
         viewToggleHot = false;
         viewTogglePaletteDirty = true;
+        viewToggleHint.clear();
     }
     ViewState() {background->notificationLifetime=lifetimeToken;}
     ~ViewState() {
@@ -38024,21 +38026,25 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 tool.lpszText = const_cast<LPWSTR>(hint);
                 if (!SendMessageW(state->viewToggleTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool))) {
                     DestroyWindow(state->viewToggleTooltip); state->viewToggleTooltip = nullptr;
-                }
+                } else state->viewToggleHint = hint;
             }
         }
         // Keep native hover/tooltips alive. Unavailable actions are rejected
         // internally by the command handler, while our painter dims the icon.
-        InvalidateRect(state->viewToggle, nullptr, FALSE);
+        // Chrome events (the status bar's own location changes) refresh this
+        // often: only a changed state repaints the button or re-measures, and
+        // so moves, a showing tooltip.
         wchar_t current[64]{}; GetWindowTextW(state->viewToggle, current, ARRAYSIZE(current));
         if (wcscmp(current, caption) != 0) {
             SetWindowTextW(state->viewToggle, caption);
+            InvalidateRect(state->viewToggle, nullptr, FALSE);
         }
-        if (IsWindow(state->viewToggleTooltip)) {
+        if (IsWindow(state->viewToggleTooltip) && state->viewToggleHint != hint) {
             TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
             tool.hwnd = frame; tool.uId = reinterpret_cast<UINT_PTR>(state->viewToggle);
             tool.lpszText = const_cast<LPWSTR>(hint);
             SendMessageW(state->viewToggleTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+            state->viewToggleHint = hint;
         }
         const int dpi = DpiOf(frame);
         if (state->viewToggleDpi != dpi || state->viewToggleIconColor != state->viewToggleForeground ||

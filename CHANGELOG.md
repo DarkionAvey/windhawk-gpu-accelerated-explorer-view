@@ -5,10 +5,13 @@
 - **ADDED** Batch renaming of multiple selected files and folders, with native numbering and undo support.
 - **ADDED** Click-to-rename behavior, matching native Explorer.
 - **ADDED** Automatic renaming when creating new files or folders.
+
 - **IMPROVED** Rename field appearance to match the list's font, scaling, and text rendering.
+- **IMPROVED** Build validation reliability with additional retries and diagnostics.
+
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
-- **IMPROVED** Build validation reliability with additional retries and diagnostics.
+- **FIXED** View switch tooltip flickering and moving while shown.
 
 ## 1.0.4 — Public release
 - **FIXED** ARM64 compatibility.
@@ -18,21 +21,25 @@
 - **FIXED** Touch drag-and-drop issues.
 
 ## 1.0.2
-- **FIXED** Text rendering inconsistencies across views.
 - **IMPROVED** New-tab loading and animation responsiveness.
+
+- **FIXED** Text rendering inconsistencies across views.
 - **FIXED** Renaming items inside collapsed groups.
 
 ## 1.0.1
 - **IMPROVED** Type-to-select performance and Unicode support.
-- **FIXED** Relative date calculations in tooltips.
 - **IMPROVED** Keyboard navigation and group selection behavior.
+
+- **FIXED** Relative date calculations in tooltips.
 - **FIXED** Thumbnail overlay scaling at large icon sizes.
 
 ## 1.0.0
 - **ADDED** Localized relative dates to file tooltips.
 - **ADDED** Keyboard navigation and expand/collapse controls for group headers.
+
 - **IMPROVED** Type-to-select with flexible matching and Backspace support.
 - **IMPROVED** Group animations, drag previews, and selection visuals.
+
 - **FIXED** View toggle behavior when GPU rendering is unavailable.
 - **FIXED** Compatibility with native Explorer tooltips and accessibility settings.
 
@@ -44,14 +51,17 @@
 
 ## 0.9.345
 - **ADDED** Smooth icon rearrangement animations when resizing or zooming.
+
 - **FIXED** Touchscreen pinch-zoom flickering and clipping.
 
 ## 0.9.344
 - **ADDED** Double-tap on empty space to navigate up a folder.
+
 - **IMPROVED** Visual sharpness at non-default display scaling.
 
 ## 0.9.343
 - **IMPROVED** Icon overlay and thumbnail badge scaling.
+
 - **FIXED** Scrollbar flickering during column resizing.
 
 ## 0.9.342
@@ -59,6 +69,7 @@
 
 ## 0.9.341
 - **IMPROVED** Drag-and-drop previews, animations, and touch compatibility.
+
 - **FIXED** Select All occasionally clearing selections.
 - **FIXED** Text rendering inconsistencies and rename-field alignment.
 
@@ -71,6 +82,7 @@
 
 ## 0.9.338
 - **ADDED** Detailed file tooltips with additional metadata.
+
 - **IMPROVED** Tooltip localization, formatting, and appearance.
 
 ## 0.9.337
@@ -112,6 +124,7 @@
 
 ## 0.9.324
 - **IMPROVED** File size loading and large-folder responsiveness.
+
 - **FIXED** Dragging with swapped mouse buttons.
 
 ## 0.9.323
@@ -182,8 +195,9 @@
 - **FIXED** Missing animations when changing folder grouping.
 
 ## 0.9.301
-- **FIXED** Native sorting, view switching, and refresh behavior.
 - **IMPROVED** Rename fields and selection marquee rendering.
+
+- **FIXED** Native sorting, view switching, and refresh behavior.
 
 ## 0.9.300
 - **FIXED** Back/Forward gesture indicators sometimes disappearing.
@@ -250,6 +264,7 @@
 
 ## 0.9.277
 - **ADDED** Redesigned, animated Back/Forward swipe indicators.
+
 - **IMPROVED** Gesture feedback and navigation behavior.
 
 ## 0.9.276
@@ -275,6 +290,7 @@
 
 ## 0.9.269
 - **IMPROVED** Touch-friendly scrollbar animations.
+
 - **FIXED** Temporary scrollbar flashes and initial touch scroll jumps.
 
 ## 0.9.268
@@ -284,11 +300,13 @@
 - **IMPROVED** Touch gesture detection and selection behavior.
 
 ## 0.9.266
-- **IMPROVED** Touch scrolling, selection, and swipe navigation.
 - **ADDED** Support for Explorer's single-click activation preferences.
+
+- **IMPROVED** Touch scrolling, selection, and swipe navigation.
 
 ## 0.9.265
 - **ADDED** Native touchscreen gesture handling and hold-to-drag functionality.
+
 - **IMPROVED** Touch scrollbars and pinch-to-zoom.
 
 ## 0.9.264
@@ -300,6 +318,7 @@
 
 ## 0.9.262
 - **ADDED** Background refresh when returning to inactive tabs.
+
 - **IMPROVED** Refresh behavior without unnecessary flickering.
 
 ## 0.9.261
@@ -315,8 +334,9 @@
 - **IMPROVED** Text and icon caching during scrolling and zooming.
 
 ## 0.9.257
-- **FIXED** Missing icons when zooming or recreating the GPU view.
 - **IMPROVED** Icon scaling and image quality.
+
+- **FIXED** Missing icons when zooming or recreating the GPU view.
 
 ## 0.9.255
 - **IMPROVED** Selection responsiveness and reduced unnecessary repaints.
