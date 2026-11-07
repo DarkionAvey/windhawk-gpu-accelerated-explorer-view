@@ -6,6 +6,12 @@
   per-type extension rules (such as shortcuts) as reported by the Shell, live
   when the option changes. Name sorting, type-to-select, tooltips and rename
   use the displayed name; rename keeps a hidden extension.
+- Rename several selected items at once with F2 or Explorer's Rename command.
+  Explorer itself names and numbers the items, keeping each extension, and
+  the rename can be undone as in native views; the native view stays hidden.
+  Clicking another item to finish renames the whole set before selecting it.
+- Leaving a rename field by clicking elsewhere, tapping a touchpad or switching
+  to another app commits the new name, as in Explorer; only Escape cancels.
 
 - Collect three isolated retries after unsuccessful runtime checks, retain each
   attempt's diagnostics, and distinguish pending checks from test failures before
