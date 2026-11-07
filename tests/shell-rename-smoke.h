@@ -521,3 +521,147 @@ static void TestRenameTextWeight(const std::wstring& fixture) {
     std::cout << "PASS: rename field text matches the list's DirectWrite weight (ink within 3%) and antialiasing "
         "(no ClearType fringes), including buffered partial repaints\n";
 }
+
+namespace RenameTextFixture {
+// Columns/rows holding ink (any channel away from the background).
+struct Extent {
+    int left = -1, right = -1, top = -1, bottom = -1;
+    int Width() const { return right - left + 1; }
+    int Height() const { return bottom - top + 1; }
+};
+inline Extent InkExtent(const Canvas& canvas, COLORREF background) {
+    Extent e;
+    for (int y = 0; y < canvas.height; ++y) for (int x = 0; x < canvas.width; ++x) {
+        const DWORD c = canvas.bits[y * canvas.width + x];
+        const int d = std::abs(int((c >> 16) & 255) - int(GetRValue(background))) +
+            std::abs(int((c >> 8) & 255) - int(GetGValue(background))) + std::abs(int(c & 255) - int(GetBValue(background)));
+        if (d < 96) continue; // Ignore faint antialiasing at the glyph ends.
+        if (e.left < 0 || x < e.left) e.left = x;
+        if (x > e.right) e.right = x;
+        if (e.top < 0) e.top = y;
+        e.bottom = y;
+    }
+    return e;
+}
+}
+
+// A long name in the rename field has the list's size and spacing. The
+// expectation is the list's own text format in a natural DirectWrite layout,
+// drawn independently, in details and list views, at the configured and a
+// zoomed (fractional) size, with Explorer's font and custom families.
+static void TestRenameTextMetrics(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    using RenameTextFixture::Canvas;
+    const std::wstring name = L"Quarterly financial report draft for the regional board meeting 2026.txt"; // Long, yet one line in Courier New zoomed.
+    const auto root = std::filesystem::path(fixture) / L"rename-text-metrics";
+    CreateFiles(root, {name});
+    auto values = OptionCatalog::Defaults();
+    values[L"Appearance.rowHeight"] = L"32";
+    values[L"Appearance.fontSizePercent"] = L"52";
+    values[L"Appearance.gridFontSizePercent"] = L"42";
+    struct Restore { ~Restore() { SettingsFixture::values = nullptr; } } restore;
+    SettingsFixture::values = &values;
+    const auto factoryBefore = g_writeFactory;
+    struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
+    if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "rename metric fonts");
+    std::vector<std::wstring> families{L"", L"Courier New"};
+    {
+        ComPtr<IDWriteFontCollection> fonts; UINT32 index = 0; BOOL exists = FALSE;
+        if (SUCCEEDED(g_writeFactory->GetSystemFontCollection(&fonts)) &&
+            SUCCEEDED(fonts->FindFamilyName(L"Arial Nova", &index, &exists)) && exists) families.push_back(L"Arial Nova");
+    }
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 1);
+    bool failed = false;
+    for (const auto& family : families) for (UINT mode : {UINT(FVM_DETAILS), UINT(FVM_LIST)}) for (bool zoomed : {false, true}) {
+        values[L"Appearance.fontFamily"] = family;
+        LoadSettings();
+        ApplyViewLayout(state, {mode, 48}, false); UpdateColumns(state);
+        state.rowHeight96[0] = zoomed ? 35 : 0; state.preciseRowHeight96[0] = zoomed ? 34.6 : 0.; // Fractional list size.
+        UpdateMetrics(state);
+        Check(MakeTextFormats(state) && state.textFormat, "rename metric list format");
+        RefreshTextRendering(state);
+        state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
+        Check(SyncNativeSelection(state), "rename metric selection");
+        BeginRename(state, 0);
+        const HWND editor = state.rename.editor;
+        Check(editor != nullptr, "rename metric editor");
+        FocusFixture::focus = state.hwnd;
+        RECT client{}; GetClientRect(editor, &client);
+        const std::wstring text = Text(editor);
+        const int width = std::max<int>(client.right, 2400);
+        Canvas field(width, client.bottom), gdi(width, client.bottom), list(width, client.bottom);
+        const auto brush = reinterpret_cast<HBRUSH>(SendMessageW(GetParent(editor), WM_CTLCOLOREDIT,
+            reinterpret_cast<WPARAM>(field.dc), reinterpret_cast<LPARAM>(editor)));
+        LOGBRUSH fill{}; GetObjectW(brush, sizeof(fill), &fill);
+        const COLORREF background = fill.lbColor, foreground = GetTextColor(field.dc);
+        SendMessageW(GetParent(editor), WM_CTLCOLOREDIT, reinterpret_cast<WPARAM>(gdi.dc), reinterpret_cast<LPARAM>(editor));
+        HBRUSH solid = CreateSolidBrush(background);
+        RECT all{0, 0, width, client.bottom};
+        FillRect(field.dc, &all, solid); FillRect(gdi.dc, &all, solid); DeleteObject(solid);
+        const bool directWrite = PaintRenameText(state, editor, field.dc, client);
+        SendMessageW(editor, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(gdi.dc), PRF_CLIENT);
+        // The list's own format and natural layout, drawn independently.
+        ComPtr<ID2D1Factory> factory; ComPtr<ID2D1DCRenderTarget> target; ComPtr<ID2D1SolidColorBrush> ink;
+        ComPtr<IDWriteTextLayout> layout;
+        const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.f, 96.f);
+        Check(SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.GetAddressOf())) &&
+            SUCCEEDED(factory->CreateDCRenderTarget(&properties, &target)) && SUCCEEDED(target->BindDC(list.dc, &all)) &&
+            SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(GetRValue(foreground) / 255.f, GetGValue(foreground) / 255.f,
+                GetBValue(foreground) / 255.f), &ink)) &&
+            SUCCEEDED(g_writeFactory->CreateTextLayout(text.c_str(), UINT32(text.size()), state.textFormat.Get(),
+                100000.f, float(client.bottom), &layout)), "rename metric list layout");
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        target->BeginDraw();
+        target->SetTextRenderingParams(state.textRenderingParams.Get());
+        target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        target->Clear(D2D1::ColorF(GetRValue(background) / 255.f, GetGValue(background) / 255.f, GetBValue(background) / 255.f));
+        target->DrawTextLayout(D2D1::Point2F(4.f, 1.f), layout.Get(), ink.Get());
+        Check(SUCCEEDED(target->EndDraw()), "rename metric list rendering");
+        const auto l = RenameTextFixture::InkExtent(list, background), f = RenameTextFixture::InkExtent(field, background),
+            g = RenameTextFixture::InkExtent(gdi, background);
+        std::wcout << L"METRICS family=" << (family.empty() ? L"(Explorer)" : family) << L" view="
+            << (mode == FVM_DETAILS ? L"details" : L"list") << L" zoomed=" << zoomed << L" fontPx=" << state.fontPx
+            << L" field-client=" << client.right << L" directWrite=" << directWrite
+            << L" | width list=" << l.Width() << L" field=" << f.Width() << L" gdi=" << g.Width()
+            << L" | height list=" << l.Height() << L" field=" << f.Height() << L" gdi=" << g.Height() << std::endl;
+        const bool oneLine = SendMessageW(editor, EM_GETLINECOUNT, 0, 0) == 1;
+        failed |= !oneLine || !directWrite || std::abs(f.Width() - l.Width()) > 1 || std::abs(f.Height() - l.Height()) > 1 ||
+            f.right >= client.right;
+        // The caret and the pointer follow the displayed text: a boundary of
+        // the list's own layout, not the EDIT's GDI advances.
+        ::SetFocus(editor); FocusFixture::focus = editor;
+        const auto boundary = [&](UINT32 k) {
+            DWRITE_HIT_TEST_METRICS hit{}; FLOAT x = 0.f, y = 0.f;
+            layout->HitTestTextPosition(k, FALSE, &x, &y, &hit);
+            return x;
+        };
+        SendMessageW(editor, EM_SETSEL, 0, 0);
+        POINT origin{}; GetCaretPos(&origin);
+        int caretError = 0, clickError = 0;
+        for (UINT32 k : {UINT32(text.size() / 4), UINT32(text.size() / 2), UINT32(text.size() * 3 / 4), UINT32(text.size() - 1)}) {
+            const int expected = int(std::lround(boundary(k) - boundary(0)));
+            SendMessageW(editor, EM_SETSEL, k, k);
+            POINT caret{}; GetCaretPos(&caret);
+            caretError = std::max(caretError, std::abs(int(caret.x - origin.x) - expected));
+            const LPARAM at = MAKELPARAM(origin.x + expected + 1, caret.y + 2);
+            SendMessageW(editor, WM_LBUTTONDOWN, MK_LBUTTON, at);
+            SendMessageW(editor, WM_LBUTTONUP, 0, at);
+            DWORD selectionStart = 0, selectionEnd = 0;
+            SendMessageW(editor, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+            clickError = std::max(clickError, std::abs(int(selectionStart) - int(k)) + std::abs(int(selectionEnd) - int(k)));
+        }
+        std::wcout << L"  caret error=" << caretError << L" px, click error=" << clickError << L" characters" << std::endl;
+        failed |= caretError > 1 || clickError != 0;
+        FocusFixture::focus = state.hwnd;
+        CancelRename(state);
+    }
+    Check(!failed, "the rename field's text size, spacing, caret or pointer differs from the list's text");
+    std::cout << "PASS: long names in the rename field match the list's text width and height in details and list views, "
+        "configured and fractional zoomed sizes, Explorer's and custom font families; caret and clicks follow the shown text\n";
+}

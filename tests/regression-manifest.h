@@ -150,6 +150,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("native-multiple-rename", PARALLEL, TestNativeMultipleRename(fixture)),
     REGRESSION("click-rename", PARALLEL, TestClickRename(fixture)),
     REGRESSION("rename-text-weight", PARALLEL, TestRenameTextWeight(fixture)),
+    REGRESSION("rename-text-metrics", PARALLEL, TestRenameTextMetrics(fixture)),
     REGRESSION("burst-row-continuity", PARALLEL, TestBurstRowContinuity(fixture)),
     REGRESSION("sort-details", PARALLEL, TestSortDetails(fixture)),
     REGRESSION("shell-size-details", PARALLEL, TestShellSizeDetails(fixture)),
