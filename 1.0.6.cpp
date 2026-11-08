@@ -1882,6 +1882,9 @@ struct DirectoryJob {
     SharedPidl folderIdentity; // Native binding, including filesystem-addressed providers.
     SharedPidl namespaceFolder; // Immutable; rebound only by the names worker.
     std::shared_ptr<const NamespaceIdentities> verifyIdentities;
+    // The displayed listing of this same folder; keeps row identities stable
+    // when its provider returns canonically equal items with different bytes.
+    std::shared_ptr<const NamespaceIdentities> previousIdentities;
     SharedPidl nativeWitness; // Explorer item contradicting an empty snapshot.
     bool nativeWitnessExists = false;
     std::shared_ptr<std::atomic<size_t>> capacityRemaining;
@@ -3625,6 +3628,10 @@ struct ViewState {
     ScrollbarMotion scrollbarMotion[2]; // Vertical and horizontal, independently retargetable.
     int hovered = -1;
     std::wstring typeSearch;
+    // Words of the displayed search-results query; their matches in names
+    // are highlighted like Explorer's own search view. Empty elsewhere.
+    std::vector<std::wstring> searchHighlightTerms;
+    SharedPidl searchHighlightFolder; // Identity the terms were read from.
     TypeSearchCandidates typeSearchCandidates; // Owner-only; never copied to presentation snapshots.
     bool typeSearchWaiting=false;
     unsigned long long typeSearchWaitingListing=0;
@@ -4265,7 +4272,7 @@ struct SwipeFeedbackSnapshot {
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
     X(hoverFromHeight) X(hoverToHeight) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
-    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
+    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
@@ -7701,7 +7708,7 @@ std::wstring FolderLocation(PCIDLIST_ABSOLUTE pidl) {
     // Filesystem containers can expose descendants with no Win32 path. Keep
     // their complete Shell identity instead of inventing a path or rebinding
     // their display/parsing name. Determine scope from PIDL prefixes only;
-    // no enumeration, attributes, or cold display-name provider on this STA.
+    // no enumeration or cold display-name provider on this STA.
     // Walk from the root so even a deeply nested container finds its physical
     // ancestor in a few calls. Bound work for non-filesystem namespace roots.
     OwnedPidl prefix(ILCloneFull(pidl));
@@ -7715,6 +7722,21 @@ std::wstring FolderLocation(PCIDLIST_ABSOLUTE pidl) {
         if (filesystem) return NamespaceItemKey(pidl);
         component = next;
     }
+    // List through the Shell provider, like other namespace folders:
+    // - containers of filesystem items without one Win32 path of their own
+    //   (libraries, for example);
+    // - plain item lists with no subfolder tree (Applications, Printers).
+    //   Folders that report subfolders (Home, Control Panel's category page)
+    //   present sections or navigation pages, and stay native.
+    // The attributes are answered by the displayed folder's parent, which
+    // Explorer already bound for this navigation.
+    ComPtr<IShellItem> item;
+    SFGAOF attributes = 0;
+    if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->GetAttributes(SFGAO_FILESYSANCESTOR | SFGAO_FOLDER | SFGAO_HASSUBFOLDER, &attributes)) &&
+        (attributes & SFGAO_FOLDER) &&
+        (attributes & (SFGAO_FILESYSANCESTOR | SFGAO_HASSUBFOLDER)) != SFGAO_HASSUBFOLDER)
+        return NamespaceItemKey(pidl);
     return kUnsupportedShellLocation;
 }
 
@@ -8028,8 +8050,9 @@ void ArmInteractiveCreation(ViewState& state, unsigned mask,
 bool EnsureDirectoryWorker(ViewState& state, bool properties);
 DWORD WINAPI DirectoryWorkerProc(LPVOID context);
 
+void UpdateSearchHighlightTerms(ViewState& state);
 bool EnsureDirectoryFolderIdentity(ViewState& state) {
-    if (state.directoryFolderIdentity) return true;
+    if (state.directoryFolderIdentity) { UpdateSearchHighlightTerms(state); return true; }
     // Optimistic navigation still holds the departing native folder. Only
     // a destination identity supplied by the Shell or retained from its prior
     // native binding can authorize provisional work. Never capture this stale
@@ -8041,7 +8064,65 @@ bool EnsureDirectoryFolderIdentity(ViewState& state) {
     OwnedPidl owned(root);
     if (FAILED(hr) || !owned) return false;
     state.directoryFolderIdentity = SharedPidl(owned.release(), TaskMemDeleter{});
+    UpdateSearchHighlightTerms(state);
     return true;
+}
+
+// A search-results folder is addressed by its search-ms: query, whose
+// System.Generic.String crumbs hold the typed text. Keep its plain words and
+// quoted phrases; property filters (kind:, date:) and operators match no name.
+std::vector<std::wstring> SearchQueryTerms(const std::wstring& address) {
+    std::vector<std::wstring> terms;
+    if (_wcsnicmp(address.c_str(), L"search-ms:", 10) != 0) return terms;
+    std::wstring_view rest(address);
+    rest.remove_prefix(10);
+    while (!rest.empty()) {
+        const size_t end = rest.find(L'&');
+        std::wstring part(rest.substr(0, end));
+        rest = end == std::wstring_view::npos ? std::wstring_view{} : rest.substr(end + 1);
+        DWORD length = static_cast<DWORD>(part.size() + 1);
+        if (FAILED(UrlUnescapeW(part.data(), nullptr, &length, URL_UNESCAPE_INPLACE | URL_UNESCAPE_AS_UTF8))) continue;
+        part.resize(wcslen(part.c_str()));
+        constexpr std::wstring_view crumb = L"crumb=System.Generic.String:";
+        if (part.size() <= crumb.size() || _wcsnicmp(part.c_str(), crumb.data(), crumb.size()) != 0) continue;
+        const std::wstring query = part.substr(crumb.size());
+        for (size_t i = 0; i < query.size();) {
+            if (iswspace(query[i])) { ++i; continue; }
+            std::wstring term;
+            if (query[i] == L'"') {
+                const size_t close = query.find(L'"', i + 1);
+                term = query.substr(i + 1, close == std::wstring::npos ? std::wstring::npos : close - i - 1);
+                i = close == std::wstring::npos ? query.size() : close + 1;
+            } else {
+                size_t stop = i;
+                while (stop < query.size() && !iswspace(query[stop])) ++stop;
+                term = query.substr(i, stop - i);
+                i = stop;
+                if (term.find(L':') != std::wstring::npos || term.front() == L'-' ||
+                    term == L"AND" || term == L"OR" || term == L"NOT") continue;
+            }
+            std::erase_if(term, [](wchar_t c) { return c == L'*' || c == L'?'; });
+            if (!term.empty() && std::find(terms.begin(), terms.end(), term) == terms.end())
+                terms.push_back(std::move(term));
+        }
+    }
+    return terms;
+}
+
+// Reads the displayed folder's address-bar form once per identity (a search
+// folder's parsing name is only its title). Explorer has
+// already resolved this folder, so no provider is bound or enumerated here.
+void UpdateSearchHighlightTerms(ViewState& state) {
+    const auto& identity = state.directoryFolderIdentity;
+    if (identity.get() == state.searchHighlightFolder.get()) return;
+    state.searchHighlightFolder = identity;
+    state.searchHighlightTerms.clear();
+    PWSTR address = nullptr;
+    if (identity && SUCCEEDED(SHGetNameFromIDList(identity.get(), SIGDN_DESKTOPABSOLUTEEDITING, &address)) && address)
+        state.searchHighlightTerms = SearchQueryTerms(address);
+    if (g_perf.load(std::memory_order_relaxed) && address && _wcsnicmp(address, L"search-ms:", 10) == 0)
+        Wh_Log(L"[GPU search] terms=%zu address=%s", state.searchHighlightTerms.size(), address);
+    CoTaskMemFree(address);
 }
 
 void WatchDirectory(ViewState& state) {
@@ -8762,6 +8843,25 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     return SUCCEEDED(hr); // An empty folder size is authoritative too.
 }
 
+// A namespace row that is a real filesystem item (a library entry, for
+// example) takes its Size from its own filesystem folder, exactly as that
+// folder's view shows it, including Shell size formatting hooks. A
+// container's own Size column may lack or misformat that text.
+bool ReadDelegatedSizeDetail(PCIDLIST_ABSOLUTE identity, std::wstring& text,
+                             ShellSizeBinding& binding, unsigned long long token) {
+    auto storage = std::make_unique<ShellPathStorage>();
+    if (!identity || !SHGetPathFromIDListEx(identity, storage->value, ARRAYSIZE(storage->value), GPFIDL_DEFAULT))
+        return false;
+    const std::wstring path = storage->value;
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    const ShellFindFacts facts{.attributes = data.dwFileAttributes,
+        .folder = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, .sizeKnown = true,
+        .size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow,
+        .created = data.ftCreationTime, .accessed = data.ftLastAccessTime, .modified = data.ftLastWriteTime};
+    return ReadShellSizeDetail(path, nullptr, text, binding, token, &facts);
+}
+
 // Folder sizes exist only through the Size column's provider (for example
 // Better file sizes). Size sorts and groups order folders by the same value
 // the column shows; folders without one keep the Win32 directory size of 0.
@@ -9041,8 +9141,10 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         else if (SameKey(key, PKEY_Size)) {
             const ShellFindFacts facts{.attributes = job.attributes, .folder = job.folder,
                 .sizeKnown = job.sizeKnown, .size = job.size, .created = job.created, .modified = job.modified};
-            resolved = !recalled && ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding,
-                job.listing, job.sizeKnown && !job.namespaceItem ? &facts : nullptr);
+            resolved = !recalled && ((job.namespaceItem &&
+                    ReadDelegatedSizeDetail(job.identity.get(), text, sizeBinding, job.listing)) ||
+                ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding,
+                    job.listing, job.sizeKnown && !job.namespaceItem ? &facts : nullptr));
             if (!resolved && job.sizeKnown && !job.folder) { text = FormatSize(job.size); resolved = true; }
             // Filesystem directory allocation is not its contents' size.
             // Only cached/column-provider text can supply a folder size.
@@ -9275,6 +9377,50 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
     result.error = error;
     result.nativeWitnessExists = directory.nativeWitnessExists;
     return result;
+}
+
+// Shell ID bytes are not item identity: a provider may return a canonically
+// equal item with different bytes (delegate IDs, as in libraries). Rows the
+// previous listing already held keep that identity, so reorders animate as
+// moves and selection, caches and detail cells stay attached to them.
+template<class Current>
+void AdoptPreviousNamespaceIdentities(std::vector<Entry>& names, PCIDLIST_ABSOLUTE parent,
+                                      const NamespaceIdentities& previous, Current current) {
+    ComPtr<IShellFolder> folder;
+    std::unordered_multimap<std::wstring, const NamespaceIdentities::value_type*> byName;
+    const auto parsingName = [&](PCUITEMID_CHILD child) {
+        STRRET name{}; PWSTR text = nullptr; std::wstring result;
+        if (SUCCEEDED(folder->GetDisplayNameOf(child, SHGDN_INFOLDER | SHGDN_FORPARSING, &name)) &&
+            SUCCEEDED(StrRetToStrW(&name, child, &text)) && text) result = text;
+        CoTaskMemFree(text);
+        return result;
+    };
+    for (auto& entry : names) {
+        if (!current()) return;
+        if (!entry.shellIdentity || previous.contains(entry.path)) continue;
+        if (!folder) {
+            // Index the previous listing only once a key actually drifted.
+            if (FAILED(SHBindToObject(nullptr, parent, nullptr, IID_PPV_ARGS(&folder))) || !folder) return;
+            byName.reserve(previous.size());
+            for (const auto& item : previous) {
+                if (!current()) return;
+                if (item.second) byName.emplace(parsingName(item.second.get()), &item);
+            }
+        }
+        const PCUITEMID_CHILD child = entry.shellChild ? entry.shellChild.get() :
+            ILFindLastID(entry.shellIdentity.get());
+        const auto [first, last] = byName.equal_range(parsingName(child));
+        for (auto it = first; it != last; ++it) {
+            const HRESULT order = folder->CompareIDs(SHCIDS_CANONICALONLY, child, it->second->second.get());
+            if (FAILED(order) || HRESULT_CODE(order) != 0) continue;
+            SharedPidl absolute(ILCombine(parent, it->second->second.get()), TaskMemDeleter{});
+            if (!absolute) break;
+            entry.path = it->second->first;
+            entry.shellChild = it->second->second;
+            entry.shellIdentity = std::move(absolute);
+            break;
+        }
+    }
 }
 
 DirectoryResult PrepareDirectoryResult(TabBackground& work, DirectoryJob& directory,
@@ -9510,6 +9656,9 @@ void ResolveNativeRowsJob(TabBackground& work, NativeRowsJob& job, Resolver&& re
         // Recycle Bin uses the SAME background layout and snapshot commit as
         // filesystem directories. No whole-list projection on Explorer's STA.
         auto& directory = *job.presentation;
+        if (directory.previousIdentities && job.folder)
+            AdoptPreviousNamespaceIdentities(rows, job.folder.get(), *directory.previousIdentities,
+                [&] { return DirectoryJobCurrent(work, job.token); });
         directory.enumerated = true;
         directory.enumeratedEntries = std::move(rows);
         directory.enumerationError = error;
@@ -10524,8 +10673,10 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         ColumnCell cell; cell.key = key;
                         bool resolved=false;
                         if (SameKey(key, PKEY_Size))
-                            resolved = ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text,
-                                sizeBinding, detail.token);
+                            resolved = ReadDelegatedSizeDetail(req.shellIdentity.get(), cell.text,
+                                    sizeBinding, detail.token) ||
+                                ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text,
+                                    sizeBinding, detail.token);
                         if (!resolved) {
                             if (!store)
                                 EntryPropertyStore(req.path, req.shellIdentity.get(),
@@ -10818,8 +10969,11 @@ void AdvanceNativeCatalog(ViewState& state) {
         const HRESULT enumHr=SUCCEEDED(hr) && count>=0 ?
             view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items)) : E_FAIL;
         if (!current()) return;
+        // An empty native model is not proof of an empty folder: a view that
+        // re-enumerates (a library re-sorting, for one) is briefly empty. The
+        // worker's own provider enumeration decides emptiness instead.
         if (SUCCEEDED(hr) && count==0 && enumHr!=E_NOTIMPL && enumHr!=E_NOINTERFACE) {
-            state.nativeCatalogCount=0; complete=available=true;
+            state.nativeCatalogCount=0; complete=true;
         }
         else if (FAILED(enumHr) || !items) complete=true;
         else { state.nativeCatalogCount=count; state.nativeCatalogCapture=std::move(items); }
@@ -11501,6 +11655,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     state.sortRevealPath.clear(); state.sortRevealOldIndex=-1;
     if (UsesNamespaceFolderIdentity(state.folderPath)) {
         newJob.namespaceFolder = state.directoryFolderIdentity;
+        if (state.loaded) newJob.previousIdentities = state.namespaceIdentities;
     }
     // An ancestor return has a known child to reveal. A prefix at row zero
     // cannot position that child in the final layout; publish the complete,
@@ -17098,8 +17253,10 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
 
 void Text(ViewState& state, const std::wstring& text, float l, float t,
           float r, float b, unsigned hex, bool header=false, float opacity=1.f,
-          bool sortedHeader=false, bool wrapped=false, UINT32 highlight=0, bool deferCold=false,
+          bool sortedHeader=false, bool wrapped=false,
+          const std::vector<DWRITE_TEXT_RANGE>* highlight=nullptr, bool deferCold=false,
           bool filename=false, bool underline=false) {
+    if (highlight && highlight->empty()) highlight = nullptr;
     if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
     RefreshTextRendering(state);
@@ -17144,14 +17301,18 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         if (SUCCEEDED(layout->GetUnderline(0,&currentUnderline)) && bool(currentUnderline) != underline)
             layout->SetUnderline(underline,{0,static_cast<UINT32>(text.size())});
         if (highlight) {
-            DWRITE_HIT_TEST_METRICS matches[64]{};
-            UINT32 count = 0;
-            if (SUCCEEDED(layout->HitTestTextRange(0, std::min(highlight, static_cast<UINT32>(text.size())),
-                l, t, matches, ARRAYSIZE(matches), &count))) {
-                // The outline includes horizontal padding outside the glyph
-                // box. Keep it inside its own clip, including shortened labels.
-                const auto clip=SnapDrawRect(state.target.Get(),D2D1::RectF(l-1.f,t,r+1.f,b));
-                state.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            // The outline includes horizontal padding outside the glyph
+            // box. Keep it inside its own clip, including shortened labels.
+            const auto clip=SnapDrawRect(state.target.Get(),D2D1::RectF(l-1.f,t,r+1.f,b));
+            state.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            for (const auto& range : *highlight) {
+                const UINT32 size = static_cast<UINT32>(text.size());
+                if (range.startPosition >= size || !range.length) continue;
+                DWRITE_HIT_TEST_METRICS matches[64]{};
+                UINT32 count = 0;
+                if (FAILED(layout->HitTestTextRange(range.startPosition,
+                        std::min(range.length, size - range.startPosition),
+                        l, t, matches, ARRAYSIZE(matches), &count))) continue;
                 for (UINT32 i=0; i<count; ++i) {
                     const auto& m = matches[i];
                     if (!m.isText || m.isTrimmed || m.width <= 0.f || m.height <= 0.f) continue;
@@ -17169,8 +17330,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
                     StrokeRoundedRect(state,rc, state.brush.Get(), 1.f);
                 }
-                state.target->PopAxisAlignedClip();
             }
+            state.target->PopAxisAlignedClip();
             state.brush->SetColor(Packed(hex, opacity));
         }
         if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename)) {
@@ -19054,6 +19215,23 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
 }
 
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
+// Every occurrence of each search word, matched as Windows Search does:
+// ignoring case and diacritics, with the original text extent of the match.
+void SearchHighlightRanges(const std::wstring& name, const std::vector<std::wstring>& terms,
+                           std::vector<DWRITE_TEXT_RANGE>& ranges) {
+    for (const auto& term : terms) {
+        for (int from = 0; from < static_cast<int>(name.size());) {
+            int found = 0;
+            const int at = FindNLSStringEx(LOCALE_NAME_USER_DEFAULT,
+                FIND_FROMSTART | LINGUISTIC_IGNORECASE | LINGUISTIC_IGNOREDIACRITIC,
+                name.c_str() + from, static_cast<int>(name.size()) - from,
+                term.c_str(), static_cast<int>(term.size()), &found, nullptr, nullptr, 0);
+            if (at < 0 || found <= 0) break;
+            ranges.push_back({static_cast<UINT32>(from + at), static_cast<UINT32>(found)});
+            from += at + found;
+        }
+    }
+}
 
 void ResetItemContentOpacity(ViewState& state) {
     state.itemOpacityRows.clear();
@@ -21555,6 +21733,7 @@ void Paint(ViewState& state) {
         }
     }
     uiComparisonRow=true;
+    std::vector<DWRITE_TEXT_RANGE> highlightRanges; // Reused by every painted name.
     contentTrace.emplace(state.background,L"render.labels");
     for (const auto& item:paintedItems) {
         const int i=item.index;
@@ -21572,11 +21751,16 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         const float nameTextRight = usage.visible ? usage.labelRight : geometry.text.right;
-        const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(EntryLabel(e),state.typeSearch) : 0;
+        // Typing to select owns the highlight while visible; otherwise a
+        // search-results folder marks every match of its query words.
+        highlightRanges.clear();
+        if (const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(EntryLabel(e),state.typeSearch) : 0)
+            highlightRanges.push_back({0, match});
+        else SearchHighlightRanges(EntryLabel(e), state.searchHighlightTerms, highlightRanges);
         if (!(state.rename.editor && i == state.rename.index))
             Text(state, EntryLabel(e), geometry.text.left, geometry.text.top,
                 nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
-                false, geometry.wrapped, match,false,true,
+                false, geometry.wrapped, &highlightRanges,false,true,
                 state.clickPolicy.singleClick && (state.clickPolicy.underlineCold ||
                     (state.clickPolicy.underlineHot && state.hovered==i)));
         if (usage.visible && DriveTiles(state)) {
@@ -22941,6 +23125,17 @@ bool VerifyNativeSelection(ViewState& state, const PidlSelection& expected) {
         if (state.folder && SUCCEEDED(SHGetDataFromIDListW(state.folder.Get(), item,
                 SHGDFIL_FINDDATA, &data, sizeof(data))) && data.cFileName[0])
             return SelectionPathHash(data.cFileName);
+        // Delegate IDs (library items) carry volatile bytes; the canonical
+        // comparison below decides equality, so bucket them by parsing name.
+        STRRET name{}; PWSTR text = nullptr;
+        if (state.folder && SUCCEEDED(state.folder->GetDisplayNameOf(item,
+                SHGDN_INFOLDER | SHGDN_FORPARSING, &name)) &&
+            SUCCEEDED(StrRetToStrW(&name, item, &text)) && text && *text) {
+            const size_t hash = SelectionPathHash(text);
+            CoTaskMemFree(text);
+            return hash;
+        }
+        CoTaskMemFree(text);
         size_t hash = static_cast<size_t>(2166136261u);
         const auto bytes = reinterpret_cast<const unsigned char*>(item);
         const UINT size = ILGetSize(item);
@@ -36659,6 +36854,21 @@ void PrepareInitialOverlay(ViewState& state) {
             afterGraphics - beforeGraphics, state.total, state.loaded);
 }
 
+// Explorer can keep one native view and swap the folder it shows (refining a
+// search replaces the results folder each keystroke). Between two namespace
+// folders that are not each other's ancestor, that is new content for the
+// same place, not a navigation: the displayed rows are kept and compared.
+bool ReplacesFolderInPlace(const ViewState& state, IShellFolder* folder, const std::wstring& path,
+                           bool sameViewNewPath) {
+    if (!sameViewNewPath || !state.loaded || !folder || !state.directoryFolderIdentity ||
+        !UsesNamespaceFolderIdentity(path) || !UsesNamespaceFolderIdentity(state.folderPath)) return false;
+    PIDLIST_ABSOLUTE raw = nullptr;
+    if (FAILED(SHGetIDListFromObject(folder, &raw))) return false;
+    OwnedPidl incoming(raw);
+    const auto current = state.directoryFolderIdentity.get();
+    return incoming && !ILIsParent(current, incoming.get(), FALSE) && !ILIsParent(incoming.get(), current, FALSE);
+}
+
 void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ComPtr<IShellFolder>& folder, ComPtr<IShellBrowser>& shellBrowser,
                 const std::wstring& path, bool prepareTab = false) {
@@ -36861,6 +37071,17 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             if (g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU overlay] optimistic display confirmed: native ready after %llu ms (%s)",
                     static_cast<unsigned long long>(optimisticElapsed), path.c_str());
+        } else if (ReplacesFolderInPlace(*s, folder.Get(), path, changedPath && !changedView && !wasOutside &&
+                       !optimistic && oldTabHost == newTabHost)) {
+            // Explorer kept its view and swapped the folder inside it, as a
+            // refined search does. Keep the displayed rows; the refresh
+            // compares the new listing to them and animates the difference.
+            s->folderPath = path;
+            s->folder = folder;
+            s->directoryFolderIdentity.reset();
+            RefreshSortFromExplorer(*s, false, true);
+            WatchDirectory(*s);
+            QueueDirectoryRefresh(*s, true, true);
         } else if (changedPath || changedBinding || wasOutside || s->folderPath.empty() || optimistic) {
             // A redirected/failed prediction is never allowed to remain visible
             // after Explorer reports its actual folder.

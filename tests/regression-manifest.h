@@ -164,6 +164,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("sort-details", PARALLEL, TestSortDetails(fixture)),
     REGRESSION("shell-size-details", PARALLEL, TestShellSizeDetails(fixture)),
     REGRESSION("shell-size-truth", PARALLEL, TestShellSizeTruth(fixture)),
+    REGRESSION("namespace-identity", PARALLEL, TestNamespaceIdentityStability(fixture)),
+    REGRESSION("search-highlight", PARALLEL, TestSearchHighlight(fixture)),
     REGRESSION("item-tips", PARALLEL, TestItemTips(fixture)),
     REGRESSION("item-tip-relative-dates", PARALLEL, TestItemTipRelativeDates()),
     REGRESSION("cloud-item-tip", PARALLEL, TestCloudItemTip(fixture)),

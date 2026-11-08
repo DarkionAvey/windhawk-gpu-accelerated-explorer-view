@@ -27,7 +27,8 @@ static void TestTypeSearchBorder(const std::wstring& fixture) {
         Check(SUCCEEDED(line->GetMetrics(&lineMetrics)),"search border line metrics");
         const float height=std::ceil(lineMetrics.height)*(wrapped ? 2.f:1.f);
         state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,1.f));
-        Text(state,name,left,top,left+width,top+height,0xFFFFFF,false,1.f,false,wrapped,prefix);
+        const std::vector<DWRITE_TEXT_RANGE> highlight{{0,prefix}};
+        Text(state,name,left,top,left+width,top+height,0xFFFFFF,false,1.f,false,wrapped,&highlight);
         Check(SUCCEEDED(state.target->EndDraw()),"search border draw");
         const auto pixels=IconAlphaFixture::Read(state,surface.Get());
         const float physicalLeft=rtl ? 1024-left-width:left;

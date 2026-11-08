@@ -1975,6 +1975,7 @@ static void TestPreviewInput() {
 #include "shell-overlay-smoke.h"
 #include "shell-provider-smoke.h"
 #include "shell-size-smoke.h"
+#include "namespace-search-smoke.h"
 #include "provider-selection-smoke.h"
 #include "initial-sort-smoke.h"
 #include "empty-sort-key-smoke.h"
