@@ -615,6 +615,12 @@ std::atomic<int> g_gridSelectionRadius{16};
 // Maximum thumbnail corner radius in logical (96-DPI) pixels, independent of
 // selection. Small thumbnails cap it further to 20% of their shorter edge.
 float g_thumbnailCornerRadius96 = 8.f;
+// The one thumbnail rounding rule, applied by each surface (grid item, drag
+// pile) to its own drawn image size at its own DPI.
+float ThumbnailCornerRadius(float width, float height, int dpi) {
+    return std::min(std::max(0.f, g_thumbnailCornerRadius96) * static_cast<float>(dpi) / 96.f,
+        std::min(width, height) * .2f);
+}
 std::atomic<unsigned long long> g_shellAssociationEpoch{1};
 std::atomic<bool> g_scrollbar{true};
 std::atomic<bool> g_instantScrub{false};
@@ -1490,6 +1496,7 @@ struct DragShadow {
     ComPtr<ID2D1Bitmap1> bitmap;
     const void* identity=nullptr;
     float side=0.f;
+    int dpi=0; // Thumbnail corners follow the pile's DPI.
 };
 // Same policy calculation as list text, with an independent monitor cache so
 // a drag on another display never invalidates the tab's existing glyph masks.
@@ -17512,8 +17519,7 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
             .v={rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top}},true);
     if (thumbnail) {
         const float dpi = std::max(96,state.textFormatDpi)/96.f;
-        const float radius = std::min(std::max(0.f,g_thumbnailCornerRadius96)*dpi,
-            std::min(width,height)*.2f);
+        const float radius = ThumbnailCornerRadius(width, height, std::max(96,state.textFormatDpi));
         // Three small translucent fills approximate a soft shadow. No blur
         // effect, offscreen surface, extra texture or per-item geometry exists.
         // Whole-pixel spreads keep each band's straight edges on the grid.
@@ -19621,6 +19627,7 @@ float DragShadowPadding(float side) {return std::ceil(3.f*DragShadowSigma(side))
 float DragShadowOffset(float side) {return side*.025f;}
 struct DragPreviewGeometry {
     D2D1_RECT_F artwork{},operation{},caption{};
+    D2D1_RECT_F pile{}; // Bounds of every layer's tilted artwork: the pile as drawn.
     D2D1_SIZE_U extent{};
     float edge=0.f;
 };
@@ -19657,11 +19664,20 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
     float pileTop=square.top;
     const auto shadow=D2D1::RectF(square.left-padding,square.top-padding+offset,
         square.right+padding,square.bottom+padding+offset);
+    geometry.pile=D2D1::RectF(FLT_MAX,FLT_MAX,-FLT_MAX,-FLT_MAX);
     for(size_t i=0;i<std::min(preview.imageCount,kDragPreviewImages);++i) {
         const auto transform=DragStackTransform(preview,i,square);
         for(auto point:{D2D1::Point2F(square.left,square.top),D2D1::Point2F(square.right,square.top),
             D2D1::Point2F(square.left,square.bottom),D2D1::Point2F(square.right,square.bottom)})
             pileTop=std::min(pileTop,transform.TransformPoint(point).y);
+        // Each layer's own artwork, as DrawDragPreview places and tilts it.
+        const auto art=DragArtworkRect(preview.Image(i).pixels,side,(square.left+square.right)*.5f,square.bottom);
+        for(auto point:{D2D1::Point2F(art.left,art.top),D2D1::Point2F(art.right,art.top),
+            D2D1::Point2F(art.left,art.bottom),D2D1::Point2F(art.right,art.bottom)}) {
+            point=transform.TransformPoint(point);
+            geometry.pile.left=std::min(geometry.pile.left,point.x); geometry.pile.top=std::min(geometry.pile.top,point.y);
+            geometry.pile.right=std::max(geometry.pile.right,point.x); geometry.pile.bottom=std::max(geometry.pile.bottom,point.y);
+        }
         for(auto point:{D2D1::Point2F(shadow.left,shadow.top),D2D1::Point2F(shadow.right,shadow.top),
             D2D1::Point2F(shadow.left,shadow.bottom),D2D1::Point2F(shadow.right,shadow.bottom)}) {
             point=transform.TransformPoint(point);
@@ -19685,7 +19701,8 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
         geometry.caption=D2D1::RectF(x,bottom-2*edge-preview.captionSize.height,x+width,bottom);
     }
     const auto shift=[&](D2D1_RECT_F& r) {r.left-=bounds.left; r.right-=bounds.left; r.top-=bounds.top; r.bottom-=bounds.top;};
-    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption);
+    if(geometry.pile.right<geometry.pile.left) geometry.pile=geometry.artwork; // No layers.
+    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption); shift(geometry.pile);
     geometry.extent=D2D1::SizeU(UINT(std::ceil(bounds.right-bounds.left)),UINT(std::ceil(bounds.bottom-bounds.top)));
     geometry.edge=edge;
     return geometry;
@@ -19870,9 +19887,29 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
     target->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     target->SetTransform(previous);
 }
-DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,float side) {
+// A pile thumbnail is rounded by the thumbnail rule at the pile's own drawn
+// size and DPI, whatever the grid item shows; icons keep their silhouettes.
+void DrawDragArtwork(ID2D1DeviceContext* target,ID2D1Bitmap* bitmap,const IconPixels& pixels,
+    const D2D1_RECT_F& destination,int dpi) {
+    const auto source=D2D1::RectF(0,0,float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width),
+        float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height));
+    ComPtr<ID2D1RoundedRectangleGeometry> corners;
+    if(pixels.thumbnailWidth && pixels.thumbnailHeight) {
+        const float radius=ThumbnailCornerRadius(destination.right-destination.left,destination.bottom-destination.top,dpi);
+        ComPtr<ID2D1Factory> factory; target->GetFactory(&factory);
+        if(radius>0.f && factory &&
+            FAILED(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(destination,radius,radius),&corners)))
+            corners.Reset();
+    }
+    if(corners) target->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),corners.Get(),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE),nullptr);
+    target->DrawBitmap(bitmap,&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+    if(corners) target->PopLayer();
+}
+
+DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,float side,int dpi) {
     DragShadow result;
-    result.identity=image.pixels.data.Identity(); result.side=side;
+    result.identity=image.pixels.data.Identity(); result.side=side; result.dpi=dpi;
     const float pad=DragShadowPadding(side);
     const auto rect=DragArtworkRect(image.pixels,side,0.f,0.f);
     const float width=rect.right-rect.left,height=rect.bottom-rect.top;
@@ -19894,10 +19931,8 @@ DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,cons
     target->BeginDraw(); target->Clear(D2D1::ColorF(0,0.f));
     const auto destination=D2D1::RectF(pad,pad,pad+width,pad+height);
     const auto& pixels=image.pixels;
-    const auto source=D2D1::RectF(0,0,float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width),
-        float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height));
     if(artwork && pixels.Ready()) {
-        target->DrawBitmap(artwork,&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+        DrawDragArtwork(target,artwork,pixels,destination,dpi); // The shadow follows rounded corners.
     } else {
         ComPtr<ID2D1SolidColorBrush> silhouette;
         if(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White,.8f),&silhouette))) {
@@ -19966,10 +20001,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&bitmap)))) {
             // Thumbnail decoration has a separate atlas band. Never squeeze that
             // band into the image, stretch its aspect ratio, or crop it to a square.
-            const float w=float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width);
-            const float h=float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height);
-            const auto source=D2D1::RectF(0,0,w,h);
-            target->DrawBitmap(bitmap.Get(),&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+            DrawDragArtwork(target,bitmap.Get(),pixels,destination,preview.dpi);
         } else {
             // Only used when even the currently displayed association is missing.
             // A recognizable, antialiased silhouette replaces the old blank box.
@@ -19991,9 +20023,10 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         const auto count=preview.countLabel.empty() ? FormatDragCount(preview.count,preview.rtl):preview.countLabel;
         const float height=side*.38f*preview.dragBadgeScaling;
         const float width=std::max(height,height*.65f*float(count.size())+height*.4f);
-        const float x=std::clamp(preview.rtl ? geometry.artwork.right-width:geometry.artwork.left,
+        // The whole pile's leading top corner, whatever size its front item is.
+        const float x=std::clamp(preview.rtl ? geometry.pile.right-width:geometry.pile.left,
             geometry.edge,float(geometry.extent.width)-geometry.edge-width);
-        const auto bounds=SnapDrawRect(target,D2D1::RectF(x,geometry.artwork.top,x+width,geometry.artwork.top+height));
+        const auto bounds=SnapDrawRect(target,D2D1::RectF(x,geometry.pile.top,x+width,geometry.pile.top+height));
         const auto palette=preview.badgePalette;
         color(COLORREF(palette&0xFFFFFF)); target->FillRoundedRectangle(D2D1::RoundedRect(bounds,height*.5f,height*.5f),brush.Get());
         brush->SetOpacity(float((palette>>48)&255)/255.f);
@@ -20058,13 +20091,14 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
         const auto identity=layer.artworkIdentity[i];
         auto& shadow=layer.shadows[i];
         if(i>=preview->imageCount) {shadow={}; continue;}
-        if(shadow.identity==identity && shadow.side==preview->side) continue;
-        shadow={}; shadow.identity=identity; shadow.side=preview->side;
+        if(shadow.identity==identity && shadow.side==preview->side && shadow.dpi==preview->dpi) continue;
+        shadow={}; shadow.identity=identity; shadow.side=preview->side; shadow.dpi=preview->dpi;
         bool shared=false;
-        for(size_t j=0;j<i;++j) if(layer.shadows[j].identity==identity && layer.shadows[j].side==preview->side) {
+        for(size_t j=0;j<i;++j) if(layer.shadows[j].identity==identity && layer.shadows[j].side==preview->side &&
+            layer.shadows[j].dpi==preview->dpi) {
             shadow=layer.shadows[j]; shared=true; break;
         }
-        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),preview->Image(i),preview->side);
+        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),preview->Image(i),preview->side,preview->dpi);
     }
     ComPtr<ID2D1Image> previous; state.target->GetTarget(&previous);
     ComPtr<IDWriteRenderingParams> previousTextParams; state.target->GetTextRenderingParams(&previousTextParams);

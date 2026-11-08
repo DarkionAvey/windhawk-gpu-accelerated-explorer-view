@@ -98,6 +98,11 @@
   **Do not turn README.md into a changelog, audit dump or test report.**
 - Add user-readable changes to `CHANGELOG.md`. Keep technical
   investigations in `tests/` or `docs/`. Do not make it verbose.
+  Add change code for each changelog item, like ADDED/FIXED/IMPROVED/REMOVED.
+  Group these with others, so that all ADDED items are together, then line break, 
+  then IMPROVED items together, then line break, then FIXED items together, then line
+  break, then REMOVED items together. This makes it easier for the user to read.
+  The changelog should be natural common simple language.
 - Do not hand-edit the embedded Windhawk README; the build replaces it from
   root `README.md`. Avoid C++ comment terminators in README content.
 - Distinguish offscreen component tests and CPU submission measurements from

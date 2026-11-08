@@ -313,8 +313,8 @@ static void TestDragPreview(const std::wstring& fixture) {
                     "drag text ignored shared policy or invalidated the tab glyph cache");
                 const auto pixels=IconAlphaFixture::Read(state,surface.Get());
                 const float height=preview.side*.38f*preview.dragBadgeScaling;
-                const auto count=D2D1::RectF(geometry.artwork.left+height*.25f,geometry.artwork.top+height*.25f,
-                    geometry.artwork.left+height*.75f,geometry.artwork.top+height*.75f);
+                const auto count=D2D1::RectF(geometry.pile.left+height*.25f,geometry.pile.top+height*.25f,
+                    geometry.pile.left+height*.75f,geometry.pile.top+height*.75f);
                 auto caption=geometry.caption; caption.left+=geometry.edge; caption.top+=geometry.edge;
                 caption.right-=geometry.edge; caption.bottom-=geometry.edge;
                 for(auto area:{count,caption}) {
@@ -417,4 +417,119 @@ static void TestDragPreview(const std::wstring& fixture) {
     }
     g_writeFactory=fonts;
     std::cout<<"PASS: immediate shared Shell pixels; real PNG background thumbnails with Details thumbnails disabled; transparent previews, equal-width operation emoji, texture reuse and uncropped atlas-aware images at three DPIs (offscreen components)\n";
+}
+
+namespace DragPileFixture {
+inline IconPixels Solid(UINT width,UINT height,bool thumbnail) {
+    IconPixels pixels; pixels.width=width; pixels.height=height; pixels.stride=width*4;
+    if(thumbnail) {pixels.thumbnailWidth=width; pixels.thumbnailHeight=height;}
+    pixels.data.assign(size_t(pixels.stride)*height,0);
+    for(size_t i=0;i<size_t(width)*height;++i) {auto* p=pixels.data.data()+i*4; p[2]=220; p[3]=255;} // Opaque red.
+    return pixels;
+}
+struct Box {LONG left=LONG_MAX,top=LONG_MAX,right=LONG_MIN,bottom=LONG_MIN; bool Empty() const {return right<left;}};
+template<class Match> Box Find(const IconPixels& image,Match match) {
+    Box box;
+    for(UINT y=0;y<image.height;++y) for(UINT x=0;x<image.width;++x)
+        if(match(image.data.data()+size_t(y)*image.stride+x*4)) {
+            box.left=std::min<LONG>(box.left,x); box.top=std::min<LONG>(box.top,y);
+            box.right=std::max<LONG>(box.right,x+1); box.bottom=std::max<LONG>(box.bottom,y+1);
+        }
+    return box;
+}
+// Draws a pile on a private offscreen target of the tab's device.
+struct Sheet {
+    PresentationFixture::Tab tab{L"drag pile",1,false,true};
+    ViewState& state=tab.state;
+    ComPtr<ID2D1Image> previous;
+    ComPtr<ID2D1Bitmap1> surface;
+    Sheet() {
+        Check(EnsureTarget(state),"drag pile GPU target");
+        state.target->GetTarget(&previous);
+        const auto properties=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+        Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(1024,1024),nullptr,0,&properties,&surface)),"drag pile sheet");
+    }
+    ~Sheet() {state.target->SetTarget(previous.Get());}
+    IconPixels Draw(const DragPreview& preview) {
+        state.target->SetTarget(surface.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
+        state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
+        DrawDragPreview(state.target.Get(),preview);
+        Check(SUCCEEDED(state.target->EndDraw()),"drag pile draw");
+        return IconAlphaFixture::Read(state,surface.Get());
+    }
+};
+}
+
+// Pile thumbnails round their corners by the grid thumbnail rule (8 px at
+// 96 DPI, at most a fifth of the shorter side), worked out from the pile's
+// own drawn size and DPI; association icons stay square. Measured where the
+// corner curve leaves the drawn thumbnail's top edge.
+static void TestDragPileThumbnailCorners() {
+    if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"drag pile fonts");
+    DragPileFixture::Sheet sheet;
+    bool failed=false;
+    for(int dpi:{96,144,192}) for(int side96:{96,32}) for(bool thumbnail:{true,false}) {
+        DragPreview preview; preview.dpi=dpi; preview.side=float(side96)*dpi/96.f; preview.effect=DROPEFFECT_COPY;
+        preview.background=RGB(24,24,24); preview.foreground=RGB(245,245,245);
+        preview.pixels=DragPileFixture::Solid(64,64,thumbnail);
+        const auto image=sheet.Draw(preview);
+        // The thumbnail's full-coverage extent; its top row starts after the curve.
+        const auto red=[](const BYTE* p) {return p[3]>=250 && p[2]>200 && p[1]<40 && p[0]<40;};
+        const auto full=DragPileFixture::Find(image,red);
+        Check(!full.Empty(),"drag pile thumbnail was not drawn");
+        const float width=float(full.right-full.left),height=float(full.bottom-full.top);
+        const float radius=thumbnail ? std::min(8.f*dpi/96.f,.2f*std::min(width,height)):0.f;
+        const float expected=radius>=.5f ? radius-std::sqrt(radius*radius-(radius-.5f)*(radius-.5f)):0.f;
+        LONG first=full.left;
+        const BYTE* row=image.data.data()+size_t(full.top)*image.stride;
+        while(first<full.right && row[first*4+3]<128) ++first;
+        const float measured=float(first-full.left);
+        if(std::abs(measured-expected)>1.f) failed=true;
+        std::cout<<"PILE CORNER dpi="<<dpi<<" side="<<preview.side<<" thumbnail="<<thumbnail<<" drawn="<<width<<"x"<<height
+            <<" radius="<<radius<<" curve="<<measured<<" expected="<<expected<<std::endl;
+    }
+    Check(!failed,"drag pile thumbnail corners do not follow the thumbnail rounding rule at the pile's size and DPI");
+    std::cout<<"PASS: drag pile thumbnails round by the grid thumbnail rule at their own size and DPI (96/144/192, large "
+        "and small piles); association icons stay square\n";
+}
+
+// The item count sits at the whole pile's leading top corner, not the front
+// item's: a small front image must not pull it into the pile's middle.
+static void TestDragPileCountBadge() {
+    if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"drag pile fonts");
+    DragPileFixture::Sheet sheet;
+    bool failed=false;
+    for(int dpi:{96,192}) for(bool rtl:{false,true}) {
+        DragPreview preview; preview.dpi=dpi; preview.side=96.f*dpi/96.f; preview.rtl=rtl; preview.effect=DROPEFFECT_COPY;
+        preview.background=RGB(24,24,24); preview.foreground=RGB(245,245,245);
+        const COLORREF badge=RGB(0,200,0);
+        preview.badgePalette=static_cast<unsigned long long>(badge) |
+            (static_cast<unsigned long long>(RGB(255,255,255))<<24) | (255ULL<<48);
+        // Square icons, so the pile's corners are its geometric corners; the
+        // front one is small and wide.
+        preview.imageCount=4;
+        preview.pixels=DragPileFixture::Solid(64,16,false);
+        for(size_t i=1;i<preview.imageCount;++i) {
+            preview.Image(i).pixels=DragPileFixture::Solid(64,64,false);
+            preview.Image(i).tilt=DragStackTilt(std::to_wstring(i),i);
+        }
+        const auto red=[](const BYTE* p) {return p[3]>=128 && p[2]>100 && p[1]<60 && p[0]<60;};
+        preview.count=1;
+        const auto pile=DragPileFixture::Find(sheet.Draw(preview),red);
+        preview.count=4;
+        const auto counted=sheet.Draw(preview);
+        const auto marker=DragPileFixture::Find(counted,[](const BYTE* p) {return p[3]>=250 && p[1]>180 && p[2]<40 && p[0]<40;});
+        Check(!pile.Empty() && !marker.Empty(),"drag pile or its count badge was not drawn");
+        const LONG horizontal=rtl ? marker.right-pile.right : marker.left-pile.left;
+        const LONG vertical=marker.top-pile.top;
+        std::cout<<"PILE BADGE dpi="<<dpi<<" rtl="<<rtl<<" pile="<<pile.left<<","<<pile.top<<"-"<<pile.right<<","<<pile.bottom
+            <<" badge="<<marker.left<<","<<marker.top<<"-"<<marker.right<<","<<marker.bottom<<std::endl;
+        failed|=std::abs(horizontal)>1 || std::abs(vertical)>1;
+    }
+    Check(!failed,"the count badge is not at the pile's leading top corner");
+    std::cout<<"PASS: the drag count badge sits at the whole pile's top-left (top-right in RTL) at 96/192 DPI, "
+        "independent of a small front item\n";
 }

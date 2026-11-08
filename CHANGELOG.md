@@ -8,11 +8,13 @@
 
 - **IMPROVED** Rename field appearance to match the list's font, scaling, and text rendering.
 - **IMPROVED** Build validation reliability with additional retries and diagnostics.
+- **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.
+- **IMPROVED** Thumbnails in the drag pile have rounded corners, sized for the pile like grid thumbnails are for the grid.
 
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
 - **FIXED** View switch tooltip flickering and moving while shown.
-- **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.
+- **FIXED** The drag item count now sits at the pile's top corner, not over a small first item.
 - **FIXED** Spacing that did not scale with display scaling: row and item insets, the gap after names, group headings, highlight corners, and the minimum text and icon sizes.
 
 ## 1.0.4 — Public release
