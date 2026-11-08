@@ -95,6 +95,18 @@ public:
 int Row(ViewState& state, const wchar_t* name) {
     for (int row = 0; row < state.total; ++row)
         if (state.entries[row].name == name) return row;
+    // A namespace provider's display name follows Explorer's "hide extensions"
+    // setting. Identify fixture items by the provider's own parsing name.
+    for (int row = 0; row < state.total; ++row) {
+        const auto& child = state.entries[row].shellChild;
+        STRRET text{}; PWSTR parsing = nullptr;
+        if (!state.folder || !child || FAILED(state.folder->GetDisplayNameOf(
+                reinterpret_cast<PCUITEMID_CHILD>(child.get()), SHGDN_INFOLDER | SHGDN_FORPARSING, &text)) ||
+            FAILED(StrRetToStrW(&text, reinterpret_cast<PCUITEMID_CHILD>(child.get()), &parsing))) continue;
+        const bool match = _wcsicmp(PathFindFileNameW(parsing), name) == 0;
+        CoTaskMemFree(parsing);
+        if (match) return row;
+    }
     Check(false, "provider navigation fixture row missing"); return -1;
 }
 SharedPidl Identity(ViewState& state, const wchar_t* name) {

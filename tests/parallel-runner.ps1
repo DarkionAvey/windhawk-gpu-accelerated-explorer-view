@@ -113,7 +113,7 @@ function Get-ExitDescription([int]$Code) {
         0xC00000FD = 'stack overflow'; 0xC0000374 = 'heap corruption'; 0xC000001D = 'illegal instruction';
         0xC0000094 = 'integer divide by zero'; 0xC0000420 = 'assertion failure'; 0x80000003 = 'breakpoint'
     }
-    $unsigned = [uint32]([int64]$Code -band 0xFFFFFFFF)
+    $unsigned = [uint32]([int64]$Code -band 0xFFFFFFFFL) # Unsuffixed 0xFFFFFFFF is Int32 -1.
     if ($known.ContainsKey([int64]$unsigned)) { return ('0x{0:X8} {1}' -f $unsigned, $known[[int64]$unsigned]) }
     if ($Code -eq 3) { return 'abort' }
     "$Code"
@@ -240,6 +240,15 @@ function Invoke-RegressionTasks {
             if ($ObserveInterference) {
                 foreach ($child in $running) {
                     $child.Modules = @($child.Modules + @(Get-TestInterference $child.Process) | Select-Object -Unique)
+                }
+                # An injected engine invalidates every result of this run, not
+                # just one test: stop all tests now instead of finishing and
+                # retrying them. The finally block reaps the running processes.
+                $injected = @($running | Where-Object { $_.Modules.Count })
+                if ($injected.Count) {
+                    throw "PENDING: Windhawk (or another mod engine) injected into test process $($injected[0].Task.Name): " +
+                        "$($injected[0].Modules -join '; '). Results would be invalid, so the run was cancelled. " +
+                        "Exclude the regression executables from Windhawk (or pause it), then rerun. Logs: $OutputDirectory"
                 }
             }
             $remaining = ($running | ForEach-Object { $TimeoutSeconds*1000 - $_.Clock.ElapsedMilliseconds } |

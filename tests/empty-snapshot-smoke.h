@@ -150,13 +150,38 @@ static void TestEmptySnapshotReconciliation(const std::wstring& fixture) {
     create(L"hidden.txt", FILE_ATTRIBUTE_HIDDEN);
     create(L"system-folder", FILE_ATTRIBUTE_SYSTEM, true);
     create(L"customized-folder", FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM, true);
+    // CFSFolder also consults the user's own "hide protected operating system
+    // files" setting, so its raw enumeration only describes the policy this
+    // machine actually has. Every policy is checked against the documented
+    // Win32 attribute rules; the live provider is the oracle for the real one.
+    const auto machine = ReadShellVisibilityPolicy();
+    const auto printNames = [](const wchar_t* label, const std::vector<std::wstring>& names) {
+        std::wcout << L" " << label << L"=[";
+        for (const auto& name : names) std::wcout << name << L";";
+        std::wcout << L"]";
+    };
     for (bool showHidden : {false, true}) for (bool showProtected : {false, true}) {
         state.visibility = {showHidden, showProtected}; refresh();
-        std::vector<std::wstring> gpu;
+        std::vector<std::wstring> gpu, expected;
         for (const auto& entry : state.entries) gpu.push_back(entry.name);
-        std::sort(gpu.begin(), gpu.end(), [](const auto& a, const auto& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
-        Check(gpu == ShellProviderNames(state.folder.Get(), state.visibility),
-            "GPU visibility differs from the Shell provider's enumeration");
+        for (const auto& path : std::vector<std::wstring>{files.begin(), files.end()}) {
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            const bool hidden = attributes & FILE_ATTRIBUTE_HIDDEN, system = attributes & FILE_ATTRIBUTE_SYSTEM;
+            if ((!hidden || showHidden) && (!(hidden && system) || showProtected))
+                expected.push_back(PathFindFileNameW(path.c_str()));
+        }
+        for (const auto& path : folders) expected.push_back(PathFindFileNameW(path.c_str())); // Neither is hidden.
+        const auto byName = [](const auto& a, const auto& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; };
+        std::sort(gpu.begin(), gpu.end(), byName); std::sort(expected.begin(), expected.end(), byName);
+        const bool live = showHidden == machine.showHidden && showProtected == machine.showProtected;
+        const auto shell = live ? ShellProviderNames(state.folder.Get(), state.visibility) : expected;
+        if (gpu != expected || gpu != shell) {
+            std::wcout << L"VISIBILITY hidden=" << showHidden << L" protected=" << showProtected << L" live=" << live;
+            printNames(L"gpu", gpu); printNames(L"expected", expected); printNames(L"shell", shell);
+            std::wcout << std::endl;
+        }
+        Check(gpu == expected, "GPU visibility differs from Explorer's hidden/protected attribute rules");
+        Check(gpu == shell, "GPU visibility differs from the Shell provider's enumeration under this machine's policy");
     }
 
     // A validated, visible Explorer item absent from both listings is not

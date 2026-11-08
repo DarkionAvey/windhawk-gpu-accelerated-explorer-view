@@ -27,7 +27,10 @@ public:
         UINT value = 0; const HRESULT result = GetCurrentViewMode(&value);
         *out = static_cast<FOLDERVIEWMODE>(value); *size = iconSize; return result;
     }
-    HRESULT STDMETHODCALLTYPE GetFolder(REFIID iid, void** out) override { return folder->QueryInterface(iid, out); }
+    HRESULT STDMETHODCALLTYPE GetFolder(REFIID iid, void** out) override {
+        if (!folder) { *out = nullptr; return E_NOINTERFACE; } // As DefView without a bound folder.
+        return folder->QueryInterface(iid, out);
+    }
     HRESULT STDMETHODCALLTYPE ItemCount(UINT, int* out) override { *out = 0; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetSelection(BOOL, IShellItemArray** out) override { *out = nullptr; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetGroupBy(PROPERTYKEY* key, BOOL* ascending) override {

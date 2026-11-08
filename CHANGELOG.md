@@ -10,6 +10,7 @@
 - **IMPROVED** Build validation reliability with additional retries and diagnostics.
 - **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.
 - **IMPROVED** Thumbnails in the drag pile have rounded corners, sized for the pile like grid thumbnails are for the grid.
+- **IMPROVED** The log now records sort, navigation and GPU device details that help diagnose a stuck or blank view.
 
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
@@ -17,6 +18,9 @@
 - **FIXED** The drag item count now sits at the pile's top corner, not over a small first item.
 - **FIXED** The drag operation symbol (🚫, 📋, 🔗) is always smoothly antialiased, whatever the text antialiasing option.
 - **FIXED** Spacing that did not scale with display scaling: row and item insets, the gap after names, group headings, highlight corners, and the minimum text and icon sizes.
+- **FIXED** Opening a drive from This PC could leave the view stuck on This PC or blank, when Explorer had saved that drive without a sort column.
+- **FIXED** Double-clicking while a folder was still loading could jump back to the parent folder.
+- **FIXED** The view could stay blank after being hidden and shown again while a folder was loading.
 
 ## 1.0.4 — Public release
 - **FIXED** ARM64 compatibility.

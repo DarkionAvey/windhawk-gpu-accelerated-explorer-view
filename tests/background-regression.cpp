@@ -1977,6 +1977,7 @@ static void TestPreviewInput() {
 #include "shell-size-smoke.h"
 #include "provider-selection-smoke.h"
 #include "initial-sort-smoke.h"
+#include "empty-sort-key-smoke.h"
 #include "preprocessing-benchmark.h"
 #include "profile-identity-smoke.h"
 #include "provider-navigation-smoke.h"

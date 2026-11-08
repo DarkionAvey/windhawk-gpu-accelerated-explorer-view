@@ -52,9 +52,12 @@ static void TestLiveSorting(HWND frame, const std::wstring& fixture) {
         for(int i=0;i<rendered.total;++i) {
             const auto& name=ModelEntry(rendered,i).name;
             Check(!name.empty() && name==state.entries[i].name,"filename width model lost the published name");
+            // The width is the drawn label's, which follows Explorer's
+            // "hide extensions for known file types" setting.
+            const auto& label=EntryLabel(ModelEntry(rendered,i));
             for(float available:{420.f,90.f,420.f}) {
                 ComPtr<IDWriteTextLayout> reference;
-                Check(SUCCEEDED(g_writeFactory->CreateTextLayout(name.c_str(),UINT32(name.size()),
+                Check(SUCCEEDED(g_writeFactory->CreateTextLayout(label.c_str(),UINT32(label.size()),
                     rendered.textFormat.Get(),available,roundf(rendered.rowPx),&reference)),"filename width reference");
                 DWRITE_TEXT_METRICS metrics{};
                 Check(SUCCEEDED(reference->GetMetrics(&metrics)),"filename width reference metrics");

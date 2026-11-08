@@ -244,7 +244,8 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(state.directoryToken && state.background->itemTipListing.load() == state.directoryToken,
         "item tip Size binding is not scoped to the listing");
     const Entry& file = state.entries[size_t(note)];
-    Check(tip.name == file.name && tip.rows.size() >= 3, "file item tip rows");
+    // The tooltip names the item as its row does (Explorer's extension setting).
+    Check(tip.name == EntryLabel(file) && tip.rows.size() >= 3, "file item tip rows");
     ShellSizeBinding sizeBinding; std::wstring shellSize;
     Check(ReadShellSizeDetail(file.path, nullptr, shellSize, sizeBinding, 1), "native tooltip size");
     Check(valueOf(PKEY_Size) == shellSize && valueOf(PKEY_ItemTypeText) == textType.szTypeName,

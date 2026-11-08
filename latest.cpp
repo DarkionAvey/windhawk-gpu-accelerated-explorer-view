@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.0.4
+// @version         1.0.5
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -401,6 +401,7 @@ constexpr UINT_PTR kTimerId = 101;
 constexpr UINT_PTR kTypeSearchTimerId = 105;
 constexpr UINT_PTR kZoomAutoRefitTimerId = 106;
 constexpr UINT_PTR kTouchHoldTimerId = 107;
+constexpr UINT_PTR kClickRenameTimerId = 108;
 // Input batching only: expiry never substitutes for gesture/animation/data completion.
 constexpr UINT kZoomAutoRefitDebounceMs = 200;
 constexpr UINT kMsgDispose = WM_APP + 31;
@@ -462,6 +463,10 @@ constexpr UINT kMsgItemTipReady = WM_APP + 78;
 constexpr UINT kMsgReconcileEmptySnapshot = WM_APP + 79;
 constexpr UINT kMsgNativeInputLayout = WM_APP + 80;
 constexpr UINT kMsgTypeSearchReady = WM_APP + 81;
+// Multiple rename transaction step, posted behind DefView's own queued work:
+// wParam 0 follows DoRename (its editor exists), 1 follows the commit (DefView
+// captured its selected set).
+constexpr UINT kMsgNativeRenameStep = WM_APP + 82;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -610,6 +615,12 @@ std::atomic<int> g_gridSelectionRadius{16};
 // Maximum thumbnail corner radius in logical (96-DPI) pixels, independent of
 // selection. Small thumbnails cap it further to 20% of their shorter edge.
 float g_thumbnailCornerRadius96 = 8.f;
+// The one thumbnail rounding rule, applied by each surface (grid item, drag
+// pile) to its own drawn image size at its own DPI.
+float ThumbnailCornerRadius(float width, float height, int dpi) {
+    return std::min(std::max(0.f, g_thumbnailCornerRadius96) * static_cast<float>(dpi) / 96.f,
+        std::min(width, height) * .2f);
+}
 std::atomic<unsigned long long> g_shellAssociationEpoch{1};
 std::atomic<bool> g_scrollbar{true};
 std::atomic<bool> g_instantScrub{false};
@@ -632,6 +643,36 @@ using TranslateAcceleratorW_t = decltype(&TranslateAcceleratorW);
 TranslateAcceleratorW_t g_translateAcceleratorOriginal = nullptr;
 using RaiseStructureEvent_t = HRESULT(WINAPI*)(IRawElementProviderSimple*,StructureChangeType,int*,int);
 RaiseStructureEvent_t g_raiseStructureEventOriginal = nullptr;
+using GetDC_t = decltype(&GetDC);
+using ReleaseDC_t = decltype(&ReleaseDC);
+GetDC_t g_getDcOriginal = nullptr;
+ReleaseDC_t g_releaseDcOriginal = nullptr;
+// The rename EDIT draws typed text and drag selections straight through
+// GetDC. While its field shows list-matched text, that drawing goes to an
+// offscreen DC on the editor's thread; one WM_PAINT shows each edit instead.
+// Each GetDC is a nested save: a measurement inside the EDIT's own drawing
+// (field placement during a click) releases only its own font and clip,
+// never the EDIT's, which would then measure its caret with the system font.
+bool g_renameSinkAvailable = false; // Both hooks installed.
+thread_local HWND t_renameSinkWindow = nullptr;
+thread_local HDC t_renameSink = nullptr;
+HDC WINAPI GetDcHook(HWND hwnd) {
+    if (hwnd && hwnd == t_renameSinkWindow && t_renameSink && SaveDC(t_renameSink)) return t_renameSink;
+    return g_getDcOriginal(hwnd);
+}
+int WINAPI ReleaseDcHook(HWND hwnd, HDC dc) {
+    if (dc && dc == t_renameSink) return RestoreDC(dc, -1) ? 1 : 0;
+    return g_releaseDcOriginal(hwnd, dc);
+}
+void SetRenameTextSink(HWND editor, bool enabled) {
+    if (enabled && (!editor || !g_renameSinkAvailable || (t_renameSinkWindow == editor && t_renameSink))) return;
+    if (!enabled && t_renameSinkWindow != editor) return;
+    if (t_renameSink) DeleteDC(t_renameSink);
+    t_renameSink = nullptr; t_renameSinkWindow = nullptr;
+    if (!enabled) return;
+    t_renameSink = CreateCompatibleDC(nullptr);
+    if (t_renameSink) t_renameSinkWindow = editor;
+}
 HMODULE g_uiaModule = nullptr;
 // DirectWrite cleanup is explicit after tab workers drain. Explorer exit skips
 // Wh_ModUninit, so never release this COM object from CRT/loader-lock teardown.
@@ -881,13 +922,17 @@ struct EntrySortKey {
     std::vector<ExtraSortValue> secondarySortValues;
     FILETIME created{}, accessed{};
     std::wstring path;
-    std::wstring name;
+    std::wstring name; // Parsing leaf (namespace rows: Shell display name).
+    // Shell's in-folder label when it differs from the parsing leaf, e.g. a
+    // hidden extension. Empty otherwise; read through EntryLabel().
+    std::wstring label;
     FILETIME lastWrite{};
     ULONGLONG byteSize = 0;
     bool folder = false;
     SharedPidl shellIdentity; // Immutable identity for targeted provider rechecks.
     bool operator==(const EntrySortKey&) const = default;
 };
+const std::wstring& EntryLabel(const EntrySortKey& e) { return e.label.empty() ? e.name : e.label; }
 struct Entry : EntrySortKey {
     std::wstring date, type, size;
     std::vector<ColumnCell> cells;
@@ -1137,12 +1182,16 @@ struct GroupHeaderMotion {
 // Explorer's Show hidden items and Hide protected OS files are different
 // settings. Capture a tiny immutable policy on the owning UI thread; workers
 // never query Shell settings, and all icon/index/row paths see the same rows.
+// "Hide extensions for known file types" changes only labels; it is part of
+// the policy so a toggle refreshes rows and invalidates labelled snapshots.
 struct ShellVisibilityPolicy {
     bool showHidden = false;
     bool showProtected = false;
+    bool showExtensions = true;
     bool operator==(const ShellVisibilityPolicy& other) const {
         return showHidden == other.showHidden &&
-               showProtected == other.showProtected;
+               showProtected == other.showProtected &&
+               showExtensions == other.showExtensions;
     }
     bool operator!=(const ShellVisibilityPolicy& other) const {
         return !(*this == other);
@@ -1152,8 +1201,9 @@ struct ShellVisibilityPolicy {
 ShellVisibilityPolicy ReadShellVisibilityPolicy() {
     SHELLSTATE settings{};
     SHGetSetSettings(&settings, SSF_SHOWALLOBJECTS |
-        SSF_SHOWSUPERHIDDEN, FALSE);
-    return {settings.fShowAllObjects != 0, settings.fShowSuperHidden != 0};
+        SSF_SHOWSUPERHIDDEN | SSF_SHOWEXTENSIONS, FALSE);
+    return {settings.fShowAllObjects != 0, settings.fShowSuperHidden != 0,
+            settings.fShowExtensions != 0};
 }
 
 struct ShellClickPolicy {
@@ -1446,6 +1496,7 @@ struct DragShadow {
     ComPtr<ID2D1Bitmap1> bitmap;
     const void* identity=nullptr;
     float side=0.f;
+    int dpi=0; // Thumbnail corners follow the pile's DPI.
 };
 // Same policy calculation as list text, with an independent monitor cache so
 // a drag on another display never invalidates the tab's existing glyph masks.
@@ -2347,6 +2398,9 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
         PTP_WORK pooled = nullptr;
         std::atomic<bool> scheduled{false};
         std::map<std::wstring, std::wstring> typeNames;
+        // Shell's per-extension label verdicts for one captured ShowExtensions.
+        std::unordered_map<std::wstring, bool> hiddenExtensions;
+        bool hiddenExtensionsShowAll = true;
         // Lane-owned. Compare watch-only edits without copying
         // the entire live list on Explorer's STA or retaining provider objects.
         std::vector<EntrySortKey> sortedEntries;
@@ -3123,6 +3177,13 @@ struct ViewState {
     bool viewToggleLayoutQueued = false;
     bool viewToggleHot = false, viewTogglePaletteDirty = true;
     COLORREF viewToggleBackground = CLR_INVALID, viewToggleForeground = CLR_INVALID;
+    std::wstring viewToggleHint; // Last text given to the tooltip.
+    // Explorer's status-bar button theme (CommandModule) and the tooltip font
+    // copied from Explorer's own tooltip; the stock tooltip they were read from.
+    HTHEME viewToggleTheme = nullptr;
+    HFONT viewToggleTipFont = nullptr;
+    HWND viewToggleTipSource = nullptr;
+    bool viewToggleStyled = false;
     void ReleaseViewToggle() {
         for (HWND child : {viewToggleTooltip, viewToggle}) {
             if (IsWindow(child) && GetPropW(child, kViewToggleOwnerProperty) == hwnd) {
@@ -3145,6 +3206,11 @@ struct ViewState {
         viewToggleDpi = 0;
         viewToggleHot = false;
         viewTogglePaletteDirty = true;
+        viewToggleHint.clear();
+        if (viewToggleTheme) CloseThemeData(viewToggleTheme);
+        if (viewToggleTipFont) DeleteObject(viewToggleTipFont);
+        viewToggleTheme = nullptr; viewToggleTipFont = nullptr;
+        viewToggleTipSource = nullptr; viewToggleStyled = false;
     }
     ViewState() {background->notificationLifetime=lifetimeToken;}
     ~ViewState() {
@@ -3384,6 +3450,12 @@ struct ViewState {
     bool trackNativeSort = false; // Follow Shell changes after opting into sorting.
     bool preSortEnabled = g_preSort.load(std::memory_order_relaxed);
     bool nativeSortPending = false; // Retry a failed initial settings read on native readiness.
+    // Diagnostics: one log line per distinct sort-read failure and per blocked
+    // directory generation, never one per timer tick.
+    unsigned long long sortReadLogKey = 0, sortBlockLoggedToken = 0, sortOkLoggedToken = 0;
+    // Generation whose stable Shell view could not report a sort at all. Its
+    // names proceed in enumeration order; a later successful read re-sorts.
+    unsigned long long sortReadUnavailableToken = 0;
     std::optional<SortSpec> instantInteractionSort; // One header intent, including replacement refreshes.
     // When navigating from a descendant to an ancestor, reveal the immediate
     // child on the return path. This selection stays stable while a cached
@@ -3694,7 +3766,10 @@ struct ViewState {
     bool pendingSelectionContextMenu = false;
     bool pendingSelectionContextKeyboard = false;
     LPARAM pendingSelectionContextPoint = 0;
-    struct DeferredSelectionKey { WPARAM key = 0; DWORD modifiers = 0; bool newTab = false; };
+    struct DeferredSelectionKey {
+        WPARAM key = 0; DWORD modifiers = 0; bool newTab = false;
+        std::wstring renameText; // VK_F2: the label DefView's own editor commits.
+    };
     std::deque<DeferredSelectionKey> deferredSelectionKeys;
     std::vector<std::wstring> nativeSelectionPaths;
     std::wstring nativeFocusedPath;
@@ -3731,6 +3806,11 @@ struct ViewState {
         std::wstring path, folder;
         HWND tab = nullptr, native = nullptr;
         RECT frameRect{}; // Vacated GDI child area; also valid on external destroy.
+        // The frame surface under the rename viewport before the field drew
+        // there (physical frame client coordinates), and the frame client
+        // area that surface had.
+        HBITMAP underlay = nullptr;
+        RECT underlayRect{}, underlayFrame{};
         UINT_PTR epoch = 0;
         bool finishing = false;
         bool positioning = false;
@@ -3743,16 +3823,48 @@ struct ViewState {
         bool zoomHidden = false, zoomRetargeting = false, restoreZoomFocus = false;
         bool parentSubclassInstalled = false;
         HWND notificationHost = nullptr;
+        bool multiple = false; // Several selected items: DefView renames the set.
         bool creationSticky = false; // Ignore non-pointer Shell focus transitions.
         bool creationPointerPending = false; // The initiating press must actually release.
         bool refocusQueued = false;
         ULONGLONG startedAt = 0;
         ULONGLONG lastRefocusAt = 0;
+        // The field shows its text as the list draws it (the list's text
+        // format, rendering parameters and antialias mode); the EDIT keeps
+        // editing, with caret and pointer translated per character.
+        ComPtr<ID2D1Factory> textFactory;
+        ComPtr<ID2D1DCRenderTarget> textTarget;
+        struct TextLine {
+            ComPtr<IDWriteTextLayout> layout;
+            float x = 0.f, baselineTop = 0.f; // Displayed origin.
+            int top = 0, start = 0, length = 0;
+            int gdiLeft = 0, gdiWidth = 0; // The EDIT's own extent of this line.
+        };
+        std::vector<TextLine> textLines;
+        std::wstring textLinesText;
+        RECT textLinesRect{};
+        float textLinesFont = 0.f;
+        unsigned long long textLinesFace = 0;
+        HFONT textLinesGdiFont = nullptr;
+        int textLineHeight = 0;
+        POINT caretShown{-32768, -32768};
+        bool textMapping = false; // Our own EM_* queries are not user edits.
+        const char* textFallback = nullptr; // Why the last paint kept GDI text (diagnostics).
+
     } rename;
     // A label handoff while the owner STA is inside SetNameOf. A reentrant
     // directory delivery must not put the old name back above the closed EDIT.
     std::wstring renamePreviewPath, renamePreviewName;
     unsigned long long renamePreviewToken = 0;
+    // Multiple-item rename: DefView numbers the set itself. The text waits for
+    // the hidden native label editor that DoRename opens for this view token.
+    std::wstring nativeRenameText;
+    unsigned long long nativeRenameToken = 0;
+    // DefView reads its selection when its queued commit runs. Until then
+    // (view token while held) GPU selection changes wait for the release.
+    unsigned long long nativeRenameHold = 0;
+    bool nativeRenameSelectionDeferred = false;
+    HWND nativeRenameCommitEditor = nullptr; // DefView's editor that received the commit.
     // CS_DBLCLKS is scoped to the persistent GPU HWND, not the Shell folder.
     // Track a completed first row-click explicitly so Windows cannot pair a
     // click in one folder with a double-click in the next folder.
@@ -3770,6 +3882,18 @@ struct ViewState {
     ULONGLONG dividerClickEpoch = 0;
     ULONGLONG dividerClickTick = 0;
     bool mousePressActive = false;
+    // Explorer's slow second click on the selected filename. The press
+    // records eligibility; the release arms a GetDoubleClickTime() wait that
+    // only proposes the rename: the timer revalidates every identity below.
+    bool mousePressRenameEligible = false;
+    unsigned long long inputSerial = 0; // Presses, keys, wheels and menus on this view.
+    struct ClickRename {
+        bool armed = false;
+        int row = -1;
+        std::wstring path;
+        unsigned long long token = 0, directory = 0, input = 0;
+        ULONGLONG epoch = 0, due = 0;
+    } clickRename;
     bool releasingPointerCapture = false;
     // Preserve click modifiers until release: an unselected row only becomes
     // selected after mouse-up, so that the same press cannot authorize OLE drag.
@@ -4424,7 +4548,8 @@ bool UsesThumbnails(const ViewState& state, const Entry& entry) {
     return !entry.folder && FileThumbnails(state);
 }
 float GroupHeadingHeight(const ViewState& state) {
-    return state.gridView ? std::max(24.f, state.fontPx * 1.5f + 8.f) : state.rowPx;
+    const int dpi = ViewDpi(state);
+    return state.gridView ? std::max(float(Scale96(24, dpi)), state.fontPx * 1.5f + Scale96(8, dpi)) : state.rowPx;
 }
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
@@ -4452,7 +4577,8 @@ void LayoutGroupSections(ViewState& state) {
         auto extent = [&](int columns) {
             const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
             const float row = state.zoomAnimating ? state.zoomToRowPx : state.rowPx;
-            const float heading = state.zoomAnimating ? std::max(24.f, font*1.5f+8.f) :
+            const float heading = state.zoomAnimating ?
+                std::max(float(Scale96(24, ViewDpi(state))), font*1.5f+Scale96(8, ViewDpi(state))) :
                 GroupHeadingHeight(state);
             if (state.sections.empty()) return lines(state.total) * row;
             float height = 0.f;
@@ -4789,8 +4915,22 @@ int KeyboardFocusedSection(const ViewState& state) {
             if(state.sections[i].key==*state.keyboardSectionKey) return int(i);
     return -1;
 }
+void FinishRename(ViewState& state, bool commit);
+ViewState* State(HWND hwnd);
 void ToggleGroupSection(ViewState& state, int index) {
     if (index < 0 || index >= static_cast<int>(state.sections.size())) return;
+    // Toggling a section is input outside an open rename field: commit it
+    // first, as a click elsewhere does, before its row can be hidden.
+    if (state.rename.editor) {
+        const HWND owner = state.hwnd;
+        const auto key = state.sections[static_cast<size_t>(index)].key;
+        FinishRename(state, true);
+        if (State(owner) != &state) return;
+        index = -1; // The commit may have republished the sections.
+        for (size_t i = 0; i < state.sections.size(); ++i)
+            if (state.sections[i].key == key) { index = static_cast<int>(i); break; }
+        if (index < 0) return;
+    }
     auto& group = state.sections[static_cast<size_t>(index)];
     group.from = group.fraction;
     group.collapsed = !group.collapsed;
@@ -5146,6 +5286,7 @@ ClickSource CurrentClickSource(const ViewState& state) {
 
 void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
     state.mousePressBackground = false;
+    state.mousePressRenameEligible = false;
     if (folderChanged) {++state.mouseFolderEpoch; state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
     state.checkboxPress = -1;
     state.checkboxPressItem.clear();
@@ -6506,7 +6647,60 @@ bool DarkerThan(COLORREF a, COLORREF b) {
 COLORREF RaisedSurface(COLORREF background, COLORREF foreground) {
     return BlendColor(background, foreground, DarkerThan(background, foreground) ? 12 : 4);
 }
+
+// Explorer's status bar (shell32's StatusBarModule UI file) paints its view
+// buttons with Explorer::CommandModule part 4 over ExplorerStatusBar's fill
+// and text colors. Explorer's chrome windows, its tooltips included, opt into
+// dark mode (uxtheme's AllowDarkModeForWindow); Windows then opens each class's
+// dark variant whenever apps use dark mode. Explorer's tooltips carry the theme
+// Explorer gave them: SetWindowTheme records its sub-app and sub-ID list, and
+// the opt-in its state, as these property atoms.
+constexpr ATOM kThemeSubAppProperty = 43281, kThemeSubIdListProperty = 43280, kDarkModeOptInProperty = 43294;
+constexpr wchar_t kStatusButtonTheme[] = L"Explorer::CommandModule", kStatusBarTheme[] = L"ExplorerStatusBar";
+constexpr int kCommandModuleButton = 4; // Its states: 1 normal, 2 pressed, 4 hot.
+std::wstring WindowThemeName(HWND hwnd, ATOM property) {
+    const auto atom = static_cast<ATOM>(reinterpret_cast<UINT_PTR>(GetPropW(hwnd, MAKEINTATOM(property))));
+    wchar_t name[256]{};
+    if (!atom || !GetAtomNameW(atom, name, ARRAYSIZE(name)) || !wcscmp(name, L"$")) return {}; // "$": none given.
+    return name;
+}
+// A tooltip of Explorer's own (not this mod's) on the frame, themed by
+// Explorer: the one serving `host` (the status bar's DirectUI window) when
+// there is one, as Explorer's tooltips differ in width and delays.
+HWND StockFrameTooltip(HWND frame, HWND host = nullptr) {
+    struct Search { HWND frame, host, found, served; } search{frame, host, nullptr, nullptr};
+    if (!IsWindow(frame)) return nullptr;
+    EnumThreadWindows(GetWindowThreadProcessId(frame, nullptr), [](HWND hwnd, LPARAM context) -> BOOL {
+        auto& s = *reinterpret_cast<Search*>(context);
+        wchar_t cls[32]{};
+        if (GetWindow(hwnd, GW_OWNER) != s.frame || GetPropW(hwnd, kViewToggleOwnerProperty) ||
+            !GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || _wcsicmp(cls, TOOLTIPS_CLASSW) ||
+            !GetPropW(hwnd, MAKEINTATOM(kThemeSubAppProperty))) return TRUE;
+        if (!s.found) s.found = hwnd;
+        TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
+        if (s.host && SendMessageW(hwnd, TTM_ENUMTOOLSW, 0, reinterpret_cast<LPARAM>(&tool)) && tool.hwnd == s.host) {
+            s.served = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.served ? search.served : search.found;
+}
+// Whether Explorer opted this window into dark mode ("Enabled" when it did).
+bool DarkModeOptedIn(HWND hwnd) {
+    return WindowThemeName(hwnd, kDarkModeOptInProperty) == L"Enabled";
+}
+// uxtheme exports AllowDarkModeForWindow only by ordinal (133).
+void OptIntoDarkMode(HWND hwnd, bool allow) {
+    using Allow = bool(WINAPI*)(HWND, bool);
+    static const auto allowDark = [] {
+        const HMODULE theme = GetModuleHandleW(L"uxtheme.dll");
+        return theme ? reinterpret_cast<Allow>(GetProcAddress(theme, MAKEINTRESOURCEA(133))) : nullptr;
+    }();
+    if (allowDark && IsWindow(hwnd)) allowDark(hwnd, allow);
+}
 void RefreshItemTipPalette(ViewState& state, bool highContrast);
+void RefreshViewTogglePalette(ViewState& state);
 
 bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     // Resolve WinRT only at attachment/theme/settings changes. Maintenance
@@ -6585,32 +6779,46 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
         ReadableForeground(state.nativeEditBackground, {text, state.nativeAppForeground, systemText});
     RefreshRenamePalette(state);
     RefreshItemTipPalette(state, highContrast);
-    if (state.viewTogglePaletteDirty) {
-        state.viewTogglePaletteDirty = false;
-        COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
-        if (!highContrast) {
-            // Classic BUTTON/Explorer themes can remain light in dark-mode
-            // Explorer. Read Windows' app palette once on creation/theme change,
-            // never from paint, input or the periodic maintenance path.
-            // Explorer's light status bar is the page surface itself; only
-            // the dark page black is lifted to Explorer's raised dark surface.
-            if (ValidRgb(state.nativeAppBackground)) {
-                background = state.nativeAppBackground;
-                foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
-                if (DarkerThan(background, foreground)) background = RaisedSurface(background, foreground);
-            }
+    if (state.viewTogglePaletteDirty && IsWindow(state.viewToggle)) RefreshViewTogglePalette(state);
+    return changed;
+}
+
+// The switch's surface: the status bar's own fill and text, as its UI file
+// reads them. Resolved on the switch's creation and theme changes, never from
+// paint, input or the periodic maintenance path, and only where a tab shows one.
+void RefreshViewTogglePalette(ViewState& state) {
+    state.viewTogglePaletteDirty = false;
+    state.viewToggleStyled = false; // Theme classes follow the same change.
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
+    if (!highContrast) {
+        // Read through the switch, opted into dark mode as Explorer's chrome is.
+        COLORREF fill = CLR_INVALID, ink = CLR_INVALID;
+        if (HTHEME bar = OpenThemeData(state.viewToggle, kStatusBarTheme)) {
+            if (FAILED(GetThemeColor(bar, 0, 0, TMT_FILLCOLOR, &fill))) fill = CLR_INVALID;
+            if (FAILED(GetThemeColor(bar, 0, 0, TMT_TEXTCOLOR, &ink))) ink = CLR_INVALID;
+            CloseThemeData(bar);
         }
-        if (!ValidRgb(background)) background = RGB(255,255,255);
-        if (!highContrast || !ValidRgb(foreground))
-            foreground = ReadableForeground(background, {foreground, text});
-        if (background != state.viewToggleBackground || foreground != state.viewToggleForeground) {
-            state.viewToggleBackground = background;
-            state.viewToggleForeground = foreground;
-            if (IsWindow(state.viewToggle)) InvalidateRect(state.viewToggle, nullptr, FALSE);
-            if (state.viewToggleIcons[0]) RefreshViewToggleForFrame(state.frameHwnd, true);
+        if (ValidRgb(fill)) {
+            background = fill;
+            foreground = ReadableForeground(background, {ink, state.nativeAppForeground, foreground});
+        } else if (ValidRgb(state.nativeAppBackground)) {
+            background = state.nativeAppBackground;
+            foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
+            if (DarkerThan(background, foreground)) background = RaisedSurface(background, foreground);
         }
     }
-    return changed;
+    if (!ValidRgb(background)) background = RGB(255,255,255);
+    if (!highContrast || !ValidRgb(foreground))
+        foreground = ReadableForeground(background, {foreground, state.nativeTextColor});
+    if (background != state.viewToggleBackground || foreground != state.viewToggleForeground) {
+        state.viewToggleBackground = background;
+        state.viewToggleForeground = foreground;
+        if (IsWindow(state.viewToggle)) InvalidateRect(state.viewToggle, nullptr, FALSE);
+        if (state.viewToggleIcons[0]) RefreshViewToggleForFrame(state.frameHwnd, true);
+    }
 }
 
 // Classify borrowed WM_SETTINGCHANGE strings while the message is in scope;
@@ -7710,10 +7918,11 @@ bool NativeContextMenuHasFeedback(const ViewState& state) {
         GetWindowThreadProcessId(popup, nullptr) == GetCurrentThreadId();
 }
 
+// The item whose rename field is open is always shown selected, including
+// while a new item's field is still taking keyboard focus from Shell.
 bool SelectionFeedbackVisible(const ViewState& state) {
     if (state.presentationOnly) return state.selectionFeedbackVisible;
-    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state) ||
-        (state.rename.editor && InputFocusOwner(state) == ViewInputOwner::RenameEditor);
+    return OverlayHasInputFocus(state) || NativeContextMenuHasFeedback(state) || state.rename.editor;
 }
 
 // All list-focus returns use the same ownership boundary. Native Shell focus
@@ -7736,8 +7945,14 @@ bool ReturnListInputFocus(ViewState& state, HWND previousOwner) {
     return State(owner) == &state && OverlayHasInputFocus(state);
 }
 
+// A New command may come from the list, its context menu or the command bar,
+// so input only has to stay in this foreground Explorer window until the new
+// item's field opens; switching to another window abandons the creation.
 bool CreationHasInputFocus(const ViewState& state) {
-    return OverlayHasInputFocus(state) || InputFocusOwner(state) == ViewInputOwner::NativeEditor;
+    if (OverlayHasInputFocus(state) || InputFocusOwner(state) == ViewInputOwner::NativeEditor) return true;
+    const HWND focus = GetFocus();
+    return ExplorerFrameHasForeground(state.frameHwnd) &&
+        (!focus || focus == state.frameHwnd || IsChild(state.frameHwnd, focus));
 }
 
 void RefreshInputFocusIndicators(ViewState& state) {
@@ -7869,9 +8084,41 @@ void RegisterSystemShellNotifications(ViewState& state) {
 ULONGLONG FileTimeNumber(const FILETIME& ft) {
     return (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
+// Explorer's Name order follows the displayed label; the parsing leaf keeps
+// equal labels (same stem, hidden extensions) in a stable order.
 int CompareEntryNames(const EntrySortKey& a, const EntrySortKey& b) {
-    int c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
+    int c = StrCmpLogicalW(EntryLabel(a).c_str(), EntryLabel(b).c_str());
+    if (!c) c = StrCmpLogicalW(a.name.c_str(), b.name.c_str());
     return c ? c : wcscmp(a.name.c_str(), b.name.c_str());
+}
+
+// Which extensions Explorer hides (Folder Options, NeverShowExt, AlwaysShowExt,
+// per-user associations) is Shell association policy. Ask the Shell for one
+// file's in-folder label per extension without touching the file, and reuse
+// that answer for the extension. Names-worker only; the lane owns the memo and
+// clears it with the captured policy or a Shell association change.
+void ResolveShellFileLabel(Entry& e, std::unordered_map<std::wstring, bool>& hiddenExtensions) {
+    if (e.folder) return;
+    const wchar_t* ext = PathFindExtensionW(e.name.c_str());
+    if (!ext || !*ext || ext == e.name.c_str()) return;
+    const size_t stem = static_cast<size_t>(ext - e.name.c_str());
+    std::wstring key(ext);
+    std::transform(key.begin(), key.end(), key.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    auto known = hiddenExtensions.find(key);
+    if (known == hiddenExtensions.end()) {
+        SHFILEINFOW info{};
+        if (e.name.size() >= ARRAYSIZE(info.szDisplayName) ||
+            !SHGetFileInfoW(e.path.c_str(), FILE_ATTRIBUTE_NORMAL, &info, sizeof(info),
+                SHGFI_DISPLAYNAME | SHGFI_USEFILEATTRIBUTES)) return;
+        const std::wstring_view shown(info.szDisplayName);
+        // Only an exact stem or the exact leaf is an extension verdict.
+        if (shown == e.name) known = hiddenExtensions.emplace(std::move(key), false).first;
+        else if (shown == std::wstring_view(e.name).substr(0, stem))
+            known = hiddenExtensions.emplace(std::move(key), true).first;
+        else return;
+    }
+    if (known->second) e.label.assign(e.name, 0, stem);
 }
 const wchar_t* EntryExtension(const EntrySortKey& e) {
     const wchar_t* ext = PathFindExtensionW(e.name.c_str());
@@ -8254,6 +8501,13 @@ unsigned long long DirectoryOrderHash(const std::vector<Entry>& entries,
         hash ^= rowHashes ? (*rowHashes)[i].first : SelectionPathHash(e.path);
         hash *= 1099511628211ULL;
         for (wchar_t ch : e.name) {
+            hash ^= static_cast<unsigned long long>(ch);
+            hash *= 1099511628211ULL;
+        }
+        // A relabel (Folder Options extensions) must not reuse the old rows.
+        hash ^= 0x102ULL;
+        hash *= 1099511628211ULL;
+        for (wchar_t ch : e.label) {
             hash ^= static_cast<unsigned long long>(ch);
             hash *= 1099511628211ULL;
         }
@@ -9710,6 +9964,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             std::memory_order_acquire);
         if (observedAssociationEpoch != associationEpoch) {
             typeNames.clear();
+            lane.hiddenExtensions.clear();
             observedAssociationEpoch = associationEpoch;
         }
         if (haveWatch) {
@@ -9911,6 +10166,10 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 names.reserve(directory.previewRows);
                 size_t nextPreview = 1;
                 size_t visited = 0;
+                if (lane.hiddenExtensionsShowAll != directory.visibility.showExtensions) {
+                    lane.hiddenExtensions.clear();
+                    lane.hiddenExtensionsShowAll = directory.visibility.showExtensions;
+                }
                 const std::wstring pattern = JoinPath(directory.path, L"*");
                 WIN32_FIND_DATAW data{};
                 HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic,
@@ -9953,6 +10212,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         e.accessed = data.ftLastAccessTime;
                         e.byteSize = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) |
                                       data.nFileSizeLow;
+                        ResolveShellFileLabel(e, lane.hiddenExtensions);
                         names.push_back(std::move(e));
                         // In *unsorted and ungrouped* folders the first N results
                         // retain these exact indices in the complete enumeration.
@@ -10471,7 +10731,7 @@ size_t FolderCacheBudget(FolderCache& cache) {
 // Snapshot and resolved-property accounting must include the same variable
 // payloads, especially provider strings and immutable namespace PIDLs.
 size_t EntryPayloadBytes(const Entry& entry) {
-    size_t bytes = (entry.path.capacity() + entry.name.capacity() + entry.sortText.capacity() +
+    size_t bytes = (entry.path.capacity() + entry.name.capacity() + entry.label.capacity() + entry.sortText.capacity() +
         entry.date.capacity() + entry.type.capacity() + entry.size.capacity() +
         entry.groupKey.capacity() + entry.groupTitle.capacity()) * sizeof(wchar_t) +
         entry.cells.capacity()*sizeof(ColumnCell);
@@ -10943,6 +11203,14 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
     }
 }
 
+// An unread Shell sort defers names only while the read can still succeed
+// (an identity change raced the COM call). Once this generation's stable
+// view proved unable to report one, rows proceed in enumeration order and
+// RefreshSortFromExplorer re-sorts them if a later read succeeds.
+bool SortReadDefersNames(const ViewState& state) {
+    return state.nativeSortPending && state.sortReadUnavailableToken!=state.token;
+}
+
 void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
                            bool preserveViewport = false, bool verifyNamespace = false) {
     PipelineScope pipeline(state.background,L"directory.request",replacePending,verifyNamespace);
@@ -10952,8 +11220,19 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
                 double(state.loaded),double(bool(state.namespaceIdentities))}};
         e.note=std::make_shared<const std::wstring>(state.folderPath); PipelineEvent(*state.background,std::move(e));
     }
+    const bool sortDeferred=SortReadDefersNames(state);
+    if (state.nativeSortPending && !state.thisPcGpu && state.sortBlockLoggedToken!=state.token*2+sortDeferred) {
+        // Record each deferral state once per navigation generation.
+        state.sortBlockLoggedToken=state.token*2+sortDeferred;
+        Wh_Log(L"[GPU sort] %s folder=%s token=%llu directory=%llu loaded=%d pending=%d replace=%d "
+            L"preSort=%d track=%d initialized=%d",
+            sortDeferred ? L"REQUEST_DEFERRED" : L"REQUEST_UNSORTED",
+            state.folderPath.c_str(),static_cast<unsigned long long>(state.token),
+            static_cast<unsigned long long>(state.directoryToken),state.loaded,state.directoryPending,replacePending,
+            state.preSortEnabled,state.trackNativeSort,state.sortInitialized);
+    }
     if ((state.directoryPending && !replacePending) || !state.hwnd ||
-        state.nativeSortPending ||
+        sortDeferred ||
         (state.optimisticStartedAt && !state.directoryFolderIdentity) ||
         g_unloading.load()) return;
     if (state.thisPcGpu) {
@@ -11448,6 +11727,58 @@ void ReconcileShellVisibility(ViewState& state) {
 // Legacy active-view reconciliation also catches programmatic sort changes.
 // This owning-STA COM call can block; the descriptor's small size is no latency
 // guarantee. Actual resorting and property enrichment run on the worker.
+// Diagnostics: snapshot of the Shell view whose sort descriptor was read, once
+// per navigation generation. It identifies the view actually queried (the
+// read can precede folderPath's update), its provider and its column set.
+void ProbeShellSortState(ViewState& state, IFolderView2* view, const wchar_t* outcome,
+                         const std::vector<SORTCOLUMN>& sort) {
+    std::wstring path; ComPtr<IShellFolder> folder;
+    const bool resolved=GetFolderPath(view,path,folder);
+    CLSID provider{}; wchar_t providerText[40]=L"-";
+    if (ComPtr<IPersist> persist; folder && SUCCEEDED(folder.As(&persist)) && SUCCEEDED(persist->GetClassID(&provider)))
+        StringFromGUID2(provider,providerText,ARRAYSIZE(providerText));
+    int items=-1; view->ItemCount(SVGIO_ALLVIEW,&items);
+    // Mode and grouping come from the tab's last reads: this probe must not
+    // add Shell mode/group queries that the owner's command fences account for.
+    const int mode=static_cast<int>(state.layoutNativeMode), iconSize=static_cast<int>(state.layoutIconSize);
+    DWORD flags=0; view->GetCurrentFolderFlags(&flags);
+    const PROPERTYKEY group=state.grouping.enabled ? state.grouping.key : PROPERTYKEY{};
+    const ULONG groupHr=state.grouping.enabled ? S_OK : S_FALSE;
+    wchar_t groupText[40]=L"-"; StringFromGUID2(group.fmtid,groupText,ARRAYSIZE(groupText));
+    HWND shellWindow=nullptr;
+    if (ComPtr<IShellView> shellView; SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&shellView)))) shellView->GetWindow(&shellWindow);
+    UINT driveType=DRIVE_UNKNOWN;
+    if (resolved && path.size()>=3 && path[1]==L':' && path[2]==L'\\') driveType=GetDriveTypeW(path.substr(0,3).c_str());
+    std::wstring sortText,columnText; UINT visible=0,all=0; bool sortVisible=false;
+    for (const auto& column : sort) {
+        wchar_t key[40]; StringFromGUID2(column.propkey.fmtid,key,ARRAYSIZE(key));
+        wchar_t item[80]; swprintf_s(item,L"%s%s,%lu,%d",sortText.empty()?L"":L";",key,column.propkey.pid,
+            static_cast<int>(column.direction));
+        sortText+=item;
+    }
+    if (ComPtr<IColumnManager> columns; SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&columns)))) {
+        columns->GetColumnCount(CM_ENUM_ALL,&all);
+        if (SUCCEEDED(columns->GetColumnCount(CM_ENUM_VISIBLE,&visible)) && visible && visible<=kMaxShellColumns) {
+            std::vector<PROPERTYKEY> keys(visible);
+            if (SUCCEEDED(columns->GetColumns(CM_ENUM_VISIBLE,keys.data(),visible))) for (const auto& key : keys) {
+                if (!sort.empty() && IsEqualPropertyKey(key,sort.front().propkey)) sortVisible=true;
+                if (columnText.size()<600) {
+                    wchar_t id[40]; StringFromGUID2(key.fmtid,id,ARRAYSIZE(id));
+                    wchar_t item[64]; swprintf_s(item,L"%s%s,%lu",columnText.empty()?L"":L";",id,key.pid);
+                    columnText+=item;
+                }
+            }
+        }
+    }
+    Wh_Log(L"[GPU sort] VIEW_STATE outcome=%s folder=%s viewFolder=%s resolved=%d provider=%s driveType=%u token=%llu "
+        L"items=%d mode=%d icon=%d flags=0x%08lX groupHr=0x%08lX group=%s,%lu shellWindow=%p native=%p visible=%d "
+        L"sort=[%s] sortVisible=%d columns=%u/%u visibleKeys=[%s]",
+        outcome,state.folderPath.c_str(),resolved ? path.c_str() : L"-",resolved,providerText,driveType,
+        static_cast<unsigned long long>(state.token),items,mode,iconSize,flags,groupHr,
+        groupText,group.pid,shellWindow,state.nativeHwnd,shellWindow && IsWindowVisible(shellWindow),
+        sortText.c_str(),sortVisible,visible,all,columnText.c_str());
+}
+
 bool ReadShellSort(ViewState& state, SortSpec& out) {
     if (!state.folderView) return false;
     const auto view = state.folderView;
@@ -11455,18 +11786,81 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
     const HWND native = state.nativeHwnd;
     PipelineScope query(state.background,L"shell.view.sort",state.token);
     int count=1;
-    const HRESULT countResult=view->GetSortColumnCount(&count);
-    if (state.folderView.Get()!=view.Get() || state.token!=token || state.nativeHwnd!=native) return false;
-    if (FAILED(countResult)) count=1;
-    if (count<1 || count>static_cast<int>(kMaxShellColumns)) return false;
-    std::vector<SORTCOLUMN> columns(count);
-    if (FAILED(view->GetSortColumns(columns.data(), count)) || state.folderView.Get() != view.Get() ||
-        state.token != token || state.nativeHwnd != native) return false;
-    for (const auto& column : columns)
-        if (IsEqualGUID(column.propkey.fmtid,GUID_NULL) || !column.propkey.pid) return false;
-    const auto& column=columns.front();
-    if (IsEqualGUID(column.propkey.fmtid, GUID_NULL) || !column.propkey.pid)
+    HRESULT columnsResult=S_OK;
+    std::vector<SORTCOLUMN> columns;
+    // Logged once per (token, reason, result) so a failure that blocks a
+    // folder's names is visible in user logs without per-tick spam.
+    const auto fail=[&](unsigned reason, HRESULT countHr, const SORTCOLUMN* bad) {
+        const unsigned long long key=(static_cast<unsigned long long>(token)<<8)^reason^
+            (static_cast<unsigned long long>(static_cast<ULONG>(countHr))<<32)^static_cast<ULONG>(columnsResult);
+        if (state.sortReadLogKey!=key) {
+            state.sortReadLogKey=key;
+            wchar_t fmtid[40]=L"-";
+            if (bad) StringFromGUID2(bad->propkey.fmtid,fmtid,ARRAYSIZE(fmtid));
+            Wh_Log(L"[GPU sort] READ_FAILED folder=%s token=%llu reason=%u countHr=0x%08lX count=%d columnsHr=0x%08lX "
+                L"key=%s,%lu pending=%d preSort=%d track=%d viewChanged=%d tokenChanged=%d nativeChanged=%d",
+                state.folderPath.c_str(),static_cast<unsigned long long>(token),reason,static_cast<ULONG>(countHr),count,
+                static_cast<ULONG>(columnsResult),fmtid,bad ? bad->propkey.pid : 0ul,state.nativeSortPending,
+                state.preSortEnabled,state.trackNativeSort,state.folderView.Get()!=view.Get(),state.token!=token,
+                state.nativeHwnd!=native);
+            if (reason!=1 && reason!=4 && state.folderView.Get()==view.Get())
+                ProbeShellSortState(state,view.Get(),L"unavailable",columns);
+        }
         return false;
+    };
+    // A stable view that answered without error is authoritative even when it
+    // names no sort column. Only an identity change during the COM calls is
+    // transient; a failed query on a stable view is recorded as unavailable so
+    // it cannot hold back this generation's names (see QueueDirectoryRefresh).
+    const auto unavailable=[&](unsigned reason,HRESULT countHr) {
+        state.sortReadUnavailableToken=token;
+        return fail(reason,countHr,nullptr);
+    };
+    const auto unsorted=[&](const SORTCOLUMN* empty) {
+        // Explorer persists a sort column with an all-zero PROPERTYKEY in a
+        // folder's saved view state (observed for This PC > drive bags) and
+        // reports it unchanged. Native DefView then shows its own item order,
+        // so the GPU view follows enumeration order rather than guessing a key.
+        state.sortReadLogKey=0;
+        if (state.sortOkLoggedToken!=token) {
+            state.sortOkLoggedToken=token;
+            wchar_t fmtid[40]=L"-";
+            if (empty) StringFromGUID2(empty->propkey.fmtid,fmtid,ARRAYSIZE(fmtid));
+            Wh_Log(L"[GPU sort] READ_UNSORTED folder=%s token=%llu count=%d key=%s,%lu pending=%d",
+                state.folderPath.c_str(),static_cast<unsigned long long>(token),count,fmtid,
+                empty ? empty->propkey.pid : 0ul,state.nativeSortPending);
+            ProbeShellSortState(state,view.Get(),L"empty-key",columns);
+        }
+        out=DefaultSort();
+        return true;
+    };
+    const HRESULT countResult=view->GetSortColumnCount(&count);
+    if (state.folderView.Get()!=view.Get() || state.token!=token || state.nativeHwnd!=native)
+        return fail(1,countResult,nullptr);
+    if (FAILED(countResult)) count=1;
+    if (!count) return unsorted(nullptr);
+    if (count<0 || count>static_cast<int>(kMaxShellColumns)) return unavailable(2,countResult);
+    columns.resize(count);
+    columnsResult=view->GetSortColumns(columns.data(), count);
+    if (state.folderView.Get() != view.Get() || state.token != token || state.nativeHwnd != native)
+        return fail(4,countResult,nullptr);
+    if (FAILED(columnsResult)) return unavailable(3,countResult);
+    // Empty entries carry no order. Keep the remaining real keys in sequence.
+    const auto emptyKey=[](const SORTCOLUMN& column) {
+        return IsEqualGUID(column.propkey.fmtid,GUID_NULL) || !column.propkey.pid;
+    };
+    const auto firstEmpty=std::find_if(columns.begin(),columns.end(),emptyKey);
+    const SORTCOLUMN emptySample=firstEmpty!=columns.end() ? *firstEmpty : SORTCOLUMN{};
+    std::erase_if(columns,emptyKey);
+    if (columns.empty()) return unsorted(&emptySample);
+    const auto& column=columns.front();
+    state.sortReadLogKey=0;
+    // A read that recovers an earlier failure records the view it recovered
+    // on. Ordinary navigation adds no diagnostic Shell calls.
+    if (state.nativeSortPending && state.sortOkLoggedToken!=token) {
+        state.sortOkLoggedToken=token;
+        ProbeShellSortState(state,view.Get(),L"ok",columns);
+    }
     out.key = column.propkey;
     out.direction = column.direction == SORT_DESCENDING ? SORT_DESCENDING : SORT_ASCENDING;
     out.kind = ClassifySort(out.key);
@@ -11562,6 +11956,8 @@ void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force =
         (state.preSortEnabled || acceptUntrackedSort || state.trackNativeSort) && ReadShellSort(state, updated)) {
         state.trackNativeSort = true;
         const bool pending = std::exchange(state.nativeSortPending, false);
+        if (pending) Wh_Log(L"[GPU sort] READ_RECOVERED folder=%s token=%llu columns=%zu",
+            state.folderPath.c_str(),static_cast<unsigned long long>(state.token),updated.secondary.size()+1);
         sortChanged = pending || !state.sortInitialized || !SameSort(updated, state.sort);
         updated.userChosen = state.sort.userChosen || acceptUntrackedSort ||
             (state.sortInitialized && !SameSort(updated,state.sort));
@@ -12580,14 +12976,14 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     const float baseRow = direct ? static_cast<float>((state.gridView ? std::min(size96, 96.) : size96) * dpi / 96.) :
         static_cast<float>(Scale96(state.gridView ? std::min(height96, 96) : height96, dpi));
     const int fontPercent = state.gridView ? g_gridFontPercent.load() : g_fontPercent.load();
-    const float font = direct ? std::max(7.f, baseRow * fontPercent / 100.f) :
-        static_cast<float>(std::max(7, MulDiv(static_cast<int>(baseRow), fontPercent, 100)));
+    const float font = direct ? std::max(float(Scale96(7, dpi)), baseRow * fontPercent / 100.f) :
+        static_cast<float>(std::max(Scale96(7, dpi), MulDiv(static_cast<int>(baseRow), fontPercent, 100)));
     // Display size is independent of the bounded Shell image request tiers.
     // Keep this arithmetic floating point: MulDiv/int casts would overflow
     // well before the tab's zoom preference reaches its storage limit.
     const double iconSize = state.nativeIconSize * (direct ? size96 * dpi / 96. : std::round(size96 * dpi / 96.)) /
         std::max(1, Scale96(g_row96.load(), dpi));
-    const float icon = state.gridView ? std::max(16.f, static_cast<float>(direct ? iconSize : std::round(iconSize))) :
+    const float icon = state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
         static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), baseRow - Scale96(6, dpi)));
     const float row = !state.gridView ? static_cast<float>(baseRow) :
@@ -12699,6 +13095,8 @@ float SelectionCheckboxBorder(float side) {
 float SelectionCheckboxSpace(const ViewState& state) {
     return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
 }
+// The Name text ends this far before its cell (and the list) ends.
+float NameTrailingGap(const ViewState& state) { return static_cast<float>(Scale96(8, ViewDpi(state))); }
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
@@ -12716,11 +13114,12 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     const float side = IconPixelSize(state);
     const float start = ListStartX(state), end = ListEndX(state);
     ItemGeometry g;
-    g.cell = D2D1::RectF(start, visual.top + 2.f, end, visual.top + visual.height - 2.f);
+    const float inset = static_cast<float>(Scale96(2, dpi)); // Between rows and grid items.
+    g.cell = D2D1::RectF(start, visual.top + inset, end, visual.top + visual.height - inset);
     if (state.gridView) {
         const float pad = static_cast<float>(Scale96(6, dpi));
-        g.cell.left = start + visual.left + 2.f;
-        g.cell.right = start + visual.left + (visual.width > 0.f ? visual.width : state.itemWidth) - 2.f;
+        g.cell.left = start + visual.left + inset;
+        g.cell.right = start + visual.left + (visual.width > 0.f ? visual.width : state.itemWidth) - inset;
         const bool tiles = DriveTiles(state);
         const bool compact = tiles || state.cachedNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
@@ -12752,7 +13151,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
-            NameContentEnd(state)-8.f,
+            NameContentEnd(state)-NameTrailingGap(state),
             visual.top+state.rowPx);
     }
     if (state.clickPolicy.checkSelect) {
@@ -14392,7 +14791,7 @@ const std::wstring* ColumnCellText(const Entry& entry,
                                    const PROPERTYKEY& key,
                                    unsigned long long epoch,
                                    unsigned long long propertyEpoch) {
-    if (ClassifySort(key) == SortKind::Name) return &entry.name;
+    if (ClassifySort(key) == SortKind::Name) return &EntryLabel(entry);
     // Freshness controls demand and result acceptance, not whether the last
     // resolved value stays visible while its replacement is being requested.
     (void)propertyEpoch;
@@ -14422,7 +14821,7 @@ D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
     const bool name = ClassifySort(column.key) == SortKind::Name;
     const float padding = static_cast<float>(Scale96(kColumnTextPadding96, dpi));
     const float trailing = header ? (sorted ? Scale96(kColumnFitSortInset96, dpi) : padding) :
-        (name ? 8.f : 6.f);
+        (name ? NameTrailingGap(state) : float(Scale96(6, dpi)));
     const float leading = name ? NameTextOrigin(state, header) - NameColumnStart(state) : padding;
     const float headerOffset = header ? ColumnHeaderOffset(state,dpi) : 0.f;
     return D2D1::RectF(from + leading,
@@ -14465,7 +14864,7 @@ float SharedInlineDriveLabelWidth(ViewState& state) {
         return cache.width;
     const auto sample=SampleColumnRows(state);
     const auto labelAt=[&](size_t i) {
-        return std::wstring_view(ModelEntry(state,sample.At(i)).name).substr(0,kColumnFitTextLimit);
+        return std::wstring_view(EntryLabel(ModelEntry(state,sample.At(i)))).substr(0,kColumnFitTextLimit);
     };
     bool sameLabels=sample.count==cache.labels.size();
     for (size_t i=0;sameLabels && i<sample.count;++i)
@@ -14506,9 +14905,9 @@ bool HasPendingVisibleColumnDetails(ViewState& state) {
 void FitColumnsToVisibleRows(ViewState& state) {
     if (state.columns.empty()) return;
     const int dpi = ViewDpi(state);
-    const float inset = static_cast<float>(Scale96(kColumnTextPadding96, dpi)) + 6.f;
+    const float inset = static_cast<float>(Scale96(kColumnTextPadding96 + 6, dpi));
     const float nameInset = static_cast<float>(Scale96(kColumnFitNameInset96, dpi) +
-        IconPixelSize(state)) + 8.f;
+        IconPixelSize(state)) + NameTrailingGap(state);
     const float arrowInset = static_cast<float>(Scale96(kColumnFitSortInset96, dpi));
     // CM_COLUMNINFO exposes default/ideal widths, not a readability minimum.
     // Reserve ten body-character advances (twelve for Name), using the same
@@ -14683,7 +15082,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
             float room = content.right - content.left - tolerance;
             if (name && state.thisPcGpu &&
                 (entry.driveTotal || entry.driveUsedPercent >= 0)) {
-                const float labelRoom=InlineDriveLabelWidth(content.right-content.left+8.f,driveLabel,dpi);
+                const float labelRoom=InlineDriveLabelWidth(content.right-content.left+NameTrailingGap(state),driveLabel,dpi);
                 // A hidden optional track does not make a full label clipped.
                 if (labelRoom>0.f) room=std::min(room,labelRoom);
             }
@@ -15740,7 +16139,7 @@ void ClearModeComposition(ViewState& state, bool restoreRoot = true) {
     TraceUiState(state,L"ui.scene.cleared[layout,native,header,selected]",false);
 }
 
-void DropTarget(ViewState& state) {
+__attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEASE logs its caller.
     if(state.presenter && !state.presentationOnly) {
         ReleasePresentation(state);
         state.graphicsReady=false; state.graphicsSuspended=true;
@@ -15750,6 +16149,24 @@ void DropTarget(ViewState& state) {
         .a=reinterpret_cast<ULONG_PTR>(state.compositionRoot.Get()),.b=static_cast<unsigned>(state.graphicsFailure),
         .v={double(state.graphicsFailureStage),double(state.graphicsReady),double(state.graphicsStandby),
             double(state.presentationActive)}},true);
+    // Repeated drops of an already empty lane (hidden tabs) are not logged.
+    if (state.d3d || FAILED(state.graphicsFailure)) {
+        // Diagnostics: who released the render lane's device and why. The
+        // caller is a module-relative return address (same RVA form as the
+        // stack traces), resolvable against this build's symbols.
+        HMODULE module=nullptr;
+        const void* caller=__builtin_return_address(0);
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCWSTR>(caller),&module);
+        const HRESULT removed=state.d3d ? state.d3d->GetDeviceRemovedReason() : S_OK;
+        Wh_Log(L"[GPU device] RELEASE hwnd=%p tab=%p hadDevice=%d failure=0x%08lX stage=%d removed=0x%08lX ready=%d "
+            L"standby=%d active=%d visible=%d suspended=%d devices=%u caller=+0x%llX folder=%s",
+            state.hwnd,state.activeTabHost,bool(state.d3d),static_cast<ULONG>(state.graphicsFailure),
+            static_cast<int>(state.graphicsFailureStage),static_cast<ULONG>(removed),state.graphicsReady,state.graphicsStandby,
+            state.presentationActive,PresentationVisible(state),state.graphicsSuspended,g_gpuDevices.load(),
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(caller)-reinterpret_cast<ULONG_PTR>(module)),
+            state.folderPath.c_str());
+    }
     GraphicsContinuation continuation(state);
     ScopedFlag releasing(state.graphicsInitializing);
     auto memoryAdapter=g_gpuMemoryLogging.load(std::memory_order_relaxed) ? MemoryAdapter(state) : nullptr;
@@ -15955,6 +16372,16 @@ bool EnsureTarget(ViewState& state) {
                 state.d3d.GetAddressOf(), nullptr, nullptr);
         }
         if (SUCCEEDED(graphicsHr)) { state.gpuDeviceCounted=true; ++g_gpuDevices; graphicsHr = state.d3d.As(&state.dxgiDevice); }
+        {
+            // Diagnostics: every device creation, with the adapter it landed on.
+            DXGI_ADAPTER_DESC adapterDesc{};
+            ComPtr<IDXGIAdapter> adapter;
+            if (state.dxgiDevice && SUCCEEDED(state.dxgiDevice->GetAdapter(&adapter))) adapter->GetDesc(&adapterDesc);
+            Wh_Log(L"[GPU device] CREATE hwnd=%p tab=%p hr=0x%08lX level=0x%X adapter=%s luid=%08lX:%08lX devices=%u visible=%d folder=%s",
+                state.hwnd,state.activeTabHost,static_cast<ULONG>(graphicsHr),state.d3d ? state.d3d->GetFeatureLevel() : 0,
+                adapterDesc.Description,static_cast<ULONG>(adapterDesc.AdapterLuid.HighPart),adapterDesc.AdapterLuid.LowPart,
+                g_gpuDevices.load(),PresentationVisible(state),state.folderPath.c_str());
+        }
         if (SUCCEEDED(graphicsHr)) graphicsHr = CreateDXGIFactory1(IID_PPV_ARGS(&state.dxgiFactory));
         if (SUCCEEDED(graphicsHr)) graphicsHr = D2D1CreateFactory(
             D2D1_FACTORY_TYPE_SINGLE_THREADED, IID_PPV_ARGS(&state.d2dFactory));
@@ -16576,7 +17003,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                     bounds.left=std::max(bounds.left,clip.left); bounds.right=std::min(bounds.right,clip.right);
                     bounds.top=std::max(bounds.top,clip.top); bounds.bottom=std::min(bounds.bottom,clip.bottom);
                     if(bounds.right<=bounds.left || bounds.bottom<=bounds.top) continue;
-                    const auto rc = D2D1::RoundedRect(bounds, 2.f, 2.f);
+                    const float radius = static_cast<float>(Scale96(2, ViewDpi(state)));
+                    const auto rc = D2D1::RoundedRect(bounds, radius, radius);
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
@@ -17261,8 +17689,7 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
             .v={rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top}},true);
     if (thumbnail) {
         const float dpi = std::max(96,state.textFormatDpi)/96.f;
-        const float radius = std::min(std::max(0.f,g_thumbnailCornerRadius96)*dpi,
-            std::min(width,height)*.2f);
+        const float radius = ThumbnailCornerRadius(width, height, std::max(96,state.textFormatDpi));
         // Three small translucent fills approximate a soft shadow. No blur
         // effect, offscreen surface, extra texture or per-item geometry exists.
         // Whole-pixel spreads keep each band's straight edges on the grid.
@@ -17834,8 +18261,9 @@ float SelectionRadius(ViewState& state, float width, float height) {
 // The scrollbar is reserved in both modes. Text/icons remain inside the
 // inset list viewport regardless of the corner-radius setting.
 D2D1_RECT_F RowHighlightRect(ViewState& state, float top, float rowHeight) {
-    return D2D1::RectF(RowBackgroundStartX(state), top + 2.f,
-                       RowBackgroundEndX(state), top + rowHeight - 2.f);
+    const float inset = static_cast<float>(Scale96(2, ViewDpi(state)));
+    return D2D1::RectF(RowBackgroundStartX(state), top + inset,
+                       RowBackgroundEndX(state), top + rowHeight - inset);
 }
 
 void DrawZebraBand(ViewState& state, float top,
@@ -17849,7 +18277,7 @@ void DrawZebraBand(ViewState& state, float top,
 float SelectedFilenameWidth(ViewState& state, int index, float available) {
     if (index < 0 || index >= state.total || available <= 0.f ||
         !state.textFormat || !g_writeFactory) return 0.f;
-    const std::wstring& name = ModelEntry(state,index).name;
+    const std::wstring& name = EntryLabel(ModelEntry(state,index));
     const float font = state.textFormat->GetFontSize();
     const float layoutWidth = roundf(available);
     const bool middleTrim = ViewOptionEnabled(state,g_middleEllipsis);
@@ -17879,23 +18307,27 @@ float FilenameSelectionPadding(const ViewState& state) {
 // All normal and moving selection backgrounds use the SAME bounds and fill.
 // Interpolating this rectangle also handles filename-only pills with different
 // text widths, rather than jumping to the next filename's width.
+// `filenameText` requests the filename-only shape regardless of the option
+// (the slow-click rename target); otherwise Selection.filenameOnlySelection decides.
 D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
                           float nameLeft, float nameRight, float listRight,
                           float itemLeft = -1.f, float itemWidth = 0.f,
-                          SelectionShape* shape = nullptr, const Entry* entry = nullptr) {
+                          SelectionShape* shape = nullptr, const Entry* entry = nullptr,
+                          bool filenameText = false) {
     if (shape) *shape = {};
+    const bool filenameOnly = filenameText || ViewOptionEnabled(state,g_filenameOnly);
     if (state.gridView) {
         const auto geometry = LayoutItem(state, {top, row, 1.f,
             itemLeft >= 0.f ? itemLeft : DocumentRowLeft(state, index), itemWidth});
-        if (!ViewOptionEnabled(state,g_filenameOnly)) return geometry.cell;
+        if (!filenameOnly) return geometry.cell;
         if (!entry && index >= 0 && index < state.total)
             entry = &ModelEntry(state,index);
-        if (!entry || entry->name.empty()) return {};
+        if (!entry || EntryLabel(*entry).empty()) return {};
         const auto& text = geometry.text;
-        auto* layout = ResolveTextLayout(state,entry->name,text.right-text.left,
+        auto* layout = ResolveTextLayout(state,EntryLabel(*entry),text.right-text.left,
             text.bottom-text.top,false,false,nullptr,geometry.wrapped,true);
         if (!layout) return {};
-        auto& cached = state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(entry->name);
+        auto& cached = state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(EntryLabel(*entry));
         if (!cached.filenameSelectionReady) {
             cached.filenameSelection = {};
             cached.filenameSelectionReady = true;
@@ -17975,7 +18407,7 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         return result.bounds;
     }
     D2D1_RECT_F rc = RowHighlightRect(state, top, row);
-    if (ViewOptionEnabled(state,g_filenameOnly)) {
+    if (filenameOnly) {
         const auto usage=LayoutDriveBar(state,index,LayoutItem(state,{top,row,1.f}));
         if (usage.visible) nameRight=std::min(nameRight,usage.labelRight);
         const float pad = static_cast<float>(Scale96(7, ViewDpi(state)));
@@ -18032,18 +18464,36 @@ void InterpolateSelectionBounds(const ViewState& state, D2D1_RECT_F& rc,
 
 // Derive the same logical X bounds as Paint. Used only on keyboard input to
 // capture the currently visible shape before a rapid-arrow retarget.
-D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = true) {
+D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = true,
+                                 SelectionShape* shape = nullptr, bool filenameText = false) {
     const float listRight = ListEndX(state);
     const float left = static_cast<float>(NameTextOrigin(state));
     const float nameEnd = ColumnsPresented(state) ? NameColumnEnd(state) : listRight;
-    const float right = std::min(nameEnd - 8.f, listRight - 8.f);
+    const float right = std::min(nameEnd, listRight) - NameTrailingGap(state);
     D2D1_RECT_F rc = SelectionRect(state, index,
         state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
-        DisplayRowHeight(state, index), left, right, listRight);
+        DisplayRowHeight(state, index), left, right, listRight, -1.f, 0.f, shape, nullptr, filenameText);
     if (animated && state.keyboardSelectionAnimating) {
         InterpolateSelectionBounds(state, rc, KeyboardSelectionProgress(state));
     }
     return rc;
+}
+
+int RowFromPoint(ViewState& state, int y, int x);
+// The slow-click rename target is the filename text itself: the shape that
+// Selection.filenameOnlySelection highlights (wrapped grid labels per line),
+// not Explorer's whole Name column. `point` is in client pixels.
+bool PointOnFilenameText(ViewState& state, int index, POINT point) {
+    if (index < 0 || index >= state.total || static_cast<size_t>(index) >= state.entries.size() ||
+        !InsideListX(state, point.x) || RowFromPoint(state, point.y, point.x) != index) return false;
+    SelectionShape shape;
+    const auto bounds = CurrentSelectionRect(state, index, false, &shape, true);
+    const float x = static_cast<float>(LogicalX(state, point.x)), y = static_cast<float>(point.y);
+    const auto inside = [&](const D2D1_RECT_F& rc) { return x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom; };
+    if (!shape.count) return inside(bounds);
+    for (unsigned i = 0; i < shape.count; ++i)
+        if (inside(shape.lines[i])) return true;
+    return false;
 }
 
 // Pointer hover and keyboard selection use the same SelectionRect geometry,
@@ -18128,7 +18578,7 @@ D2D1_RECT_F PointerHoverRect(ViewState& state, int index) {
     const float nameEnd = ColumnsPresented(state) ? NameColumnEnd(state) : listEnd;
     return SelectionRect(state, index, 0.f, static_cast<float>(state.rowPx),
         static_cast<float>(NameTextOrigin(state)),
-        std::min(nameEnd - 8.f, listEnd - 8.f), listEnd);
+        std::min(nameEnd, listEnd) - NameTrailingGap(state), listEnd);
 }
 
 HoverVisual PointerHoverVisual(ViewState& state, int index, int section) {
@@ -18253,8 +18703,9 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
         for (int index : visibleItems) {
             const float selected = strength(index);
             if (selected <= 0.f) continue;
-            const float left = ListStartX(state) + DocumentRowLeft(state, index) + 2.f;
-            selectedWeight += selected * overlap(left, left+state.itemWidth-4.f,
+            const float inset = static_cast<float>(Scale96(2, ViewDpi(state)));
+            const float left = ListStartX(state) + DocumentRowLeft(state, index) + inset;
+            selectedWeight += selected * overlap(left, left+state.itemWidth-2.f*inset,
                 DocumentRowTop(state, index));
         }
         if (state.keyboardSelectionAnimating) {
@@ -18318,7 +18769,7 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
         result.visible = result.track.right > result.track.left;
         return result;
     }
-    const float textLeft = item.text.left, columnRight = item.text.right + 8.f;
+    const float textLeft = item.text.left, columnRight = item.text.right + NameTrailingGap(state);
     const float margin = static_cast<float>(Scale96(kDriveBarSideMargin96, dpi));
     const float minimum = static_cast<float>(Scale96(kDriveBarMinimumWidth96, dpi));
     const float labelLimit = InlineDriveLabelWidth(columnRight-textLeft,SharedInlineDriveLabelWidth(state),dpi);
@@ -19346,6 +19797,7 @@ float DragShadowPadding(float side) {return std::ceil(3.f*DragShadowSigma(side))
 float DragShadowOffset(float side) {return side*.025f;}
 struct DragPreviewGeometry {
     D2D1_RECT_F artwork{},operation{},caption{};
+    D2D1_RECT_F pile{}; // Bounds of every layer's tilted artwork: the pile as drawn.
     D2D1_SIZE_U extent{};
     float edge=0.f;
 };
@@ -19382,11 +19834,20 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
     float pileTop=square.top;
     const auto shadow=D2D1::RectF(square.left-padding,square.top-padding+offset,
         square.right+padding,square.bottom+padding+offset);
+    geometry.pile=D2D1::RectF(FLT_MAX,FLT_MAX,-FLT_MAX,-FLT_MAX);
     for(size_t i=0;i<std::min(preview.imageCount,kDragPreviewImages);++i) {
         const auto transform=DragStackTransform(preview,i,square);
         for(auto point:{D2D1::Point2F(square.left,square.top),D2D1::Point2F(square.right,square.top),
             D2D1::Point2F(square.left,square.bottom),D2D1::Point2F(square.right,square.bottom)})
             pileTop=std::min(pileTop,transform.TransformPoint(point).y);
+        // Each layer's own artwork, as DrawDragPreview places and tilts it.
+        const auto art=DragArtworkRect(preview.Image(i).pixels,side,(square.left+square.right)*.5f,square.bottom);
+        for(auto point:{D2D1::Point2F(art.left,art.top),D2D1::Point2F(art.right,art.top),
+            D2D1::Point2F(art.left,art.bottom),D2D1::Point2F(art.right,art.bottom)}) {
+            point=transform.TransformPoint(point);
+            geometry.pile.left=std::min(geometry.pile.left,point.x); geometry.pile.top=std::min(geometry.pile.top,point.y);
+            geometry.pile.right=std::max(geometry.pile.right,point.x); geometry.pile.bottom=std::max(geometry.pile.bottom,point.y);
+        }
         for(auto point:{D2D1::Point2F(shadow.left,shadow.top),D2D1::Point2F(shadow.right,shadow.top),
             D2D1::Point2F(shadow.left,shadow.bottom),D2D1::Point2F(shadow.right,shadow.bottom)}) {
             point=transform.TransformPoint(point);
@@ -19410,7 +19871,8 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
         geometry.caption=D2D1::RectF(x,bottom-2*edge-preview.captionSize.height,x+width,bottom);
     }
     const auto shift=[&](D2D1_RECT_F& r) {r.left-=bounds.left; r.right-=bounds.left; r.top-=bounds.top; r.bottom-=bounds.top;};
-    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption);
+    if(geometry.pile.right<geometry.pile.left) geometry.pile=geometry.artwork; // No layers.
+    shift(geometry.artwork); shift(geometry.operation); shift(geometry.caption); shift(geometry.pile);
     geometry.extent=D2D1::SizeU(UINT(std::ceil(bounds.right-bounds.left)),UINT(std::ceil(bounds.bottom-bounds.top)));
     geometry.edge=edge;
     return geometry;
@@ -19595,9 +20057,29 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
     target->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     target->SetTransform(previous);
 }
-DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,float side) {
+// A pile thumbnail is rounded by the thumbnail rule at the pile's own drawn
+// size and DPI, whatever the grid item shows; icons keep their silhouettes.
+void DrawDragArtwork(ID2D1DeviceContext* target,ID2D1Bitmap* bitmap,const IconPixels& pixels,
+    const D2D1_RECT_F& destination,int dpi) {
+    const auto source=D2D1::RectF(0,0,float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width),
+        float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height));
+    ComPtr<ID2D1RoundedRectangleGeometry> corners;
+    if(pixels.thumbnailWidth && pixels.thumbnailHeight) {
+        const float radius=ThumbnailCornerRadius(destination.right-destination.left,destination.bottom-destination.top,dpi);
+        ComPtr<ID2D1Factory> factory; target->GetFactory(&factory);
+        if(radius>0.f && factory &&
+            FAILED(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(destination,radius,radius),&corners)))
+            corners.Reset();
+    }
+    if(corners) target->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),corners.Get(),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE),nullptr);
+    target->DrawBitmap(bitmap,&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+    if(corners) target->PopLayer();
+}
+
+DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,float side,int dpi) {
     DragShadow result;
-    result.identity=image.pixels.data.Identity(); result.side=side;
+    result.identity=image.pixels.data.Identity(); result.side=side; result.dpi=dpi;
     const float pad=DragShadowPadding(side);
     const auto rect=DragArtworkRect(image.pixels,side,0.f,0.f);
     const float width=rect.right-rect.left,height=rect.bottom-rect.top;
@@ -19619,10 +20101,8 @@ DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,cons
     target->BeginDraw(); target->Clear(D2D1::ColorF(0,0.f));
     const auto destination=D2D1::RectF(pad,pad,pad+width,pad+height);
     const auto& pixels=image.pixels;
-    const auto source=D2D1::RectF(0,0,float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width),
-        float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height));
     if(artwork && pixels.Ready()) {
-        target->DrawBitmap(artwork,&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+        DrawDragArtwork(target,artwork,pixels,destination,dpi); // The shadow follows rounded corners.
     } else {
         ComPtr<ID2D1SolidColorBrush> silhouette;
         if(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White,.8f),&silhouette))) {
@@ -19691,10 +20171,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&bitmap)))) {
             // Thumbnail decoration has a separate atlas band. Never squeeze that
             // band into the image, stretch its aspect ratio, or crop it to a square.
-            const float w=float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width);
-            const float h=float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height);
-            const auto source=D2D1::RectF(0,0,w,h);
-            target->DrawBitmap(bitmap.Get(),&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
+            DrawDragArtwork(target,bitmap.Get(),pixels,destination,preview.dpi);
         } else {
             // Only used when even the currently displayed association is missing.
             // A recognizable, antialiased silhouette replaces the old blank box.
@@ -19710,15 +20187,23 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     const float badge=DragPreviewBadgeSize(preview);
     const auto rect=geometry.operation;
     const bool blocked=!(preview.effect&(DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK));
+    // The operation symbol is an icon on the transparent canvas, not text:
+    // grayscale antialiasing with default parameters (as its ink is measured),
+    // whatever the text policy. Count and caption text take that policy below.
+    ComPtr<IDWriteRenderingParams> textParams; target->GetTextRenderingParams(&textParams);
+    const auto textMode=target->GetTextAntialiasMode();
+    SetCompatibleTextRendering(target,nullptr,D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     DrawCenteredDragLabel(target,brush.Get(),blocked ? L"\U0001F6AB":preview.effect&DROPEFFECT_LINK ? L"\U0001F517":preview.effect&DROPEFFECT_COPY ? L"\U0001F4CB":
         preview.rtl ? L"\u2B05\uFE0F":L"\u27A1\uFE0F",L"Segoe UI Emoji",badge*.82f,rect,preview.foreground,true,glyph);
+    SetCompatibleTextRendering(target,textParams.Get(),textMode);
     if(preview.count>1) {
         const auto count=preview.countLabel.empty() ? FormatDragCount(preview.count,preview.rtl):preview.countLabel;
         const float height=side*.38f*preview.dragBadgeScaling;
         const float width=std::max(height,height*.65f*float(count.size())+height*.4f);
-        const float x=std::clamp(preview.rtl ? geometry.artwork.right-width:geometry.artwork.left,
+        // The whole pile's leading top corner, whatever size its front item is.
+        const float x=std::clamp(preview.rtl ? geometry.pile.right-width:geometry.pile.left,
             geometry.edge,float(geometry.extent.width)-geometry.edge-width);
-        const auto bounds=SnapDrawRect(target,D2D1::RectF(x,geometry.artwork.top,x+width,geometry.artwork.top+height));
+        const auto bounds=SnapDrawRect(target,D2D1::RectF(x,geometry.pile.top,x+width,geometry.pile.top+height));
         const auto palette=preview.badgePalette;
         color(COLORREF(palette&0xFFFFFF)); target->FillRoundedRectangle(D2D1::RoundedRect(bounds,height*.5f,height*.5f),brush.Get());
         brush->SetOpacity(float((palette>>48)&255)/255.f);
@@ -19783,13 +20268,14 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
         const auto identity=layer.artworkIdentity[i];
         auto& shadow=layer.shadows[i];
         if(i>=preview->imageCount) {shadow={}; continue;}
-        if(shadow.identity==identity && shadow.side==preview->side) continue;
-        shadow={}; shadow.identity=identity; shadow.side=preview->side;
+        if(shadow.identity==identity && shadow.side==preview->side && shadow.dpi==preview->dpi) continue;
+        shadow={}; shadow.identity=identity; shadow.side=preview->side; shadow.dpi=preview->dpi;
         bool shared=false;
-        for(size_t j=0;j<i;++j) if(layer.shadows[j].identity==identity && layer.shadows[j].side==preview->side) {
+        for(size_t j=0;j<i;++j) if(layer.shadows[j].identity==identity && layer.shadows[j].side==preview->side &&
+            layer.shadows[j].dpi==preview->dpi) {
             shadow=layer.shadows[j]; shared=true; break;
         }
-        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),preview->Image(i),preview->side);
+        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),preview->Image(i),preview->side,preview->dpi);
     }
     ComPtr<ID2D1Image> previous; state.target->GetTarget(&previous);
     ComPtr<IDWriteRenderingParams> previousTextParams; state.target->GetTextRenderingParams(&previousTextParams);
@@ -20619,7 +21105,7 @@ void Paint(ViewState& state) {
         D2D1::RectF(w-rowBgEnd,itemClipTop,w-rowBgStart,contentBottom) :
         D2D1::RectF(rowBgStart,itemClipTop,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
     const float nameEnd = details ? NameColumnEnd(state) : lastTextEnd;
-    const float nameRight = (compositionFrame.Widths() ? nameEnd : std::min(nameEnd,listEnd)) - 8.f;
+    const float nameRight = (compositionFrame.Widths() ? nameEnd : std::min(nameEnd,listEnd)) - NameTrailingGap(state);
     const ULONGLONG typeSearchNow = GetTickCount64();
     const bool typeSearchVisible = state.inputFocusIndicators && !state.typeSearch.empty() && state.lastTyped &&
         typeSearchNow - state.lastTyped <= kTypeSearchTimeoutMs;
@@ -20869,7 +21355,7 @@ void Paint(ViewState& state) {
                 w, top + height), D2D1_ANTIALIAS_MODE_ALIASED);
             const auto geometry = LayoutItem(state, {top, height, opacity, old.oldLeft, old.oldWidth});
             const float contentOpacity = opacity * ItemContentOpacity(state, old.entry);
-            Text(state, old.entry.name, geometry.text.left, geometry.text.top,
+            Text(state, EntryLabel(old.entry), geometry.text.left, geometry.text.top,
                  geometry.text.right, geometry.text.bottom,
                  nameColor, false, contentOpacity, false, geometry.wrapped,0,false,true);
             state.target->PopAxisAlignedClip();
@@ -20927,9 +21413,9 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         const float nameTextRight = usage.visible ? usage.labelRight : geometry.text.right;
-        const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(e.name,state.typeSearch) : 0;
+        const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(EntryLabel(e),state.typeSearch) : 0;
         if (!(state.rename.editor && i == state.rename.index))
-            Text(state, e.name, geometry.text.left, geometry.text.top,
+            Text(state, EntryLabel(e), geometry.text.left, geometry.text.top,
                 nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
                 false, geometry.wrapped, match,false,true,
                 state.clickPolicy.singleClick && (state.clickPolicy.underlineCold ||
@@ -21082,11 +21568,14 @@ void Paint(ViewState& state) {
             // logical column geometry mirrored by Fill().
             Fill(state, state.rtlLayout ? w - right : left, top,
                  state.rtlLayout ? w - left : right, bottom,
-                 rgb, opacity, 4.f);
+                 rgb, opacity, float(Scale96(4, ViewDpi(state))));
             state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
             if (right == left || bottom == top)
                 StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
-            else StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),state.brush.Get(),1.f);
+            else {
+                const float radius = static_cast<float>(Scale96(4, ViewDpi(state)));
+                StrokeRoundedRect(state,D2D1::RoundedRect(rc, radius, radius),state.brush.Get(),1.f);
+            }
         }
         state.target->PopAxisAlignedClip();
     }
@@ -22451,7 +22940,17 @@ bool ClearNativeSelection(ViewState& state) {
     return verified;
 }
 
+// A multiple rename's set must not change before DefView's queued commit
+// reads it. Every GPU-to-native selection writer asks here; the GPU view
+// updates at once and the release applies its final selection.
+bool NativeSelectionHeldForRename(ViewState& state) {
+    if (state.nativeRenameHold != state.token || !state.nativeRenameHold) return false;
+    state.nativeRenameSelectionDeferred = true;
+    return true;
+}
+
 void MaybeRecoverNativeSelection(ViewState& state) {
+    if (NativeSelectionHeldForRename(state)) return;
     if (state.nativeSelectionRecoveryPending && NativeSelectionRestorePending(state)) {
         TraceSelectionIdentity(state, L"recovery.defer-identity");
         return;
@@ -22670,6 +23169,7 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
     const auto view=state.folderView;
     const auto token=state.token, directory=state.directoryToken;
     TraceSelectionIdentity(state, L"native.sync.before");
+    if (NativeSelectionHeldForRename(state)) return false;
     // A fresh explicit selection supersedes an older queued recovery. Failed
     // commits still use the normal verified import/recovery path.
     state.nativeSelectionRecoveryPending = false;
@@ -23023,7 +23523,7 @@ void SelectWithModifiers(ViewState& state, int index, bool control, bool shift) 
 // only gestures for the GPU-rendered list are handled here.
 void SyncNativeKeyboardCaret(ViewState& state) {
     const int index = state.selected;
-    if (!state.folderView || index < 0 || index >= state.total) return;
+    if (!state.folderView || index < 0 || index >= state.total || NativeSelectionHeldForRename(state)) return;
     constexpr DWORD flags = SVSI_FOCUSED | SVSI_SELECTIONMARK | SVSI_NOTAKEFOCUS;
     PITEMID_CHILD item = nullptr;
     if (SUCCEEDED(EntryChildPidl(state, state.entries[static_cast<size_t>(index)], &item)) && item) {
@@ -23442,6 +23942,18 @@ struct NativeFileCommandScope {
     }
 };
 
+bool AdoptNativeRenameEditor(ViewState& state, HWND editor);
+
+// Ends a multiple rename transaction and applies the GPU selection the user
+// made meanwhile (a commit click, keyboard movement) through the normal path.
+void ReleaseNativeRenameHold(ViewState& state) {
+    state.nativeRenameText.clear(); state.nativeRenameToken = 0;
+    state.nativeRenameCommitEditor = nullptr;
+    if (!state.nativeRenameHold) return;
+    state.nativeRenameHold = 0;
+    if (std::exchange(state.nativeRenameSelectionDeferred, false)) SyncNativeSelection(state);
+}
+
 // Immediate GPU/frame shortcuts and prepared selections share native verbs.
 // Paste belongs to the active folder, independently of any selected items.
 HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
@@ -23504,7 +24016,7 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
             owner,tab,flags,static_cast<unsigned>(hr));
         return hr;
     }
-    if (key.key==VK_RETURN) {
+    if (key.key==VK_RETURN || key.key==VK_F2) {
         const auto view=activationView;
         auto* live=State(owner);
         if (!view || live!=&state || live->lifetimeToken!=lifetime || live->token!=viewToken ||
@@ -23514,6 +24026,21 @@ HRESULT InvokeNativeFileKey(ViewState& state, IShellView* native,
             live->nativeSelectionAwaitingRefresh || !live->inScope ||
             live->optimisticStartedAt || !TabOwnsActiveView(*live) || g_unloading.load(std::memory_order_acquire))
             return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        if (key.key==VK_F2) {
+            if (key.renameText.empty()) return E_INVALIDARG;
+            // DefView's own label editor renames and numbers the whole
+            // selection (per-item extensions, conflicts, undo). Its host stays
+            // suppressed. DoRename queues the editor and DefView's commit later
+            // reads the selection, so hold the native set until step 1.
+            live->nativeRenameText=key.renameText; live->nativeRenameToken=viewToken;
+            live->nativeRenameHold=viewToken; live->nativeRenameSelectionDeferred=false;
+            const HRESULT hr=view->DoRename();
+            live=State(owner);
+            if (!live || live->lifetimeToken!=lifetime || live->nativeRenameHold!=viewToken) return hr;
+            if (FAILED(hr) || !PostMessageW(owner,kMsgNativeRenameStep,0,static_cast<LPARAM>(viewToken)))
+                ReleaseNativeRenameHold(*live);
+            return hr;
+        }
         // Let Explorer own the invocation context and launch options instead
         // of synthesizing IContextMenu parameters. NULL requests the view's
         // default action without forcing a canonical verb.
@@ -23904,7 +24431,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
     // Use the whole Name column even when its current origin is offscreen.
     // Measuring against the clipped draw extent could collapse the EDIT to 1px.
     const float textEnd = !state.gridView && ColumnsPresented(state) ?
-        NameColumnEnd(state) - 9.f : geometry.text.right;
+        NameColumnEnd(state) - NameTrailingGap(state) - 1.f : geometry.text.right;
     const RECT viewport = RenameViewport(state, false);
     const float maxWidth = std::max(1.f, std::min(textEnd - nameStart,
         static_cast<float>(viewport.right - viewport.left)));
@@ -23923,6 +24450,13 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
                 if (old && old != HGDI_ERROR) SelectObject(dc, old);
                 ReleaseDC(editor, dc);
             }
+            // The field shows the list's layout; fit whichever is wider.
+            ComPtr<IDWriteTextLayout> shown; DWRITE_TEXT_METRICS metrics{};
+            if (g_writeFactory && state.textFormat && copied > 0 &&
+                SUCCEEDED(g_writeFactory->CreateTextLayout(text.data(), UINT32(copied), state.textFormat.Get(),
+                    100000.f, 1000.f, &shown)) && SUCCEEDED(shown->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)) &&
+                SUCCEEDED(shown->GetMetrics(&metrics)))
+                measured = std::max(measured, metrics.widthIncludingTrailingWhitespace);
         }
     }
     const int limit = std::max(1, static_cast<int>(maxWidth));
@@ -23933,7 +24467,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
         static_cast<int>(client.right - nameStart - width) : static_cast<int>(nameStart);
     const int y = static_cast<int>(geometry.text.top + Scale96(2, dpi));
     const int height = std::max(1, std::min(static_cast<int>(viewport.bottom - viewport.top),
-        static_cast<int>(std::lround(std::max(20.f,
+        static_cast<int>(std::lround(std::max(float(Scale96(20, dpi)),
             geometry.text.bottom - geometry.text.top - Scale96(4, dpi))))));
     RECT rc{x, y, x + width, y + height};
     // Native EDIT is a sibling of the composited GPU HWND, not its child.
@@ -23960,6 +24494,83 @@ bool RenameSessionValid(const ViewState& state) {
 // Finalize ONLY after the physical EDIT HWND has been destroyed. Clearing
 // rename.editor earlier lost the sole reference if DestroyWindow failed,
 // leaking a visible FRAME child across tabs/directories indefinitely.
+// The field is a FRAME child: it draws into Explorer's frame surface beneath
+// the GPU visual, which paints no GDI, so nothing repaints what the field
+// leaves behind and it shows through the transparent list. Keep that
+// surface's content under the rename viewport from before the field, and put
+// it back wherever the field stops covering (close, move or hide).
+bool FramePhysicalRect(HWND frame, HWND from, RECT& rect) {
+    RECT client{};
+    if (!GetClientRect(frame, &client)) return false;
+    MapWindowPoints(frame, nullptr, reinterpret_cast<POINT*>(&client), 2);
+    MapWindowPoints(from, nullptr, reinterpret_cast<POINT*>(&rect), 2);
+    OffsetRect(&rect, -std::min(client.left, client.right), -std::min(client.top, client.bottom));
+    return true;
+}
+
+void ReleaseRenameUnderlay(ViewState::RenameSession& r) {
+    if (r.underlay) DeleteObject(r.underlay);
+    r.underlay = nullptr;
+    r.underlayRect = r.underlayFrame = {};
+}
+
+void CaptureRenameUnderlay(ViewState& state) {
+    auto& r = state.rename;
+    ReleaseRenameUnderlay(r);
+    RECT area = RenameViewport(state, false);
+    if (IsRectEmpty(&area) || !FramePhysicalRect(state.frameHwnd, state.hwnd, area)) return;
+    const HDC frame = GetDCEx(state.frameHwnd, nullptr, DCX_CACHE); // Children included.
+    if (!frame) return;
+    SetLayout(frame, 0);
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), area.right - area.left, -(area.bottom - area.top), 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(frame, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool copied = false;
+    if (const HDC memory = bitmap ? CreateCompatibleDC(frame) : nullptr) {
+        const HGDIOBJ previous = SelectObject(memory, bitmap);
+        copied = BitBlt(memory, 0, 0, area.right - area.left, area.bottom - area.top,
+            frame, area.left, area.top, SRCCOPY) != FALSE;
+        SelectObject(memory, previous);
+        DeleteDC(memory);
+    }
+    ReleaseDC(state.frameHwnd, frame);
+    if (!copied) { if (bitmap) DeleteObject(bitmap); return; }
+    r.underlay = bitmap;
+    r.underlayRect = area;
+    GetClientRect(state.frameHwnd, &r.underlayFrame);
+}
+
+// `vacated` is in frame client coordinates (frameRect). A visible field keeps
+// its current pixels; GDI siblings repaint over the restored area on their
+// own invalidation.
+void RestoreRenameUnderlay(ViewState& state, RECT vacated) {
+    auto& r = state.rename;
+    RECT frameClient{}, area{};
+    if (!r.underlay || IsRectEmpty(&vacated) || !IsWindow(state.frameHwnd) || !GetClientRect(state.frameHwnd, &frameClient))
+        return;
+    // A resized frame has a new surface, repainted by its owners.
+    if (!EqualRect(&frameClient, &r.underlayFrame)) { ReleaseRenameUnderlay(r); return; }
+    if (!FramePhysicalRect(state.frameHwnd, state.frameHwnd, vacated) ||
+        !IntersectRect(&area, &vacated, &r.underlayRect)) return;
+    const HDC frame = GetDCEx(state.frameHwnd, nullptr, DCX_CACHE);
+    if (!frame) return;
+    SetLayout(frame, 0);
+    IntersectClipRect(frame, area.left, area.top, area.right, area.bottom);
+    RECT live{};
+    if (r.editor && IsWindowVisible(r.editor) && GetWindowRect(r.editor, &live) &&
+        FramePhysicalRect(state.frameHwnd, nullptr, live))
+        ExcludeClipRect(frame, live.left, live.top, live.right, live.bottom);
+    if (const HDC memory = CreateCompatibleDC(frame)) {
+        const HGDIOBJ previous = SelectObject(memory, r.underlay);
+        BitBlt(frame, area.left, area.top, area.right - area.left, area.bottom - area.top,
+            memory, area.left - r.underlayRect.left, area.top - r.underlayRect.top, SRCCOPY);
+        SelectObject(memory, previous);
+        DeleteDC(memory);
+    }
+    ReleaseDC(state.frameHwnd, frame);
+}
+
 void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     auto& r = state.rename;
     if (r.editor != editor) return;
@@ -23969,6 +24580,9 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.notificationHost = nullptr;
     ++r.epoch; // Invalidate any queued Enter/Escape/focus messages.
     r.editor = nullptr;
+    SetRenameTextSink(editor, false);
+    r.textTarget.Reset(); r.textLines.clear(); r.textLinesText.clear(); r.textLinesGdiFont = nullptr;
+    r.caretShown = {-32768, -32768};
     if (r.font) { DeleteObject(r.font); r.font = nullptr; }
     if (r.background) { DeleteObject(r.background); r.background = nullptr; }
     r.backgroundColor = CLR_INVALID;
@@ -23988,6 +24602,8 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     // Every destruction path (Enter, Escape, tab close, Shell lifecycle, or
     // external HWND deletion) invalidates the same vacated FRAME rectangle.
     // The GDI editor was never part of the DirectComposition swapchain.
+    RestoreRenameUnderlay(state, r.frameRect);
+    ReleaseRenameUnderlay(r);
     if (IsWindow(state.frameHwnd))
         RedrawWindow(state.frameHwnd, &r.frameRect, nullptr,
             RDW_INVALIDATE | RDW_ALLCHILDREN);
@@ -24188,6 +24804,207 @@ void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) 
     rename.layoutSize={rect.right-rect.left,rect.bottom-rect.top}; rename.layoutValid=true;
 }
 
+// The field shows its text as the list draws filenames: each EDIT line laid
+// out with the list's own text format (face, size, letter spacing) and drawn
+// with this view's rendering parameters and the antialias mode the Text
+// antialiasing option resolves to on the list's transparent surface (Windows
+// default is grayscale there). GDI fonts have whole-pixel sizes and GDI
+// rounds every advance, which drifts over long names, so the EDIT's own
+// geometry only drives editing: its caret and the pointer are translated
+// between the two layouts per character.
+bool RenameTextFallback(ViewState::RenameSession& r, const char* reason) {
+    if (r.textFallback != reason && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] field keeps GDI text: %S", reason);
+    r.textFallback = reason;
+    r.textLines.clear(); r.textLinesText.clear();
+    SetRenameTextSink(r.editor, false); // The EDIT draws its own text again.
+    return false;
+}
+
+bool BuildRenameTextLines(ViewState& state, HWND edit) {
+    auto& r = state.rename;
+    if (!g_writeFactory || !state.textFormat || !r.font || edit != r.editor) return RenameTextFallback(r, "unavailable");
+    const int length = GetWindowTextLengthW(edit);
+    if (length < 0 || length >= 32768) return RenameTextFallback(r, "text length");
+    std::wstring text(size_t(length) + 1, L'\0');
+    text.resize(GetWindowTextW(edit, text.data(), length + 1));
+    RECT format{};
+    SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+    if (!r.textLines.empty() && text == r.textLinesText && EqualRect(&format, &r.textLinesRect) &&
+        r.textLinesFont == state.fontPx && r.textLinesFace == state.textFaceSerial && r.textLinesGdiFont == r.font)
+        return true;
+    r.textLines.clear(); r.textLinesText.clear();
+    const HDC dc = GetDC(edit);
+    if (!dc) return RenameTextFallback(r, "device context");
+    const HGDIOBJ selected = SelectObject(dc, r.font);
+    TEXTMETRICW metrics{};
+    bool ok = GetTextMetricsW(dc, &metrics) != FALSE;
+    const LONG_PTR style = GetWindowLongPtrW(edit, GWL_STYLE);
+    const bool rtl = (GetWindowLongPtrW(edit, GWL_EXSTYLE) & WS_EX_RTLREADING) != 0;
+    const auto align = [&](float width) {
+        const float span = static_cast<float>(format.right - format.left);
+        return (style & ES_CENTER) ? format.left + (span - width) / 2.f :
+            (style & ES_RIGHT) ? format.right - width : static_cast<float>(format.left);
+    };
+    std::vector<ViewState::RenameSession::TextLine> lines;
+    const int count = static_cast<int>(SendMessageW(edit, EM_GETLINECOUNT, 0, 0));
+    for (int i = 0; ok && i < count; ++i) {
+        const int start = static_cast<int>(SendMessageW(edit, EM_LINEINDEX, i, 0));
+        const int size = start < 0 ? -1 : static_cast<int>(SendMessageW(edit, EM_LINELENGTH, start, 0));
+        if (size < 0 || start + size > static_cast<int>(text.size())) { ok = false; break; }
+        ViewState::RenameSession::TextLine line;
+        line.start = start; line.length = size;
+        const LRESULT at = size ? SendMessageW(edit, EM_POSFROMCHAR, WPARAM(start), 0) : -1;
+        line.top = at == -1 ? format.top + i * metrics.tmHeight : static_cast<short>(HIWORD(at));
+        SIZE extent{};
+        if (size && !GetTextExtentPoint32W(dc, text.data() + start, size, &extent)) { ok = false; break; }
+        line.gdiLeft = static_cast<int>(std::lround(align(static_cast<float>(extent.cx))));
+        line.gdiWidth = extent.cx;
+        DWRITE_TEXT_METRICS layoutMetrics{}; DWRITE_LINE_METRICS lineMetrics{}; UINT32 lineCount = 0;
+        const DWRITE_TRIMMING none{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
+        if (FAILED(g_writeFactory->CreateTextLayout(text.data() + start, UINT32(size), state.textFormat.Get(),
+                100000.f, static_cast<float>(metrics.tmHeight), &line.layout)) ||
+            FAILED(line.layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)) ||
+            FAILED(line.layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)) ||
+            FAILED(line.layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)) ||
+            FAILED(line.layout->SetTrimming(&none, nullptr)) ||
+            FAILED(line.layout->SetReadingDirection(rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT :
+                DWRITE_READING_DIRECTION_LEFT_TO_RIGHT)) ||
+            FAILED(line.layout->GetMetrics(&layoutMetrics)) ||
+            FAILED(line.layout->GetLineMetrics(&lineMetrics, 1, &lineCount)) || lineCount != 1) { ok = false; break; }
+        line.x = align(layoutMetrics.widthIncludingTrailingWhitespace) - layoutMetrics.left;
+        line.baselineTop = static_cast<float>(line.top + metrics.tmAscent) - lineMetrics.baseline;
+        lines.push_back(std::move(line));
+    }
+    SelectObject(dc, selected);
+    ReleaseDC(edit, dc);
+    if (!ok || lines.empty()) return RenameTextFallback(r, "layout");
+    r.textLines = std::move(lines);
+    r.textLinesText = std::move(text);
+    r.textLinesRect = format;
+    r.textLinesFont = state.fontPx; r.textLinesFace = state.textFaceSerial; r.textLinesGdiFont = r.font;
+    r.textLineHeight = metrics.tmHeight;
+    return true;
+}
+
+const ViewState::RenameSession::TextLine* RenameTextLineAt(const ViewState::RenameSession& r, int y) {
+    if (r.textLines.empty()) return nullptr;
+    for (const auto& line : r.textLines)
+        if (y < line.top + r.textLineHeight) return &line;
+    return &r.textLines.back();
+}
+
+// Displayed x of the caret boundary before `index` (its end, past the line).
+float RenameDisplayedX(const ViewState::RenameSession::TextLine& line, int index) {
+    DWRITE_HIT_TEST_METRICS hit{}; FLOAT x = 0.f, y = 0.f;
+    const int offset = std::clamp(index - line.start, 0, line.length);
+    if (!line.length) line.layout->HitTestTextPosition(0, FALSE, &x, &y, &hit);
+    else if (offset < line.length) line.layout->HitTestTextPosition(UINT32(offset), FALSE, &x, &y, &hit);
+    else line.layout->HitTestTextPosition(UINT32(line.length - 1), TRUE, &x, &y, &hit);
+    return line.x + x;
+}
+
+// The character boundary under a displayed point, in the EDIT's coordinates.
+bool RenamePointerToEdit(ViewState& state, HWND edit, POINT& point) {
+    auto& r = state.rename;
+    if (!BuildRenameTextLines(state, edit)) return false;
+    const auto* line = RenameTextLineAt(r, point.y);
+    BOOL trailing = FALSE, inside = FALSE; DWRITE_HIT_TEST_METRICS hit{};
+    if (!line || FAILED(line->layout->HitTestPoint(static_cast<float>(point.x) - line->x,
+            r.textLineHeight * .5f, &trailing, &inside, &hit))) return false;
+    const int index = std::clamp(line->start + int(hit.textPosition) + (trailing ? int(hit.length) : 0),
+        line->start, line->start + line->length);
+    const bool rtl = (GetWindowLongPtrW(edit, GWL_EXSTYLE) & WS_EX_RTLREADING) != 0;
+    if (index < line->start + line->length) {
+        const LRESULT at = SendMessageW(edit, EM_POSFROMCHAR, WPARAM(index), 0);
+        if (at == -1) return false;
+        point.x = static_cast<short>(LOWORD(at));
+    } else point.x = rtl ? line->gdiLeft - 2 : line->gdiLeft + line->gdiWidth + 2; // Past the line's end.
+    point.y = line->top + r.textLineHeight / 2;
+    return true;
+}
+
+// Move the EDIT's caret from its GDI position to the same boundary as shown.
+void RenameCaretToDisplay(ViewState& state, HWND edit) {
+    auto& r = state.rename;
+    POINT caret{};
+    if (GetFocus() != edit || !GetCaretPos(&caret) ||
+        (caret.x == r.caretShown.x && caret.y == r.caretShown.y) || !BuildRenameTextLines(state, edit)) return;
+    const auto* line = RenameTextLineAt(r, caret.y);
+    if (!line) return;
+    const LRESULT found = SendMessageW(edit, EM_CHARFROMPOS, 0, MAKELPARAM(caret.x, caret.y));
+    int index = std::clamp(static_cast<int>(LOWORD(found)), line->start, line->start + line->length);
+    if (index < line->start + line->length) {
+        const LRESULT at = SendMessageW(edit, EM_POSFROMCHAR, WPARAM(index), 0);
+        const bool rtl = (GetWindowLongPtrW(edit, GWL_EXSTYLE) & WS_EX_RTLREADING) != 0;
+        const int x = at == -1 ? caret.x : static_cast<short>(LOWORD(at));
+        if (rtl ? x > caret.x : x < caret.x) ++index; // The caret follows that character.
+    }
+    const POINT shown{static_cast<LONG>(std::lround(RenameDisplayedX(*line, index))), caret.y};
+    if (SetCaretPos(shown.x, shown.y)) r.caretShown = shown;
+}
+
+bool PaintRenameText(ViewState& state, HWND edit, HDC dc, const RECT& clip) {
+    auto& r = state.rename;
+    if (!BuildRenameTextLines(state, edit)) return false;
+    if (clip.right <= clip.left || clip.bottom <= clip.top) { // Nothing to draw; still the field's text path.
+        SetRenameTextSink(edit, true);
+        return true;
+    }
+    if (!r.textFactory && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, r.textFactory.GetAddressOf())))
+        return RenameTextFallback(r, "D2D factory");
+    if (!r.textTarget) {
+        const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.f, 96.f);
+        if (FAILED(r.textFactory->CreateDCRenderTarget(&properties, &r.textTarget))) return RenameTextFallback(r, "render target");
+    }
+    if (FAILED(r.textTarget->BindDC(dc, &clip))) return RenameTextFallback(r, "bind DC");
+    RefreshTextRendering(state);
+    LOGBRUSH fill{};
+    const COLORREF background = r.background && GetObjectW(r.background, sizeof(fill), &fill) ? fill.lbColor : GetBkColor(dc);
+    const auto color = [](COLORREF value) {
+        return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f);
+    };
+    auto& target = r.textTarget;
+    ComPtr<ID2D1SolidColorBrush> ink, highlight, highlightInk;
+    if (FAILED(target->CreateSolidColorBrush(color(GetTextColor(dc)), &ink)) ||
+        FAILED(target->CreateSolidColorBrush(color(GetSysColor(COLOR_HIGHLIGHT)), &highlight)) ||
+        FAILED(target->CreateSolidColorBrush(color(GetSysColor(COLOR_HIGHLIGHTTEXT)), &highlightInk)))
+        return RenameTextFallback(r, "brushes");
+    DWORD selectionStart = 0, selectionEnd = 0;
+    SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+    const bool showSelection = selectionEnd > selectionStart && GetFocus() == edit; // EDIT hides it unfocused.
+    target->BeginDraw();
+    target->SetTransform(D2D1::Matrix3x2F::Translation(-static_cast<float>(clip.left), -static_cast<float>(clip.top)));
+    const auto antialias = state.textAntialiasMode == D2D1_TEXT_ANTIALIAS_MODE_DEFAULT ?
+        D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE : state.textAntialiasMode;
+    SetCompatibleTextRendering(target.Get(), state.textRenderingParams.Get(), antialias);
+    target->Clear(color(background));
+    for (auto& line : r.textLines) {
+        const DWRITE_TEXT_RANGE all{0, UINT32(line.length)};
+        line.layout->SetDrawingEffect(nullptr, all);
+        const int first = std::max<int>(line.start, int(selectionStart));
+        const int last = std::min<int>(line.start + line.length, int(selectionEnd));
+        if (showSelection && first < last) {
+            DWRITE_HIT_TEST_METRICS runs[64]{}; UINT32 runCount = 0;
+            const DWRITE_TEXT_RANGE range{UINT32(first - line.start), UINT32(last - first)};
+            if (SUCCEEDED(line.layout->HitTestTextRange(range.startPosition, range.length, 0.f, 0.f,
+                    runs, ARRAYSIZE(runs), &runCount)))
+                for (UINT32 i = 0; i < runCount; ++i)
+                    target->FillRectangle(D2D1::RectF(line.x + runs[i].left, float(line.top),
+                        line.x + runs[i].left + runs[i].width, float(line.top + r.textLineHeight)), highlight.Get());
+            line.layout->SetDrawingEffect(highlightInk.Get(), range);
+        }
+        target->DrawTextLayout(D2D1::Point2F(line.x, line.baselineTop), line.layout.Get(), ink.Get());
+    }
+    const HRESULT drawn = target->EndDraw();
+    if (drawn == D2DERR_RECREATE_TARGET) target.Reset();
+    if (FAILED(drawn)) return RenameTextFallback(r, "draw");
+    r.textFallback = nullptr;
+    SetRenameTextSink(edit, true); // This paint path now shows every edit.
+    return true;
+}
+
 LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                 UINT_PTR id, DWORD_PTR data) {
     WindowCallbackGuard callback;
@@ -24234,7 +25051,8 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // A native EDIT erases its whole client, then draws text. This frame child
     // paints into a surface DWM can compose between the two, flashing an empty
     // field. Fill the same parent-provided brush and text off-screen, then copy
-    // once. Typing's direct line updates never erase and stay native.
+    // once. Typing and drag selection draw GDI text directly; those messages
+    // repaint synchronously below, so the list-matched text is what DWM shows.
     if (msg == WM_ERASEBKGND && current) return 1;
     if (msg == WM_PAINT && current && !wp) {
         PAINTSTRUCT paint{};
@@ -24247,7 +25065,10 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             reinterpret_cast<WPARAM>(dc), reinterpret_cast<LPARAM>(hwnd)));
         if (!brush) brush = GetSysColorBrush(COLOR_WINDOW);
         FillRect(dc, &paint.rcPaint, brush);
-        DefSubclassProc(hwnd, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+        bool shown = false;
+        { ScopedFlag mapping(state->rename.textMapping); shown = PaintRenameText(*state, hwnd, dc, paint.rcPaint); }
+        if (!shown)
+            DefSubclassProc(hwnd, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
         if (painting) EndBufferedPaint(painting, TRUE);
         EndPaint(hwnd, &paint);
         return 0;
@@ -24294,6 +25115,23 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (current && (msg==WM_SIZE || msg==WM_SETFONT || msg==EM_SETRECT || msg==EM_SETRECTNP))
         state->rename.requestedTextRectValid=false;
     if (current && (msg==WM_SETFONT || msg==WM_SETTEXT)) state->rename.layoutValid=false;
+    // The pointer addresses the displayed (list-matched) text; give the EDIT
+    // the same character boundary in its own GDI coordinates.
+    if (current && msg == WM_POINTERDOWN && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] pointer-message press pointer=%u at=(%d,%d)", GET_POINTERID_WPARAM(wp),
+            GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+    const bool pointer = msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_LBUTTONDBLCLK ||
+        msg == WM_MOUSEMOVE || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP;
+    if (current && pointer && !state->rename.textMapping && !state->rename.finishing) {
+        ScopedFlag mapping(state->rename.textMapping);
+        POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const bool mapped = RenamePointerToEdit(*state, hwnd, point);
+        if (msg == WM_LBUTTONDOWN && g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU rename] press shown=(%d,%d) edit=(%ld,%ld) mapped=%d lines=%zu text=%S",
+                GET_X_LPARAM(lp), GET_Y_LPARAM(lp), point.x, point.y, mapped, state->rename.textLines.size(),
+                state->rename.textFallback ? state->rename.textFallback : "list");
+        if (mapped) lp = MAKELPARAM(point.x, point.y);
+    }
     if (current) ++state->rename.nativeDispatchDepth;
     const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
     if (current) --state->rename.nativeDispatchDepth;
@@ -24311,36 +25149,91 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         state->rename.textLayoutDirty = false;
         RepositionRenameEdit(*state);
     }
+    if (state && state->rename.editor == hwnd && !state->rename.finishing && !state->rename.textMapping &&
+        (msg == WM_CHAR || msg == WM_KEYDOWN || msg == WM_IME_CHAR || msg == WM_IME_COMPOSITION ||
+         msg == WM_PASTE || msg == WM_CUT || msg == WM_CLEAR || msg == WM_UNDO || msg == EM_UNDO ||
+         msg == EM_REPLACESEL || msg == EM_SETSEL || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+         msg == WM_LBUTTONUP || msg == WM_SETFOCUS || msg == WM_KILLFOCUS ||
+         ((msg == WM_MOUSEMOVE || msg == WM_TIMER) && GetCapture() == hwnd)))
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    // The EDIT places its caret by GDI metrics; show it at the same boundary
+    // of the displayed text.
+    if (state && state->rename.editor == hwnd && !state->rename.finishing && !state->rename.textMapping &&
+        !state->rename.nativeDispatchDepth) {
+        ScopedFlag mapping(state->rename.textMapping);
+        RenameCaretToDisplay(*state, hwnd);
+        if ((msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) && g_perf.load(std::memory_order_relaxed)) {
+            DWORD start = 0, end = 0; POINT caret{};
+            SendMessageW(hwnd, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+            GetCaretPos(&caret);
+            Wh_Log(L"[GPU rename] %s selection=%lu-%lu of %d caret=(%ld,%ld)",
+                msg == WM_LBUTTONDOWN ? L"press" : L"release", start, end, GetWindowTextLengthW(hwnd), caret.x, caret.y);
+        }
+    }
     if (msg == WM_NCDESTROY && current)
         FinalizeDestroyedRenameEditor(*state, hwnd);
     return result;
 }
 
-void BeginRename(ViewState& state, int index, bool createdItem = false) {
+// `multiple` accepts a larger selection containing `index`, as Explorer's F2
+// and Rename command do; the commit is then DefView's own (FinishRename).
+void BeginRename(ViewState& state, int index, bool createdItem = false, bool multiple = false) {
     if (state.thisPcGpu || IsRecycleBinLocation(state.folderPath) || state.rename.editor ||
         (!state.renamePreviewPath.empty() && state.renamePreviewToken == state.token) || !state.visible || !state.inScope ||
         !IsWindow(state.frameHwnd) || GetParent(state.hwnd) != state.frameHwnd ||
         state.optimisticStartedAt || !TabOwnsActiveView(state) ||
         !state.detailsViewActive || state.emptyNative ||
         index < 0 || index >= state.total || !state.folder ||
-        !state.folderView || !PresentationVisible(state)) return;
-    if (state.selectedFlags.Count(0,state.selectedFlags.size()) != 1 ||
+        !state.folderView || !PresentationVisible(state) ||
+        (state.nativeRenameHold && state.nativeRenameHold == state.token)) return; // DefView still renames a set.
+    const size_t selectedCount = state.selectedFlags.Count(0,state.selectedFlags.size());
+    if (!selectedCount || (selectedCount != 1 && !multiple) ||
         index >= static_cast<int>(state.selectedFlags.size()) ||
         !state.selectedFlags[static_cast<size_t>(index)]) return;
     const HWND owner = state.hwnd, native = state.nativeHwnd;
     const auto lifetime = state.lifetimeToken, token = state.token;
     const std::wstring path = state.entries[size_t(index)].path;
     NativeFileCommandScope inputOwnership(&state);
+    // A set Explorer already confirmed stays the commit source: re-preparing
+    // a large set here would restart the selection lane on every attempt.
+    auto confirmed = state.confirmedNativeSelection;
     InvalidateNativeSelectionObservation(state);
+    if (confirmed && GpuSelectionMatches(state, *confirmed)) state.confirmedNativeSelection = std::move(confirmed);
     // Establish the file identity in both models before the editor takes HWND
     // focus. Cancelling a native editor can clear Shell's selected/focused PIDL.
-    SyncNativeSelection(state);
+    // A just-created item can reach these rows before Explorer's view adds it
+    // (grouped views add it later); Explorer selects it itself when it does,
+    // so keep it selected here instead of rejecting it as a stale row.
+    bool nativeHasItem = true;
+    if (createdItem && state.folderView) {
+        PITEMID_CHILD child = nullptr;
+        nativeHasItem = SUCCEEDED(EntryChildPidl(state, state.entries[size_t(index)], &child)) && child &&
+            NativeSelectionTarget(state.folderView.Get(), child);
+        CoTaskMemFree(child);
+    }
+    if (nativeHasItem) SyncNativeSelection(state);
     // Shell calls can navigate/rebind the view while dispatching callbacks.
     // The old input owner must never open an editor in the new context.
     if (State(owner) != &state || state.lifetimeToken != lifetime || state.token != token ||
         state.nativeHwnd != native || state.rename.editor || !state.visible || !state.inScope ||
         !TabOwnsActiveView(state) || index >= state.total || size_t(index) >= state.entries.size() ||
         state.entries[size_t(index)].path != path) return;
+    if (selectedCount > 1) {
+        // A set over kMaxDirectNativeSelectionItems reaches Explorer through
+        // the selection lane. Open the editor once Explorer holds the whole
+        // set, so the commit never waits on (or races) that preparation.
+        if (state.pendingNativeSelection) {
+            const bool queued = std::any_of(state.deferredSelectionKeys.begin(), state.deferredSelectionKeys.end(),
+                [](const auto& key) { return key.key == VK_F2 && key.renameText.empty(); });
+            if (!queued) {
+                ViewState::DeferredSelectionKey key;
+                key.key = VK_F2;
+                state.deferredSelectionKeys.push_back(std::move(key));
+            }
+            return;
+        }
+        if (state.nativeSelectionUnsafe || state.nativeSelectionImportPending) return; // Explorer's set unverified.
+    }
     StopKeyboardSelectionAnimation(state);
     // The frame-child EDIT must be revealed before it is ever shown. An
     // animated scroll can otherwise expose it over unrelated Explorer chrome.
@@ -24375,7 +25268,10 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     if (!DisplayedRow(state, index)) return;
     SetScrollImmediate(state, RevealScrollTarget(state, index, state.scrollNow));
     RECT rc = RenameEditorRect(state, index);
-    const std::wstring name = state.entries[static_cast<size_t>(index)].name;
+    // Edit Explorer's label, as native rename does; with a hidden extension
+    // SetNameOf(SHGDN_INFOLDER) keeps that extension on commit.
+    const bool labelled = !state.entries[static_cast<size_t>(index)].label.empty();
+    const std::wstring name = EntryLabel(state.entries[static_cast<size_t>(index)]);
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
     const bool wrapped = RenameItemGeometry(state, index).wrapped;
@@ -24397,6 +25293,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     auto& r = state.rename;
     ++r.epoch;
     r.editor = edit;
+    r.multiple = selectedCount > 1;
     r.creationSticky = createdItem;
     r.creationPointerPending = createdItem && ((GetAsyncKeyState(VK_LBUTTON)&0x8000) ||
         (GetAsyncKeyState(VK_RBUTTON)&0x8000) || (GetAsyncKeyState(VK_MBUTTON)&0x8000));
@@ -24409,6 +25306,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
     r.tab = state.activeTabHost;
     r.native = state.nativeHwnd;
     r.frameRect = rc;
+    CaptureRenameUnderlay(state); // The EDIT is still hidden.
     EnsurePipelineTrace(state);
     RefreshRenamePalette(state);
     // Buffered paint is per-thread; this session holds one balanced reference
@@ -24431,7 +25329,7 @@ void BeginRename(ViewState& state, int index, bool createdItem = false) {
             static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
     }
     int end = static_cast<int>(name.size());
-    if (!state.entries[static_cast<size_t>(index)].folder) {
+    if (!state.entries[static_cast<size_t>(index)].folder && !labelled) {
         const size_t dot = name.find_last_of(L'.');
         if (dot != std::wstring::npos && dot > 0)
             end = static_cast<int>(dot);
@@ -24471,6 +25369,22 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
             live->nativeHwnd == native && !g_unloading.load(std::memory_order_acquire);
     };
     NativeFileCommandScope inputOwnership(&state);
+    // Our committed multiple-item rename. Enter ends DefView's label edit as
+    // a native commit does; step 1 is queued behind DefView's commit.
+    if (state.nativeRenameToken == token && !state.nativeRenameText.empty() && !state.rename.editor) {
+        const std::wstring text = std::exchange(state.nativeRenameText, std::wstring{});
+        state.nativeRenameToken = 0;
+        SetWindowTextW(editor, text.c_str());
+        state.nativeRenameCommitEditor = editor;
+        SendMessageW(editor, WM_KEYDOWN, VK_RETURN, 0);
+        if (!current()) return true;
+        if (!PostMessageW(owner, kMsgNativeRenameStep, 1, static_cast<LPARAM>(token)))
+            ReleaseNativeRenameHold(state);
+        ReturnListInputFocus(state, editor);
+        if (g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU rename] NATIVE_MULTIPLE_COMMIT native-edit=%p", editor);
+        return true;
+    }
     // A context-menu creation may already have opened our field before Shell
     // subsequently focuses its duplicate. Cancel only the duplicate session.
     if (state.rename.editor) {
@@ -24510,10 +25424,20 @@ bool AdoptNativeRenameEditor(ViewState& state, HWND editor) {
     // Escape closes Shell's editing transaction before SetFocus can commit it.
     SendMessageW(editor, WM_KEYDOWN, VK_ESCAPE, 0);
     if (!current() || GpuRowForNativePath(state, path) != row) return false;
-    state.selectedFlags.assign(state.entries.size(), 0);
-    state.selectedFlags[size_t(row)] = 1;
-    state.selected = state.anchor = row;
-    BeginRename(state, row, true);
+    // Explorer's Rename on a multiple selection renames the set; keep that
+    // set when it is the one the GPU view already shows.
+    int nativeSelected = 0;
+    const bool multiple = SUCCEEDED(view->ItemCount(SVGIO_SELECTION, &nativeSelected)) && current() &&
+        nativeSelected > 1 && size_t(row) < state.selectedFlags.size() && state.selectedFlags[size_t(row)] &&
+        state.selectedFlags.Count(0,state.selectedFlags.size()) == size_t(nativeSelected);
+    if (!current()) return false;
+    if (!multiple) {
+        state.selectedFlags.assign(state.entries.size(), 0);
+        state.selectedFlags[size_t(row)] = 1;
+        state.anchor = row;
+    }
+    state.selected = row;
+    BeginRename(state, row, true, multiple);
     if (!state.rename.editor) return false;
     SetWindowTextW(state.rename.editor, text.c_str());
     SendMessageW(state.rename.editor, EM_SETSEL, first == 0 ? last : first, first == 0 ? first : last);
@@ -24595,6 +25519,7 @@ void RepositionRenameEdit(ViewState& state) {
             rename.zoomHidden = true;
             rename.restoreZoomFocus = GetFocus() == rename.editor;
             SetPresentationVisibility(rename.editor, false);
+            RestoreRenameUnderlay(state, rename.frameRect);
             Redraw(state);
         }
         return; // No native sizing/font/painting work during compositor zoom.
@@ -24617,6 +25542,7 @@ void RepositionRenameEdit(ViewState& state) {
     RECT overlayArea = RenameViewport(state, false);
     if (IsRectEmpty(&overlayArea)) {
         SetPresentationVisibility(state.rename.editor, false);
+        RestoreRenameUnderlay(state, state.rename.frameRect);
         return;
     }
     RECT local = RenameEditorRect(state, state.rename.index, false);
@@ -24646,9 +25572,10 @@ void RepositionRenameEdit(ViewState& state) {
     MapWindowPoints(state.hwnd, state.frameHwnd, reinterpret_cast<POINT*>(&local), 2);
     // A Shell layout can reorder siblings without moving the field. Repair
     // visibility and Z order too, including the sticky New Folder refocus path.
-    if (PositionOverlayWindows(state,nullptr,&local))
+    if (PositionOverlayWindows(state,nullptr,&local)) {
+        if (!EqualRect(&state.rename.frameRect, &local)) RestoreRenameUnderlay(state, state.rename.frameRect);
         state.rename.frameRect = local;
-    else {
+    } else {
         state.nativePresentationPending=true;
         RegisterViewAnimation(state);
         return; // Keep zoom suspension/focus intent until placement succeeds.
@@ -24659,6 +25586,104 @@ void RepositionRenameEdit(ViewState& state) {
             SetFocus(rename.editor);
         Redraw(state);
     }
+}
+
+void CancelClickRename(ViewState& state) {
+    if (!state.clickRename.armed) return;
+    state.clickRename = {};
+    if (IsWindow(state.hwnd)) KillTimer(state.hwnd, kClickRenameTimerId);
+}
+
+// Explorer starts its label edit GetDoubleClickTime() after the release of a
+// slow second click on the selected item (measured against DefView). The
+// user's current Mouse setting is read for each click, never cached.
+void ArmClickRename(ViewState& state, int row) {
+    CancelClickRename(state);
+    if (row < 0 || row >= state.total || static_cast<size_t>(row) >= state.entries.size()) return;
+    const UINT wait = GetDoubleClickTime();
+    auto& click = state.clickRename;
+    click.row = row;
+    click.path = state.entries[static_cast<size_t>(row)].path;
+    click.token = state.token; click.directory = state.directoryToken;
+    click.epoch = state.mouseFolderEpoch; click.input = state.inputSerial;
+    click.due = GetTickCount64() + wait;
+    click.armed = SetTimer(state.hwnd, kClickRenameTimerId, wait, nullptr) != 0;
+    if (!click.armed) state.clickRename = {};
+}
+
+// The timer only proposes. KillTimer leaves an already queued WM_TIMER, so a
+// wake is honored solely for the armed click it belongs to, after its full
+// wait, while the same tab, folder, item and single selection still own
+// input and nothing was pressed, typed or wheeled since the release.
+void FireClickRename(ViewState& state) {
+    KillTimer(state.hwnd, kClickRenameTimerId);
+    auto& click = state.clickRename;
+    if (!click.armed) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < click.due) {
+        // An older wake queued before this arm; keep waiting for this one.
+        SetTimer(state.hwnd, kClickRenameTimerId, static_cast<UINT>(click.due - now), nullptr);
+        return;
+    }
+    const auto armed = std::exchange(click, ViewState::ClickRename{});
+    const int row = armed.row;
+    if (g_unloading.load(std::memory_order_acquire) || armed.token != state.token ||
+        armed.directory != state.directoryToken || armed.epoch != state.mouseFolderEpoch ||
+        armed.input != state.inputSerial || row < 0 || row >= state.total ||
+        static_cast<size_t>(row) >= state.entries.size() || state.entries[static_cast<size_t>(row)].path != armed.path ||
+        state.selected != row || static_cast<size_t>(row) >= state.selectedFlags.size() ||
+        !state.selectedFlags[static_cast<size_t>(row)] || state.selectedFlags.Count(0, state.selectedFlags.size()) != 1 ||
+        state.rename.editor || state.mousePressActive || GetCapture() == state.hwnd || state.marqueePossible ||
+        state.shellDragRunning || state.pendingNativeSelection || state.optimisticStartedAt ||
+        (state.nativeRenameHold && state.nativeRenameHold == state.token) || !state.visible || !state.inScope ||
+        !state.detailsViewActive || !TabOwnsActiveView(state) || !ExplorerFrameHasForeground(state.frameHwnd) ||
+        !OverlayHasInputFocus(state)) return;
+    BeginRename(state, row);
+}
+
+// A committed name is never dropped silently; the single-item path reports
+// its Shell failure the same way.
+void ReportMultipleRenameFailure(ViewState& state, const wchar_t* reason, HRESULT hr = S_OK) {
+    Wh_Log(L"[GPU rename] multiple rename not performed: %s hr=0x%08X", reason, static_cast<unsigned>(hr));
+    if (IsWindow(state.hwnd) && !g_unloading.load(std::memory_order_acquire))
+        MessageBoxW(state.hwnd, L"Explorer could not rename the selected items.", L"Rename", MB_OK | MB_ICONWARNING);
+}
+
+// Explorer's multiple-item rename belongs to DefView. Hand the committed label
+// to its own editor for the verified native selection, as Open() does for the
+// default action. BeginRename opened the editor only once Explorer held the
+// set, so this never queues behind a selection preparation a click can cancel.
+void RenameSelectionNatively(ViewState& state, const std::wstring& text) {
+    ViewState::DeferredSelectionKey key;
+    key.key = VK_F2; key.renameText = text;
+    const HWND owner = state.hwnd;
+    const auto lifetime = state.lifetimeToken, token = state.token, directory = state.directoryToken;
+    const auto current = [&] {
+        auto* live = State(owner);
+        return live == &state && live->lifetimeToken == lifetime && live->token == token &&
+            live->directoryToken == directory && !g_unloading.load(std::memory_order_acquire);
+    };
+    if (state.pendingNativeSelection || state.nativeSelectionUnsafe || state.nativeSelectionImportPending ||
+        state.nativeSelectionAwaitingRefresh) {
+        ReportMultipleRenameFailure(state, L"Explorer's selection is not verified");
+        return;
+    }
+    const bool verified = state.verifiedSelectionToken == token && state.verifiedSelectionDirectory == directory &&
+        state.verifiedSelectionFlags.SharesStorage(state.selectedFlags);
+    if (!verified) {
+        const bool synced = SyncNativeSelection(state);
+        if (!current()) return;
+        if (!synced || state.pendingNativeSelection) {
+            ReportMultipleRenameFailure(state, L"Explorer's selection could not be confirmed");
+            return;
+        }
+    }
+    ComPtr<IShellView> native;
+    if (FAILED(state.folderView.As(&native)) && state.shellBrowser)
+        state.shellBrowser->QueryActiveShellView(&native);
+    if (!current()) return;
+    const HRESULT hr = InvokeNativeFileKey(state, native.Get(), key);
+    if (FAILED(hr) && current()) ReportMultipleRenameFailure(state, L"DefView did not start renaming", hr);
 }
 
 void FinishRename(ViewState& state, bool commit) {
@@ -24673,6 +25698,7 @@ void FinishRename(ViewState& state, bool commit) {
     const int index = state.rename.index;
     const std::wstring oldPath = state.rename.path;
     const std::wstring oldName = index >= 0 && index < state.total ? state.entries[size_t(index)].name : L"";
+    const std::wstring oldLabel = index >= 0 && index < state.total ? state.entries[size_t(index)].label : L"";
     const HWND owner = state.hwnd, native = state.nativeHwnd;
     const auto lifetime = state.lifetimeToken, token = state.token;
     const std::wstring parent = state.folderPath;
@@ -24691,17 +25717,32 @@ void FinishRename(ViewState& state, bool commit) {
             newName = buffer.data();
         }
     }
-    const bool changed = valid && commit && !newName.empty() && newName != oldName;
+    // The editor holds Explorer's label; the parsing name changes only when
+    // Shell reports the committed item.
+    const bool changed = valid && commit && !newName.empty() &&
+        newName != (oldLabel.empty() ? oldName : oldLabel);
+    if (state.rename.multiple) {
+        // No label preview: DefView decides every item's resulting name and
+        // the Shell change notifications publish them.
+        if (!CloseRenameEditor(state) || !current()) return;
+        if (state.presenter) SubmitPresentation(state);
+        if (changed) RenameSelectionNatively(state, newName);
+        else {
+            if (valid) SyncNativeSelection(state);
+            if (current() && returnInput) ReturnListInputFocus(state, editor);
+        }
+        return;
+    }
     if (changed) {
         state.typeSearchCandidates.Reset();
         state.renamePreviewPath = oldPath; state.renamePreviewName = newName;
         state.renamePreviewToken = token;
-        state.entries[size_t(index)].name = newName;
+        state.entries[size_t(index)].label = newName;
     }
     if (!CloseRenameEditor(state)) {
         if (changed) {
             state.typeSearchCandidates.Reset();
-            state.entries[size_t(index)].name = oldName;
+            state.entries[size_t(index)].label = oldLabel;
         }
         state.renamePreviewPath.clear(); state.renamePreviewName.clear();
         return;
@@ -24715,14 +25756,18 @@ void FinishRename(ViewState& state, bool commit) {
         if (current() && returnInput) ReturnListInputFocus(state, editor);
         return;
     }
-    const auto complete = [&](bool success, const std::wstring& name, const std::wstring& path) {
+    const auto complete = [&](bool success, const std::wstring& label, const std::wstring& path) {
         auto* live = current();
         if (!live) return;
+        const wchar_t* leaf = success ? PathFindFileNameW(path.c_str()) : nullptr;
+        const std::wstring name = leaf && *leaf ? leaf : label;
         int row = GpuRowForNativePath(*live, oldPath);
         if (row < 0 && success) row = GpuRowForNativePath(*live, path);
         if (row >= 0) {
             live->typeSearchCandidates.Reset();
-            live->entries[size_t(row)].name = success ? name : oldName;
+            auto& entry = live->entries[size_t(row)];
+            entry.name = success ? name : oldName;
+            entry.label = !success ? oldLabel : label != name ? label : L"";
             if (success) SetIndexedEntryPath(*live, row, path);
             live->selectedFlags.assign(live->entries.size(), 0);
             live->selectedFlags[size_t(row)] = 1;
@@ -25093,8 +26138,9 @@ void ClearSelectionForFolderMenu(ViewState& state) {
     CancelNativeSelectionPreparation(state);
     // First commit the native transaction. The status bar, Delete and other
     // apps observe this view, so never fade out the GPU selection before
-    // Explorer acknowledges a real empty selection.
-    if (!ClearNativeSelection(state)) {
+    // Explorer acknowledges a real empty selection. A held multiple rename
+    // clears Explorer's selection after its commit instead.
+    if (!NativeSelectionHeldForRename(state) && !ClearNativeSelection(state)) {
         ReconcileFailedNativeSelection(state);
         return;
     }
@@ -25303,7 +26349,7 @@ void ApplyTypeSearch(ViewState& state,wchar_t ch) {
         auto* candidates=PrepareTypeSearchCandidates(state.typeSearchCandidates,prefix,state.entries.data(),
             state.entries.size(),state.directoryToken,state.rowSceneRevision,state.displayedOrderHash);
         return FindTypeSearchCandidate(prefix,searchFrom,size_t(state.total),candidates,
-            [&](size_t row)->const std::wstring& {return state.entries[row].name;},
+            [&](size_t row)->const std::wstring& {return EntryLabel(state.entries[row]);},
             [&](int row) {return DisplayedRow(state,row);});
     };
     int found = findPrefix(state.typeSearch,
@@ -25619,6 +26665,7 @@ void SetActive(HWND hwnd, bool on) {
         s->columnMenuPending = false;
         s->zebraExtentAnimating = false;
         CancelRename(*s);
+        CancelClickRename(*s);
         CancelAutoRefit(*s);
         CancelColumnDrag(*s);
         ResetMouseGestureForNavigation(*s);
@@ -25740,6 +26787,7 @@ void SetActive(HWND hwnd, bool on) {
         s->swipeEdgeX = 0.f;
         ClearSwipeFeedback(*s);
         CancelRename(*s);
+        CancelClickRename(*s);
         RestoreNativeContent(*s);
         StopScrollAnimation(*s);
         s->marqueeFading = false;
@@ -27400,7 +28448,7 @@ void ShowItemTip(ViewState& state, POINT client) {
     CacheRowDetails(state, entry, false); // Includes properties cached in another view mode.
     HideItemTip(state);
     tip.item = entry.path;
-    tip.name = entry.name;
+    tip.name = EntryLabel(entry);
     tip.anchor = client;
     ClientToScreen(state.hwnd, &tip.anchor);
     ItemTipJob facts;
@@ -29092,7 +30140,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
         bool reused=false;
         if(renamePreview && source.path==state.renamePreviewPath) {
             auto preview=std::make_shared<Entry>(source);
-            preview->name=state.renamePreviewName;
+            preview->label=state.renamePreviewName;
             row.entry=std::move(preview);
         } else if(const auto found=state.presentationRows.find(i);found!=state.presentationRows.end() &&
             found->second.entry && *found->second.entry==source) {
@@ -29520,6 +30568,17 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
     std::shared_ptr<const PresentationModel> standbyControl;
     std::shared_ptr<const DragPreview> activeDragPreview;
     bool awaitingNames=false;
+    ULONGLONG awaitingNamesSince=0;
+    // Diagnostics: a cold folder keeps the previous folder's pixels until its
+    // names arrive. Record entry/exit so a stuck wait is visible in user logs.
+    const auto traceAwaiting=[&](bool enter,const wchar_t* why,const PresentationModel& control) {
+        if(enter==awaitingNames) return;
+        const ULONGLONG now=GetTickCount64();
+        Wh_Log(L"[GPU presenter] %s reason=%s folder=%s shown=%s waited=%llu ms graphicsReady=%d device=%d standby=%d",
+            enter ? L"AWAIT_NAMES" : L"AWAIT_END",why,control.folderPath.c_str(),state.folderPath.c_str(),
+            enter ? 0ull : now-awaitingNamesSince,state.graphicsReady,bool(state.d3d),state.graphicsStandby);
+        if(enter) awaitingNamesSince=now;
+    };
     state.firstContentSubmittedAt=1; state.deferColumnProviders=false; state.featureInitializationStep=kOverlayFeatureSteps;
     struct Retirement {
         ViewState& state; const std::shared_ptr<PresentationLane>& lane;
@@ -29574,6 +30633,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         // continuation while that work runs.
         if(foregroundChanged && state.graphicsReady) RenderSwipeFeedback(state);
         if(model && !model->active) {
+            traceAwaiting(false,L"inactive",*model);
             awaitingNames=false;
             standbyControl=model;
             state.presentationActive=false; state.inputFocusIndicators=false; state.selectionFeedbackVisible=false;
@@ -29596,6 +30656,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             // as the new directory. Visibility/fallback packets still run above.
             standbyControl=model;
             PublishPresentationReceipt(state,lane,false,standbyControl.get());
+            traceAwaiting(true,L"cold",*model);
             awaitingNames=true;
             model.reset();
         }
@@ -29604,6 +30665,7 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
             PulsePresentation(lane,false); continue;
         }
         if(model) {
+            traceAwaiting(false,L"names",*model);
             awaitingNames=false;
             standbyControl.reset();
             if(!ApplyPresentationModel(state,*model,lane)) {
@@ -30853,6 +31915,23 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    // Any newer press, double-click, key, wheel or menu request on this view
+    // supersedes a pending slow-click rename (validated again when it fires).
+    if (s && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN ||
+        msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN || msg == WM_POINTERDOWN || msg == WM_KEYDOWN ||
+        msg == WM_SYSKEYDOWN || msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL || msg == WM_CONTEXTMENU ||
+        msg == WM_CANCELMODE)) {
+        ++s->inputSerial;
+        CancelClickRename(*s);
+    }
+    // A press anywhere on the view is outside the rename field: commit it
+    // before headers, scrollbars or rows handle the press.
+    const bool pressEndedRename = s && s->rename.editor && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+        msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN);
+    if (pressEndedRename) {
+        FinishRename(*s, true);
+        s = State(hwnd);
+    }
     if(s && s->startupAnimationsSuppressed) ObserveInitialLoadingInput(hwnd);
     if(s && s->keyboardSectionKey &&
         (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
@@ -31512,6 +32591,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (!native || !IsWindow(target) || !live ||
                         live->token != viewToken || live->nativeHwnd != target ||
                         !GpuSelectionMatches(*live, *prepared)) break;
+                    if (key.key == VK_F2 && key.renameText.empty()) {
+                        // F2 on a large set: Explorer now holds it; open the editor.
+                        BeginRename(*live, live->selected, false, true);
+                        continue;
+                    }
                     const HRESULT hr = InvokeNativeFileKey(*live,native.Get(),key);
                     if (FAILED(hr)) Wh_Log(L"[GPU selection] deferred %s command failed hr=0x%08X",
                         key.newTab ? L"new-tab" : L"native",static_cast<unsigned>(hr));
@@ -31778,6 +32862,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             BeginTouchDrag(*s);
         return 0;
     case WM_TIMER:
+        if (wParam == kClickRenameTimerId) {
+            if (s) FireClickRename(*s);
+            else KillTimer(hwnd, kClickRenameTimerId);
+            return 0;
+        }
         if (wParam == kTouchHoldTimerId) {
             if (s) TouchHoldDeadline(*s);
             return 0;
@@ -31846,6 +32935,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!TabOwnsActiveView(*s)) {
                 s->tabResumeRefreshToken = s->token;
                 if (s->rename.editor) CancelRename(*s);
+                CancelClickRename(*s);
                 if (IsWindowVisible(hwnd)) SetPresentationVisibility(hwnd, false);
                 // Preserve the original inactive-tab frame shutdown except
                 // for the short HWND-only switch probe. Otherwise a hidden
@@ -32454,6 +33544,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 !OnHorizontalBar(*s, pressX, pressY))
                 s->mousePressRow = RowFromPoint(*s, pressY, pressX);
             FinishColumnTransition(*s); // no moving divider during mouse drag
+            // As in Explorer, a click that activates the window or ends an
+            // edit is not the slow second click on an item.
+            const bool listHadInput = !pressEndedRename && !s->rename.editor && OverlayHasInputFocus(*s) &&
+                ExplorerFrameHasForeground(s->frameHwnd);
             if (s->rename.editor) FinishRename(*s, true);
             SetFocus(IsWindow(s->nativeHwnd) ? s->nativeHwnd : hwnd);
             const int y = GET_Y_LPARAM(lParam);
@@ -32512,6 +33606,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         s->shellDragStart = POINT{x, y};
                         s->shellDragCollapseOnClick = !control && !shift;
                         s->shellDragToggleOnClick = control && !shift;
+                        // Only the sole selected, focused item, pressed on its
+                        // filename text by a mouse button (not a touch tap),
+                        // may become a rename.
+                        s->mousePressRenameEligible = listHadInput && !control && !shift &&
+                            !s->clickPolicy.singleClick && s->mousePressSource != ClickSource::Touch &&
+                            s->selected == index && s->selectedFlags.Count(0, s->selectedFlags.size()) == 1 &&
+                            PointOnFilenameText(*s, index, POINT{x, y});
                     } else {
                         // An unselected row is a possible marquee origin.
                         // Defer ordinary click/Shift/Ctrl selection until UP;
@@ -32613,6 +33714,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool pressControl = s->mousePressControl;
         const bool pressShift = s->mousePressShift;
         const auto pressSource = s->mousePressSource;
+        const bool renameEligible = s->mousePressRenameEligible; // Capture release resets press state.
         if (s->shellDragRow >= 0) {
             const int pressed = s->shellDragRow;
             const bool sameItem = s->mousePressRow == pressed &&
@@ -32642,6 +33744,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->mouseClickEpoch = epoch;
                 s->mouseClickTick = GetTickCount64();
                 if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,pressed);
+                // Released on the same filename text: Explorer's slow-click
+                // rename, unless a double-click or other input supersedes it.
+                else if (renameEligible && s->mouseFolderEpoch == epoch &&
+                    PointOnFilenameText(*s, pressed, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}))
+                    ArmClickRename(*s, pressed);
             }
             return 0;
         }
@@ -32862,6 +33969,32 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && s->token == static_cast<unsigned long long>(lParam))
             AdoptNativeRenameEditor(*s, reinterpret_cast<HWND>(wParam));
         return 0;
+    case kMsgNativeRenameStep:
+        if (s && s->nativeRenameHold && s->nativeRenameHold == static_cast<unsigned long long>(lParam)) {
+            if (wParam == 0 && !s->nativeRenameText.empty()) {
+                // DoRename's queued editor exists by now. Commit it here if no
+                // focus event did; anything else ends the transaction unrenamed.
+                const HWND focus = GetFocus();
+                if (NativeRenameEditor(*s, focus) && AdoptNativeRenameEditor(*s, focus)) return 0;
+                if (NativeRenameEditor(*s, focus)) SendMessageW(focus, WM_KEYDOWN, VK_ESCAPE, 0);
+                if (auto* live = State(hwnd)) {
+                    ReleaseNativeRenameHold(*live);
+                    ReportMultipleRenameFailure(*live, L"Explorer's editor could not be used");
+                }
+            } else if (wParam == 1) {
+                // Explorer ends its edit on commit, including when it rejects
+                // the name with its own message. Never leave a hidden editor
+                // holding the keyboard.
+                const HWND editor = s->nativeRenameCommitEditor;
+                if (editor && IsWindow(editor) && NativeRenameEditor(*s, editor)) {
+                    SendMessageW(editor, WM_KEYDOWN, VK_ESCAPE, 0);
+                    if (!State(hwnd)) return 0;
+                    ReturnListInputFocus(*s, editor);
+                }
+                ReleaseNativeRenameHold(*s);
+            }
+        }
+        return 0;
     case kMsgCreationRefocus:
         if (s && s->rename.editor && !s->rename.zoomHidden && s->rename.creationSticky &&
             s->rename.epoch == static_cast<UINT_PTR>(lParam)) {
@@ -32975,7 +34108,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->mouseClickBackground && s->mouseClickEpoch==s->mouseFolderEpoch &&
                 s->mouseClickSource==CurrentClickSource(*s) && s->mouseClickTick &&
                 (s->touch.replaying || GetTickCount64()-s->mouseClickTick<=GetDoubleClickTime());
+            // "Empty" is only confirmed once this folder's complete names are
+            // in the model. Before that the surface can still show the
+            // previous folder, and every point of an unloaded model is empty.
+            if (up && (!s->loaded || s->namesPreview)) {
+                Wh_Log(L"[GPU navigation] DOUBLE_CLICK_UP_IGNORED folder=%s token=%llu x=%d y=%d total=%d loaded=%d preview=%d",
+                    s->folderPath.c_str(),static_cast<unsigned long long>(s->token),x,y,s->total,s->loaded,s->namesPreview);
+                ResetMouseClickSequence(*s);
+                return 0;
+            }
             if (up) {
+                Wh_Log(L"[GPU navigation] DOUBLE_CLICK_UP folder=%s token=%llu x=%d y=%d row=%d total=%d loaded=%d "
+                    L"pending=%d sortPending=%d sinceFirstClick=%llu ms messageAge=%lu ms folderEpoch=%llu",
+                    s->folderPath.c_str(),static_cast<unsigned long long>(s->token),x,y,row,s->total,s->loaded,
+                    s->directoryPending,s->nativeSortPending,GetTickCount64()-s->mouseClickTick,
+                    GetTickCount()-static_cast<DWORD>(GetMessageTime()),
+                    static_cast<unsigned long long>(s->mouseFolderEpoch));
                 ResetMouseClickSequence(*s);
                 NavigateCurrentShellTab(*s,SBSP_PARENT | SBSP_SAMEBROWSER);
                 return 0;
@@ -33143,7 +34291,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 return 0;
             case VK_F2:
                 if (!control && !shift && !(lParam & (1LL << 30)))
-                    BeginRename(*s, s->selected);
+                    BeginRename(*s, s->selected, false, true);
                 return 0;
             }
         }
@@ -33567,6 +34715,7 @@ void SynchronizeTabSurfaces(HWND frame, bool activate) {
             if (state->manipulationFrameActive || state->touch.active) StopTouchpad(*state, false);
             state->columnMenuPending = false;
             if (state->rename.editor) CancelRename(*state);
+            CancelClickRename(*state);
             const bool wasVisible = IsWindowVisible(hwnd) != FALSE;
             if (wasVisible) {
                 const ULONGLONG startHide = GetTickCount64();
@@ -33989,6 +35138,9 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
                           const SharedPidl& destinationIdentity) {
     TraceUiState(state,L"ui.navigation.depart[layout,native,header,selected]");
     state.renamePreviewPath.clear(); state.renamePreviewName.clear(); state.renamePreviewToken = 0;
+    state.nativeRenameText.clear(); state.nativeRenameToken = 0;
+    state.nativeRenameHold = 0; state.nativeRenameSelectionDeferred = false;
+    CancelClickRename(state);
     if (state.manipulationFrameActive || state.touch.active) StopTouchpad(state, false);
     state.background->capacityGeneration.store(0, std::memory_order_release);
     state.capacityToken = 0;
@@ -34905,7 +36057,7 @@ void BindTabPresentation(ViewState& state, HWND tabHost) {
 bool RefreshThisPcRows(ViewState& state, bool requestData) {
     TabTraceSlowScope trace(L"This PC row projection", state.hwnd);
     state.thisPcRowsDirty = false;
-    if (!state.thisPcGpu || state.nativeSortPending) return false;
+    if (!state.thisPcGpu || SortReadDefersNames(state)) return false;
     if (state.nativeRowsNeedCapture && !state.nativeRowsPending) RequestNativeRows(state);
     if (state.nativeRows.empty() && !state.nativeRowsComplete) return false;
     if (state.loaded && state.nativeRowsPending) return false;
@@ -36028,6 +37180,55 @@ void NoteNativeNewFolderShortcut(const MSG& msg) {
     ArmInteractiveCreation(*state, 1, L"Ctrl+Shift+N");
 }
 
+// The context menu's New submenu, the command bar's New and Ctrl+Shift+N all
+// run the Shell's New menu object. Its command records the creation intent
+// for the view it creates into: one path for every route, matched by the
+// Shell's creation notification and opened as the GPU rename field.
+using NewMenuInvoke_t = HRESULT (STDMETHODCALLTYPE*)(IContextMenu*, LPCMINVOKECOMMANDINFO);
+NewMenuInvoke_t g_newMenuInvokeOriginal = nullptr;
+
+void ObserveNewItemCommand(IContextMenu* menu, LPCMINVOKECOMMANDINFO info) {
+    if (g_unloading.load(std::memory_order_acquire) || !menu || !info || info->cbSize < sizeof(CMINVOKECOMMANDINFO))
+        return;
+    // The view the menu was built for, else the window that invoked it.
+    HWND native = nullptr;
+    ComPtr<IObjectWithSite> site; ComPtr<IServiceProvider> services; ComPtr<IShellView> view;
+    if (SUCCEEDED(menu->QueryInterface(IID_PPV_ARGS(&site))) && SUCCEEDED(site->GetSite(IID_PPV_ARGS(&services))) &&
+        SUCCEEDED(services->QueryService(SID_SFolderView, IID_PPV_ARGS(&view))))
+        view->GetWindow(&native);
+    ViewState* state = native ? State(reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty))) : nullptr;
+    if (!state && info->hwnd) {
+        const HWND frame = GetAncestor(info->hwnd, GA_ROOT);
+        state = IsExplorerFrame(frame) ? State(OverlayUnder(frame)) : nullptr;
+    }
+    if (!state || (native && state->nativeHwnd != native)) return;
+    // The named verb creates a folder; the indexed entries are file templates.
+    const bool unicode = info->cbSize >= sizeof(CMINVOKECOMMANDINFOEX) && (info->fMask & CMIC_MASK_UNICODE) &&
+        reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info)->lpVerbW;
+    const bool folder = unicode ? !IS_INTRESOURCE(reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info)->lpVerbW) &&
+            !_wcsicmp(reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info)->lpVerbW, CMDSTR_NEWFOLDERW) :
+        !IS_INTRESOURCE(info->lpVerb) && !_stricmp(info->lpVerb, CMDSTR_NEWFOLDERA);
+    ArmInteractiveCreation(*state, folder ? 1u : 2u, L"New menu");
+}
+
+HRESULT STDMETHODCALLTYPE NewMenuInvokeHook(IContextMenu* menu, LPCMINVOKECOMMANDINFO info) {
+    ObserveNewItemCommand(menu, info);
+    return g_newMenuInvokeOriginal(menu, info);
+}
+
+// The Shell's New menu implementation, shared by all of its instances.
+void* NewMenuInvokeCommandAddress() {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    void* address = nullptr;
+    {
+        ComPtr<IContextMenu> menu;
+        if (SUCCEEDED(CoCreateInstance(CLSID_NewMenu, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&menu))))
+            address = (*reinterpret_cast<void***>(menu.Get()))[4]; // IContextMenu::InvokeCommand
+    }
+    if (SUCCEEDED(apartment)) CoUninitialize();
+    return address;
+}
+
 // Native-owned shortcuts remain native. Frame/GPU shortcuts use the active
 // view's selected group or folder, without moving focus or reading clipboard
 // formats. The Shell retains deferred/virtual data such as archive contents.
@@ -36885,12 +38086,26 @@ void DrawViewToggle(const ViewState& state, const DRAWITEMSTRUCT& destination) {
     InflateRect(&bounds, -Scale96(1, dpi), -Scale96(1, dpi));
     const int radius = Scale96(4, dpi);
     const bool disabled = !state.inScope || !state.detailsViewActive || (item.itemState & ODS_DISABLED) != 0;
-    if (!disabled && (state.viewToggleHot || (item.itemState & ODS_SELECTED))) {
+    const bool focusShown = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS;
+    if (state.viewToggleTheme) {
+        // As the status bar's own buttons: pressed, else hot or keyboard
+        // focused (with a focus rectangle), else the bar's fill alone.
+        const int part = !disabled && (item.itemState & ODS_SELECTED) ? 2 :
+            (!disabled && state.viewToggleHot) || focusShown ? 4 : 1;
+        if (part != 1)
+            DrawThemeBackground(state.viewToggleTheme, item.hDC, kCommandModuleButton, part, &item.rcItem, nullptr);
+        if (focusShown) {
+            RECT focus = item.rcItem;
+            InflateRect(&focus, -Scale96(3, dpi), -Scale96(3, dpi));
+            SetTextColor(item.hDC, foreground); SetBkColor(item.hDC, background);
+            DrawFocusRect(item.hDC, &focus);
+        }
+    } else if (!disabled && (state.viewToggleHot || (item.itemState & ODS_SELECTED))) {
         SetDCBrushColor(item.hDC, blend((item.itemState & ODS_SELECTED) ? 18 : 10));
         SelectObject(item.hDC, brush); SelectObject(item.hDC, GetStockObject(NULL_PEN));
         RoundRect(item.hDC, bounds.left, bounds.top, bounds.right, bounds.bottom, radius, radius);
     }
-    if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) {
+    if (!state.viewToggleTheme && focusShown) {
         SelectObject(item.hDC, GetStockObject(DC_PEN));
         SetDCPenColor(item.hDC, foreground); SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
         RoundRect(item.hDC, bounds.left, bounds.top, bounds.right, bounds.bottom, radius, radius);
@@ -37085,6 +38300,50 @@ void RequestStatusButtonGeometry(ViewState& state,const StatusButtonQuery& query
     SetEvent(work.columns.wake);
 }
 
+// The switch takes Explorer's own look: the status bar buttons' theme class
+// and the theme, dark-mode opt-in, font, wrapping width, delays and margins of
+// Explorer's own tooltip on this frame (before one exists, Explorer's chrome
+// defaults: its "Explorer" sub-app, opted in). Windows picks light or dark.
+// Restyled only when that tooltip or the theme changes.
+void StyleViewToggle(ViewState& state, HWND frame, int dpi) {
+    const HWND stock = StockFrameTooltip(frame, state.viewToggleGeometry.providerHost);
+    if (state.viewToggleStyled && stock == state.viewToggleTipSource) return;
+    const bool optIn = !stock || DarkModeOptedIn(stock);
+    if (optIn != DarkModeOptedIn(state.viewToggle)) {
+        OptIntoDarkMode(state.viewToggle, optIn);
+        state.viewTogglePaletteDirty = true; // The bar's colors follow on the next refresh.
+    }
+    std::wstring subApp = stock ? WindowThemeName(stock, kThemeSubAppProperty) : std::wstring(L"Explorer");
+    if (state.viewToggleTheme) CloseThemeData(state.viewToggleTheme);
+    state.viewToggleTheme = OpenThemeData(state.viewToggle, kStatusButtonTheme); // At the switch's DPI.
+    if (const HWND tip = state.viewToggleTooltip; IsWindow(tip)) {
+        const std::wstring ids = stock ? WindowThemeName(stock, kThemeSubIdListProperty) : std::wstring{};
+        OptIntoDarkMode(tip, optIn);
+        SetWindowTheme(tip, subApp.empty() ? nullptr : subApp.c_str(), ids.empty() ? nullptr : ids.c_str());
+        LOGFONTW face{};
+        const auto font = stock ? reinterpret_cast<HFONT>(SendMessageW(stock, WM_GETFONT, 0, 0)) : nullptr;
+        if (font && GetObjectW(font, sizeof(face), &face)) {
+            if (const HFONT copy = CreateFontIndirectW(&face)) {
+                SendMessageW(tip, WM_SETFONT, reinterpret_cast<WPARAM>(copy), FALSE);
+                if (state.viewToggleTipFont) DeleteObject(state.viewToggleTipFont);
+                state.viewToggleTipFont = copy;
+            }
+        }
+        if (stock) {
+            SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, SendMessageW(stock, TTM_GETMAXTIPWIDTH, 0, 0));
+            for (WPARAM delay : {TTDT_INITIAL, TTDT_AUTOPOP, TTDT_RESHOW})
+                SendMessageW(tip, TTM_SETDELAYTIME, delay,
+                    MAKELPARAM(static_cast<WORD>(SendMessageW(stock, TTM_GETDELAYTIME, delay, 0)), 0));
+            RECT margin{};
+            SendMessageW(stock, TTM_GETMARGIN, 0, reinterpret_cast<LPARAM>(&margin));
+            SendMessageW(tip, TTM_SETMARGIN, 0, reinterpret_cast<LPARAM>(&margin));
+        } else SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, Scale96(360, dpi));
+    }
+    state.viewToggleTipSource = stock;
+    state.viewToggleStyled = true;
+    InvalidateRect(state.viewToggle, nullptr, FALSE);
+}
+
 void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometry) {
     if (g_unloading.load(std::memory_order_relaxed) || !IsWindow(frame)) return;
     if (deferred) {
@@ -37117,7 +38376,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             gpu ? L"Switch to native Explorer view" : L"Switch to GPU overlay view";
         const wchar_t* hint = !state->inScope ? L"GPU view unavailable for this folder." :
             !state->detailsViewActive ? L"GPU view unavailable in this Explorer layout." :
-            gpu ? L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)" : L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)";
+            gpu ? L"Switch to native Explorer view.  (Ctrl+Alt+F9)" : L"Switch to GPU overlay view.  (Ctrl+Alt+F9)";
         if (!IsWindow(state->viewToggle)) {
             state->viewToggle = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"BUTTON", L"",
                 WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON | BS_ICON | BS_FLAT, 0, 0, 1, 1, frame,
@@ -37130,6 +38389,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 DestroyWindow(state->viewToggle); state->viewToggle = nullptr; continue;
             }
             state->viewToggleHot = false;
+            OptIntoDarkMode(state->viewToggle, true); // As Explorer's chrome; restyling follows its tooltip.
             state->viewToggleBufferedPaint = SUCCEEDED(BufferedPaintInit());
             // Creating/restoring chrome reuses the event-resolved tab palette.
             // Navigation and layout must not become color probes.
@@ -37153,30 +38413,36 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 tool.lpszText = const_cast<LPWSTR>(hint);
                 if (!SendMessageW(state->viewToggleTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool))) {
                     DestroyWindow(state->viewToggleTooltip); state->viewToggleTooltip = nullptr;
-                }
+                } else state->viewToggleHint = hint;
             }
         }
         // Keep native hover/tooltips alive. Unavailable actions are rejected
         // internally by the command handler, while our painter dims the icon.
-        InvalidateRect(state->viewToggle, nullptr, FALSE);
+        // Chrome events (the status bar's own location changes) refresh this
+        // often: only a changed state repaints the button or re-measures, and
+        // so moves, a showing tooltip.
         wchar_t current[64]{}; GetWindowTextW(state->viewToggle, current, ARRAYSIZE(current));
         if (wcscmp(current, caption) != 0) {
             SetWindowTextW(state->viewToggle, caption);
+            InvalidateRect(state->viewToggle, nullptr, FALSE);
         }
-        if (IsWindow(state->viewToggleTooltip)) {
+        if (IsWindow(state->viewToggleTooltip) && state->viewToggleHint != hint) {
             TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
             tool.hwnd = frame; tool.uId = reinterpret_cast<UINT_PTR>(state->viewToggle);
             tool.lpszText = const_cast<LPWSTR>(hint);
             SendMessageW(state->viewToggleTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+            state->viewToggleHint = hint;
         }
         const int dpi = DpiOf(frame);
+        if (state->viewTogglePaletteDirty) RefreshViewTogglePalette(*state);
+        if (state->viewToggleDpi != dpi) state->viewToggleStyled = false;
+        StyleViewToggle(*state, frame, dpi);
         if (state->viewToggleDpi != dpi || state->viewToggleIconColor != state->viewToggleForeground ||
             !state->viewToggleIcons[0]) {
-            if (IsWindow(state->viewToggleTooltip))
-                SendMessageW(state->viewToggleTooltip, TTM_SETMAXTIPWIDTH, 0, Scale96(360, dpi));
             // Rasterize the Switch symbol once per DPI/palette. Native paint
             // consumes an HICON, never a private-use character in its DC.
-            const int size = std::max(1, Scale96(16, dpi));
+            // Explorer's view buttons use the small-icon size.
+            const int size = std::max(1, GetSystemMetricsForDpi(SM_CXSMICON, dpi));
             const auto coverage = ViewToggleGlyphCoverage(size, dpi);
             BITMAPINFO bitmapInfo{};
             bitmapInfo.bmiHeader = {sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB};
@@ -37344,6 +38610,16 @@ BOOL Wh_ModInit() {
     // Optional: keep the ordinary GPU list alive if this hook is unavailable.
     WindhawkUtils::SetFunctionHook(TranslateAcceleratorW,
         TranslateAcceleratorHook, &g_translateAcceleratorOriginal);
+    // Keeps the rename EDIT's direct GDI drawing off screen while its field
+    // shows list-matched text. Optional: without it, edits briefly show GDI text.
+    const bool getDcHooked = WindhawkUtils::SetFunctionHook(GetDC, GetDcHook, &g_getDcOriginal);
+    g_renameSinkAvailable = getDcHooked &&
+        WindhawkUtils::SetFunctionHook(ReleaseDC, ReleaseDcHook, &g_releaseDcOriginal);
+    // Every New command reaches the Shell's New menu object. Optional: without
+    // it, Ctrl+Shift+N and Explorer's own editor still start the rename.
+    if (void* invoke = NewMenuInvokeCommandAddress())
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<NewMenuInvoke_t>(invoke),
+            NewMenuInvokeHook, &g_newMenuInvokeOriginal);
     // Retain this early suppression hook: applying hooks after startup is slow
     // in Windhawk, and the first owned native dispatch must already be batched.
     // Install last: failure before this point cannot release a module while

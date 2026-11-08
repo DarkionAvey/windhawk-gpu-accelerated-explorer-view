@@ -144,6 +144,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("shell-provider-contents", PARALLEL, TestShellProviderContents(fixture)),
     REGRESSION("provider-selection", PARALLEL, TestProviderSelection(fixture)),
     REGRESSION("initial-sorting", PARALLEL, TestInitialSorting(fixture)),
+    REGRESSION("empty-sort-key", PARALLEL, TestEmptyShellSortKey(fixture)),
     REGRESSION("native-menu-interaction", PARALLEL, TestNativeMenuInteraction(L"filesystem")),
     REGRESSION("native-menu-archive", PARALLEL, TestNativeMenuInteraction(L"archive")),
     REGRESSION("native-menu-delegated", PARALLEL, TestNativeMenuInteraction(L"delegated")),

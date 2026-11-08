@@ -153,37 +153,24 @@ if($Mode -like 'retry-*') {
     Copy-Item -LiteralPath (Join-Path ([Environment]::GetFolderPath('System')) 'version.dll') -Destination (Join-Path $fixture 'windhawk-fixture.dll')
     $injectedDirectory=Join-Path $fixture 'injected-gate'
     $null=New-Item -ItemType Directory -Path $injectedDirectory
-    $rejected=$false
+    # Injection invalidates the whole run: the gate must cancel at once,
+    # name the module, reap every running test and start no retries.
+    $message=''
+    $clock=[Diagnostics.Stopwatch]::StartNew()
     try {
-        Invoke-RegressionGate -Tasks @((Task 'interfered'),(Task 'unaffected')) -OutputDirectory $injectedDirectory -Jobs 2 -TimeoutSeconds 5 -ObserveInterference *> $null
-    } catch { $rejected=$_.Exception.Message -like 'PENDING:*' }
-    $injected=Get-Content -LiteralPath (Join-Path $injectedDirectory 'regression-report.json') -Raw | ConvertFrom-Json
-    $observed=@($injected.Attempts | Where-Object {$_.Name -eq 'interfered' -and $_.Modules -like '*windhawk-fixture.dll*' -and $_.Status -eq 'Pending'})
-    # A real installed injector may also enter the peer. Establish that case
-    # independently using the DLL's product metadata, rather than assuming the
-    # machine is clean or changing its injection configuration.
-    $peerHistory=@($injected.Attempts | Where-Object Name -eq unaffected)
-    $peerInjected=@($peerHistory | Where-Object Status -eq Pending)
-    foreach($entry in $peerInjected) {
-        if(!$entry.Modules -or $entry.ExitCode -ne 0 -or $entry.TimedOut) {throw 'Peer was pending without a successful process exit and module evidence'}
-        $knownWindhawk=@($entry.Modules -split '; ' | Where-Object {
-            [Diagnostics.FileVersionInfo]::GetVersionInfo($_).ProductName -like '*Windhawk*'
-        })
-        if(!$knownWindhawk.Count) {throw "Peer interference lacks independent Windhawk product evidence: $($entry.Modules)"}
-    }
-    $expectedPending=if($peerInjected.Count) {2} else {1}
-    $peerSummary=$injected.Tests | Where-Object Name -eq unaffected
-    $expectedPeerStatus=if($peerInjected.Count) {'Pending'} else {'Pass'}
-    $expectedPeerAttempts=if($peerHistory[0].Status -eq 'Pending') {4} else {1}
-    if(!$rejected -or $injected.Pending -ne $expectedPending -or $injected.Failed -ne 0 -or
-        $injected.Passed -ne (2-$expectedPending) -or $observed.Count -ne 4 -or
-        $peerSummary.Status -ne $expectedPeerStatus -or $peerSummary.Attempts -ne $expectedPeerAttempts -or
-        @($peerHistory | Where-Object ExitCode -ne 0).Count) {
-        throw 'Observed module interference was not distinguished from test failure while allowing peers to finish'
+        Invoke-RegressionGate -Tasks @((Task 'interfered'),(Task 'unaffected')) -OutputDirectory $injectedDirectory -Jobs 2 -TimeoutSeconds 60 -ObserveInterference *> $null
+    } catch { $message=$_.Exception.Message }
+    $clock.Stop()
+    $orphans=@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*$identity*" -and $_.CommandLine -like '*interfered*' })
+    if($message -notlike 'PENDING:*injected into test process*' -or $message -notlike '*windhawk-fixture.dll*' -or
+        $clock.Elapsed.TotalSeconds -ge 60 -or $orphans.Count -or
+        (Test-Path -LiteralPath (Join-Path $injectedDirectory 'isolated-1'))) {
+        throw "Observed module interference did not cancel the run immediately: $message"
     }
     Write-Output 'PASS: parallel rendezvous, parallel-before-serial phases, isolated serial tasks, -Jobs 1, timeouts, Windows argument quoting, stdout/stderr draining, failure propagation and peer cleanup'
     Write-Output 'PASS: three isolated retries, zero/one versus two/three failure threshold, no retry overlap, preserved attempt logs, recovered success and infrastructure pending'
-    Write-Output 'PASS: real private module observation, interference marked pending across retries, unaffected peers complete'
+    Write-Output 'PASS: real private module observation cancels the whole run at once, with no retries or orphaned tests'
     $passed=$true
 } finally {
     $resolved=[IO.Path]::GetFullPath($fixture)

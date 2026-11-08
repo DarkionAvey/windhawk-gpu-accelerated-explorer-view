@@ -399,14 +399,29 @@ static void TestRenameAppearanceImpl(const std::wstring& directory) {
                 }),"rename presentation retained the collapsed destination section");
             }
             if(!trailing) {
+                // The item being renamed stays highlighted, as in Explorer,
+                // both while its field owns focus and while focus is still
+                // handing off within the frame. The baseline is the same row
+                // rendered without its selection.
                 TouchInputTest::RenderedTouch rendered;
+                const size_t row=size_t(state.selected);
                 FocusFixture::focus=tab.frame;
+                state.selectedFlags[row]=0;
                 const auto plain=rendered.Capture(state);
+                state.selectedFlags[row]=1;
+                const auto handoff=rendered.Capture(state);
                 FocusFixture::focus=state.rename.editor;
                 const auto selected=rendered.Capture(state);
-                unsigned highlights=0;
-                for(size_t p=3;p<plain.size();p+=4) highlights+=selected[p]>plain[p]+10;
-                Check(highlights>20,"renamed item selection background was absent from actual GPU pixels");
+                const auto highlighted=[&](const std::vector<BYTE>& pixels) {
+                    unsigned count=0;
+                    for(size_t p=3;p<plain.size() && p<pixels.size();p+=4) count+=pixels[p]>plain[p]+10;
+                    return count;
+                };
+                const unsigned focused=highlighted(selected), pending=highlighted(handoff);
+                if(focused<=20 || pending<=20) std::wcout<<L"RENAME HIGHLIGHT focused="<<focused<<L" handoff="<<pending
+                    <<L" row="<<row<<L" label="<<EntryLabel(state.entries[row])<<std::endl;
+                Check(focused>20,"renamed item selection background was absent from actual GPU pixels");
+                Check(pending>20,"renamed item lost its selection while focus was handing off to its field");
             }
             for(const wchar_t* face:{L"Arial",L"Consolas"}) {
                 HFONT font=CreateFontW(-Scale96(13,dpi),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
