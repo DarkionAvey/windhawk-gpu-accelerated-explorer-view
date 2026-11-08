@@ -101,3 +101,177 @@ static void TestShellSizeDetails(const std::wstring& directory) {
     Check(ReleasePrivateFixture(root), "size fixture cleanup");
     std::cout << "PASS: actual Shell Size text reaches background detail cells for path/PIDL identities, zero-byte/large files and blank folders\n";
 }
+
+// Sizes are never invented: Shell size-less item IDs (as Windows builds for
+// removable media) cannot reach the Size column, unread files show "--",
+// and Size sorts use the Shell's folder sizes.
+static void TestShellSizeTruth(const std::wstring& directory) {
+    const auto root = std::filesystem::path(directory) / L"shell-size-truth";
+    std::filesystem::create_directories(root / L"small");
+    std::filesystem::create_directories(root / L"large");
+    const auto write = [](const std::filesystem::path& path, LONGLONG bytes) {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Check(file != INVALID_HANDLE_VALUE, "size truth fixture file");
+        LARGE_INTEGER length{}; length.QuadPart = bytes;
+        const bool sized = SetFilePointerEx(file, length, nullptr, FILE_BEGIN) && SetEndOfFile(file);
+        CloseHandle(file);
+        Check(sized, "size truth fixture length");
+    };
+    write(root / L"a.bin", 3001);
+    write(root / L"b.bin", 70003);
+    write(root / L"gone.bin", 4096);
+    write(root / L"small" / L"one.bin", 10);
+    write(root / L"large" / L"two.bin", 900000);
+    ComPtr<IShellItem> item;
+    ComPtr<IShellFolder2> folder;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(root.c_str(), nullptr, IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder))),
+        "size truth Shell folder");
+    UINT sizeColumn = 0;
+    for (;; ++sizeColumn) {
+        PROPERTYKEY key{};
+        Check(sizeColumn < kMaxShellColumns &&
+            SUCCEEDED(folder->MapColumnToSCID(sizeColumn, &key)), "size truth Size column");
+        if (SameKey(key, PKEY_Size)) break;
+    }
+    // Independent expectations come from the folder's own parsed children.
+    const auto native = [&](const std::wstring& leaf, std::wstring* text, ULONGLONG* value) {
+        PIDLIST_RELATIVE child = nullptr;
+        auto name = leaf;
+        Check(SUCCEEDED(folder->ParseDisplayName(nullptr, nullptr, name.data(), nullptr, &child, nullptr)),
+            "size truth native child");
+        OwnedPidl owned(child);
+        bool known = false;
+        if (text) {
+            SHELLDETAILS details{}; PWSTR formatted = nullptr;
+            Check(SUCCEEDED(folder->GetDetailsOf(child, sizeColumn, &details)) &&
+                SUCCEEDED(StrRetToStrW(&details.str, child, &formatted)), "size truth native text");
+            *text = formatted ? formatted : L"";
+            CoTaskMemFree(formatted);
+        }
+        if (value) {
+            VARIANT raw{}; SHCOLUMNID column = PKEY_Size;
+            known = SUCCEEDED(folder->GetDetailsEx(child, &column, &raw)) && raw.vt == VT_UI8;
+            if (known) *value = raw.ullVal;
+            VariantClear(&raw);
+        }
+        return known;
+    };
+    {
+        // Witness: Windows does build item IDs without size data.
+        const auto path = (root / L"a.bin").wstring();
+        OwnedPidl simple(SHSimpleIDListFromPath(path.c_str()));
+        ComPtr<IShellFolder2> parent; PCUITEMID_CHILD child = nullptr;
+        VARIANT raw{}; SHCOLUMNID column = PKEY_Size;
+        Check(simple && SUCCEEDED(SHBindToParent(simple.get(), IID_PPV_ARGS(&parent), &child)) &&
+            SUCCEEDED(parent->GetDetailsEx(child, &column, &raw)) && raw.vt == VT_UI8 && raw.ullVal != 3001,
+            "simple Shell IDs carried size data; removable-drive witness lost");
+        VariantClear(&raw);
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        Check(GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data), "size truth attributes");
+        ShellFindFacts facts{.attributes = data.dwFileAttributes, .sizeKnown = true, .size = 3001,
+            .created = data.ftCreationTime, .accessed = data.ftLastAccessTime, .modified = data.ftLastWriteTime};
+        std::wstring expected, text;
+        native(L"a.bin", &expected, nullptr);
+        ShellSizeBinding binding;
+        Check(ReadShellSizeDetail(path, nullptr, text, binding, 1, &facts) && text == expected,
+            "enumerated facts did not produce the Shell's own Size text");
+    }
+    ViewState state;
+    // Shell change notifications reach ordinary windows, not message-only ones.
+    HWND frame = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"size-truth-frame",
+        WS_POPUP | WS_VISIBLE, -32000, -32000, 640, 480, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Check(frame != nullptr, "size truth frame");
+    state.hwnd = CreateWindowExW(0, L"STATIC", L"size-truth", WS_CHILD | WS_VISIBLE, 0, 0, 640, 480,
+        frame, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Check(state.hwnd != nullptr, "size truth window");
+    state.background->hwnd = state.hwnd;
+    state.folderPath = root.wstring(); state.inScope = true; state.rowPx = 34;
+    SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    const auto pump = [&] {
+        MSG message{};
+        // Shell delivery passes through its own window on this thread.
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.hwnd != state.hwnd) { DispatchMessageW(&message); continue; }
+            if (message.message == kMsgShellItemCreated || message.message == kMsgFilesystemChanged ||
+                message.message == kMsgFlushDirectoryChanges)
+                OverlayProc(state.hwnd, message.message, message.wParam, message.lParam);
+        }
+        ReceiveDirectoryResults(state);
+    };
+    WatchDirectory(state); QueueDirectoryRefresh(state);
+    Check(Eventually([&] { pump(); return state.loaded && !state.directoryPending &&
+        state.directoryWatch && state.directoryWatch->registration; }),
+        "size truth names completion");
+    Check(state.total == 5, "size truth row count");
+    // A row without a size record whose item is unreadable shows "--", not 0 bytes.
+    Check(DeleteFileW((root / L"gone.bin").c_str()), "size truth delete");
+    DetailJob job;
+    job.hwnd = state.hwnd; job.token = state.directoryToken; job.columnEpoch = state.columnEpoch;
+    std::vector<std::wstring> expected(size_t(state.total));
+    for (int row = 0; row < state.total; ++row) {
+        const auto& entry = state.entries[size_t(row)];
+        Check(entry.byteSizeKnown, "enumerated row lost its Win32 size record");
+        if (entry.name == L"gone.bin") expected[size_t(row)] = L"--";
+        else native(entry.name, &expected[size_t(row)], nullptr);
+        DetailRequest request;
+        request.index = row; request.path = entry.path; request.folder = entry.folder;
+        // gone.bin stands for a native row with no size record whose item vanished.
+        request.size = entry.byteSize; request.sizeKnown = entry.byteSizeKnown && entry.name != L"gone.bin";
+        request.attributes = entry.attributes; request.modified = entry.lastWrite;
+        request.created = entry.created; request.accessed = entry.accessed;
+        request.missingKeys.push_back(PKEY_Size);
+        job.requests.push_back(std::move(request));
+    }
+    state.background->detailEpoch = state.columnEpoch;
+    {
+        ExclusiveSrwLock lock(state.background->directoryLock);
+        state.background->detailJobs.push_back(std::move(job));
+    }
+    Check(EnsureProviderWorkers(state, TabBackground::Lane::Details), "size truth provider workers");
+    Check(Eventually([&] {
+        ReceiveDirectoryResults(state);
+        for (int row = 0; row < state.total; ++row)
+            if (!HasCachedColumnCell(state.entries[size_t(row)], PKEY_Size) ||
+                state.entries[size_t(row)].size != expected[size_t(row)]) return false;
+        return true;
+    }) || [&] {
+        for (int row = 0; row < state.total; ++row)
+            std::wcout << L"SIZE row=" << state.entries[size_t(row)].name << L" got=[" <<
+                state.entries[size_t(row)].size << L"] expected=[" << expected[size_t(row)] << L"]\n";
+        return false;
+    }(), "Size cells differ from the Shell, or an unread size was shown as a value");
+    // Size sorts order folders by the Shell's folder value, files by Win32.
+    for (const auto placement : {FolderPlacement::ExplorerDefault, FolderPlacement::Mixed}) {
+        auto sorted = state.entries;
+        SortSpec size = DefaultSort(); size.explicitOrder = true; size.kind = SortKind::Size;
+        size.key = PKEY_Size; size.placement = placement;
+        std::map<std::wstring, std::wstring> types;
+        SortDirectoryEntries(sorted, size, types, *state.background, state.directoryToken);
+        ULONGLONG previousFolder = 0, previousFile = 0;
+        for (const auto& entry : sorted) {
+            if (entry.name == L"gone.bin") continue;
+            ULONGLONG value = 0;
+            const bool known = native(entry.name, nullptr, &value);
+            if (entry.folder) {
+                Check(entry.contentSizeKnown == known && (!known || entry.contentSize == value),
+                    "folder sort value differs from the Shell's Size value");
+                Check(value >= previousFolder, "folders not ordered by Shell size");
+                previousFolder = value;
+            } else {
+                Check(value == entry.byteSize && value >= previousFile, "files not ordered by size");
+                previousFile = value;
+            }
+        }
+    }
+    const std::weak_ptr<TabBackground> retired = state.background;
+    Stop(state.background);
+    DestroyWindow(state.hwnd); DestroyWindow(frame);
+    Check(Eventually([&] { return retired.expired(); }), "size truth providers did not drain");
+    folder.Reset(); item.Reset();
+    Check(root.parent_path() == std::filesystem::path(directory), "size truth cleanup boundary");
+    Check(ReleasePrivateFixture(root), "size truth cleanup");
+    std::cout << "PASS: Size never shows unread/size-less values, and sorts folders by Shell size\n";
+}
