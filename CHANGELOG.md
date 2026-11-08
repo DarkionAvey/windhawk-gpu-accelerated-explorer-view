@@ -15,6 +15,7 @@
 - **FIXED** Selection and interaction issues when finishing a rename.
 - **FIXED** View switch tooltip flickering and moving while shown.
 - **FIXED** The drag item count now sits at the pile's top corner, not over a small first item.
+- **FIXED** The drag operation symbol (🚫, 📋, 🔗) is always smoothly antialiased, whatever the text antialiasing option.
 - **FIXED** Spacing that did not scale with display scaling: row and item insets, the gap after names, group headings, highlight corners, and the minimum text and icon sizes.
 
 ## 1.0.4 — Public release

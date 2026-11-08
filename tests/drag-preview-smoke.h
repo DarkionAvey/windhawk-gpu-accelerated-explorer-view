@@ -533,3 +533,54 @@ static void TestDragPileCountBadge() {
     std::cout<<"PASS: the drag count badge sits at the whole pile's top-left (top-right in RTL) at 96/192 DPI, "
         "independent of a small front item\n";
 }
+
+// The operation symbol is an icon, on the pile's transparent canvas: it is
+// antialiased in grayscale whatever the text antialiasing policy (ClearType
+// needs an opaque background; Aliased is for text). Its edges match the same
+// symbol drawn with no text policy at all.
+static void TestDragPileSymbolSmoothing() {
+    if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"drag pile fonts");
+    DragPileFixture::Sheet sheet;
+    const auto old=g_textAntialiasing.load();
+    struct Restore {TextAntialiasing mode; ~Restore() {g_textAntialiasing=mode; ++g_textRenderingRevision;}} restore{old};
+    bool failed=false;
+    for(int dpi:{96,120,144,192}) for(DWORD effect:{DWORD(DROPEFFECT_NONE),DWORD(DROPEFFECT_COPY),DWORD(DROPEFFECT_LINK)}) {
+        DragPreview preview; preview.dpi=dpi; preview.side=96.f*dpi/96.f; preview.effect=effect;
+        preview.background=RGB(24,24,24); preview.foreground=RGB(245,245,245);
+        preview.pixels=DragPileFixture::Solid(64,2,false); // A thin item: the symbol lies on transparent pixels.
+        const auto geometry=LayoutDragPreview(preview);
+        const auto draw=[&](const DragTextStyle* style) {
+            sheet.state.target->SetTarget(sheet.surface.Get());
+            sheet.state.target->SetTransform(D2D1::Matrix3x2F::Identity());
+            sheet.state.target->BeginDraw(); sheet.state.target->Clear(D2D1::ColorF(0,0.f));
+            DrawDragPreview(sheet.state.target.Get(),preview,nullptr,nullptr,style);
+            Check(SUCCEEDED(sheet.state.target->EndDraw()),"drag symbol draw");
+            return IconAlphaFixture::Read(sheet.state,sheet.surface.Get());
+        };
+        // Reference: grayscale antialiasing with DirectWrite's default parameters.
+        SetCompatibleTextRendering(sheet.state.target.Get(),nullptr,D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        const auto reference=draw(nullptr);
+        for(auto mode:{TextAntialiasing::System,TextAntialiasing::Smooth,TextAntialiasing::Aliased}) {
+            g_textAntialiasing=mode; ++g_textRenderingRevision;
+            DragTextStyle style; RefreshTextRenderingForWindow(style,sheet.state.hwnd,true);
+            const auto image=draw(&style);
+            size_t partial=0,referencePartial=0,different=0;
+            const auto& box=geometry.operation;
+            for(UINT y=UINT(std::max(0.f,box.top));y<UINT(box.bottom) && y<image.height;++y)
+                for(UINT x=UINT(std::max(0.f,box.left));x<UINT(box.right) && x<image.width;++x) {
+                    const BYTE* p=image.data.data()+size_t(y)*image.stride+x*4;
+                    const BYTE* r=reference.data.data()+size_t(y)*reference.stride+x*4;
+                    partial+=p[3]>0 && p[3]<255; referencePartial+=r[3]>0 && r[3]<255;
+                    for(int c=0;c<4;++c) different+=std::abs(int(p[c])-int(r[c]))>2;
+                }
+            std::cout<<"PILE SYMBOL dpi="<<dpi<<" effect="<<effect<<" mode="<<int(mode)
+                <<" opaqueAA="<<int(style.opaqueTextAntialiasMode)<<" partial="<<partial<<" reference="<<referencePartial
+                <<" differing="<<different<<std::endl;
+            failed|=referencePartial<20 || different!=0;
+        }
+    }
+    Check(!failed,"the drag operation symbol is not drawn with grayscale antialiasing");
+    std::cout<<"PASS: the drag operation symbol keeps grayscale antialiased edges under System, Smooth and Aliased "
+        "text policies at 96/120/144/192 DPI\n";
+}

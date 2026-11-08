@@ -20017,8 +20017,15 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     const float badge=DragPreviewBadgeSize(preview);
     const auto rect=geometry.operation;
     const bool blocked=!(preview.effect&(DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK));
+    // The operation symbol is an icon on the transparent canvas, not text:
+    // grayscale antialiasing with default parameters (as its ink is measured),
+    // whatever the text policy. Count and caption text take that policy below.
+    ComPtr<IDWriteRenderingParams> textParams; target->GetTextRenderingParams(&textParams);
+    const auto textMode=target->GetTextAntialiasMode();
+    SetCompatibleTextRendering(target,nullptr,D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     DrawCenteredDragLabel(target,brush.Get(),blocked ? L"\U0001F6AB":preview.effect&DROPEFFECT_LINK ? L"\U0001F517":preview.effect&DROPEFFECT_COPY ? L"\U0001F4CB":
         preview.rtl ? L"\u2B05\uFE0F":L"\u27A1\uFE0F",L"Segoe UI Emoji",badge*.82f,rect,preview.foreground,true,glyph);
+    SetCompatibleTextRendering(target,textParams.Get(),textMode);
     if(preview.count>1) {
         const auto count=preview.countLabel.empty() ? FormatDragCount(preview.count,preview.rtl):preview.countLabel;
         const float height=side*.38f*preview.dragBadgeScaling;

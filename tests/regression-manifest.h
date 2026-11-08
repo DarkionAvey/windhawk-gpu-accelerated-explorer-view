@@ -91,6 +91,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("drag-preview", PARALLEL, TestDragPreview(fixture)),
     REGRESSION("drag-pile-thumbnail-corners", PARALLEL, TestDragPileThumbnailCorners()),
     REGRESSION("drag-pile-count-badge", PARALLEL, TestDragPileCountBadge()),
+    REGRESSION("drag-pile-symbol-smoothing", PARALLEL, TestDragPileSymbolSmoothing()),
     REGRESSION("overlay-stack-filter", PARALLEL, TestOverlayStackFilter()),
     REGRESSION("compositor-wait-errors", PARALLEL, TestCompositorWaitErrors()),
     REGRESSION("empty-frame-summary", PARALLEL, TestEmptyFrameSummary()),
