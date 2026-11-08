@@ -12,6 +12,8 @@
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
 - **FIXED** View switch tooltip flickering and moving while shown.
+- **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.
+- **FIXED** Spacing that did not scale with display scaling: row and item insets, the gap after names, group headings, highlight corners, and the minimum text and icon sizes.
 
 ## 1.0.4 — Public release
 - **FIXED** ARM64 compatibility.

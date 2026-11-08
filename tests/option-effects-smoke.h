@@ -354,18 +354,21 @@ inline void PrepareProbe(Canvas& canvas,Settings& settings) {
 inline void CheckFilenameHighlight(Canvas& canvas,const std::wstring& name,const char* where) {
     auto& state=canvas.state;
     const int dpi=ViewDpi(state);
-    const auto h=MeasureHighlight(canvas,canvas.Row(name));
+    const int row=canvas.Row(name);
+    const auto h=MeasureHighlight(canvas,row);
     const float pad=float(Scale96(7,dpi));
-    const float advance=FontProbe(state.textFormat.Get()).Advance(name);
+    // The name as Explorer shows it: Folder Options may hide its extension.
+    const float advance=FontProbe(state.textFormat.Get()).Advance(EntryLabel(state.entries[size_t(row)]));
     const float bearing=.15f*state.fontPx+2.f;
     const int leading=h.ink.left-h.fill.left, trailing=h.fill.right-h.ink.right;
     // An ellipsized name is highlighted to its visible end; the exact width
-    // applies when the whole name fits before the Name column/list end.
-    const auto end=canvas.Span(0.f,ColumnsPresented(state) ? NameColumnEnd(state) : ListEndX(state));
-    const bool fits=state.rtlLayout ? h.ink.right+1-advance>=end.first+2 : h.ink.left+advance<=end.second-2;
+    // applies when the whole name fits the item's text area (the Name cell
+    // less its trailing gap), which the row was laid out with.
+    const auto text=LayoutItem(state,LayoutRowVisual(state,row,1.f)).text;
+    const bool fits=advance<=text.right-text.left+.5f;
     const bool exact=!fits || std::abs(h.fill.Width()-(advance+2*pad))<=2.5f;
     if(h.uncovered || !exact || leading<pad-2 || trailing<pad-2.5f || leading>pad+bearing || trailing>pad+bearing)
-        std::cout<<"FILENAME HIGHLIGHT "<<where<<" name="<<Regression::Narrow(name)<<" fill="<<h.fill.left<<".."<<h.fill.right
+        std::cout<<"FILENAME HIGHLIGHT "<<where<<" name="<<Regression::Narrow(name)<<" shown="<<Regression::Narrow(EntryLabel(state.entries[size_t(row)]))<<" row="<<row<<" formatSize="<<state.textFormat->GetFontSize()<<" scroll="<<state.scrollNow<<" zoomAnimating="<<state.zoomAnimating<<" fill="<<h.fill.left<<".."<<h.fill.right
             <<" ink="<<h.ink.left<<".."<<h.ink.right<<" expected-width="<<advance+2*pad<<" font="<<state.fontPx
             <<" uncovered="<<h.uncovered<<" dpi="<<dpi<<" rtl="<<state.rtlLayout<<std::endl, h.Save("option-filename-highlight");
     Check(!h.uncovered,"filename-only highlight left part of the filename uncovered");
@@ -400,7 +403,8 @@ inline void CheckFont(Canvas& canvas,int expected,const std::wstring& capitals,c
     }
     Check(capMatches,"rendered capital height does not match the configured text size");
 }
-inline int ListFont(int row96,int percent,int dpi) {return std::max(7,MulDiv(Scale96(row96,dpi),percent,100));}
+// The list text floor is 7 px at 96 DPI, scaled like every view distance.
+inline int ListFont(int row96,int percent,int dpi) {return std::max(Scale96(7,dpi),MulDiv(Scale96(row96,dpi),percent,100));}
 
 // Row pitch from two highlighted rows two apart.
 inline void CheckRowPitch(Canvas& canvas,int row96) {
@@ -414,10 +418,11 @@ inline void CheckRowPitch(Canvas& canvas,int row96) {
     canvas.Select({});
     const float expected=float(Scale96(row96,ViewDpi(state)));
     const float pitch=(boxB.top-boxA.top)*.5f;
-    if(std::abs(pitch-expected)>.6f || std::abs(boxA.Height()-(expected-4.f))>1.5f)
+    const float inset=float(Scale96(2,ViewDpi(state))); // Between rows, at the view's DPI.
+    if(std::abs(pitch-expected)>.6f || std::abs(boxA.Height()-(expected-2.f*inset))>1.5f)
         std::cout<<"ROW PITCH row96="<<row96<<" expected="<<expected<<" pitch="<<pitch<<" band="<<boxA.Height()<<std::endl;
     Check(std::abs(pitch-expected)<=.6f,"row pitch does not match the configured row height");
-    Check(std::abs(boxA.Height()-(expected-4.f))<=1.5f,"row highlight height does not match the configured row height");
+    Check(std::abs(boxA.Height()-(expected-2.f*inset))<=1.5f,"row highlight height does not match the configured row height");
 }
 
 inline std::vector<std::wstring> ListNames() {
@@ -588,6 +593,84 @@ static void TestZoomInputs(const std::wstring& fixture) {
     }
     std::cout<<"PASS: Ctrl+wheel and touchpad pinch change row height within limits, keep text ratio and exact filename "
         "highlights, scale grid icons proportionally, and a settings change restores option values\n";
+}
+
+// Every DPI-dependent distance of the view's item layout scales with its DPI.
+// The same view at 96 and 384 DPI (4x), with option values that divide evenly
+// (32 px rows, 50% text), shows an unscaled pixel constant as an error of
+// three times its size. Explorer's own columns and the fixture window do not
+// follow the substituted DPI, so distances are taken from the view's own
+// anchors (row, cell, Name column start/end), never absolute positions.
+static void TestDpiScaledGeometry(const std::wstring& fixture) {
+    const auto names=ListNames();
+    const auto folder=std::filesystem::path(fixture)/L"dpi-geometry";
+    MakeFiles(folder,names);
+    struct Mode {UINT mode; int size; const char* name;};
+    using Snapshot=std::vector<std::pair<std::string,float>>;
+    const auto measure=[&](int dpi,const Mode& m) {
+        Settings settings;
+        Canvas canvas(folder,int(names.size()),dpi,false);
+        auto& state=canvas.state;
+        canvas.Apply(settings,L"Appearance.rowHeight",L"32");
+        canvas.Apply(settings,L"Appearance.fontSizePercent",L"50");
+        canvas.Apply(settings,L"Appearance.gridFontSizePercent",L"50");
+        canvas.Layout(m.mode,m.size);
+        Snapshot s;
+        const auto add=[&](std::string what,float value) {s.push_back({std::move(what),value});};
+        // Icon views take their image size (and so row and caption position)
+        // from Explorer's own icon size, which the fixture's native view
+        // reports at the process DPI, like its column widths.
+        const bool nativeImage=state.gridView && state.cachedNativeMode!=FVM_SMALLICON;
+        if(!nativeImage) {add("row",state.rowPx); add("icon",IconPixelSize(state));}
+        add("font",state.fontPx);
+        add("group heading",GroupHeadingHeight(state)); add("Name trailing gap",NameTrailingGap(state));
+        add("edge margin",EdgeMarginPx(state));
+        for(int row:{0,1}) {
+            const std::string at=" [row "+std::to_string(row)+"]";
+            const auto visual=LayoutRowVisual(state,row,1.f);
+            const auto g=LayoutItem(state,visual);
+            const float height=visual.height>0.f ? visual.height : state.rowPx;
+            add("cell top inset"+at,g.cell.top-visual.top);
+            add("cell bottom inset"+at,visual.top+height-g.cell.bottom);
+            if(!nativeImage) {
+                add("icon width"+at,g.icon.right-g.icon.left); add("icon height"+at,g.icon.bottom-g.icon.top);
+                add("icon top"+at,g.icon.top-visual.top); add("text top"+at,g.text.top-visual.top);
+            }
+            add("text height"+at,g.text.bottom-g.text.top);
+            if(state.gridView) {
+                add("cell leading inset"+at,g.cell.left-(ListStartX(state)+visual.left));
+                continue;
+            }
+            const float column=ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
+            add("icon from Name start"+at,g.icon.left-column); add("text from Name start"+at,g.text.left-column);
+            add("text end before Name end"+at,NameContentEnd(state)-g.text.right);
+            const auto band=RowHighlightRect(state,visual.top,height);
+            add("row highlight top inset"+at,band.top-visual.top);
+            add("row highlight bottom inset"+at,visual.top+height-band.bottom);
+            const auto hover=PointerHoverRect(state,row);
+            add("hover height"+at,hover.bottom-hover.top); add("hover before text"+at,g.text.left-hover.left);
+            const RECT rename=RenameEditorRect(state,row,false);
+            add("rename top"+at,float(rename.top)-g.text.top); add("rename height"+at,float(rename.bottom-rename.top));
+            add("rename from text"+at,float(rename.left)-g.text.left);
+        }
+        return s;
+    };
+    bool failed=false;
+    for(const Mode& m : {Mode{FVM_DETAILS,16,"details"},Mode{FVM_LIST,16,"list"},
+            Mode{FVM_SMALLICON,16,"small icons"},Mode{FVM_ICON,48,"medium icons"}}) {
+        const auto base=measure(96,m), scaled=measure(384,m);
+        Check(base.size()==scaled.size(),"DPI geometry snapshots differ in shape");
+        for(size_t i=0;i<base.size();++i) {
+            const float expected=4.f*base[i].second, actual=scaled[i].second;
+            if(std::abs(actual-expected)<=1.f) continue;
+            failed=true;
+            std::cout<<"UNSCALED "<<m.name<<" "<<base[i].first<<": 96 DPI="<<base[i].second
+                <<" 384 DPI="<<actual<<" expected="<<expected<<std::endl;
+        }
+    }
+    Check(!failed,"a layout distance does not scale with the view's DPI");
+    std::cout<<"PASS: row, text, icon, cell, highlight, hover, Name gap and rename geometry scale exactly with DPI "
+        "(96 vs 384) in details, list, small and medium icons\n";
 }
 
 static void TestAppearance(const std::wstring& fixture) {

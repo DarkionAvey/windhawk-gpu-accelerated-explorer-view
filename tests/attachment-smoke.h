@@ -489,9 +489,104 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         wchar_t tooltip[128]{}; TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
         tool.hwnd=frame; tool.uId=reinterpret_cast<UINT_PTR>(switchButton); tool.lpszText=tooltip;
         SendMessageW(switchTooltip,TTM_GETTEXTW,ARRAYSIZE(tooltip),reinterpret_cast<LPARAM>(&tool));
-        Check(IsWindow(switchTooltip) && wcscmp(tooltip,L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)")==0 &&
+        Check(IsWindow(switchTooltip) && wcscmp(tooltip,L"Switch to native Explorer view.  (Ctrl+Alt+F9)")==0 &&
             SendMessageW(switchTooltip,TTM_GETMAXTIPWIDTH,0,0)>0,
-            "icon switch tooltip lost its multiline action and shortcut");
+            "icon switch tooltip lost its action and shortcut");
+        // Explorer's own tooltip on the frame gives the switch's tooltip its
+        // theme, font, wrapping width, delays and margins; hovering paints
+        // Explorer's status-bar button part over the bar's fill.
+        {
+            const HWND stock=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+                0,0,0,0,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+            // As Explorer themes its chrome: its "Explorer" sub-app, opted into dark
+            // mode, in a process whose apps may use dark mode.
+            using AppMode=int(WINAPI*)(int);
+            if(const auto preferred=reinterpret_cast<AppMode>(GetProcAddress(GetModuleHandleW(L"uxtheme.dll"),MAKEINTRESOURCEA(135))))
+                preferred(1);
+            OptIntoDarkMode(stock,true);
+            Check(stock && SUCCEEDED(SetWindowTheme(stock,L"Explorer",nullptr)),"stock tooltip fixture");
+            if(const HWND statusHost=state->viewToggleGeometry.providerHost) { // As the status bar's tooltip.
+                TOOLINFOW served{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
+                served.hwnd=statusHost; served.uId=1; served.lpszText=LPSTR_TEXTCALLBACKW;
+                GetClientRect(statusHost,&served.rect);
+                Check(SendMessageW(stock,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&served)),"stock tooltip tool");
+            }
+            LOGFONTW face{}; face.lfHeight=-23; wcscpy_s(face.lfFaceName,L"Segoe UI");
+            const HFONT stockFont=CreateFontIndirectW(&face);
+            SendMessageW(stock,WM_SETFONT,reinterpret_cast<WPARAM>(stockFont),FALSE);
+            SendMessageW(stock,TTM_SETMAXTIPWIDTH,0,437);
+            SendMessageW(stock,TTM_SETDELAYTIME,TTDT_INITIAL,MAKELPARAM(733,0));
+            SendMessageW(stock,TTM_SETDELAYTIME,TTDT_AUTOPOP,MAKELPARAM(9100,0));
+            SendMessageW(stock,TTM_SETDELAYTIME,TTDT_RESHOW,MAKELPARAM(131,0));
+            RECT stockMargin{2,3,4,5}; SendMessageW(stock,TTM_SETMARGIN,0,reinterpret_cast<LPARAM>(&stockMargin));
+            state->viewTogglePaletteDirty=true; // The app mode changed above.
+            RefreshViewToggleForFrame(frame);
+            // SetWindowTheme records the sub-app as this property atom.
+            wchar_t subApp[64]{};
+            if(const auto atom=static_cast<ATOM>(reinterpret_cast<UINT_PTR>(GetPropW(switchTooltip,MAKEINTATOM(43281)))))
+                GetAtomNameW(atom,subApp,ARRAYSIZE(subApp));
+            LOGFONTW copied{}; RECT margin{};
+            SendMessageW(switchTooltip,TTM_GETMARGIN,0,reinterpret_cast<LPARAM>(&margin));
+            const auto tipFont=reinterpret_cast<HFONT>(SendMessageW(switchTooltip,WM_GETFONT,0,0));
+            const bool sameFont=tipFont && GetObjectW(tipFont,sizeof(copied),&copied) &&
+                copied.lfHeight==-23 && !wcscmp(copied.lfFaceName,L"Segoe UI");
+            std::wcout<<L"SWITCH tip theme='"<<subApp<<L"' font="<<sameFont<<L" width="<<SendMessageW(switchTooltip,TTM_GETMAXTIPWIDTH,0,0)
+                <<L" delays="<<SendMessageW(switchTooltip,TTM_GETDELAYTIME,TTDT_INITIAL,0)<<L","
+                <<SendMessageW(switchTooltip,TTM_GETDELAYTIME,TTDT_AUTOPOP,0)<<L","<<SendMessageW(switchTooltip,TTM_GETDELAYTIME,TTDT_RESHOW,0)
+                <<L" margin="<<margin.left<<L","<<margin.top<<L","<<margin.right<<L","<<margin.bottom<<std::endl;
+            // AllowDarkModeForWindow records its state as this property atom.
+            const auto optedIn=[](HWND hwnd) {
+                wchar_t value[16]{};
+                if(const auto atom=static_cast<ATOM>(reinterpret_cast<UINT_PTR>(GetPropW(hwnd,MAKEINTATOM(43294)))))
+                    GetAtomNameW(atom,value,ARRAYSIZE(value));
+                return !wcscmp(value,L"Enabled");
+            };
+            Check(optedIn(switchTooltip) && optedIn(switchButton),"the switch and its tooltip did not opt into dark mode as Explorer's tooltip");
+            Check(!wcscmp(subApp,L"Explorer") && sameFont && SendMessageW(switchTooltip,TTM_GETMAXTIPWIDTH,0,0)==437 &&
+                SendMessageW(switchTooltip,TTM_GETDELAYTIME,TTDT_INITIAL,0)==733 &&
+                SendMessageW(switchTooltip,TTM_GETDELAYTIME,TTDT_AUTOPOP,0)==9100 &&
+                SendMessageW(switchTooltip,TTM_GETDELAYTIME,TTDT_RESHOW,0)==131 && EqualRect(&margin,&stockMargin),
+                "the switch tooltip did not take Explorer's tooltip parameters");
+            // Independently, through a window opted in the same way: Windows
+            // picks the light or dark classes for the system's app mode.
+            const HWND reference=CreateWindowExW(0,L"STATIC",L"",WS_POPUP,0,0,1,1,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+            OptIntoDarkMode(reference,true);
+            const HTHEME buttons=OpenThemeData(reference,L"Explorer::CommandModule");
+            Check(buttons!=nullptr,"Explorer status button theme");
+            COLORREF barFill=CLR_INVALID;
+            if(const HTHEME bar=OpenThemeData(reference,L"ExplorerStatusBar")) {
+                if(FAILED(GetThemeColor(bar,0,0,TMT_FILLCOLOR,&barFill))) barFill=CLR_INVALID;
+                CloseThemeData(bar);
+            }
+            std::wcout<<L"SWITCH bar fill="<<std::hex<<barFill<<L" switch="<<state->viewToggleBackground<<std::dec<<std::endl;
+            Check(barFill==CLR_INVALID || state->viewToggleBackground==barFill,"the switch does not sit on the status bar's own fill");
+            DestroyWindow(reference);
+            state->viewToggleHot=true;
+            const auto hovered=draw(0);
+            state->viewToggleHot=false;
+            // Independently: the bar's fill, then the theme's hot button part.
+            BITMAPINFO expectInfo{}; expectInfo.bmiHeader={sizeof(BITMAPINFOHEADER),width,-height,1,32,BI_RGB};
+            void* expectBits=nullptr;
+            const HDC expectDc=CreateCompatibleDC(nullptr);
+            const HBITMAP expectBitmap=CreateDIBSection(expectDc,&expectInfo,DIB_RGB_COLORS,&expectBits,nullptr,0);
+            const HGDIOBJ expectPrevious=SelectObject(expectDc,expectBitmap);
+            RECT all{0,0,width,height};
+            const HBRUSH fill=CreateSolidBrush(state->viewToggleBackground);
+            FillRect(expectDc,&all,fill); DeleteObject(fill);
+            DrawThemeBackground(buttons,expectDc,4,4,&all,nullptr);
+            GdiFlush();
+            const auto* expected=static_cast<const DWORD*>(expectBits);
+            int edgeDifferences=0;
+            for(int x=0;x<width;++x) for(int y : {0,height-1})
+                edgeDifferences+=(hovered[y*width+x]&0xFFFFFF)!=(expected[y*width+x]&0xFFFFFF);
+            for(int y=0;y<height;++y) for(int x : {0,width-1})
+                edgeDifferences+=(hovered[y*width+x]&0xFFFFFF)!=(expected[y*width+x]&0xFFFFFF);
+            SelectObject(expectDc,expectPrevious); DeleteObject(expectBitmap); DeleteDC(expectDc);
+            CloseThemeData(buttons);
+            Check(edgeDifferences==0,"the hovered switch is not Explorer's status-bar button part");
+            DestroyWindow(stock); DeleteObject(stockFont);
+            RefreshViewToggleForFrame(frame);
+        }
         SelectObject(dc,previous); DeleteObject(bitmap); DeleteDC(dc);
     }
     // Exercise the real button notification route without BM_CLICK, which
@@ -505,7 +600,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         wchar_t tooltip[128]{}; TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
         tool.hwnd=frame; tool.uId=reinterpret_cast<UINT_PTR>(switchButton); tool.lpszText=tooltip;
         SendMessageW(switchTooltip,TTM_GETTEXTW,ARRAYSIZE(tooltip),reinterpret_cast<LPARAM>(&tool));
-        Check(wcscmp(tooltip,L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)")==0,
+        Check(wcscmp(tooltip,L"Switch to GPU overlay view.  (Ctrl+Alt+F9)")==0,
             "native mode tooltip lost its reverse action and shortcut");
     }
     SendMessageW(frame,WM_COMMAND,MAKEWPARAM(0,BN_CLICKED),reinterpret_cast<LPARAM>(switchButton));

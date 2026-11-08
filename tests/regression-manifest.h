@@ -79,6 +79,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("option-effects-list", PARALLEL, OptionEffects::TestListLayouts(fixture)),
     REGRESSION("option-effects-grid", PARALLEL, OptionEffects::TestGridLayouts(fixture)),
     REGRESSION("option-effects-zoom", PARALLEL, OptionEffects::TestZoomInputs(fixture)),
+    REGRESSION("dpi-scaled-geometry", PARALLEL, OptionEffects::TestDpiScaledGeometry(fixture)),
     REGRESSION("option-effects-appearance", PARALLEL, OptionEffects::TestAppearance(fixture)),
     REGRESSION("option-live-sweep-details", PARALLEL,
         OptionEffects::TestLiveSweep(fixture,{{FVM_DETAILS,16}},L"details",true)),

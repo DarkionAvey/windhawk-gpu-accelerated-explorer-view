@@ -3171,6 +3171,12 @@ struct ViewState {
     bool viewToggleHot = false, viewTogglePaletteDirty = true;
     COLORREF viewToggleBackground = CLR_INVALID, viewToggleForeground = CLR_INVALID;
     std::wstring viewToggleHint; // Last text given to the tooltip.
+    // Explorer's status-bar button theme (CommandModule) and the tooltip font
+    // copied from Explorer's own tooltip; the stock tooltip they were read from.
+    HTHEME viewToggleTheme = nullptr;
+    HFONT viewToggleTipFont = nullptr;
+    HWND viewToggleTipSource = nullptr;
+    bool viewToggleStyled = false;
     void ReleaseViewToggle() {
         for (HWND child : {viewToggleTooltip, viewToggle}) {
             if (IsWindow(child) && GetPropW(child, kViewToggleOwnerProperty) == hwnd) {
@@ -3194,6 +3200,10 @@ struct ViewState {
         viewToggleHot = false;
         viewTogglePaletteDirty = true;
         viewToggleHint.clear();
+        if (viewToggleTheme) CloseThemeData(viewToggleTheme);
+        if (viewToggleTipFont) DeleteObject(viewToggleTipFont);
+        viewToggleTheme = nullptr; viewToggleTipFont = nullptr;
+        viewToggleTipSource = nullptr; viewToggleStyled = false;
     }
     ViewState() {background->notificationLifetime=lifetimeToken;}
     ~ViewState() {
@@ -4525,7 +4535,8 @@ bool UsesThumbnails(const ViewState& state, const Entry& entry) {
     return !entry.folder && FileThumbnails(state);
 }
 float GroupHeadingHeight(const ViewState& state) {
-    return state.gridView ? std::max(24.f, state.fontPx * 1.5f + 8.f) : state.rowPx;
+    const int dpi = ViewDpi(state);
+    return state.gridView ? std::max(float(Scale96(24, dpi)), state.fontPx * 1.5f + Scale96(8, dpi)) : state.rowPx;
 }
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
@@ -4553,7 +4564,8 @@ void LayoutGroupSections(ViewState& state) {
         auto extent = [&](int columns) {
             const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
             const float row = state.zoomAnimating ? state.zoomToRowPx : state.rowPx;
-            const float heading = state.zoomAnimating ? std::max(24.f, font*1.5f+8.f) :
+            const float heading = state.zoomAnimating ?
+                std::max(float(Scale96(24, ViewDpi(state))), font*1.5f+Scale96(8, ViewDpi(state))) :
                 GroupHeadingHeight(state);
             if (state.sections.empty()) return lines(state.total) * row;
             float height = 0.f;
@@ -6622,7 +6634,60 @@ bool DarkerThan(COLORREF a, COLORREF b) {
 COLORREF RaisedSurface(COLORREF background, COLORREF foreground) {
     return BlendColor(background, foreground, DarkerThan(background, foreground) ? 12 : 4);
 }
+
+// Explorer's status bar (shell32's StatusBarModule UI file) paints its view
+// buttons with Explorer::CommandModule part 4 over ExplorerStatusBar's fill
+// and text colors. Explorer's chrome windows, its tooltips included, opt into
+// dark mode (uxtheme's AllowDarkModeForWindow); Windows then opens each class's
+// dark variant whenever apps use dark mode. Explorer's tooltips carry the theme
+// Explorer gave them: SetWindowTheme records its sub-app and sub-ID list, and
+// the opt-in its state, as these property atoms.
+constexpr ATOM kThemeSubAppProperty = 43281, kThemeSubIdListProperty = 43280, kDarkModeOptInProperty = 43294;
+constexpr wchar_t kStatusButtonTheme[] = L"Explorer::CommandModule", kStatusBarTheme[] = L"ExplorerStatusBar";
+constexpr int kCommandModuleButton = 4; // Its states: 1 normal, 2 pressed, 4 hot.
+std::wstring WindowThemeName(HWND hwnd, ATOM property) {
+    const auto atom = static_cast<ATOM>(reinterpret_cast<UINT_PTR>(GetPropW(hwnd, MAKEINTATOM(property))));
+    wchar_t name[256]{};
+    if (!atom || !GetAtomNameW(atom, name, ARRAYSIZE(name)) || !wcscmp(name, L"$")) return {}; // "$": none given.
+    return name;
+}
+// A tooltip of Explorer's own (not this mod's) on the frame, themed by
+// Explorer: the one serving `host` (the status bar's DirectUI window) when
+// there is one, as Explorer's tooltips differ in width and delays.
+HWND StockFrameTooltip(HWND frame, HWND host = nullptr) {
+    struct Search { HWND frame, host, found, served; } search{frame, host, nullptr, nullptr};
+    if (!IsWindow(frame)) return nullptr;
+    EnumThreadWindows(GetWindowThreadProcessId(frame, nullptr), [](HWND hwnd, LPARAM context) -> BOOL {
+        auto& s = *reinterpret_cast<Search*>(context);
+        wchar_t cls[32]{};
+        if (GetWindow(hwnd, GW_OWNER) != s.frame || GetPropW(hwnd, kViewToggleOwnerProperty) ||
+            !GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || _wcsicmp(cls, TOOLTIPS_CLASSW) ||
+            !GetPropW(hwnd, MAKEINTATOM(kThemeSubAppProperty))) return TRUE;
+        if (!s.found) s.found = hwnd;
+        TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
+        if (s.host && SendMessageW(hwnd, TTM_ENUMTOOLSW, 0, reinterpret_cast<LPARAM>(&tool)) && tool.hwnd == s.host) {
+            s.served = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.served ? search.served : search.found;
+}
+// Whether Explorer opted this window into dark mode ("Enabled" when it did).
+bool DarkModeOptedIn(HWND hwnd) {
+    return WindowThemeName(hwnd, kDarkModeOptInProperty) == L"Enabled";
+}
+// uxtheme exports AllowDarkModeForWindow only by ordinal (133).
+void OptIntoDarkMode(HWND hwnd, bool allow) {
+    using Allow = bool(WINAPI*)(HWND, bool);
+    static const auto allowDark = [] {
+        const HMODULE theme = GetModuleHandleW(L"uxtheme.dll");
+        return theme ? reinterpret_cast<Allow>(GetProcAddress(theme, MAKEINTRESOURCEA(133))) : nullptr;
+    }();
+    if (allowDark && IsWindow(hwnd)) allowDark(hwnd, allow);
+}
 void RefreshItemTipPalette(ViewState& state, bool highContrast);
+void RefreshViewTogglePalette(ViewState& state);
 
 bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     // Resolve WinRT only at attachment/theme/settings changes. Maintenance
@@ -6701,32 +6766,46 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
         ReadableForeground(state.nativeEditBackground, {text, state.nativeAppForeground, systemText});
     RefreshRenamePalette(state);
     RefreshItemTipPalette(state, highContrast);
-    if (state.viewTogglePaletteDirty) {
-        state.viewTogglePaletteDirty = false;
-        COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
-        if (!highContrast) {
-            // Classic BUTTON/Explorer themes can remain light in dark-mode
-            // Explorer. Read Windows' app palette once on creation/theme change,
-            // never from paint, input or the periodic maintenance path.
-            // Explorer's light status bar is the page surface itself; only
-            // the dark page black is lifted to Explorer's raised dark surface.
-            if (ValidRgb(state.nativeAppBackground)) {
-                background = state.nativeAppBackground;
-                foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
-                if (DarkerThan(background, foreground)) background = RaisedSurface(background, foreground);
-            }
+    if (state.viewTogglePaletteDirty && IsWindow(state.viewToggle)) RefreshViewTogglePalette(state);
+    return changed;
+}
+
+// The switch's surface: the status bar's own fill and text, as its UI file
+// reads them. Resolved on the switch's creation and theme changes, never from
+// paint, input or the periodic maintenance path, and only where a tab shows one.
+void RefreshViewTogglePalette(ViewState& state) {
+    state.viewTogglePaletteDirty = false;
+    state.viewToggleStyled = false; // Theme classes follow the same change.
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    COLORREF background = GetSysColor(COLOR_BTNFACE), foreground = GetSysColor(COLOR_BTNTEXT);
+    if (!highContrast) {
+        // Read through the switch, opted into dark mode as Explorer's chrome is.
+        COLORREF fill = CLR_INVALID, ink = CLR_INVALID;
+        if (HTHEME bar = OpenThemeData(state.viewToggle, kStatusBarTheme)) {
+            if (FAILED(GetThemeColor(bar, 0, 0, TMT_FILLCOLOR, &fill))) fill = CLR_INVALID;
+            if (FAILED(GetThemeColor(bar, 0, 0, TMT_TEXTCOLOR, &ink))) ink = CLR_INVALID;
+            CloseThemeData(bar);
         }
-        if (!ValidRgb(background)) background = RGB(255,255,255);
-        if (!highContrast || !ValidRgb(foreground))
-            foreground = ReadableForeground(background, {foreground, text});
-        if (background != state.viewToggleBackground || foreground != state.viewToggleForeground) {
-            state.viewToggleBackground = background;
-            state.viewToggleForeground = foreground;
-            if (IsWindow(state.viewToggle)) InvalidateRect(state.viewToggle, nullptr, FALSE);
-            if (state.viewToggleIcons[0]) RefreshViewToggleForFrame(state.frameHwnd, true);
+        if (ValidRgb(fill)) {
+            background = fill;
+            foreground = ReadableForeground(background, {ink, state.nativeAppForeground, foreground});
+        } else if (ValidRgb(state.nativeAppBackground)) {
+            background = state.nativeAppBackground;
+            foreground = ReadableForeground(background, {state.nativeAppForeground, foreground});
+            if (DarkerThan(background, foreground)) background = RaisedSurface(background, foreground);
         }
     }
-    return changed;
+    if (!ValidRgb(background)) background = RGB(255,255,255);
+    if (!highContrast || !ValidRgb(foreground))
+        foreground = ReadableForeground(background, {foreground, state.nativeTextColor});
+    if (background != state.viewToggleBackground || foreground != state.viewToggleForeground) {
+        state.viewToggleBackground = background;
+        state.viewToggleForeground = foreground;
+        if (IsWindow(state.viewToggle)) InvalidateRect(state.viewToggle, nullptr, FALSE);
+        if (state.viewToggleIcons[0]) RefreshViewToggleForFrame(state.frameHwnd, true);
+    }
 }
 
 // Classify borrowed WM_SETTINGCHANGE strings while the message is in scope;
@@ -12748,14 +12827,14 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     const float baseRow = direct ? static_cast<float>((state.gridView ? std::min(size96, 96.) : size96) * dpi / 96.) :
         static_cast<float>(Scale96(state.gridView ? std::min(height96, 96) : height96, dpi));
     const int fontPercent = state.gridView ? g_gridFontPercent.load() : g_fontPercent.load();
-    const float font = direct ? std::max(7.f, baseRow * fontPercent / 100.f) :
-        static_cast<float>(std::max(7, MulDiv(static_cast<int>(baseRow), fontPercent, 100)));
+    const float font = direct ? std::max(float(Scale96(7, dpi)), baseRow * fontPercent / 100.f) :
+        static_cast<float>(std::max(Scale96(7, dpi), MulDiv(static_cast<int>(baseRow), fontPercent, 100)));
     // Display size is independent of the bounded Shell image request tiers.
     // Keep this arithmetic floating point: MulDiv/int casts would overflow
     // well before the tab's zoom preference reaches its storage limit.
     const double iconSize = state.nativeIconSize * (direct ? size96 * dpi / 96. : std::round(size96 * dpi / 96.)) /
         std::max(1, Scale96(g_row96.load(), dpi));
-    const float icon = state.gridView ? std::max(16.f, static_cast<float>(direct ? iconSize : std::round(iconSize))) :
+    const float icon = state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
         static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), baseRow - Scale96(6, dpi)));
     const float row = !state.gridView ? static_cast<float>(baseRow) :
@@ -12867,6 +12946,8 @@ float SelectionCheckboxBorder(float side) {
 float SelectionCheckboxSpace(const ViewState& state) {
     return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
 }
+// The Name text ends this far before its cell (and the list) ends.
+float NameTrailingGap(const ViewState& state) { return static_cast<float>(Scale96(8, ViewDpi(state))); }
 float NameTextOrigin(const ViewState& state, bool header = false) {
     const int dpi = ViewDpi(state);
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
@@ -12884,11 +12965,12 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     const float side = IconPixelSize(state);
     const float start = ListStartX(state), end = ListEndX(state);
     ItemGeometry g;
-    g.cell = D2D1::RectF(start, visual.top + 2.f, end, visual.top + visual.height - 2.f);
+    const float inset = static_cast<float>(Scale96(2, dpi)); // Between rows and grid items.
+    g.cell = D2D1::RectF(start, visual.top + inset, end, visual.top + visual.height - inset);
     if (state.gridView) {
         const float pad = static_cast<float>(Scale96(6, dpi));
-        g.cell.left = start + visual.left + 2.f;
-        g.cell.right = start + visual.left + (visual.width > 0.f ? visual.width : state.itemWidth) - 2.f;
+        g.cell.left = start + visual.left + inset;
+        g.cell.right = start + visual.left + (visual.width > 0.f ? visual.width : state.itemWidth) - inset;
         const bool tiles = DriveTiles(state);
         const bool compact = tiles || state.cachedNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
@@ -12920,7 +13002,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
-            NameContentEnd(state)-8.f,
+            NameContentEnd(state)-NameTrailingGap(state),
             visual.top+state.rowPx);
     }
     if (state.clickPolicy.checkSelect) {
@@ -14590,7 +14672,7 @@ D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
     const bool name = ClassifySort(column.key) == SortKind::Name;
     const float padding = static_cast<float>(Scale96(kColumnTextPadding96, dpi));
     const float trailing = header ? (sorted ? Scale96(kColumnFitSortInset96, dpi) : padding) :
-        (name ? 8.f : 6.f);
+        (name ? NameTrailingGap(state) : float(Scale96(6, dpi)));
     const float leading = name ? NameTextOrigin(state, header) - NameColumnStart(state) : padding;
     const float headerOffset = header ? ColumnHeaderOffset(state,dpi) : 0.f;
     return D2D1::RectF(from + leading,
@@ -14674,9 +14756,9 @@ bool HasPendingVisibleColumnDetails(ViewState& state) {
 void FitColumnsToVisibleRows(ViewState& state) {
     if (state.columns.empty()) return;
     const int dpi = ViewDpi(state);
-    const float inset = static_cast<float>(Scale96(kColumnTextPadding96, dpi)) + 6.f;
+    const float inset = static_cast<float>(Scale96(kColumnTextPadding96 + 6, dpi));
     const float nameInset = static_cast<float>(Scale96(kColumnFitNameInset96, dpi) +
-        IconPixelSize(state)) + 8.f;
+        IconPixelSize(state)) + NameTrailingGap(state);
     const float arrowInset = static_cast<float>(Scale96(kColumnFitSortInset96, dpi));
     // CM_COLUMNINFO exposes default/ideal widths, not a readability minimum.
     // Reserve ten body-character advances (twelve for Name), using the same
@@ -14851,7 +14933,7 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
             float room = content.right - content.left - tolerance;
             if (name && state.thisPcGpu &&
                 (entry.driveTotal || entry.driveUsedPercent >= 0)) {
-                const float labelRoom=InlineDriveLabelWidth(content.right-content.left+8.f,driveLabel,dpi);
+                const float labelRoom=InlineDriveLabelWidth(content.right-content.left+NameTrailingGap(state),driveLabel,dpi);
                 // A hidden optional track does not make a full label clipped.
                 if (labelRoom>0.f) room=std::min(room,labelRoom);
             }
@@ -16744,7 +16826,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                     bounds.left=std::max(bounds.left,clip.left); bounds.right=std::min(bounds.right,clip.right);
                     bounds.top=std::max(bounds.top,clip.top); bounds.bottom=std::min(bounds.bottom,clip.bottom);
                     if(bounds.right<=bounds.left || bounds.bottom<=bounds.top) continue;
-                    const auto rc = D2D1::RoundedRect(bounds, 2.f, 2.f);
+                    const float radius = static_cast<float>(Scale96(2, ViewDpi(state)));
+                    const auto rc = D2D1::RoundedRect(bounds, radius, radius);
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
@@ -18002,8 +18085,9 @@ float SelectionRadius(ViewState& state, float width, float height) {
 // The scrollbar is reserved in both modes. Text/icons remain inside the
 // inset list viewport regardless of the corner-radius setting.
 D2D1_RECT_F RowHighlightRect(ViewState& state, float top, float rowHeight) {
-    return D2D1::RectF(RowBackgroundStartX(state), top + 2.f,
-                       RowBackgroundEndX(state), top + rowHeight - 2.f);
+    const float inset = static_cast<float>(Scale96(2, ViewDpi(state)));
+    return D2D1::RectF(RowBackgroundStartX(state), top + inset,
+                       RowBackgroundEndX(state), top + rowHeight - inset);
 }
 
 void DrawZebraBand(ViewState& state, float top,
@@ -18209,7 +18293,7 @@ D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = tr
     const float listRight = ListEndX(state);
     const float left = static_cast<float>(NameTextOrigin(state));
     const float nameEnd = ColumnsPresented(state) ? NameColumnEnd(state) : listRight;
-    const float right = std::min(nameEnd - 8.f, listRight - 8.f);
+    const float right = std::min(nameEnd, listRight) - NameTrailingGap(state);
     D2D1_RECT_F rc = SelectionRect(state, index,
         state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
         DisplayRowHeight(state, index), left, right, listRight, -1.f, 0.f, shape, nullptr, filenameText);
@@ -18318,7 +18402,7 @@ D2D1_RECT_F PointerHoverRect(ViewState& state, int index) {
     const float nameEnd = ColumnsPresented(state) ? NameColumnEnd(state) : listEnd;
     return SelectionRect(state, index, 0.f, static_cast<float>(state.rowPx),
         static_cast<float>(NameTextOrigin(state)),
-        std::min(nameEnd - 8.f, listEnd - 8.f), listEnd);
+        std::min(nameEnd, listEnd) - NameTrailingGap(state), listEnd);
 }
 
 HoverVisual PointerHoverVisual(ViewState& state, int index, int section) {
@@ -18443,8 +18527,9 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
         for (int index : visibleItems) {
             const float selected = strength(index);
             if (selected <= 0.f) continue;
-            const float left = ListStartX(state) + DocumentRowLeft(state, index) + 2.f;
-            selectedWeight += selected * overlap(left, left+state.itemWidth-4.f,
+            const float inset = static_cast<float>(Scale96(2, ViewDpi(state)));
+            const float left = ListStartX(state) + DocumentRowLeft(state, index) + inset;
+            selectedWeight += selected * overlap(left, left+state.itemWidth-2.f*inset,
                 DocumentRowTop(state, index));
         }
         if (state.keyboardSelectionAnimating) {
@@ -18508,7 +18593,7 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
         result.visible = result.track.right > result.track.left;
         return result;
     }
-    const float textLeft = item.text.left, columnRight = item.text.right + 8.f;
+    const float textLeft = item.text.left, columnRight = item.text.right + NameTrailingGap(state);
     const float margin = static_cast<float>(Scale96(kDriveBarSideMargin96, dpi));
     const float minimum = static_cast<float>(Scale96(kDriveBarMinimumWidth96, dpi));
     const float labelLimit = InlineDriveLabelWidth(columnRight-textLeft,SharedInlineDriveLabelWidth(state),dpi);
@@ -20809,7 +20894,7 @@ void Paint(ViewState& state) {
         D2D1::RectF(w-rowBgEnd,itemClipTop,w-rowBgStart,contentBottom) :
         D2D1::RectF(rowBgStart,itemClipTop,rowBgEnd,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
     const float nameEnd = details ? NameColumnEnd(state) : lastTextEnd;
-    const float nameRight = (compositionFrame.Widths() ? nameEnd : std::min(nameEnd,listEnd)) - 8.f;
+    const float nameRight = (compositionFrame.Widths() ? nameEnd : std::min(nameEnd,listEnd)) - NameTrailingGap(state);
     const ULONGLONG typeSearchNow = GetTickCount64();
     const bool typeSearchVisible = state.inputFocusIndicators && !state.typeSearch.empty() && state.lastTyped &&
         typeSearchNow - state.lastTyped <= kTypeSearchTimeoutMs;
@@ -21272,11 +21357,14 @@ void Paint(ViewState& state) {
             // logical column geometry mirrored by Fill().
             Fill(state, state.rtlLayout ? w - right : left, top,
                  state.rtlLayout ? w - left : right, bottom,
-                 rgb, opacity, 4.f);
+                 rgb, opacity, float(Scale96(4, ViewDpi(state))));
             state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
             if (right == left || bottom == top)
                 StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
-            else StrokeRoundedRect(state,D2D1::RoundedRect(rc, 4.f, 4.f),state.brush.Get(),1.f);
+            else {
+                const float radius = static_cast<float>(Scale96(4, ViewDpi(state)));
+                StrokeRoundedRect(state,D2D1::RoundedRect(rc, radius, radius),state.brush.Get(),1.f);
+            }
         }
         state.target->PopAxisAlignedClip();
     }
@@ -24132,7 +24220,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
     // Use the whole Name column even when its current origin is offscreen.
     // Measuring against the clipped draw extent could collapse the EDIT to 1px.
     const float textEnd = !state.gridView && ColumnsPresented(state) ?
-        NameColumnEnd(state) - 9.f : geometry.text.right;
+        NameColumnEnd(state) - NameTrailingGap(state) - 1.f : geometry.text.right;
     const RECT viewport = RenameViewport(state, false);
     const float maxWidth = std::max(1.f, std::min(textEnd - nameStart,
         static_cast<float>(viewport.right - viewport.left)));
@@ -24168,7 +24256,7 @@ RECT RenameEditorRect(ViewState& state, int index, bool frameCoordinates = true)
         static_cast<int>(client.right - nameStart - width) : static_cast<int>(nameStart);
     const int y = static_cast<int>(geometry.text.top + Scale96(2, dpi));
     const int height = std::max(1, std::min(static_cast<int>(viewport.bottom - viewport.top),
-        static_cast<int>(std::lround(std::max(20.f,
+        static_cast<int>(std::lround(std::max(float(Scale96(20, dpi)),
             geometry.text.bottom - geometry.text.top - Scale96(4, dpi))))));
     RECT rc{x, y, x + width, y + height};
     // Native EDIT is a sibling of the composited GPU HWND, not its child.
@@ -37758,12 +37846,26 @@ void DrawViewToggle(const ViewState& state, const DRAWITEMSTRUCT& destination) {
     InflateRect(&bounds, -Scale96(1, dpi), -Scale96(1, dpi));
     const int radius = Scale96(4, dpi);
     const bool disabled = !state.inScope || !state.detailsViewActive || (item.itemState & ODS_DISABLED) != 0;
-    if (!disabled && (state.viewToggleHot || (item.itemState & ODS_SELECTED))) {
+    const bool focusShown = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS;
+    if (state.viewToggleTheme) {
+        // As the status bar's own buttons: pressed, else hot or keyboard
+        // focused (with a focus rectangle), else the bar's fill alone.
+        const int part = !disabled && (item.itemState & ODS_SELECTED) ? 2 :
+            (!disabled && state.viewToggleHot) || focusShown ? 4 : 1;
+        if (part != 1)
+            DrawThemeBackground(state.viewToggleTheme, item.hDC, kCommandModuleButton, part, &item.rcItem, nullptr);
+        if (focusShown) {
+            RECT focus = item.rcItem;
+            InflateRect(&focus, -Scale96(3, dpi), -Scale96(3, dpi));
+            SetTextColor(item.hDC, foreground); SetBkColor(item.hDC, background);
+            DrawFocusRect(item.hDC, &focus);
+        }
+    } else if (!disabled && (state.viewToggleHot || (item.itemState & ODS_SELECTED))) {
         SetDCBrushColor(item.hDC, blend((item.itemState & ODS_SELECTED) ? 18 : 10));
         SelectObject(item.hDC, brush); SelectObject(item.hDC, GetStockObject(NULL_PEN));
         RoundRect(item.hDC, bounds.left, bounds.top, bounds.right, bounds.bottom, radius, radius);
     }
-    if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) {
+    if (!state.viewToggleTheme && focusShown) {
         SelectObject(item.hDC, GetStockObject(DC_PEN));
         SetDCPenColor(item.hDC, foreground); SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
         RoundRect(item.hDC, bounds.left, bounds.top, bounds.right, bounds.bottom, radius, radius);
@@ -37958,6 +38060,50 @@ void RequestStatusButtonGeometry(ViewState& state,const StatusButtonQuery& query
     SetEvent(work.columns.wake);
 }
 
+// The switch takes Explorer's own look: the status bar buttons' theme class
+// and the theme, dark-mode opt-in, font, wrapping width, delays and margins of
+// Explorer's own tooltip on this frame (before one exists, Explorer's chrome
+// defaults: its "Explorer" sub-app, opted in). Windows picks light or dark.
+// Restyled only when that tooltip or the theme changes.
+void StyleViewToggle(ViewState& state, HWND frame, int dpi) {
+    const HWND stock = StockFrameTooltip(frame, state.viewToggleGeometry.providerHost);
+    if (state.viewToggleStyled && stock == state.viewToggleTipSource) return;
+    const bool optIn = !stock || DarkModeOptedIn(stock);
+    if (optIn != DarkModeOptedIn(state.viewToggle)) {
+        OptIntoDarkMode(state.viewToggle, optIn);
+        state.viewTogglePaletteDirty = true; // The bar's colors follow on the next refresh.
+    }
+    std::wstring subApp = stock ? WindowThemeName(stock, kThemeSubAppProperty) : std::wstring(L"Explorer");
+    if (state.viewToggleTheme) CloseThemeData(state.viewToggleTheme);
+    state.viewToggleTheme = OpenThemeData(state.viewToggle, kStatusButtonTheme); // At the switch's DPI.
+    if (const HWND tip = state.viewToggleTooltip; IsWindow(tip)) {
+        const std::wstring ids = stock ? WindowThemeName(stock, kThemeSubIdListProperty) : std::wstring{};
+        OptIntoDarkMode(tip, optIn);
+        SetWindowTheme(tip, subApp.empty() ? nullptr : subApp.c_str(), ids.empty() ? nullptr : ids.c_str());
+        LOGFONTW face{};
+        const auto font = stock ? reinterpret_cast<HFONT>(SendMessageW(stock, WM_GETFONT, 0, 0)) : nullptr;
+        if (font && GetObjectW(font, sizeof(face), &face)) {
+            if (const HFONT copy = CreateFontIndirectW(&face)) {
+                SendMessageW(tip, WM_SETFONT, reinterpret_cast<WPARAM>(copy), FALSE);
+                if (state.viewToggleTipFont) DeleteObject(state.viewToggleTipFont);
+                state.viewToggleTipFont = copy;
+            }
+        }
+        if (stock) {
+            SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, SendMessageW(stock, TTM_GETMAXTIPWIDTH, 0, 0));
+            for (WPARAM delay : {TTDT_INITIAL, TTDT_AUTOPOP, TTDT_RESHOW})
+                SendMessageW(tip, TTM_SETDELAYTIME, delay,
+                    MAKELPARAM(static_cast<WORD>(SendMessageW(stock, TTM_GETDELAYTIME, delay, 0)), 0));
+            RECT margin{};
+            SendMessageW(stock, TTM_GETMARGIN, 0, reinterpret_cast<LPARAM>(&margin));
+            SendMessageW(tip, TTM_SETMARGIN, 0, reinterpret_cast<LPARAM>(&margin));
+        } else SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, Scale96(360, dpi));
+    }
+    state.viewToggleTipSource = stock;
+    state.viewToggleStyled = true;
+    InvalidateRect(state.viewToggle, nullptr, FALSE);
+}
+
 void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometry) {
     if (g_unloading.load(std::memory_order_relaxed) || !IsWindow(frame)) return;
     if (deferred) {
@@ -37990,7 +38136,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             gpu ? L"Switch to native Explorer view" : L"Switch to GPU overlay view";
         const wchar_t* hint = !state->inScope ? L"GPU view unavailable for this folder." :
             !state->detailsViewActive ? L"GPU view unavailable in this Explorer layout." :
-            gpu ? L"Switch to native Explorer view.\r\n(Ctrl+Alt+F9)" : L"Switch to GPU overlay view.\r\n(Ctrl+Alt+F9)";
+            gpu ? L"Switch to native Explorer view.  (Ctrl+Alt+F9)" : L"Switch to GPU overlay view.  (Ctrl+Alt+F9)";
         if (!IsWindow(state->viewToggle)) {
             state->viewToggle = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"BUTTON", L"",
                 WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON | BS_ICON | BS_FLAT, 0, 0, 1, 1, frame,
@@ -38003,6 +38149,7 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
                 DestroyWindow(state->viewToggle); state->viewToggle = nullptr; continue;
             }
             state->viewToggleHot = false;
+            OptIntoDarkMode(state->viewToggle, true); // As Explorer's chrome; restyling follows its tooltip.
             state->viewToggleBufferedPaint = SUCCEEDED(BufferedPaintInit());
             // Creating/restoring chrome reuses the event-resolved tab palette.
             // Navigation and layout must not become color probes.
@@ -38047,13 +38194,15 @@ void RefreshViewToggleForFrame(HWND frame, bool deferred, bool invalidateGeometr
             state->viewToggleHint = hint;
         }
         const int dpi = DpiOf(frame);
+        if (state->viewTogglePaletteDirty) RefreshViewTogglePalette(*state);
+        if (state->viewToggleDpi != dpi) state->viewToggleStyled = false;
+        StyleViewToggle(*state, frame, dpi);
         if (state->viewToggleDpi != dpi || state->viewToggleIconColor != state->viewToggleForeground ||
             !state->viewToggleIcons[0]) {
-            if (IsWindow(state->viewToggleTooltip))
-                SendMessageW(state->viewToggleTooltip, TTM_SETMAXTIPWIDTH, 0, Scale96(360, dpi));
             // Rasterize the Switch symbol once per DPI/palette. Native paint
             // consumes an HICON, never a private-use character in its DC.
-            const int size = std::max(1, Scale96(16, dpi));
+            // Explorer's view buttons use the small-icon size.
+            const int size = std::max(1, GetSystemMetricsForDpi(SM_CXSMICON, dpi));
             const auto coverage = ViewToggleGlyphCoverage(size, dpi);
             BITMAPINFO bitmapInfo{};
             bitmapInfo.bmiHeader = {sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB};
