@@ -158,6 +158,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("native-menu-interaction", PARALLEL, TestNativeMenuInteraction(L"filesystem")),
     REGRESSION("native-menu-archive", PARALLEL, TestNativeMenuInteraction(L"archive")),
     REGRESSION("native-menu-delegated", PARALLEL, TestNativeMenuInteraction(L"delegated")),
+    REGRESSION("com-view-mode-change", PARALLEL, TestComViewModeChange(fixture)),
     REGRESSION("selection-ui-work", PARALLEL, TestSelectionUiWork(fixture)),
     REGRESSION("provider-navigation", PARALLEL, TestProviderNavigation(fixture)),
     REGRESSION("paste-focus", PARALLEL, TestPasteFocus(fixture)),

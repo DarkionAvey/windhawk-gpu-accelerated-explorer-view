@@ -467,6 +467,10 @@ constexpr UINT kMsgTypeSearchReady = WM_APP + 81;
 // wParam 0 follows DoRename (its editor exists), 1 follows the commit (DefView
 // captured its selected set).
 constexpr UINT kMsgNativeRenameStep = WM_APP + 82;
+// ShellFolderView.ViewModeChanged/IconSizeChanged: DefView's own notices for
+// every mode and size change, whatever their source (menus, command bar,
+// shortcuts, automation). A size-only change raises IconSizeChanged alone.
+constexpr UINT kMsgShellViewModeEvent = WM_APP + 83;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -3625,6 +3629,12 @@ struct ViewState {
     ULONGLONG marqueeEndTick = 0;
     bool mouseTracking = false, pointerInside = true;
     ShellClickPolicy clickPolicy;
+    // Check box option change: the band and boxes slide on the shared UI curve
+    // from checkboxRevealFrom toward clickPolicy.checkSelect. The header box
+    // keeps its last state while leaving.
+    LARGE_INTEGER checkboxRevealStarted{};
+    float checkboxRevealFrom = 0.f;
+    int checkboxRevealHeaderState = -1;
     PointingDevice pointingDevice = PointingDevice::Mouse;
     // Owner-only press identity: -2 is the Name header, -1 is no checkbox press.
     int checkboxPress = -1;
@@ -4284,7 +4294,7 @@ struct SwipeFeedbackSnapshot {
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
     X(hoverFromHeight) X(hoverToHeight) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
-    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
+    X(hovered) X(clickPolicy) X(checkboxRevealStarted) X(checkboxRevealFrom) X(checkboxRevealHeaderState)X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
@@ -4586,7 +4596,8 @@ float GroupHeadingHeight(const ViewState& state) {
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
 }
-float SelectionCheckboxSpace(const ViewState& state);
+float SelectionCheckboxSpace(const ViewState& state, bool settled = false);
+bool SelectionCheckboxRevealMoving(const ViewState& state);
 void LayoutGroupSections(ViewState& state) {
     state.itemsPerRow = 1;
     if (state.gridView) {
@@ -4597,7 +4608,7 @@ void LayoutGroupSections(ViewState& state) {
         // integer column boundary partway through an otherwise smooth zoom.
         const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
         const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float checkboxSpace = (TileLayout(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state) : 0.f;
+        const float checkboxSpace = (TileLayout(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
         const float minimum = checkboxSpace + (TileLayout(state) ?
             std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
                 icon + font * 12.f + Scale96(24, dpi)) :
@@ -5010,6 +5021,8 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
         (state.columnPresentationPending && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.sectionBadgeAnimating && state.visible && state.inScope && state.detailsViewActive &&
+            PresentationVisible(state) && !PresentationMinimized(state)) ||
+        (SelectionCheckboxRevealMoving(state) && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.itemOpacityAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
@@ -13523,8 +13536,26 @@ float SelectionCheckboxSize(const ViewState& state) {
 float SelectionCheckboxBorder(float side) {
     return std::max(1.f,std::min(roundf(side/20.f),floorf(side*.5f)));
 }
-float SelectionCheckboxSpace(const ViewState& state) {
-    return state.clickPolicy.checkSelect ? SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state)) : 0.f;
+// 0 hidden .. 1 shown, sampled at the paint's clock so layout, painting and
+// hit testing agree within a frame.
+float SelectionCheckboxReveal(const ViewState& state) {
+    const float to = state.clickPolicy.checkSelect ? 1.f : 0.f;
+    if (!state.checkboxRevealStarted.QuadPart) return to;
+    const float progress = UiTransitionProgress(state, state.checkboxRevealStarted,
+        kUiTransitionDurationMs, state.itemOpacityNow);
+    return progress >= 1.f ? to : state.checkboxRevealFrom + (to-state.checkboxRevealFrom)*EaseOutCubic(progress);
+}
+bool SelectionCheckboxRevealMoving(const ViewState& state) {
+    return state.checkboxRevealStarted.QuadPart &&
+        UiTransitionProgress(state, state.checkboxRevealStarted) < 1.f;
+}
+float SelectionCheckboxBand(const ViewState& state) {
+    return SelectionCheckboxSize(state) + Scale96(8, ViewDpi(state));
+}
+// Settled: the option's final band, for packing that must not reflow per frame.
+float SelectionCheckboxSpace(const ViewState& state, bool settled) {
+    if (settled) return state.clickPolicy.checkSelect ? SelectionCheckboxBand(state) : 0.f;
+    return SelectionCheckboxBand(state)*SelectionCheckboxReveal(state);
 }
 // The Name text ends this far before its cell (and the list) ends.
 float NameTrailingGap(const ViewState& state) { return static_cast<float>(Scale96(8, ViewDpi(state))); }
@@ -13596,12 +13627,14 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
             NameContentEnd(state)-NameTrailingGap(state),
             visual.top+state.rowPx);
     }
-    if (state.clickPolicy.checkSelect) {
+    if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
+        // Boxes slide with the band they lead, like the section badges.
+        const float slide = SelectionCheckboxBand(state)*(1.f-reveal);
         const float inset = state.gridView ? std::min(float(Scale96(6,dpi)),std::max(0.f,g.cell.right-g.cell.left)*.125f) : 0.f;
         const float available = state.gridView ? std::max(0.f,(g.cell.right-g.cell.left)*.5f-inset) : SelectionCheckboxSize(state);
         const float size = std::min({SelectionCheckboxSize(state),std::max(0.f,state.rowPx-Scale96(4,dpi)),available});
-        const float left = state.gridView ? g.cell.left + inset :
-            (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi);
+        const float left = (state.gridView ? g.cell.left + inset :
+            (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi)) - slide;
         const float top = state.gridView && !TileLayout(state) && state.cachedNativeMode != FVM_SMALLICON ?
             g.cell.top + Scale96(4,dpi) : visual.top + (state.rowPx-size)*.5f;
         g.checkbox = D2D1::RectF(left,top,left+size,top+size);
@@ -13626,7 +13659,8 @@ D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& 
 
 D2D1_RECT_F HeaderSelectionCheckbox(ViewState& state) {
     const float size = SelectionCheckboxSize(state);
-    const float left = NameColumnStart(state) + Scale96(12,ViewDpi(state));
+    const float left = NameColumnStart(state) + Scale96(12,ViewDpi(state)) -
+        SelectionCheckboxBand(state)*(1.f-SelectionCheckboxReveal(state));
     const float top = ColumnHeaderOffset(state,ViewDpi(state)) +
         (Scale96(kHeader96,ViewDpi(state))-size)*.5f;
     return D2D1::RectF(left,top,left+size,top+size);
@@ -21365,15 +21399,17 @@ void Paint(ViewState& state) {
                     SameKey(col.key, state.sort.key);
                 const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
                 const auto caption = ColumnTextBounds(state, columnIndex, true, listStart, dpi);
-                const int checked = HeaderSelectionCheckboxState(state);
-                if (checked>=0 && ClassifySort(col.key)==SortKind::Name) {
+                const float reveal = SelectionCheckboxReveal(state);
+                const int checked = state.clickPolicy.checkSelect ? HeaderSelectionCheckboxState(state) :
+                    reveal > 0.f ? state.checkboxRevealHeaderState : -1;
+                if (checked>=0 && reveal>0.f && ClassifySort(col.key)==SortKind::Name) {
                     const auto box = HeaderSelectionCheckbox(state);
                     // Narrow/reordered/scrolled Name columns retain their own clip.
                     const float l = std::max(from,listStart), r = std::min(to,listEnd);
                     if (r>l) {
                         state.target->PushAxisAlignedClip(state.rtlLayout ?
                             D2D1::RectF(w-r,0.f,w-l,header) : D2D1::RectF(l,0.f,r,header),D2D1_ANTIALIAS_MODE_ALIASED);
-                        DrawSelectionCheckbox(state,box,checked!=0,fade);
+                        DrawSelectionCheckbox(state,box,checked!=0,fade*reveal);
                         state.target->PopAxisAlignedClip();
                     }
                 }
@@ -21776,13 +21812,14 @@ void Paint(ViewState& state) {
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
         const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
-        if (state.clickPolicy.checkSelect && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
+        const float checkboxReveal = SelectionCheckboxReveal(state);
+        if (checkboxReveal > 0.f && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
             const float l = ColumnsPresented(state) && !state.gridView ? std::max(listStart,NameColumnStart(state)) : listStart;
             const float r = ColumnsPresented(state) && !state.gridView ? NameContentEnd(state) : listEnd;
             if (r>l) {
                 state.target->PushAxisAlignedClip(state.rtlLayout ? D2D1::RectF(w-r,header,w-l,contentBottom) :
                     D2D1::RectF(l,header,r,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
-                DrawSelectionCheckbox(state,geometry.checkbox,checked,v.opacity);
+                DrawSelectionCheckbox(state,geometry.checkbox,checked,v.opacity*checkboxReveal);
                 state.target->PopAxisAlignedClip();
             }
         }
@@ -33035,10 +33072,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 RefreshWheelSettings();
                 s->checkboxHeaderActionPending=false; s->checkboxHeaderActionSelection.clear();
                 const bool checkSelect=s->clickPolicy.checkSelect;
+                LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+                const float reveal=SelectionCheckboxReveal(*s);
+                const int headerState=checkSelect ? HeaderSelectionCheckboxState(*s) : s->checkboxRevealHeaderState;
                 s->clickPolicy = ReadShellClickPolicy();
                 if (s->checkboxPress!=-1 && GetCapture()==hwnd) ReleaseCapture();
                 ResetMouseClickSequence(*s);
                 if (checkSelect!=s->clickPolicy.checkSelect) {
+                    // Only this option change slides; navigation adopts it at rest.
+                    s->checkboxRevealFrom=reveal; s->checkboxRevealStarted=now;
+                    s->checkboxRevealHeaderState=headerState;
                     LayoutGroupSections(*s); ClampScroll(*s); RepositionRenameEdit(*s);
                 }
                 TRACKMOUSEEVENT cancel{sizeof(cancel),TME_CANCEL|TME_HOVER,hwnd,0};
@@ -33107,6 +33150,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s && !s->pendingCreatedItemPath.empty())
             TryStartCreatedItemRename(*s);
+        return 0;
+    case kMsgShellViewModeEvent:
+        // Commands DefView receives through COM (the command bar's View menu)
+        // bypass the input/WM_COMMAND baselines. Treat the shown layout as the
+        // baseline so the shared probe adopts only an actual difference.
+        if (s && s->nativeHwnd == reinterpret_cast<HWND>(wParam) &&
+            s->token == static_cast<unsigned long long>(lParam) && s->visible && s->inScope &&
+            !s->optimisticStartedAt && TabOwnsActiveView(*s)) {
+            FolderViewMode observed;
+            if (ReadNativeViewMode(*s, observed) && State(hwnd) == s &&
+                (observed.mode != s->layoutNativeMode ||
+                 (IsIconViewMode(observed.mode, s->thisPcGpu) && observed.iconSize != s->layoutIconSize))) {
+                const FolderViewMode shown{s->layoutNativeMode, s->layoutIconSize};
+                PostShellVisibilityProbe(*s, true, true, &shown);
+            }
+        }
         return 0;
     case kMsgNativeSelectionChanged:
         if (s) {
@@ -35841,6 +35900,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     RetireCachedEntries(state, state.namespaceIdentities);
     state.visibility = ReadShellVisibilityPolicy();
     state.clickPolicy = ReadShellClickPolicy();
+    state.checkboxRevealStarted = {};
     state.visibilitySelectionSyncPending = false;
     InitializeFolderSort(state, path, cachedPreviewOnly);
     state.nativeSelectionImportPending = false;
@@ -36331,6 +36391,9 @@ public:
         WindowCallbackGuard callback;
         if (id == DISPID_FILELISTENUMDONE && enumerationQueued_)
             enumerationQueued_->store(true, std::memory_order_release);
+        if ((id == DISPID_VIEWMODECHANGED || id == DISPID_ICONSIZECHANGED) && !g_unloading.load(std::memory_order_relaxed) && IsWindow(overlay_))
+            PostMessageW(overlay_, kMsgShellViewModeEvent, reinterpret_cast<WPARAM>(native_),
+                static_cast<LPARAM>(epoch_));
         if ((id == DISPID_SELECTIONCHANGED || (id == DISPID_FILELISTENUMDONE && enumerationQueued_)) &&
             !g_unloading.load(std::memory_order_relaxed) &&
             IsWindow(overlay_) && !queued_->exchange(true, std::memory_order_acq_rel)) {
@@ -37123,6 +37186,7 @@ void PrepareInitialOverlay(ViewState& state) {
     }
     state.visibility = ReadShellVisibilityPolicy();
     state.clickPolicy = ReadShellClickPolicy();
+    state.checkboxRevealStarted = {};
     UpdateMetrics(state);
     UpdateColumns(state);
     if (!state.nativePaletteResolved) RefreshNativePalette(state);

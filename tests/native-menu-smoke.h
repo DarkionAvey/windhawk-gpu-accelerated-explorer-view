@@ -97,7 +97,7 @@ struct Commands {
     }
     ~Commands() { DestroyMenu(root); }
     static LRESULT CALLBACK Receive(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
-        if(msg==kMsgShellVisibilityChanged || msg==kMsgShellSelectionEvent)
+        if(msg==kMsgShellVisibilityChanged || msg==kMsgShellSelectionEvent || msg==kMsgShellViewModeEvent)
             return OverlayProc(hwnd,msg,wp,lp);
         return DefSubclassProc(hwnd,msg,wp,lp);
     }
@@ -522,4 +522,59 @@ void Child(const std::wstring& fixture, const std::wstring& provider) {
 }
 static void TestNativeMenuInteraction(const wchar_t* provider) {
     PrivateDesktopFixture::Run(L"menu",L"--native-context-menu-child "+std::wstring(provider),60000);
+}
+
+// Explorer's command bar changes the view through IFolderView2 directly: no
+// WM_COMMAND reaches DefView and no recognized input precedes it. The GPU
+// layout must follow DefView's own ViewModeChanged/IconSizeChanged events,
+// including size-only changes within one mode and native-only modes.
+static void TestComViewModeChange(const std::wstring& fixture) {
+    using NativeMenuFixture::Commands;
+    const auto root = std::filesystem::path(fixture) / L"com-view-mode";
+    std::filesystem::create_directories(root / L"folder");
+    for (const wchar_t* name : {L"first.txt", L"second.txt"}) {
+        HANDLE file = CreateFileW((root / name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        Check(file != INVALID_HANDLE_VALUE, "view mode private file"); CloseHandle(file);
+    }
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 3);
+    Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))) && EnsureTarget(state), "view mode GPU target");
+    Check(SetWindowSubclass(state.hwnd, Commands::Receive, 302, 0), "view mode observation receiver");
+    struct Unsubclass { HWND hwnd; ~Unsubclass() { RemoveWindowSubclass(hwnd, Commands::Receive, 302); } } unsubclass{state.hwnd};
+    Check(AttachShellSelectionEvents(state, nullptr) && state.selectionEventCookie,
+        "native folder automation event subscription");
+    FolderViewMode initial;
+    Check(SUCCEEDED(state.folderView->SetViewModeAndIconSize(FVM_DETAILS, 16)) && ReadNativeViewMode(state, initial),
+        "view mode initial native mode");
+    host.Pump();
+    ApplyViewLayout(state, initial, false); state.directoryModePinned = true;
+    struct Step { FOLDERVIEWMODE mode; int size; const char* name; };
+    // Size-only changes (Large/Medium/Extra large) raise IconSizeChanged alone.
+    for (const Step step : {Step{FVM_ICON, 96, "large icons"}, Step{FVM_ICON, 48, "medium icons"},
+            Step{FVM_ICON, 256, "extra large icons"}, Step{FVM_ICON, 96, "large icons again"},
+            Step{FVM_SMALLICON, 16, "small icons"}, Step{FVM_LIST, 16, "list"},
+            Step{FVM_DETAILS, 16, "details"}, Step{FVM_CONTENT, 32, "content"},
+            Step{FVM_ICON, 48, "medium icons from content"}, Step{FVM_TILE, 48, "tiles"},
+            Step{FVM_DETAILS, 16, "details again"}}) {
+        Regression::Scope scope(step.name);
+        Check(SUCCEEDED(state.folderView->SetViewModeAndIconSize(step.mode, step.size)), "COM view mode change");
+        const bool icons = step.mode == FVM_ICON || step.mode == FVM_SMALLICON || step.mode == FVM_TILE;
+        Check(Eventually([&] {
+            host.Pump(); ReceiveDirectoryResults(state);
+            return !state.nativeModeSignalQueued && !state.nativeViewCommandPending &&
+                state.layoutNativeMode == UINT(step.mode) && (step.mode != FVM_ICON || state.layoutIconSize == step.size);
+        }), "a COM view/icon-size change did not reach the pinned GPU layout");
+        FinishColumnTransition(state); StopRowTransition(state);
+        Check(state.gridView == icons && state.columnsView == (step.mode == FVM_DETAILS),
+            "the GPU layout does not match the requested view");
+        const bool gpu = step.mode != FVM_CONTENT;
+        Check(bool(IsWindowVisible(state.nativeHwnd)) != gpu && bool(IsWindowVisible(state.hwnd)) == gpu,
+            "a COM view change broke exclusive native/GPU presentation");
+    }
+    DropTarget(state);
+    std::cout << "PASS: view and icon-size changes made through IFolderView2 alone (as the command bar does) reach "
+        "the GPU layout, including size-only changes and native-only modes\n";
 }
