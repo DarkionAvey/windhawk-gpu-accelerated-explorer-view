@@ -11,6 +11,7 @@
 - **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
+- **IMPROVED** Item tooltips now look like the modern tooltips in Explorer's Gallery: rounded, no border, a soft centered shadow, and text that follows the Windows text size setting.
 - **IMPROVED** Default text size now matches the Windows 11 right-click menu. The defaults follow that menu's sizes rather than usability testing.
 - **IMPROVED** Rename field appearance to match the list's font, scaling, and text rendering.
 - **IMPROVED** Build validation reliability with additional retries and diagnostics.

@@ -324,14 +324,24 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(tip.labelX == tip.padX && tip.valueX >= tip.labelX + widestLabel, "item tip columns overlap");
     RECT window{}, viewRect{};
     GetWindowRect(tip.hwnd, &window); GetWindowRect(view, &viewRect);
-    Check(window.right - window.left == tip.size.cx && window.bottom - window.top == tip.size.cy &&
-        window.left == viewRect.left + client.x && window.top > viewRect.top + client.y, "item tip is not below the cursor");
+    // Gallery-style: the window extends past the drawn body by the shadow's
+    // reach (three 4-DIP blur deviations); the body sits below the cursor.
+    const int reach = int(std::ceil(3.f * float(MulDiv(4, DpiOf(tip.hwnd), 96))));
+    Check(tip.margin == reach && window.right - window.left == tip.size.cx + 2 * reach &&
+        window.bottom - window.top == tip.size.cy + 2 * reach &&
+        window.left + reach == viewRect.left + client.x && window.top + reach > viewRect.top + client.y,
+        "item tip body is not below the cursor inside its shadow margin");
     const LONG_PTR ex = GetWindowLongPtrW(tip.hwnd, GWL_EXSTYLE);
     Check((ex & WS_EX_NOACTIVATE) && (ex & WS_EX_TOOLWINDOW) &&
         GetWindow(tip.hwnd, GW_OWNER) == view, "item tip window is activatable or unowned");
+    // Corners and shadow are drawn per pixel at a fixed DIP radius: no DWM
+    // rounding (its radius varies by display), no class shadow, no region.
     DWM_WINDOW_CORNER_PREFERENCE corners{};
-    Check(SUCCEEDED(DwmGetWindowAttribute(tip.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners))) &&
-        corners == DWMWCP_DONOTROUND, "item tip corners depend on whether DWM rounds popups");
+    const HRGN region = CreateRectRgn(0, 0, 0, 0);
+    const bool regionless = GetWindowRgn(tip.hwnd, region) == ERROR; DeleteObject(region);
+    Check((ex & WS_EX_LAYERED) && !(GetClassLongPtrW(tip.hwnd, GCL_STYLE) & CS_DROPSHADOW) && regionless &&
+        SUCCEEDED(DwmGetWindowAttribute(tip.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners))) &&
+        corners == DWMWCP_DONOTROUND, "item tip corners or shadow depend on DWM or the class shadow");
     Check(SendMessageW(tip.hwnd, WM_NCHITTEST, 0, MAKELPARAM(window.left + 1, window.top + 1)) == HTTRANSPARENT,
         "item tip intercepts the pointer");
     UpdateWindow(tip.hwnd);
@@ -421,24 +431,34 @@ static void ItemTipScenario(const std::wstring& directory) {
         GdiFlush();
         const auto pixel = [&](int x, int y) { const DWORD v = static_cast<const DWORD*>(bits)[y * 60 + x];
             return RGB((v >> 16) & 255, (v >> 8) & 255, v & 255); };
-        const COLORREF fill = pixel(30, 12), edge = pixel(30, 0);
+        const COLORREF fill = pixel(30, 12);
         SelectObject(dc, previous); DeleteObject(bitmap); DeleteDC(dc); CloseThemeData(theme);
-        Check(tip.background == fill && tip.border == BlendColor(edge, fill, 50) && tip.foreground == themeText &&
+        Check(tip.background == fill && tip.foreground == themeText &&
             tip.label != tip.foreground && tip.label != tip.background, "item tip differs from the native tooltip style");
     }
     {
-        // Native text size: the visual style's tooltip font at this DPI.
+        // Gallery's XAML tooltip text: 14 DIP at this DPI, scaled by the
+        // Accessibility text size, in the XAML face where it is installed
+        // (else the visual style's tooltip face).
         HTHEME theme = OpenThemeData(tip.hwnd, L"Tooltip");
         LOGFONTW font{};
-        Check(theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font)) && font.lfHeight < 0,
-            "native tooltip font");
+        Check(theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font)), "native tooltip font");
         if (theme) CloseThemeData(theme);
-        Check(tip.valueFormat != nullptr, "item tip formats");
-        std::wstring family(tip.valueFormat->GetFontFamilyNameLength() + 1, L'\0');
-        Check(SUCCEEDED(tip.valueFormat->GetFontFamilyName(family.data(), UINT32(family.size()))) &&
-            _wcsicmp(family.c_str(), font.lfFaceName) == 0 &&
-            std::fabs(tip.valueFormat->GetFontSize() - float(-font.lfHeight)) < .01f,
-            "item tip text is not the native tooltip font and size");
+        std::wstring expectedFamily = font.lfFaceName;
+        ComPtr<IDWriteFontCollection> system; UINT32 index = 0; BOOL exists = FALSE;
+        if (SUCCEEDED(g_writeFactory->GetSystemFontCollection(&system)) &&
+            SUCCEEDED(system->FindFamilyName(L"Segoe UI Variable Text", &index, &exists)) && exists)
+            expectedFamily = L"Segoe UI Variable Text";
+        struct Reset { ~Reset() { ExplorerSettingsFixture::textScale = 100; } } reset;
+        for (const DWORD scale : {100u, 150u}) {
+            ExplorerSettingsFixture::textScale = scale;
+            Check(PrepareItemTipFont(state, tip.hwnd) && tip.valueFormat != nullptr, "item tip formats");
+            std::wstring family(tip.valueFormat->GetFontFamilyNameLength() + 1, L'\0');
+            Check(SUCCEEDED(tip.valueFormat->GetFontFamilyName(family.data(), UINT32(family.size()))) &&
+                _wcsicmp(family.c_str(), expectedFamily.c_str()) == 0 &&
+                std::fabs(tip.valueFormat->GetFontSize() - 14.f * float(DpiOf(tip.hwnd)) / 96.f * float(scale) / 100.f) < .01f,
+                "item tip text is not Gallery's font, size and text scale");
+        }
     }
     RefreshItemTipPalette(state, true); ResolveItemTipPalette(state);
     Check(tip.background == GetSysColor(COLOR_INFOBK) && tip.foreground == GetSysColor(COLOR_INFOTEXT),
@@ -524,7 +544,8 @@ static void ItemTipScenario(const std::wstring& directory) {
             tip.rowLayouts.size() <= tip.rowCapacity, "tooltip crossed the screen work area");
         for (size_t i = 0; i < tip.rowLayouts.size(); ++i) {
             DWRITE_TEXT_METRICS metrics{}; tip.rowLayouts[i].second->GetMetrics(&metrics);
-            Check(metrics.lineCount == 1 && tip.rowTops[i] + metrics.height + tip.padY <= tip.size.cy,
+            // Spacing is ink to ink: the descenders plus one unit fit inside.
+            Check(metrics.lineCount == 1 && tip.rowTops[i] + metrics.height - tip.rowBelow + tip.padY <= tip.size.cy + .01f,
                 "multiline metadata overlapped or exceeded the tooltip");
         }
     }

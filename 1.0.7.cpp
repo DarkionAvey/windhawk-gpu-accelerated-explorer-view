@@ -3135,25 +3135,25 @@ struct ItemTip {
     POINT anchor{};          // Screen point of the hover that requested it.
     std::wstring name;
     std::vector<ItemTipRow> rows;
-    COLORREF background = CLR_INVALID, foreground = CLR_INVALID, label = CLR_INVALID, border = CLR_INVALID;
+    COLORREF background = CLR_INVALID, foreground = CLR_INVALID, label = CLR_INVALID;
     // Presentation resources, owner thread only.
     ComPtr<ID2D1Factory> factory;
     ComPtr<ID2D1DCRenderTarget> target;
     ComPtr<IDWriteTextFormat> nameFormat, labelFormat, valueFormat;
     // Font measurements, redone only when the DPI, configured face, reading
-    // direction or theme changes. Line-box space above the tallest letters and
+    // direction, text-size setting or theme changes. Line-box space above the tallest letters and
     // below the deepest descenders, in whole pixels.
-    int metricsDpi = 0; unsigned long long metricsFace = 0;
+    int metricsDpi = 0; unsigned long long metricsFace = 0; DWORD metricsTextScale = 0;
     float nameAbove = 0.f, nameBelow = 0.f, rowAbove = 0.f, rowBelow = 0.f;
     bool formatRtl = false;
     ComPtr<IDWriteTextLayout> nameLayout;
     std::vector<std::pair<ComPtr<IDWriteTextLayout>, ComPtr<IDWriteTextLayout>>> rowLayouts;
     std::vector<float> rowTops;
     float padX = 0.f, padY = 0.f, nameHeight = 0.f, labelX = 0.f, valueX = 0.f;
-    float corner = 0.f; // Radius of the window region and its painted border.
     bool paletteDirty = true, highContrast = false; // Style sampled lazily, on show.
     float nameTop = 0.f; // Name line top: padding less the font's leading above capitals.
-    SIZE size{};
+    SIZE size{}; // The body; the layered window extends past it by margin.
+    POINT position{}; int margin = 0; // Body origin on screen; shadow reach.
     size_t rowCapacity = 0;
     DragTextStyle textStyle; // Shared monitor-aware rendering policy, independent popup target.
     void Release() {
@@ -3171,6 +3171,7 @@ struct ItemTip {
     }
     ~ItemTip() { Release(); }
 };
+void RenderItemTip(ItemTip& tip);
 
 struct ViewState {
     ItemTip itemTip;
@@ -29057,7 +29058,7 @@ HTHEME OpenItemTipTheme(const ViewState& state, HWND hwnd) {
     return theme ? theme : OpenThemeData(hwnd, L"Tooltip");
 }
 
-// The native tooltip's fill and border are painted by its visual style, not
+// The native tooltip's fill is painted by its visual style, not
 // published as colors; sample them from a small rendering of that part.
 // Only the property labels differ from native: muted, for easier scanning.
 // Palette refreshes run for every tab on each theme/settings burst; sampling
@@ -29073,7 +29074,6 @@ void ResolveItemTipPalette(ViewState& state) {
     const bool highContrast = tip.highContrast;
     tip.paletteDirty = false;
     COLORREF background = GetSysColor(COLOR_INFOBK), foreground = GetSysColor(COLOR_INFOTEXT);
-    COLORREF border = GetSysColor(COLOR_WINDOWFRAME);
     if (!highContrast) {
         if (HTHEME theme = OpenItemTipTheme(state, IsWindow(tip.hwnd) ? tip.hwnd : state.hwnd)) {
             COLORREF text = CLR_INVALID;
@@ -29094,7 +29094,6 @@ void ResolveItemTipPalette(ViewState& state) {
                             return RGB((bgra >> 16) & 255, (bgra >> 8) & 255, bgra & 255);
                         };
                         background = pixel(width / 2, height / 2);
-                        border = pixel(width / 2, 0);
                     }
                     SelectObject(dc, previous);
                     DeleteObject(bitmap);
@@ -29105,11 +29104,9 @@ void ResolveItemTipPalette(ViewState& state) {
         }
     }
     const COLORREF label = highContrast ? foreground : BlendColor(foreground, background, 35);
-    // A muted border suits the subtle corners; high contrast keeps its own.
-    if (!highContrast) border = BlendColor(border, background, 50);
-    if (background == tip.background && foreground == tip.foreground && label == tip.label && border == tip.border) return;
-    tip.background = background; tip.foreground = foreground; tip.label = label; tip.border = border;
-    if (IsWindow(tip.hwnd)) InvalidateRect(tip.hwnd, nullptr, FALSE);
+    if (background == tip.background && foreground == tip.foreground && label == tip.label) return;
+    tip.background = background; tip.foreground = foreground; tip.label = label;
+    if (IsWindow(tip.hwnd) && IsWindowVisible(tip.hwnd)) RenderItemTip(tip);
 }
 
 LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -29119,13 +29116,13 @@ bool EnsureItemTipWindow(ViewState& state) {
     if (IsWindow(tip.hwnd)) return true;
     tip.hwnd = nullptr; tip.target.Reset();
     // Owned by the frame: above it, hidden with it, never activated or hit.
-    const HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, kItemTipClass, L"",
+    const HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED, kItemTipClass, L"",
         WS_POPUP, 0, 0, 1, 1, state.frameHwnd, nullptr, OverlayModuleInstance(), nullptr);
     if (!hwnd) return false;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&tip));
     tip.hwnd = hwnd;
-    // Square corners and the visual style's own border, painted below, look
-    // the same wherever DWM would or would not round a popup.
+    // The body, corners and shadow are drawn per pixel (RenderItemTip); DWM
+    // must not round or frame the window around them.
     const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
     const COLORREF frame = DWMWA_COLOR_NONE;
@@ -29186,14 +29183,20 @@ bool FontInkExtent(IDWriteTextFormat* format, float& above, float& below) {
 }
 
 // Fonts, ink extents and spacing for the tooltip. Measured only when the DPI,
-// the configured font, reading direction or system theme changes; never per
-// show. The size is the native tooltip font's; the face is the configured
-// font when one is set (as the view resolved it), else the native face.
+// the configured font, reading direction, text size or system theme changes;
+// never per show. The size and face follow Gallery's tooltips; the face is the configured
+// font when one is set (as the view resolved it), else the XAML face.
 bool PrepareItemTipFont(ViewState& state, HWND window) {
     auto& tip = state.itemTip;
     const int dpi = DpiOf(window);
+    // Accessibility > Text size, the percentage UISettings.TextScaleFactor
+    // reports; a cheap read, so a changed setting applies on the next show.
+    DWORD textScale = 100, bytes = sizeof(textScale);
+    if (SHRegGetUSValueW(L"Software\\Microsoft\\Accessibility", L"TextScaleFactor", nullptr, &textScale, &bytes,
+            FALSE, nullptr, 0) != ERROR_SUCCESS || bytes != sizeof(textScale) || textScale < 100 || textScale > 225)
+        textScale = 100;
     if (tip.nameFormat && tip.metricsDpi == dpi && tip.metricsFace == state.textFaceSerial &&
-        tip.formatRtl == state.rtlLayout) return true;
+        tip.formatRtl == state.rtlLayout && tip.metricsTextScale == textScale) return true;
     if (!g_writeFactory || ((!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat)) return false;
     LOGFONTW font{};
     HTHEME theme = OpenItemTipTheme(state, window);
@@ -29219,10 +29222,20 @@ bool PrepareItemTipFont(ViewState& state, HWND window) {
         }
     }
     if (em <= 0.f) return false;
+    // Gallery's XAML tooltips (probed with UI Automation) use 14 px control
+    // text in Segoe UI Variable, scaled by Accessibility > Text size; the
+    // classic tooltip font above remains the fallback face.
+    em = 14.f * float(dpi) / 96.f * float(textScale) / 100.f;
     // The configured font, exactly as the view resolved it (including fonts
-    // loaded from a file); otherwise the native tooltip face.
+    // loaded from a file); otherwise the XAML text face where installed.
     const bool configured = !ConfiguredFontFamily().empty();
     std::wstring family = font.lfFaceName;
+    if (!configured) {
+        ComPtr<IDWriteFontCollection> system; UINT32 index = 0; BOOL exists = FALSE;
+        if (SUCCEEDED(g_writeFactory->GetSystemFontCollection(&system)) &&
+            SUCCEEDED(system->FindFamilyName(L"Segoe UI Variable Text", &index, &exists)) && exists)
+            family = L"Segoe UI Variable Text";
+    }
     ComPtr<IDWriteFontCollection> collection;
     if (configured) {
         family.assign(state.headerFormat->GetFontFamilyNameLength() + 1, L'\0');
@@ -29263,7 +29276,7 @@ bool PrepareItemTipFont(ViewState& state, HWND window) {
     // One spacing unit, measured ink to ink: every edge, the name to the
     // details, and property names to their values.
     tip.padX = tip.padY = float(Scale96(8, dpi));
-    tip.metricsDpi = dpi; tip.metricsFace = state.textFaceSerial; tip.formatRtl = state.rtlLayout;
+    tip.metricsDpi = dpi; tip.metricsFace = state.textFaceSerial; tip.formatRtl = state.rtlLayout; tip.metricsTextScale = textScale;
     return true;
 }
 
@@ -29364,15 +29377,10 @@ void PresentItemTip(ViewState& state, const ItemTipJob& facts) {
     MONITORINFO monitor{sizeof(monitor)};
     if (!GetMonitorInfoW(MonitorFromPoint(tip.anchor, MONITOR_DEFAULTTONEAREST), &monitor) ||
         !EnsureItemTipWindow(state) || !LayoutItemTip(state, monitor.rcWork)) { HideItemTip(state); return; }
-    const POINT at = ItemTipPosition(state, tip.anchor, tip.size, monitor.rcWork);
-    // Subtle corners of our own, identical wherever DWM does or does not
-    // round popups. The window owns the region once it is set.
-    tip.corner = float(Scale96(3, DpiOf(tip.hwnd)));
-    const int diameter = int(tip.corner * 2.f) + 1;
-    SetWindowRgn(tip.hwnd, CreateRoundRectRgn(0, 0, tip.size.cx + 1, tip.size.cy + 1, diameter, diameter), FALSE);
-    InvalidateRect(tip.hwnd, nullptr, FALSE);
-    SetWindowPos(tip.hwnd, HWND_TOPMOST, at.x, at.y, tip.size.cx, tip.size.cy,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+    tip.position = ItemTipPosition(state, tip.anchor, tip.size, monitor.rcWork);
+    RenderItemTip(tip); // Places and sizes the layered window around the body.
+    SetWindowPos(tip.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
 }
 
 void CaptureItemTipCells(const Entry& entry, ItemTipJob& facts) {
@@ -29472,45 +29480,84 @@ void ConsumeItemTip(ViewState& state) {
     PresentItemTip(state, *result);
 }
 
-void PaintItemTip(ItemTip& tip, HWND hwnd) {
-    PAINTSTRUCT paint{};
-    const HDC dc = BeginPaint(hwnd, &paint);
-    RECT client{};
-    GetClientRect(hwnd, &client);
+// Like Gallery's XAML tooltips: a 4-DIP rounded body and a centered soft
+// shadow drawn into a per-pixel-alpha window, so the corners are the same
+// DIP size on every display (DWM's popup radius is not). The window extends
+// past the body by the shadow's reach; the body sits at tip.position.
+void RenderItemTip(ItemTip& tip) {
+    if (!IsWindow(tip.hwnd) || !tip.nameLayout || tip.size.cx <= 0 || tip.size.cy <= 0) return;
+    const int dpi = DpiOf(tip.hwnd);
+    const float sigma = float(Scale96(4, dpi)), radius = float(Scale96(4, dpi));
+    const int margin = int(std::ceil(3.f * sigma));
+    tip.margin = margin;
+    const SIZE full{tip.size.cx + 2 * margin, tip.size.cy + 2 * margin};
     if (!tip.factory) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, tip.factory.GetAddressOf());
     if (!tip.target && tip.factory) {
         const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         tip.factory->CreateDCRenderTarget(&properties, tip.target.GetAddressOf());
     }
-    const auto color = [](COLORREF value) {
-        return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f);
+    if (!tip.target) return;
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), full.cx, -full.cy, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    const HDC dc = CreateCompatibleDC(nullptr);
+    const HBITMAP bitmap = dc ? CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    const HGDIOBJ previous = bitmap ? SelectObject(dc, bitmap) : nullptr;
+    const RECT bounds{0, 0, full.cx, full.cy};
+    const auto color = [](COLORREF value, float alpha = 1.f) {
+        return D2D1::ColorF(GetRValue(value) / 255.f, GetGValue(value) / 255.f, GetBValue(value) / 255.f, alpha);
     };
-    if (dc && tip.target && tip.nameLayout && SUCCEEDED(tip.target->BindDC(dc, &client))) {
-        RefreshTextRenderingForWindow(tip.textStyle, hwnd, true);
-        SetCompatibleTextRendering(tip.target.Get(),tip.textStyle.textRenderingParams.Get(),
-            tip.textStyle.opaqueTextAntialiasMode);
+    bool drawn = false;
+    if (bitmap && SUCCEEDED(tip.target->BindDC(dc, &bounds))) {
+        // Text over a translucent target is grayscale, as XAML draws it.
+        tip.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         tip.target->BeginDraw();
-        tip.target->Clear(color(tip.background));
-        ComPtr<ID2D1SolidColorBrush> text, label;
+        tip.target->Clear(D2D1::ColorF(0, 0.f));
+        const auto body = D2D1::RoundedRect(D2D1::RectF(float(margin), float(margin),
+            float(margin + tip.size.cx), float(margin + tip.size.cy)), radius, radius);
+        ComPtr<ID2D1DeviceContext> context; ComPtr<ID2D1BitmapRenderTarget> mask; ComPtr<ID2D1Effect> shadow;
+        ComPtr<ID2D1SolidColorBrush> solid; ComPtr<ID2D1Bitmap> silhouette;
+        const bool dark = ColorLuminance(tip.background) < .5;
+        if (SUCCEEDED(tip.target.As(&context)) &&
+            SUCCEEDED(tip.target->CreateCompatibleRenderTarget(D2D1::SizeF(float(full.cx), float(full.cy)), &mask)) &&
+            SUCCEEDED(mask->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f), &solid)) &&
+            SUCCEEDED(context->CreateEffect(CLSID_D2D1Shadow, &shadow)) &&
+            SUCCEEDED(shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, sigma)) &&
+            SUCCEEDED(shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0.f, 0.f, 0.f, dark ? .45f : .2f)))) {
+            mask->BeginDraw(); mask->Clear(D2D1::ColorF(0, 0.f)); mask->FillRoundedRectangle(body, solid.Get());
+            if (SUCCEEDED(mask->EndDraw()) && SUCCEEDED(mask->GetBitmap(&silhouette))) {
+                shadow->SetInput(0, silhouette.Get());
+                context->DrawImage(shadow.Get());
+            }
+        }
+        ComPtr<ID2D1SolidColorBrush> fill, text, label;
+        tip.target->CreateSolidColorBrush(color(tip.background), &fill);
         tip.target->CreateSolidColorBrush(color(tip.foreground), &text);
         tip.target->CreateSolidColorBrush(color(tip.label), &label);
-        // The native tooltip's one-pixel border, on whole pixels, following
-        // the window region's corners.
-        ComPtr<ID2D1SolidColorBrush> border;
-        if (SUCCEEDED(tip.target->CreateSolidColorBrush(color(tip.border), &border)))
-            tip.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(.5f, .5f, client.right - .5f,
-                client.bottom - .5f), tip.corner, tip.corner), border.Get());
+        if (fill) tip.target->FillRoundedRectangle(body, fill.Get());
         if (text && label) {
+            tip.target->SetTransform(D2D1::Matrix3x2F::Translation(float(margin), float(margin)));
             tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.nameTop), tip.nameLayout.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             for (size_t i = 0; i < tip.rowLayouts.size() && i < tip.rowTops.size(); ++i) {
                 tip.target->DrawTextLayout(D2D1::Point2F(tip.labelX, tip.rowTops[i]), tip.rowLayouts[i].first.Get(), label.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
                 tip.target->DrawTextLayout(D2D1::Point2F(tip.valueX, tip.rowTops[i]), tip.rowLayouts[i].second.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
+            tip.target->SetTransform(D2D1::Matrix3x2F::Identity());
         }
-        if (tip.target->EndDraw() == D2DERR_RECREATE_TARGET) tip.target.Reset();
+        const HRESULT hr = tip.target->EndDraw();
+        if (hr == D2DERR_RECREATE_TARGET) tip.target.Reset();
+        drawn = SUCCEEDED(hr);
     }
-    EndPaint(hwnd, &paint);
+    if (drawn) {
+        POINT source{}, at{tip.position.x - margin, tip.position.y - margin};
+        SIZE extent = full;
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UpdateLayeredWindow(tip.hwnd, nullptr, &at, &extent, dc, &source, 0, &blend, ULW_ALPHA);
+    }
+    if (previous) SelectObject(dc, previous);
+    if (bitmap) DeleteObject(bitmap);
+    if (dc) DeleteDC(dc);
 }
 
 LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -29518,7 +29565,7 @@ LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     auto* tip = reinterpret_cast<ItemTip*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
     case WM_PAINT:
-        if (tip) { PaintItemTip(*tip, hwnd); return 0; }
+        if (tip) { ValidateRect(hwnd, nullptr); return 0; } // Drawn by RenderItemTip (layered).
         break;
     case WM_ERASEBKGND: return 1;
     case WM_NCHITTEST: return HTTRANSPARENT; // The pointer passes to the view beneath.
@@ -39572,7 +39619,7 @@ HINSTANCE g_overlayClassInstance=nullptr;
 bool RegisterItemTipClass(HINSTANCE instance) {
     WNDCLASSEXW tip{}; tip.cbSize=sizeof(tip);
     tip.lpfnWndProc=ItemTipProc; tip.hInstance=instance;
-    tip.lpszClassName=kItemTipClass; tip.style=CS_DROPSHADOW;
+    tip.lpszClassName=kItemTipClass; // Its shadow is drawn, not CS_DROPSHADOW.
     tip.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     return RegisterClassExW(&tip)!=0;
 }
