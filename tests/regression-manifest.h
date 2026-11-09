@@ -195,6 +195,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("private-fixture-release", PARALLEL, TestPrivateFixtureRelease(fixture)),
     REGRESSION("native-uia-batch", PARALLEL, TestNativeUiaBatch()),
     REGRESSION("real-native-uia-pressure", PARALLEL, TestRealNativeUiaPressure(fixture)),
+    REGRESSION("item-drag-hit-zones", PARALLEL, TestItemDragHitZones(fixture)),
     REGRESSION("zebra-grouped-bounded", PARALLEL, TestZebraSnapshots(fixture,true,false,false)),
     REGRESSION("zebra-grouped-empty", PARALLEL, TestZebraSnapshots(fixture,true,true,false)),
     REGRESSION("zebra-ungrouped", PARALLEL, TestZebraSnapshots(fixture,false,false,false)),

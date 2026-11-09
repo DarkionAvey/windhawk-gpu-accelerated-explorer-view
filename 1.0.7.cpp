@@ -3973,6 +3973,7 @@ struct ViewState {
     // Only a row selected *before* mouse-down can start a native OLE drag.
     // All other row presses may start GPU marquee selection.
     int shellDragRow = -1;
+    std::wstring shellDragItem; // Reject a refreshed row that no longer contains the pressed item.
     POINT shellDragStart{};
     bool shellDragCollapseOnClick = false;
     bool shellDragToggleOnClick = false;
@@ -5403,7 +5404,7 @@ void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
     state.mousePressActive = false;
     state.mousePressControl = false;
     state.mousePressShift = false;
-    state.shellDragRow = -1;
+    state.shellDragRow = -1; state.shellDragItem.clear();
     state.shellDragCollapseOnClick = false;
     state.shellDragToggleOnClick = false;
     state.mousePressRow = -1;
@@ -19222,6 +19223,30 @@ bool PointOnFilenameText(ViewState& state, int index, POINT point) {
     return false;
 }
 
+// Drag content is narrower than hover/selection. List icons and visible names
+// own their complete row height; grid padding between the two boxes is blank.
+// Use the same layout, shaping cache, clipping and logical RTL coordinates as paint.
+bool PointOnItemDragContent(ViewState& state, int index, POINT point) {
+    if(index<0 || index>=state.total || size_t(index)>=state.entries.size() ||
+        !InsideListX(state,point.x) || RowFromPoint(state,point.y,point.x)!=index) return false;
+    const RowVisual visual{state.headerPx+DocumentRowTop(state,index)-state.scrollNow,
+        DisplayRowHeight(state,index),1.f,DocumentRowLeft(state,index),state.itemWidth};
+    const auto item=LayoutItem(state,visual);
+    const float x=float(LogicalX(state,point.x)), y=float(point.y);
+    const auto inside=[&](const D2D1_RECT_F& rc) {
+        return rc.right>rc.left && rc.bottom>rc.top && x>=rc.left && x<rc.right && y>=rc.top && y<rc.bottom;
+    };
+    if(state.gridView) return inside(item.icon) || inside(CurrentSelectionRect(state,index,false,nullptr,true));
+    float right=std::min(item.text.right,ListEndX(state));
+    const auto usage=LayoutDriveBar(state,index,item);
+    if(usage.visible) right=std::min(right,usage.labelRight);
+    const float width=SelectedFilenameWidth(state,index,std::max(0.f,right-item.text.left));
+    const float leading=std::max(item.icon.left,ColumnsPresented(state)?NameColumnStart(state):ListStartX(state));
+    const float trailing=std::min(std::max(item.icon.right,item.text.left+width),
+        ColumnsPresented(state)?std::min(NameColumnEnd(state),ListEndX(state)):ListEndX(state));
+    return x>=leading && x<trailing && y>=visual.top && y<visual.top+visual.height;
+}
+
 // Pointer hover and keyboard selection use the same SelectionRect geometry,
 // cubic easing, and frame worker, but hover has its own duration constant.
 struct HoverVisual {
@@ -32218,6 +32243,11 @@ bool TouchItemValid(ViewState& state) {
         state.entries[size_t(state.touch.row)].path == state.touch.item);
 }
 
+bool TouchDragOriginOnContent(ViewState& state) {
+    POINT origin=state.touch.start;
+    return MapUiPoint(nullptr,state.hwnd,origin) && PointOnItemDragContent(state,state.touch.row,origin);
+}
+
 void ReplayTouchMouse(ViewState& state, UINT message, POINT point) {
     const HWND hwnd = state.hwnd;
     auto* expected = &state;
@@ -32241,6 +32271,7 @@ PCWSTR TouchDragBlock(ViewState& state) {
     if (!state.touch.dragPending) return L"not pending";
     if (!state.touch.active || !state.touch.down) return L"contact ended";
     if (state.touch.epoch != state.mouseFolderEpoch || !TouchItemValid(state)) return L"item changed";
+    if (!TouchDragOriginOnContent(state)) return L"press outside icon or filename";
     if (state.pendingNativeSelection || state.nativeSelectionUnsafe || state.nativeSelectionImportPending ||
         state.nativeSelectionAwaitingRefresh) return L"native selection not ready";
     if (!state.visible || !TabOwnsActiveView(state)) return L"inactive view";
@@ -32409,7 +32440,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                     TraceTouchHitTest(state,L"hold",state.touch.start,origin,RowFromPoint(state,origin.y,origin.x),mapped,error);
                 }
                 if (state.touch.row >= 0 && size_t(state.touch.row) < state.selectedFlags.size() && TouchItemValid(state) &&
-                    !state.selectedFlags[size_t(state.touch.row)]) Select(state, state.touch.row);
+                    TouchDragOriginOnContent(state) && !state.selectedFlags[size_t(state.touch.row)]) Select(state, state.touch.row);
             }
             // Native HOLD cancellation followed by manipulation is the
             // transition from a held item to dragging. A second contact or
@@ -32507,7 +32538,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
         state.touch.consumed = true;
         KillTimer(hwnd, kTouchHoldTimerId);
         if (state.touch.holding && session->contacts.size() <= 1 &&
-            event.contactCount == 1 && state.touch.row >= 0 && TouchItemValid(state)) {
+            event.contactCount == 1 && state.touch.row >= 0 && TouchItemValid(state) && TouchDragOriginOnContent(state)) {
             if (!state.touch.down) { StopTouch(state); return; }
             state.touch.dragPending = true;
             TraceTouchDrag(state,L"native held manipulation",true);
@@ -34736,31 +34767,31 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->mousePressControl = control;
                 s->mousePressShift = shift;
                 if (index >= 0) {
-                    // IMPORTANT: eligibility is based on the committed GPU
-                    // selection at mouse-down, never on a selection created by
-                    // this same press. Otherwise the first click-and-drag of
-                    // an unselected item unexpectedly starts an OLE file drag.
+                    // Empty row/cell padding remains available for marquee,
+                    // independently of the full-width selection background.
                     const bool alreadySelected =
                         static_cast<size_t>(index) < s->selectedFlags.size() &&
                         s->selectedFlags[static_cast<size_t>(index)] != 0;
-                    if (alreadySelected) {
-                        // A drag carries the original multi-selection, even
-                        // with Ctrl (Shell chooses Copy). Click modifiers are
-                        // applied only if mouse-up occurs without dragging.
+                    // Only the sole selected, focused item, pressed on its
+                    // filename text by a mouse button (not a touch tap),
+                    // may become a rename.
+                    s->mousePressRenameEligible = alreadySelected && listHadInput && !control && !shift &&
+                        !s->clickPolicy.singleClick && s->mousePressSource != ClickSource::Touch &&
+                        s->selected == index && s->selectedFlags.Count(0, s->selectedFlags.size()) == 1 &&
+                        PointOnFilenameText(*s, index, POINT{x, y});
+                    if (PointOnItemDragContent(*s,index,POINT{x,y})) {
+                        // Grabbing a selected member preserves the selection;
+                        // an unselected item is selected at the drag threshold.
+                        // Click modifiers remain deferred until release.
                         s->shellDragRow = index;
+                        s->shellDragItem = s->entries[size_t(index)].path;
                         s->shellDragStart = POINT{x, y};
                         s->shellDragCollapseOnClick = !control && !shift;
                         s->shellDragToggleOnClick = control && !shift;
-                        // Only the sole selected, focused item, pressed on its
-                        // filename text by a mouse button (not a touch tap),
-                        // may become a rename.
-                        s->mousePressRenameEligible = listHadInput && !control && !shift &&
-                            !s->clickPolicy.singleClick && s->mousePressSource != ClickSource::Touch &&
-                            s->selected == index && s->selectedFlags.Count(0, s->selectedFlags.size()) == 1 &&
-                            PointOnFilenameText(*s, index, POINT{x, y});
+
                     } else {
-                        // An unselected row is a possible marquee origin.
-                        // Defer ordinary click/Shift/Ctrl selection until UP;
+                        // Blank padding is a possible marquee origin, even
+                        // in a selected row. Defer click modifiers until UP;
                         // moving beyond the OS drag threshold instead starts
                         // marquee without any transient Shell selection work.
                         PrepareMarquee(*s, POINT{x, y}, control);
@@ -34800,13 +34831,26 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (std::abs(x - s->shellDragStart.x) >= GetSystemMetrics(SM_CXDRAG) ||
                 std::abs(y - s->shellDragStart.y) >= GetSystemMetrics(SM_CYDRAG)) {
                 const int row = s->shellDragRow;
+                if(size_t(row)>=s->entries.size() || s->mousePressEpoch!=s->mouseFolderEpoch ||
+                    s->entries[size_t(row)].path!=s->shellDragItem) {
+                    ResetMouseClickSequence(*s); ReleaseCapture(); return 0;
+                }
+                const auto lifetime=s->lifetimeToken, epoch=s->mouseFolderEpoch;
+                const auto item=std::move(s->shellDragItem);
                 s->shellDragRow = -1;
                 s->shellDragCollapseOnClick = false;
                 s->shellDragToggleOnClick = false;
                 s->mousePressActive = false;
                 DiscardCompletedMouseClick(*s);
                 if (GetCapture() == hwnd) ReleaseCapture();
-                StartNativeShellDrag(*s, row);
+                // A newly grabbed item becomes the sole drag source. Selection
+                // remains deferred for a simple click and for marquee origins.
+                if(State(hwnd)!=s || s->lifetimeToken!=lifetime || s->mouseFolderEpoch!=epoch ||
+                    size_t(row)>=s->entries.size() || s->entries[size_t(row)].path!=item) return 0;
+                if(size_t(row)>=s->selectedFlags.size() || !s->selectedFlags[size_t(row)]) Select(*s,row);
+                if(State(hwnd)==s && s->lifetimeToken==lifetime && s->mouseFolderEpoch==epoch &&
+                    size_t(row)<s->entries.size() && s->entries[size_t(row)].path==item)
+                    StartNativeShellDrag(*s, row);
             }
             return 0;
         }
@@ -34862,14 +34906,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool renameEligible = s->mousePressRenameEligible; // Capture release resets press state.
         if (s->shellDragRow >= 0) {
             const int pressed = s->shellDragRow;
-            const bool sameItem = s->mousePressRow == pressed &&
+            const bool sameItem = size_t(pressed)<s->entries.size() && s->entries[size_t(pressed)].path==s->shellDragItem &&
+                s->mousePressRow == pressed &&
                 s->mousePressEpoch == s->mouseFolderEpoch &&
                 InsideListX(*s, GET_X_LPARAM(lParam)) &&
                 RowFromPoint(*s, GET_Y_LPARAM(lParam), GET_X_LPARAM(lParam)) == pressed;
             const bool collapse = s->shellDragCollapseOnClick;
             const bool toggle = s->shellDragToggleOnClick;
             const ULONGLONG epoch = s->mouseFolderEpoch;
-            s->shellDragRow = -1;
+            s->shellDragRow = -1; s->shellDragItem.clear();
             s->shellDragCollapseOnClick = false;
             s->shellDragToggleOnClick = false;
             s->mousePressActive = false;
@@ -34975,6 +35020,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     s->mouseClickEpoch = completedEpoch;
                     s->mouseClickTick = GetTickCount64();
                     if (s->clickPolicy.singleClick && !pressControl && !pressShift) Open(*s,completedRow);
+                    else if (renameEligible && PointOnFilenameText(*s,completedRow,POINT{releaseX,releaseY}))
+                        ArmClickRename(*s,completedRow);
                 }
             }
             Redraw(*s);

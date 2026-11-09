@@ -58,6 +58,16 @@ void Install(ViewState& state) {
     SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     SetWindowLongPtrW(state.hwnd,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(Owner));
 }
+POINT DragContentPoint(ViewState& state,POINT point) {
+    const int row=RowFromPoint(state,point.y,point.x);
+    Check(row>=0,"held drag fixture must start on an item");
+    const RowVisual visual{state.headerPx+DocumentRowTop(state,row)-state.scrollNow,
+        DisplayRowHeight(state,row),1.f,DocumentRowLeft(state,row),state.itemWidth};
+    const auto icon=LayoutItem(state,visual).icon;
+    point.x=LogicalX(state,LONG((icon.left+icon.right)*.5f));
+    Check(PointOnItemDragContent(state,row,point),"held drag fixture missed the icon/name target");
+    return point;
+}
 void Reset(ViewState& state,Device& input,bool real=false) {
     StopTouch(state); ClearSwipeFeedback(state); state.touchRecognizer.reset(); ResetMouseGestureForNavigation(state);
     input.ResetTime(real); input.primary+=10;
@@ -1388,6 +1398,7 @@ static void TestTouchInput(const std::wstring& fixture) {
     // Actual stationary timer -> native HOLD -> SECONDARY_TAP, followed by
     // native HOLD -> manipulation -> posted OLE drag. No fabricated events.
     input.performance=false;
+    point=DragContentPoint(state,point);
     Reset(state,input,true); input.Next(); input.Send(state,{input.Packet(state,input.primary,point,down)});
     Held(state); WaitForPreparedSelection(state);
     input.Next(); input.Send(state,{input.Packet(state,input.primary,point,up)});
@@ -1430,6 +1441,24 @@ static void TestTouchInput(const std::wstring& fixture) {
     Check(!state.touch.dragPromoted,"native handoff cancellation retained promotion ownership");
     input.performance=true;
     Check(MenuFixture::calls==1 && commands->calls.size()==6,"drag release became a click or context menu");
+
+    // A genuine native hold/manipulation on unused row padding must remain
+    // available for selection/scrolling rather than promoting a file drag.
+    Reset(state,input,true);
+    POINT blank{LogicalX(state,LONG(ListEndX(state)-Scale96(20,ViewDpi(state)))),point.y};
+    const int blankRow=RowFromPoint(state,blank.y,blank.x);
+    Check(blankRow>=0 && !PointOnItemDragContent(state,blankRow,blank),"held padding fixture is not blank row space");
+    const auto promotionsBeforePadding=TouchFixture::promotions;
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,blank,down)});
+    Held(state);
+    POINT blankMoved=blank; blankMoved.y-=70;
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,blankMoved,move)});
+    Pump(state);
+    Check(!state.touch.dragPending && !state.touch.dragPromoted &&
+        TouchFixture::promotions==promotionsBeforePadding && TouchFixture::drags==0,
+        "held blank row padding armed or promoted a file drag");
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,blankMoved,up|POINTER_FLAG_CANCELED)});
+    StopTouch(state);
 
     MarqueePixels(input,fixture);
     PinchThresholdPixels(input,fixture);
@@ -1885,7 +1914,7 @@ static void TestTouchInput(const std::wstring& fixture) {
         SelectionUiFixture::Hold held(waiting.hwnd);
         SelectWithModifiers(waiting,100,false,true);
         StopScrollAnimation(waiting); SetScrollImmediate(waiting,DocumentRowTop(waiting,100)-100.f);
-        point={100,LONG(waiting.headerPx+100+DisplayRowHeight(waiting,100)*.5f)};
+        point=DragContentPoint(waiting,POINT{100,LONG(waiting.headerPx+100+DisplayRowHeight(waiting,100)*.5f)});
         Check(waiting.pendingNativeSelection!=0,"bulk selection did not enter its real preparation lane");
         input.Next(); input.Send(waiting,{input.Packet(waiting,input.primary,point,down)});
         Held(waiting);
@@ -1955,7 +1984,7 @@ static void TestTouchInput(const std::wstring& fixture) {
     Check(!state.touch.inertia && state.scrollNow==interruptedAt,"new contact did not interrupt native inertia");
     input.Next(); input.Send(state,{input.Packet(state,input.primary,point,up|POINTER_FLAG_CANCELED)});
     Check(!state.touch.active && !state.touch.dragPending,"canceled native contact retained gesture state");
-    Reset(state,input,true); point={100,200};
+    Reset(state,input,true); point=DragContentPoint(state,POINT{100,200});
     input.Next(); input.Send(state,{input.Packet(state,input.primary,point,down)});
     Held(state); WaitForPreparedSelection(state);
     moved=point; moved.y-=70; input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,move)});

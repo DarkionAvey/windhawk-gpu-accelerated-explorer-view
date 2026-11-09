@@ -1393,6 +1393,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 
 #include "animation-smoke.h"
 #include "zebra-snapshot-smoke.h"
+#include "item-drag-hit-smoke.h"
 #include "column-fit-composition-smoke.h"
 #include "drive-bar-smoke.h"
 #include "row-composition-smoke.h"
