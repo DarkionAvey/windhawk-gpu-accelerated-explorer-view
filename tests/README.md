@@ -57,9 +57,10 @@ own process, with its own mod globals, COM apartments, window classes, workers
 and private fixture directory. No test can depend on another test's state.
 The runner starts all Parallel entries first (up to `-Jobs` processes; default
 four, bounded by the logical CPU count), then each Serial entry alone. It
-reports every failure together, names crash codes (access violation, fail-fast,
+stops at the first failure: running tests are cancelled and no others start.
+It names crash codes (access violation, fail-fast,
 stack overflow...), prints the crashing test with its option/view context, and
-fails a test that exceeds `-TestTimeoutSeconds` (default 900) instead of
+fails a test that exceeds `-TestTimeoutSeconds` (default 120) instead of
 blocking the gate. Up to two compiler processes run concurrently.
 
 ```powershell
@@ -74,28 +75,25 @@ background-regression.exe --test option-live-sweep-details            # one test
 `--options`, ...) still select the matching manifest entries. Failure
 preserves binaries, per-test stdout/stderr logs, timing CSVs and any pixel
 evidence (`*.bmp`) in the printed artifact directory; `-KeepArtifacts`
-retains binaries after success too. Assertions stay unchanged. Once the initial
-parallel and serial phases have finished, each unsuccessful runtime test gets
-three isolated attempts, one process at a time. All three run even after a
-passing retry. Two or three failed isolated attempts fail the test; zero or one
-failed isolated attempts pass it. The initial parallel failure does not count
-toward that threshold. Compiler errors stop at their compile gate and are not
-retried.
+retains binaries after success too. Assertions stay unchanged. Each test runs
+once: a failure is a failure and is never retried. Compiler errors stop at
+their compile gate.
 
-Observed injected Windhawk modules, blocked process launches, and incomplete
+Before compiling, a short probe process checks whether Windhawk (or another
+mod engine) injects into new processes; if it does, the run stops at once as
+pending. During the run, observed injected Windhawk modules, blocked process launches, and incomplete
 process/output cleanup make checks **pending**, rather than proving a test bug.
 Module observation is best effort: the runner cannot identify every injector or
 infer interference from an unexplained failure. It does not change Windhawk
 settings. Pending checks block publication with a nonzero exit, even if other
-checks pass. A process that cannot be reaped prevents further isolated attempts;
+checks pass. A process that cannot be reaped stops the run;
 uncompleted checks remain pending. Process termination and output draining have
 bounded cleanup waits instead of waiting forever.
 
 The printed result directory retains `build-report.json` (release command),
 `test-run-report.json`, `regression-report.json`, `regression-summary.csv` and
-`regression-attempts.csv`. Each retry has its own logs/receipt under
-`isolated-<attempt>/<test>/`. Retried runs retain their binaries for investigation,
-even after recovery. Clean runs retain logs/reports and remove binaries unless
+`regression-attempts.csv`, with one result per test.
+Clean runs retain logs/reports and remove binaries unless
 `-KeepArtifacts` or `-Coverage` is used. `-OutputDirectory` selects an artifact
 directory (repository-relative or absolute); it must be empty so earlier results
 cannot be overwritten.
@@ -161,6 +159,14 @@ is not a full-suite coverage baseline. The implementation uses LLVM's
    reachable from the manifest.
 3. Run it alone (`--test something`) and beside the suite
    (`-Jobs 16`); both must pass.
+
+**Every test finishes within 120 seconds. This is a fixed ceiling, not a
+default.** Tests are deterministic; there is nothing a test needs a large
+buffer for. There are no per-test timeouts, and `-TestTimeoutSeconds` can only
+lower the limit (for diagnosis), never raise it. A test that comes near the
+limit is split into smaller manifest entries along its natural dimensions, as
+`rename-appearance-{user32,comctl32}-{96,144,192}` is. Each test runs once: a
+failure is final, is never retried, and stops the whole run.
 
 **Parallel is the expected declaration.** Isolation comes with the process:
 - Create files only under `fixture`; never use user folders or fixed paths.

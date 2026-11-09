@@ -283,13 +283,13 @@ void Palette(ViewState& state) {
 }
 }
 
-static void TestRenameAppearanceImpl(const std::wstring& directory) {
+static void TestRenameAppearanceImpl(const std::wstring& directory, int dpi) {
     StyleFixture::Session styles;
     const auto factory=g_writeFactory;
     const auto filenameOnly=g_filenameOnly.exchange(ViewOption::GridOnly);
     if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
         __uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"rename appearance fonts");
-    for(int dpi:{96,144,192}) for(bool rtl:{false,true})
+    for(bool rtl:{false,true})
         for(UINT mode:{FVM_DETAILS,FVM_LIST,FVM_SMALLICON,FVM_ICON,FVM_THUMBNAIL}) for(bool grouped:{false,true}) {
         const bool grid=mode==FVM_ICON || mode==FVM_SMALLICON || mode==FVM_THUMBNAIL, details=mode==FVM_DETAILS;
         StyleFixture::dpi=dpi;
@@ -477,27 +477,30 @@ static void TestRenameAppearanceImpl(const std::wstring& directory) {
         RemoveWindowSubclass(state.hwnd,RenameAppearanceFixture::Resize,1);
     }
     g_filenameOnly=filenameOnly; g_writeFactory=factory;
-    std::cout<<"PASS: native rename colors/smoothing, actual prefix coordinates and basename selection, API selection changes without layout, full wrapped-name growth, wheel/native pinch/compositor hide/restore with preserved text/selection and updated fonts; GPU selection and real resize/reveal in grouped/ungrouped LTR/RTL views at 96/144/192 DPI\n";
+    std::cout<<"PASS: native rename colors/smoothing, actual prefix coordinates and basename selection, API selection changes without layout, full wrapped-name growth, wheel/native pinch/compositor hide/restore with preserved text/selection and updated fonts; GPU selection and real resize/reveal in grouped/ungrouped LTR/RTL views at "<<dpi<<" DPI\n";
 }
 
-static void RenameAppearanceVariants(const std::wstring& directory) {
-    TestRenameAppearanceImpl(directory);
+// One control set at one DPI per test: each finishes well inside the fixed
+// per-test limit. USER32 is Windows' classic edit; COMCTL32 is the themed one.
+static void RenameAppearanceVariant(const std::wstring& directory, bool themed, int dpi) {
+    if(!themed) { TestRenameAppearanceImpl(directory,dpi); return; }
     const auto manifest=std::filesystem::path(__FILE__).parent_path()/L"rename-native-controls.manifest";
     ACTCTXW settings{sizeof(settings)}; settings.lpSource=manifest.c_str();
     const HANDLE context=CreateActCtxW(&settings);
     Check(context!=INVALID_HANDLE_VALUE,"themed native control activation context");
     ULONG_PTR cookie=0;
     if(!ActivateActCtx(context,&cookie)) {ReleaseActCtx(context); Check(false,"activate themed native controls");}
-    try {TestRenameAppearanceImpl(directory);}
+    try {TestRenameAppearanceImpl(directory,dpi);}
     catch(...) {DeactivateActCtx(0,cookie); ReleaseActCtx(context); throw;}
     DeactivateActCtx(0,cookie); ReleaseActCtx(context);
-    std::cout<<"PASS: rename appearance exercised both USER32 and themed COMCTL32 native controls\n";
+    std::cout<<"PASS: rename appearance exercised the themed COMCTL32 native control\n";
 }
 
-static void TestRenameAppearance(const std::wstring& directory) {
+static void TestRenameAppearance(const std::wstring& directory, bool themed, int dpi) {
     wchar_t desktop[256]{}; DWORD length=0;
     Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),UOI_NAME,desktop,sizeof(desktop),&length),
         "rename desktop identity");
-    if(std::wstring_view(desktop).starts_with(L"gpu-overlay-rename-")) RenameAppearanceVariants(directory);
-    else PrivateDesktopFixture::Run(L"rename",L"--test rename-appearance",900000);
+    const std::wstring name=std::wstring(L"rename-appearance-")+(themed ? L"comctl32-" : L"user32-")+std::to_wstring(dpi);
+    if(std::wstring_view(desktop).starts_with(L"gpu-overlay-rename-")) RenameAppearanceVariant(directory,themed,dpi);
+    else PrivateDesktopFixture::Run(L"rename",L"--test "+name,120000);
 }

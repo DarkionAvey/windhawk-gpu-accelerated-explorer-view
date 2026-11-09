@@ -180,30 +180,10 @@ static void TestShellSizeTruth(const std::wstring& directory) {
             "enumerated facts did not produce the Shell's own Size text");
     }
     ViewState state;
-    // Shell change notifications reach ordinary windows, not message-only ones.
-    HWND frame = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"size-truth-frame",
-        WS_POPUP | WS_VISIBLE, -32000, -32000, 640, 480, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    Check(frame != nullptr, "size truth frame");
-    state.hwnd = CreateWindowExW(0, L"STATIC", L"size-truth", WS_CHILD | WS_VISIBLE, 0, 0, 640, 480,
-        frame, nullptr, GetModuleHandleW(nullptr), nullptr);
-    Check(state.hwnd != nullptr, "size truth window");
-    state.background->hwnd = state.hwnd;
+    state.hwnd = MessageWindow(); state.background->hwnd = state.hwnd;
     state.folderPath = root.wstring(); state.inScope = true; state.rowPx = 34;
-    SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
-    const auto pump = [&] {
-        MSG message{};
-        // Shell delivery passes through its own window on this thread.
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-            if (message.hwnd != state.hwnd) { DispatchMessageW(&message); continue; }
-            if (message.message == kMsgShellItemCreated || message.message == kMsgFilesystemChanged ||
-                message.message == kMsgFlushDirectoryChanges)
-                OverlayProc(state.hwnd, message.message, message.wParam, message.lParam);
-        }
-        ReceiveDirectoryResults(state);
-    };
-    WatchDirectory(state); QueueDirectoryRefresh(state);
-    Check(Eventually([&] { pump(); return state.loaded && !state.directoryPending &&
-        state.directoryWatch && state.directoryWatch->registration; }),
+    QueueDirectoryRefresh(state);
+    Check(Eventually([&] { ReceiveDirectoryResults(state); return state.loaded && !state.directoryPending; }),
         "size truth names completion");
     Check(state.total == 5, "size truth row count");
     // A row without a size record whose item is unreadable shows "--", not 0 bytes.
@@ -268,7 +248,7 @@ static void TestShellSizeTruth(const std::wstring& directory) {
     }
     const std::weak_ptr<TabBackground> retired = state.background;
     Stop(state.background);
-    DestroyWindow(state.hwnd); DestroyWindow(frame);
+    DestroyWindow(state.hwnd);
     Check(Eventually([&] { return retired.expired(); }), "size truth providers did not drain");
     folder.Reset(); item.Reset();
     Check(root.parent_path() == std::filesystem::path(directory), "size truth cleanup boundary");

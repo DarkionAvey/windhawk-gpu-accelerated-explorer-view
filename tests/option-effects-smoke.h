@@ -88,6 +88,7 @@ inline const char* ModeName(UINT mode,int size) {
     case FVM_DETAILS: return "Details";
     case FVM_LIST: return "List";
     case FVM_SMALLICON: return "Small icons";
+    case FVM_TILE: return "Tiles";
     default: return size>=96 ? "Large icons" : "Medium icons";
     }
 }

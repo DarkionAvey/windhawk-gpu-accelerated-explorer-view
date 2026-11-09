@@ -55,6 +55,15 @@
   Serial to hide it, and never relax or retry an assertion.
 - Before reporting, run the new test alone (`--test name`) and with the suite
   at `-Jobs 16`.
+- **Every test must finish within the fixed 120-second limit. There are no
+  per-test timeouts and the limit is never raised, "just to be safe" or
+  otherwise.** If a test approaches the limit, split it into smaller manifest
+  entries along its natural dimensions (DPI, control set, view mode), as the
+  `rename-appearance-*` entries are. A test that needs longer is a test to
+  restructure, not an exception to grant. The runner rejects higher limits.
+- A failure is final: tests run once, are never retried, and the first
+  failure stops the whole run. Do not add retries or tolerance to hide flaky
+  timing; find and fix the cause.
 - A new or changed user option needs an `OptionCatalog` entry, an effect
   assertion against an independent expectation (pixels, DPI arithmetic,
   DirectWrite measurement; not the mod's own helpers) and a

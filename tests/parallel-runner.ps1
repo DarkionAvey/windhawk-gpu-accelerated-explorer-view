@@ -45,65 +45,64 @@ function New-RegressionResultDirectory([string]$Path) {
     $null = New-Item -ItemType Directory -Path $Path -Force
 }
 
-# Runtime policy only. Compiler failures never enter this retry gate.
+# Runtime policy only. Compiler failures never enter this gate. One attempt per
+# test: a failure is a failure, and the first one cancels the rest of the run.
+# Tests are deterministic, so the default limit is two minutes, not a buffer.
 function Invoke-RegressionGate {
     param(
         [Parameter(Mandatory=$true)][object[]]$Tasks,
         [Parameter(Mandatory=$true)][string]$OutputDirectory,
         [ValidateRange(1,32)][int]$Jobs = 1,
-        [ValidateRange(1,86400)][int]$TimeoutSeconds = 900,
+        [ValidateRange(1,120)][int]$TimeoutSeconds = 120, # Fixed per-test ceiling; never raised.
         [switch]$ObserveInterference
     )
-    $attempts = [Collections.Generic.List[object]]::new()
-    $initial = @(Invoke-RegressionTasks -Tasks $Tasks -OutputDirectory $OutputDirectory -Jobs $Jobs `
-        -Phase regression -TimeoutSeconds $TimeoutSeconds -CollectResults -ObserveInterference:$ObserveInterference)
-    foreach ($result in $initial) {
-        $result | Add-Member -NotePropertyName Attempt -NotePropertyValue 0
-        $attempts.Add($result)
-    }
-    $unsafe = @($initial | Where-Object { $_.Unreaped -or $_.Reason -like 'Output*' }).Count -gt 0
-    foreach ($task in $Tasks) {
-        $first = $initial | Where-Object Name -eq $task.Name
-        if ($first.Status -eq 'Pass' -or $unsafe) { continue }
-        # All three isolated attempts run, including after recovery or a second
-        # failure. Separate directories preserve every stdout/stderr and receipt.
-        foreach ($attempt in 1..3) {
-            $directory = Join-Path $OutputDirectory ("isolated-$attempt\"+$task.Name)
-            $null = New-Item -ItemType Directory -Path $directory -Force
-            $retry = @(Invoke-RegressionTasks -Tasks @($task) -OutputDirectory $directory -Jobs 1 `
-                -Phase regression -TimeoutSeconds $TimeoutSeconds -CollectResults -ObserveInterference:$ObserveInterference)
-            foreach ($result in $retry) {
-                $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $attempt
-                $attempts.Add($result)
-                if ($result.Unreaped -or $result.Reason -like 'Output*') { $unsafe = $true }
-            }
-            if ($unsafe) { break }
-        }
-    }
+    $results = @(Invoke-RegressionTasks -Tasks $Tasks -OutputDirectory $OutputDirectory -Jobs $Jobs `
+        -Phase regression -TimeoutSeconds $TimeoutSeconds -CollectResults -StopOnFailure -ObserveInterference:$ObserveInterference)
     $summary = foreach ($task in $Tasks) {
-        $history = @($attempts | Where-Object Name -eq $task.Name)
-        $retries = @($history | Where-Object Attempt -gt 0)
-        $failed = @($retries | Where-Object Status -eq Fail).Count
-        $pending = @($history | Where-Object Status -eq Pending).Count
-        $status = if ($failed -ge 2) { 'Fail' }
-            elseif ($pending -or ($history[0].Status -ne 'Pass' -and $retries.Count -lt 3)) { 'Pending' }
-            else { 'Pass' }
-        [pscustomobject]@{ Name=$task.Name; Status=$status; Attempts=$history.Count
-            FailedRetries=$failed; PendingAttempts=$pending
-            Recovered=($status -eq 'Pass' -and $history[0].Status -ne 'Pass') }
+        $result = $results | Where-Object Name -eq $task.Name | Select-Object -First 1
+        [pscustomobject]@{ Name=$task.Name; Status=$(if ($result) { $result.Status } else { 'Pending' })
+            Seconds=$(if ($result) { [Math]::Round($result.Seconds,2) } else { 0 })
+            Reason=$(if ($result) { $result.Reason } else { 'Not started' }) }
     }
-    $attempts | Export-Csv -LiteralPath (Join-Path $OutputDirectory 'regression-attempts.csv') -NoTypeInformation
+    $results | Export-Csv -LiteralPath (Join-Path $OutputDirectory 'regression-attempts.csv') -NoTypeInformation
     $summary | Export-Csv -LiteralPath (Join-Path $OutputDirectory 'regression-summary.csv') -NoTypeInformation
     $failedTests = @($summary | Where-Object Status -eq Fail)
-    $pendingTests = @($summary | Where-Object { $_.Status -eq 'Pending' -or $_.PendingAttempts })
+    $pendingTests = @($summary | Where-Object Status -eq Pending)
     $status = if ($failedTests.Count) { 'Fail' } elseif ($pendingTests.Count) { 'Pending' } else { 'Pass' }
     $report = [pscustomobject]@{ Status=$status; Failed=$failedTests.Count; Pending=$pendingTests.Count
-        Passed=@($summary | Where-Object Status -eq Pass).Count; Tests=@($summary); Attempts=$attempts.ToArray() }
+        Passed=@($summary | Where-Object Status -eq Pass).Count; Tests=@($summary); Attempts=$results }
     $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'regression-report.json') -Encoding UTF8
-    $summary | Format-Table Name,Status,Attempts,FailedRetries,PendingAttempts,Recovered -AutoSize | Out-Host
-    Write-Host "RESULT: $status ($($report.Passed) passed, $($report.Failed) failed, $($report.Pending) pending). Reports: $OutputDirectory"
+    $summary | Where-Object Status -ne Pass | Format-Table Name,Status,Seconds,Reason -AutoSize | Out-Host
+    Write-Host "RESULT: $status ($($report.Passed) passed, $($report.Failed) failed, $($report.Pending) pending or cancelled). Reports: $OutputDirectory"
     if ($status -ne 'Pass') {
         throw "$($status.ToUpperInvariant()): regression gate; failed: $($failedTests.Name -join ', '); pending: $($pendingTests.Name -join ', '). Reports: $OutputDirectory"
+    }
+}
+
+# Fail fast on a machine that would invalidate every result: start a short-lived
+# private probe and look for an injected mod engine before anything is compiled
+# or run. The in-run observation remains as a backstop.
+function Assert-NoModuleInjection {
+    $shell = Join-Path $PSHOME 'powershell.exe'
+    if (!(Test-Path -LiteralPath $shell)) { $shell = Join-Path $PSHOME 'pwsh.exe' }
+    $info = [Diagnostics.ProcessStartInfo]::new($shell, '-NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 3')
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $probe = [Diagnostics.Process]::Start($info)
+    $modules = @()
+    try {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while (!$probe.HasExited -and $clock.Elapsed.TotalSeconds -lt 5) {
+            $modules = @($modules + @(Get-TestInterference $probe) | Select-Object -Unique)
+            if ($modules.Count) { break }
+            Start-Sleep -Milliseconds 100
+        }
+    } finally {
+        if (!$probe.HasExited) { $probe.Kill(); $null = $probe.WaitForExit(5000) }
+        $probe.Dispose()
+    }
+    if ($modules.Count) {
+        throw ("PENDING: Windhawk (or another mod engine) injects into new processes on this machine: $($modules -join '; '). " +
+            'Test results would be invalid, so nothing was compiled or run. Exclude the regression executables and PowerShell from Windhawk (or pause it), then rerun.')
     }
 }
 
@@ -156,18 +155,23 @@ function Stop-RegressionProcess([Diagnostics.Process]$Process, [int]$CleanupTime
 }
 
 # Runs every task whose Serial flag is false with up to -Jobs processes, then
-# runs Serial tasks one at a time with nothing else running. All tasks run even
-# after a failure; every failure is reported together at the end.
+# runs Serial tasks one at a time with nothing else running. Without
+# -StopOnFailure all tasks run even
+# after a failure and every failure is reported together at the end. With
+# it, the first failure cancels running tests and starts no others.
 function Invoke-RegressionTasks {
     param(
         [Parameter(Mandatory=$true)][object[]]$Tasks,
         [Parameter(Mandatory=$true)][string]$OutputDirectory,
         [ValidateRange(1,32)][int]$Jobs = 1,
         [ValidatePattern('^[a-z0-9-]+$')][string]$Phase = 'tasks',
+        # Compilers use this generic runner too; tests reach it only through
+        # Invoke-RegressionGate, whose per-test ceiling is fixed at 120 s.
         [ValidateRange(1,86400)][int]$TimeoutSeconds = 1800,
         [ValidateRange(1,60)][int]$CleanupTimeoutSeconds = 10,
         [switch]$ObserveInterference,
-        [switch]$CollectResults
+        [switch]$CollectResults,
+        [switch]$StopOnFailure
     )
     $names = @{}
     foreach ($task in $Tasks) {
@@ -184,9 +188,10 @@ function Invoke-RegressionTasks {
     $results = [Collections.Generic.List[object]]::new()
     $batchClock = [Diagnostics.Stopwatch]::StartNew()
     $startFailure = $null
+    $stopFailure = $null # First failed test under -StopOnFailure.
     try {
         while ($pending.Count -or $running.Count) {
-            while (!$startFailure -and $pending.Count -and $running.Count -lt $Jobs) {
+            while (!$startFailure -and !$stopFailure -and $pending.Count -and $running.Count -lt $Jobs) {
                 # A serial task waits for every parallel task and runs alone.
                 if ($pending.Peek().Serial -and $running.Count) { break }
                 if ($running.Count -and $running[0].Task.Serial) { break }
@@ -308,6 +313,21 @@ function Invoke-RegressionTasks {
             $child.Wait.Dispose()
             $child.Process.Dispose()
             $running.RemoveAt($index)
+            if ($StopOnFailure -and $results[$results.Count-1].Status -eq 'Fail') {
+                # A failure is final: cancel the running peers (reaped below)
+                # and start nothing else, so a broken build fails in minutes.
+                $stopFailure = $results[$results.Count-1].Name
+                foreach ($other in $running) {
+                    $results.Add([pscustomobject]@{
+                        Name=$other.Task.Name; Serial=[bool]$other.Task.Serial; ExitCode=-1
+                        Seconds=$other.Clock.Elapsed.TotalSeconds; TimedOut=$false
+                        Stdout=$other.OutPath; Stderr=$other.ErrPath; Status='Pending'
+                        Reason="Cancelled after $stopFailure failed"; Modules=''; ProcessId=$other.Process.Id; Unreaped=$false
+                    })
+                    Write-Host "CANCELLED: $($other.Task.Name) (after $stopFailure failed)"
+                }
+                break
+            }
         }
     } finally {
         # On infrastructure errors or interruption, drain already started
@@ -326,7 +346,8 @@ function Invoke-RegressionTasks {
     foreach ($task in $pending) {
         $results.Add([pscustomobject]@{
             Name=$task.Name; Serial=[bool]$task.Serial; ExitCode=-1; Seconds=0; TimedOut=$false
-            Stdout=''; Stderr=''; Status='Pending'; Reason="Not started after infrastructure problem: $startFailure"
+            Stdout=''; Stderr=''; Status='Pending'
+            Reason=$(if ($stopFailure) { "Not started after $stopFailure failed" } else { "Not started after infrastructure problem: $startFailure" })
             Modules=''; ProcessId=0; Unreaped=$false
         })
     }

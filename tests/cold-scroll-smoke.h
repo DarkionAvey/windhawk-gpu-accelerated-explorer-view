@@ -182,8 +182,13 @@ static void TestColdScrollDelivery() {
                 Check(!(GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE), "cold scroll exposed native content");
             }
         }
-        pumpProviders(); AdvanceAnimationFrame(state, true);
-        Check(ready() > 0, "real metadata did not progress during held scrollbar");
+        // Cold Shell properties arrive on their own schedule; a loaded machine
+        // may need more than the 64 frames above. Wait for the completion
+        // signal (bounded) while the thumb is still held, not for elapsed time.
+        Check(Eventually([&] {
+            pumpProviders(); AdvanceAnimationFrame(state, true);
+            return state.draggingScrollbar && ready() > 0;
+        }), "real metadata did not progress during held scrollbar");
         std::sort(times.begin(), times.end());
         std::cout << "PROFILE: read-only SysWOW64 " << state.total << " rows, 256 thumb input samples, cold provider/frame CPU median=" <<
             times[times.size()/2] << " ms p95=" << times[times.size()*95/100] << " ms (offscreen; OS caches uncontrolled)\n";

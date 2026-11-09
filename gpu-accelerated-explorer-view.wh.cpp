@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.0.5
+// @version         1.0.6
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -928,11 +928,16 @@ struct EntrySortKey {
     std::wstring label;
     FILETIME lastWrite{};
     ULONGLONG byteSize = 0;
+    bool byteSizeKnown = false; // byteSize came from the item, not a default.
+    // Folder rows: the Size column provider's contents size, for size sorts.
+    ULONGLONG contentSize = 0;
+    bool contentSizeKnown = false;
     bool folder = false;
     SharedPidl shellIdentity; // Immutable identity for targeted provider rechecks.
     bool operator==(const EntrySortKey&) const = default;
 };
 const std::wstring& EntryLabel(const EntrySortKey& e) { return e.label.empty() ? e.name : e.label; }
+ULONGLONG EntrySizeValue(const EntrySortKey& e) { return e.folder ? e.contentSize : e.byteSize; }
 struct Entry : EntrySortKey {
     std::wstring date, type, size;
     std::vector<ColumnCell> cells;
@@ -963,7 +968,7 @@ bool SameEntryIdentity(const Entry& a, const Entry& b) {
 bool SameEntryMetadata(const Entry& a, const Entry& b) {
     if (a.path.starts_with(L"windhawk:pidl:") && b.path.starts_with(L"windhawk:pidl:"))
         return SameEntryIdentity(a,b) && a.folder == b.folder && a.name == b.name;
-    return a.folder == b.folder && a.byteSize == b.byteSize &&
+    return a.folder == b.folder && a.byteSize == b.byteSize && a.byteSizeKnown == b.byteSizeKnown &&
         CompareFileTime(&a.lastWrite, &b.lastWrite) == 0 &&
         CompareFileTime(&a.created, &b.created) == 0 &&
         CompareFileTime(&a.accessed, &b.accessed) == 0;
@@ -1877,6 +1882,9 @@ struct DirectoryJob {
     SharedPidl folderIdentity; // Native binding, including filesystem-addressed providers.
     SharedPidl namespaceFolder; // Immutable; rebound only by the names worker.
     std::shared_ptr<const NamespaceIdentities> verifyIdentities;
+    // The displayed listing of this same folder; keeps row identities stable
+    // when its provider returns canonically equal items with different bytes.
+    std::shared_ptr<const NamespaceIdentities> previousIdentities;
     SharedPidl nativeWitness; // Explorer item contradicting an empty snapshot.
     bool nativeWitnessExists = false;
     std::shared_ptr<std::atomic<size_t>> capacityRemaining;
@@ -1922,6 +1930,9 @@ struct DetailRequest {
     std::wstring path;
     FILETIME modified{};
     ULONGLONG size = 0;
+    bool sizeKnown = false;
+    DWORD attributes = 0;
+    FILETIME created{}, accessed{};
     bool folder = false;
     // Only unresolved PROPERTYKEYs. Previously painted columns stay cached.
     std::vector<PROPERTYKEY> missingKeys;
@@ -2457,6 +2468,10 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     bool registered = false; // Protected by the lifetime regulator's mutex.
     SRWLOCK directoryLock = SRWLOCK_INIT;
     std::deque<DirectoryJob> directoryJobs, layoutJobs, capacityJobs;
+    // Folder sizes from the Size column provider, for the listed folder only.
+    // Written by provider lanes, read by the names lane; directoryLock guards.
+    std::wstring folderSizeFolder;
+    std::unordered_map<std::wstring, ULONGLONG> folderSizes;
     std::shared_ptr<DirectoryJob> nativeCatalogRequest;
     std::deque<DetailJob> detailJobs;
     std::deque<NativeRowsJob> nativeRowsJobs;
@@ -3103,12 +3118,19 @@ struct ItemTip {
     ComPtr<ID2D1Factory> factory;
     ComPtr<ID2D1DCRenderTarget> target;
     ComPtr<IDWriteTextFormat> nameFormat, labelFormat, valueFormat;
-    unsigned long long formatSerial = 0;
+    // Font measurements, redone only when the DPI, configured face, reading
+    // direction or theme changes. Line-box space above the tallest letters and
+    // below the deepest descenders, in whole pixels.
+    int metricsDpi = 0; unsigned long long metricsFace = 0;
+    float nameAbove = 0.f, nameBelow = 0.f, rowAbove = 0.f, rowBelow = 0.f;
     bool formatRtl = false;
     ComPtr<IDWriteTextLayout> nameLayout;
     std::vector<std::pair<ComPtr<IDWriteTextLayout>, ComPtr<IDWriteTextLayout>>> rowLayouts;
     std::vector<float> rowTops;
     float padX = 0.f, padY = 0.f, nameHeight = 0.f, labelX = 0.f, valueX = 0.f;
+    float corner = 0.f; // Radius of the window region and its painted border.
+    bool paletteDirty = true, highContrast = false; // Style sampled lazily, on show.
+    float nameTop = 0.f; // Name line top: padding less the font's leading above capitals.
     SIZE size{};
     size_t rowCapacity = 0;
     DragTextStyle textStyle; // Shared monitor-aware rendering policy, independent popup target.
@@ -3123,7 +3145,7 @@ struct ItemTip {
         nameFormat.Reset(); labelFormat.Reset(); valueFormat.Reset();
         nameLayout.Reset(); rowLayouts.clear(); rowTops.clear();
         item.clear(); suppressed.clear(); name.clear(); rows.clear();
-        token = 0; formatSerial = 0; textStyle = {};
+        token = 0; metricsDpi = 0; textStyle = {};
     }
     ~ItemTip() { Release(); }
 };
@@ -3183,6 +3205,7 @@ struct ViewState {
     HTHEME viewToggleTheme = nullptr;
     HFONT viewToggleTipFont = nullptr;
     HWND viewToggleTipSource = nullptr;
+    HFONT viewToggleTipSourceFont = nullptr; // Explorer tooltip font last copied; it may change once.
     bool viewToggleStyled = false;
     void ReleaseViewToggle() {
         for (HWND child : {viewToggleTooltip, viewToggle}) {
@@ -3617,6 +3640,10 @@ struct ViewState {
     ScrollbarMotion scrollbarMotion[2]; // Vertical and horizontal, independently retargetable.
     int hovered = -1;
     std::wstring typeSearch;
+    // Words of the displayed search-results query; their matches in names
+    // are highlighted like Explorer's own search view. Empty elsewhere.
+    std::vector<std::wstring> searchHighlightTerms;
+    SharedPidl searchHighlightFolder; // Identity the terms were read from.
     TypeSearchCandidates typeSearchCandidates; // Owner-only; never copied to presentation snapshots.
     bool typeSearchWaiting=false;
     unsigned long long typeSearchWaitingListing=0;
@@ -4257,7 +4284,7 @@ struct SwipeFeedbackSnapshot {
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
     X(hoverFromHeight) X(hoverToHeight) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
-    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
+    X(hovered) X(clickPolicy) X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
@@ -4526,15 +4553,20 @@ int Scale96(int value, int dpi);
 float EdgeMarginPx(const ViewState& state);
 int VerticalScrollbarClearance(int dpi);
 
-bool IsIconViewMode(UINT mode, bool thisPc = false) {
-    return mode == FVM_ICON || mode == FVM_SMALLICON || mode == FVM_THUMBNAIL ||
-        (thisPc && mode == FVM_TILE);
+// Grid modes share one cell pipeline. Tiles are compact cells with stacked
+// detail lines; Content still stays native.
+bool IsIconViewMode(UINT mode, bool = false) {
+    return mode == FVM_ICON || mode == FVM_SMALLICON || mode == FVM_THUMBNAIL || mode == FVM_TILE;
 }
 bool IsGpuViewMode(UINT mode, bool thisPc = false) {
     return mode == FVM_DETAILS || mode == FVM_LIST || IsIconViewMode(mode, thisPc);
 }
+bool TileLayout(const ViewState& state) {
+    return state.gridView && state.cachedNativeMode == FVM_TILE;
+}
+// This PC tiles show each drive's usage bar and free space as their details.
 bool DriveTiles(const ViewState& state) {
-    return state.thisPcGpu && state.gridView;
+    return state.thisPcGpu && TileLayout(state);
 }
 bool ViewOptionEnabled(const ViewState& state, const std::atomic<ViewOption>& option) {
     const auto value = option.load(std::memory_order_relaxed);
@@ -4565,8 +4597,8 @@ void LayoutGroupSections(ViewState& state) {
         // integer column boundary partway through an otherwise smooth zoom.
         const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
         const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float checkboxSpace = (DriveTiles(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state) : 0.f;
-        const float minimum = checkboxSpace + (DriveTiles(state) ?
+        const float checkboxSpace = (TileLayout(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state) : 0.f;
+        const float minimum = checkboxSpace + (TileLayout(state) ?
             std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
                 icon + font * 12.f + Scale96(24, dpi)) :
             state.cachedNativeMode == FVM_SMALLICON ?
@@ -7250,7 +7282,17 @@ IconPixels LoadShellItemIcon(IWICImagingFactory* factory, const IconJob& job,
     bool thumbnail = false;
     if (SUCCEEDED(hr)) {
         const SIZE size{static_cast<LONG>(job.pixelSize),static_cast<LONG>(job.pixelSize)};
-        if (job.allowThumbnail) {
+        // Only items with content streams have content thumbnails. For other
+        // namespace items (applications, printers) the factory's "thumbnail"
+        // is their icon art, padded onto a provider plate above its native
+        // size; the icon path below fits that art to the slot instead.
+        // Filesystem paths name files, which always have content.
+        ComPtr<IShellItem> shellItem;
+        SFGAOF content = 0;
+        const bool thumbnailItem = job.allowThumbnail && (!job.shellIdentity ||
+            (SUCCEEDED(item.As(&shellItem)) && SUCCEEDED(shellItem->GetAttributes(SFGAO_STREAM, &content)) &&
+             (content & SFGAO_STREAM)));
+        if (thumbnailItem) {
             hr = item->GetImage(size,static_cast<SIIGBF>(SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK),&raw);
             thumbnail = SUCCEEDED(hr) && raw;
             if (!thumbnail && raw) { DeleteObject(raw); raw=nullptr; }
@@ -7693,7 +7735,7 @@ std::wstring FolderLocation(PCIDLIST_ABSOLUTE pidl) {
     // Filesystem containers can expose descendants with no Win32 path. Keep
     // their complete Shell identity instead of inventing a path or rebinding
     // their display/parsing name. Determine scope from PIDL prefixes only;
-    // no enumeration, attributes, or cold display-name provider on this STA.
+    // no enumeration or cold display-name provider on this STA.
     // Walk from the root so even a deeply nested container finds its physical
     // ancestor in a few calls. Bound work for non-filesystem namespace roots.
     OwnedPidl prefix(ILCloneFull(pidl));
@@ -7707,6 +7749,21 @@ std::wstring FolderLocation(PCIDLIST_ABSOLUTE pidl) {
         if (filesystem) return NamespaceItemKey(pidl);
         component = next;
     }
+    // List through the Shell provider, like other namespace folders:
+    // - containers of filesystem items without one Win32 path of their own
+    //   (libraries, for example);
+    // - plain item lists with no subfolder tree (Applications, Printers).
+    //   Folders that report subfolders (Home, Control Panel's category page)
+    //   present sections or navigation pages, and stay native.
+    // The attributes are answered by the displayed folder's parent, which
+    // Explorer already bound for this navigation.
+    ComPtr<IShellItem> item;
+    SFGAOF attributes = 0;
+    if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->GetAttributes(SFGAO_FILESYSANCESTOR | SFGAO_FOLDER | SFGAO_HASSUBFOLDER, &attributes)) &&
+        (attributes & SFGAO_FOLDER) &&
+        (attributes & (SFGAO_FILESYSANCESTOR | SFGAO_HASSUBFOLDER)) != SFGAO_HASSUBFOLDER)
+        return NamespaceItemKey(pidl);
     return kUnsupportedShellLocation;
 }
 
@@ -7750,6 +7807,8 @@ std::wstring FormatFileTime(const FILETIME& ft) {
     return result;
 }
 
+// Shown where a file size could not be read; never a measured "0 bytes".
+constexpr wchar_t kUnknownSizeText[] = L"--";
 std::wstring FormatSize(ULONGLONG size) {
     wchar_t buffer[64]{};
     if (StrFormatByteSizeW(static_cast<LONGLONG>(size), buffer, ARRAYSIZE(buffer)))
@@ -8018,8 +8077,9 @@ void ArmInteractiveCreation(ViewState& state, unsigned mask,
 bool EnsureDirectoryWorker(ViewState& state, bool properties);
 DWORD WINAPI DirectoryWorkerProc(LPVOID context);
 
+void UpdateSearchHighlightTerms(ViewState& state);
 bool EnsureDirectoryFolderIdentity(ViewState& state) {
-    if (state.directoryFolderIdentity) return true;
+    if (state.directoryFolderIdentity) { UpdateSearchHighlightTerms(state); return true; }
     // Optimistic navigation still holds the departing native folder. Only
     // a destination identity supplied by the Shell or retained from its prior
     // native binding can authorize provisional work. Never capture this stale
@@ -8031,7 +8091,65 @@ bool EnsureDirectoryFolderIdentity(ViewState& state) {
     OwnedPidl owned(root);
     if (FAILED(hr) || !owned) return false;
     state.directoryFolderIdentity = SharedPidl(owned.release(), TaskMemDeleter{});
+    UpdateSearchHighlightTerms(state);
     return true;
+}
+
+// A search-results folder is addressed by its search-ms: query, whose
+// System.Generic.String crumbs hold the typed text. Keep its plain words and
+// quoted phrases; property filters (kind:, date:) and operators match no name.
+std::vector<std::wstring> SearchQueryTerms(const std::wstring& address) {
+    std::vector<std::wstring> terms;
+    if (_wcsnicmp(address.c_str(), L"search-ms:", 10) != 0) return terms;
+    std::wstring_view rest(address);
+    rest.remove_prefix(10);
+    while (!rest.empty()) {
+        const size_t end = rest.find(L'&');
+        std::wstring part(rest.substr(0, end));
+        rest = end == std::wstring_view::npos ? std::wstring_view{} : rest.substr(end + 1);
+        DWORD length = static_cast<DWORD>(part.size() + 1);
+        if (FAILED(UrlUnescapeW(part.data(), nullptr, &length, URL_UNESCAPE_INPLACE | URL_UNESCAPE_AS_UTF8))) continue;
+        part.resize(wcslen(part.c_str()));
+        constexpr std::wstring_view crumb = L"crumb=System.Generic.String:";
+        if (part.size() <= crumb.size() || _wcsnicmp(part.c_str(), crumb.data(), crumb.size()) != 0) continue;
+        const std::wstring query = part.substr(crumb.size());
+        for (size_t i = 0; i < query.size();) {
+            if (iswspace(query[i])) { ++i; continue; }
+            std::wstring term;
+            if (query[i] == L'"') {
+                const size_t close = query.find(L'"', i + 1);
+                term = query.substr(i + 1, close == std::wstring::npos ? std::wstring::npos : close - i - 1);
+                i = close == std::wstring::npos ? query.size() : close + 1;
+            } else {
+                size_t stop = i;
+                while (stop < query.size() && !iswspace(query[stop])) ++stop;
+                term = query.substr(i, stop - i);
+                i = stop;
+                if (term.find(L':') != std::wstring::npos || term.front() == L'-' ||
+                    term == L"AND" || term == L"OR" || term == L"NOT") continue;
+            }
+            std::erase_if(term, [](wchar_t c) { return c == L'*' || c == L'?'; });
+            if (!term.empty() && std::find(terms.begin(), terms.end(), term) == terms.end())
+                terms.push_back(std::move(term));
+        }
+    }
+    return terms;
+}
+
+// Reads the displayed folder's address-bar form once per identity (a search
+// folder's parsing name is only its title). Explorer has
+// already resolved this folder, so no provider is bound or enumerated here.
+void UpdateSearchHighlightTerms(ViewState& state) {
+    const auto& identity = state.directoryFolderIdentity;
+    if (identity.get() == state.searchHighlightFolder.get()) return;
+    state.searchHighlightFolder = identity;
+    state.searchHighlightTerms.clear();
+    PWSTR address = nullptr;
+    if (identity && SUCCEEDED(SHGetNameFromIDList(identity.get(), SIGDN_DESKTOPABSOLUTEEDITING, &address)) && address)
+        state.searchHighlightTerms = SearchQueryTerms(address);
+    if (g_perf.load(std::memory_order_relaxed) && address && _wcsnicmp(address, L"search-ms:", 10) == 0)
+        Wh_Log(L"[GPU search] terms=%zu address=%s", state.searchHighlightTerms.size(), address);
+    CoTaskMemFree(address);
 }
 
 void WatchDirectory(ViewState& state) {
@@ -8142,7 +8260,7 @@ void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key) {
     PROPVARIANT pv{};
     PropVariantInit(&pv);
     if (SUCCEEDED(store->GetValue(key, &pv))) {
-        if (SameKey(key, PKEY_Size) && pv.vt == VT_UI8) e.byteSize = pv.uhVal.QuadPart;
+        if (SameKey(key, PKEY_Size) && pv.vt == VT_UI8) { e.byteSize = pv.uhVal.QuadPart; e.byteSizeKnown = true; }
         if (pv.vt == VT_FILETIME) {
             if (SameKey(key, PKEY_DateModified)) e.lastWrite = pv.filetime;
             else if (SameKey(key, PKEY_DateCreated)) e.created = pv.filetime;
@@ -8242,11 +8360,17 @@ void SortEntriesByIndex(std::vector<Entry>& entries, Less&& less) {
 
 // Compute group identities before publishing a directory snapshot. This runs
 // on the existing background Shell worker; never on WM_PAINT or Explorer's STA.
+// Folder sizes come from the Size column's provider. The names lane only
+// reads what a provider lane already recorded; provider lanes ask afresh.
+enum class FolderSizeSource { Off, Recorded, Fresh };
+void ResolveFolderContentSizes(std::vector<Entry>& entries, TabBackground& work,
+                               unsigned long long token, FolderSizeSource source);
 void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& group,
                             std::map<std::wstring, std::wstring>& typeCache,
-                            const TabBackground& work, unsigned long long token) {
+                            TabBackground& work, unsigned long long token) {
     if (!group.enabled) return;
     const SortKind kind = ClassifySort(group.key);
+    if (kind == SortKind::Size) ResolveFolderContentSizes(entries, work, token, FolderSizeSource::Fresh);
     for (size_t i = 0; i < entries.size(); ++i) {
         if (!DirectoryJobCurrent(work, token)) return;
         Entry& e = entries[i];
@@ -8276,10 +8400,11 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
             e.groupKey = e.groupTitle;
             break;
         case SortKind::Size: {
-            if (e.folder) break; // Shell folders have no meaningful file size.
+            // Folders without a provider size have no meaningful size group.
+            if (e.folder && !e.contentSizeKnown) break;
             // Stable non-overlapping bins; sorting groups is independent of
             // the overlay's optional folder/file placement policy.
-            const ULONGLONG size = e.byteSize;
+            const ULONGLONG size = EntrySizeValue(e);
             int bin = 0;
             for (ULONGLONG bound = 10ULL * 1024; size > bound && bin < 6;
                  bound *= 100, ++bin) {}
@@ -8389,7 +8514,7 @@ int CompareEntrySortKey(const EntrySortKey& a, const EntrySortKey& b, SortKind k
         break;
     }
     case SortKind::Size:
-        result = a.byteSize < b.byteSize ? -1 : a.byteSize > b.byteSize ? 1 : 0;
+        result = EntrySizeValue(a) < EntrySizeValue(b) ? -1 : EntrySizeValue(a) > EntrySizeValue(b) ? 1 : 0;
         break;
     case SortKind::Extension:
         result = StrCmpLogicalW(EntryExtension(a), EntryExtension(b));
@@ -8432,6 +8557,12 @@ bool EntryPrecedes(const EntrySortKey& a, const EntrySortKey& b, const SortSpec&
     return descending ? nameOrder > 0 : nameOrder < 0;
 }
 
+bool SortUsesSize(const SortSpec& sort) {
+    return sort.explicitOrder && (sort.kind==SortKind::Size ||
+        std::any_of(sort.secondary.begin(),sort.secondary.end(),[](const SORTCOLUMN& c) {return ClassifySort(c.propkey)==SortKind::Size;}));
+}
+// Size sorts stay on the names lane: files use enumeration sizes and folders
+// the sizes a provider lane already recorded, refined afterwards.
 bool SortNeedsProvider(const SortSpec& sort) {
     const auto provider=[](SortKind kind) {return kind==SortKind::Type || kind==SortKind::ShellProperty;};
     return sort.explicitOrder && (provider(sort.kind) ||
@@ -8440,13 +8571,15 @@ bool SortNeedsProvider(const SortSpec& sort) {
 
 void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested,
                           std::map<std::wstring, std::wstring>& typeNames,
-                          TabBackground& work, unsigned long long token, bool nativeNamespace = false) {
+                          TabBackground& work, unsigned long long token, bool nativeNamespace = false,
+                          FolderSizeSource folderSizes = FolderSizeSource::Fresh) {
     PipelineScope timing(work, L"directory.sort", token, entries.size());
     SortSpec spec = requested;
     if (!entries.empty()) spec.kind = EntrySortKind(spec,entries.front());
     // The opt-out policy retains enumeration order without provider calls.
     if (!spec.explicitOrder) return;
     for (auto& entry : entries) entry.secondarySortValues.clear();
+    if (SortUsesSize(spec)) ResolveFolderContentSizes(entries, work, token, folderSizes);
     if (spec.kind == SortKind::Type) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
@@ -8539,6 +8672,7 @@ unsigned long long DirectoryMetadataHash(const std::vector<Entry>& entries) {
     for (const Entry& entry : entries) {
         mix(entry.attributes & FILE_ATTRIBUTE_HIDDEN); // Presentation changes retain resolved property cells.
         mix(entry.byteSize);
+        mix(entry.contentSize); // Provider folder sizes reorder size sorts.
         mix(FileTimeNumber(entry.lastWrite));
         mix(FileTimeNumber(entry.created));
         mix(FileTimeNumber(entry.accessed));
@@ -8594,22 +8728,95 @@ struct ShellSizeBinding {
     void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
 };
 
-// Use the folder's formatted column rather than formatting its raw property
-// ourselves. This keeps Shell size/formatting hooks (including Better file
-// sizes) on their normal path, without importing another mod's calculations.
-// Bind in the requesting provider worker's apartment; never use the live view.
-bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
-                         std::wstring& text, ShellSizeBinding& binding,
-                         unsigned long long token) {
+// Supplies the enumerated Win32 record to a filesystem parse. Without it the
+// Shell may build a child ID without size data (always on removable drives),
+// and the folder's Size column then reports 0 bytes for every file.
+class FindDataBindData final : public IFileSystemBindData {
+public:
+    explicit FindDataBindData(const WIN32_FIND_DATAW& data) : data_(data) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid == IID_IUnknown || iid == IID_IFileSystemBindData) {
+            *out = static_cast<IFileSystemBindData*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (!left) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE SetFindData(const WIN32_FIND_DATAW* data) override {
+        if (!data) return E_POINTER;
+        data_ = *data;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetFindData(WIN32_FIND_DATAW* data) override {
+        if (!data) return E_POINTER;
+        *data = data_;
+        return S_OK;
+    }
+private:
+    CallbackObjectLifetime lifetime_;
+    std::atomic<ULONG> refs_{1};
+    WIN32_FIND_DATAW data_{};
+};
+
+// Caller-known filesystem facts for a parse that must not re-probe the item.
+struct ShellFindFacts {
+    DWORD attributes = 0;
+    bool folder = false, sizeKnown = false;
+    ULONGLONG size = 0;
+    FILETIME created{}, accessed{}, modified{};
+};
+
+HRESULT ParseWithFindFacts(const std::wstring& path, const ShellFindFacts& facts,
+                           PIDLIST_ABSOLUTE* out) {
+    *out = nullptr;
+    WIN32_FIND_DATAW data{};
+    data.dwFileAttributes = facts.attributes ? facts.attributes :
+        facts.folder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    if (facts.folder) data.dwFileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
+    data.ftCreationTime = facts.created;
+    data.ftLastAccessTime = facts.accessed;
+    data.ftLastWriteTime = facts.modified;
+    data.nFileSizeHigh = static_cast<DWORD>(facts.size >> 32);
+    data.nFileSizeLow = static_cast<DWORD>(facts.size);
+    const wchar_t* leaf = PathFindFileNameW(path.c_str());
+    if (!leaf || !*leaf || wcslen(leaf) >= ARRAYSIZE(data.cFileName)) return E_INVALIDARG;
+    wcscpy_s(data.cFileName, leaf);
+    ComPtr<IBindCtx> context;
+    HRESULT hr = CreateBindCtx(0, &context);
+    if (FAILED(hr)) return hr;
+    ComPtr<IFileSystemBindData> bindData;
+    bindData.Attach(new (std::nothrow) FindDataBindData(data));
+    if (!bindData) return E_OUTOFMEMORY;
+    hr = context->RegisterObjectParam(const_cast<LPOLESTR>(STR_FILE_SYS_BIND_DATA), bindData.Get());
+    if (FAILED(hr)) return hr;
+    hr = SHParseDisplayName(path.c_str(), context.Get(), out, 0, nullptr);
+    context->RevokeObjectParam(const_cast<LPOLESTR>(STR_FILE_SYS_BIND_DATA));
+    return hr;
+}
+
+// Resolves the item's child ID within binding.folder. `owned` keeps a parsed
+// ID alive for the caller; the bound parent is reused for its siblings.
+PCUITEMID_CHILD BindShellSizeItem(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
+                                  ShellSizeBinding& binding, unsigned long long token,
+                                  const ShellFindFacts* facts, OwnedPidl& owned) {
     if (binding.token != token) { binding.Reset(); binding.token = token; }
     PIDLIST_ABSOLUTE parsed = nullptr;
     if (!identity) {
-        const HRESULT hr = SHParseDisplayName(path.c_str(), nullptr, &parsed, 0, nullptr);
-        if (FAILED(hr)) { CoTaskMemFree(parsed); return false; }
+        const HRESULT hr = facts ? ParseWithFindFacts(path, *facts, &parsed) :
+            SHParseDisplayName(path.c_str(), nullptr, &parsed, 0, nullptr);
+        if (FAILED(hr)) { CoTaskMemFree(parsed); return nullptr; }
         identity = parsed;
     }
-    OwnedPidl owned(parsed);
-    if (!identity || ILIsEmpty(identity)) return false;
+    owned.reset(parsed);
+    if (!identity || ILIsEmpty(identity)) return nullptr;
     PCUITEMID_CHILD child = ILFindLastID(identity);
     const size_t parentBytes = static_cast<size_t>(
         reinterpret_cast<const BYTE*>(child) - reinterpret_cast<const BYTE*>(identity));
@@ -8621,18 +8828,46 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
         // a Size column is not rescanned for every remaining row.
         binding.Reset();
         OwnedPidl parent(ILCloneFull(identity));
-        if (!parent || !ILRemoveLastID(parent.get())) return false;
+        if (!parent || !ILRemoveLastID(parent.get())) return nullptr;
         binding.parent = std::move(parent);
         PCUITEMID_CHILD ignored = nullptr;
         if (FAILED(SHBindToParent(identity, IID_PPV_ARGS(&binding.folder), &ignored)) || !binding.folder)
-            return false;
+            return nullptr;
         for (UINT column = 0; column < kMaxShellColumns; ++column) {
             PROPERTYKEY key{};
             if (FAILED(binding.folder->MapColumnToSCID(column, &key))) break;
             if (SameKey(key, PKEY_Size)) { binding.column = column; binding.hasColumn = true; break; }
         }
     }
-    if (!binding.folder || !binding.hasColumn) return false;
+    return binding.folder && binding.hasColumn ? child : nullptr;
+}
+
+// The Size column's numeric value, as the folder's own comparisons see it.
+bool ReadShellSizeValue(ShellSizeBinding& binding, PCUITEMID_CHILD child, ULONGLONG& value) {
+    VARIANT raw{};
+    SHCOLUMNID column = PKEY_Size;
+    const bool known = SUCCEEDED(binding.folder->GetDetailsEx(child, &column, &raw)) && raw.vt == VT_UI8;
+    if (known) value = raw.ullVal;
+    VariantClear(&raw);
+    return known;
+}
+
+// Use the folder's formatted column rather than formatting its raw property
+// ourselves. This keeps Shell size/formatting hooks (including Better file
+// sizes) on their normal path, without importing another mod's calculations.
+// Bind in the requesting provider worker's apartment; never use the live view.
+// Filesystem rows pass their enumerated facts; namespace rows pass identity.
+bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
+                         std::wstring& text, ShellSizeBinding& binding,
+                         unsigned long long token, const ShellFindFacts* facts = nullptr) {
+    OwnedPidl owned;
+    const PCUITEMID_CHILD child = BindShellSizeItem(path, identity, binding, token, facts, owned);
+    if (!child) return false;
+    ULONGLONG shellSize = 0;
+    // A file's Shell size must agree with its own Win32 record; otherwise
+    // the item ID lacks size data and its column text would be invented.
+    if (facts && facts->sizeKnown && !facts->folder &&
+        (!ReadShellSizeValue(binding, child, shellSize) || shellSize != facts->size)) return false;
     SHELLDETAILS details{};
     if (FAILED(binding.folder->GetDetailsOf(child, binding.column, &details))) return false;
     PWSTR formatted = nullptr;
@@ -8640,6 +8875,71 @@ bool ReadShellSizeDetail(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     if (SUCCEEDED(hr)) text = formatted ? formatted : L"";
     CoTaskMemFree(formatted);
     return SUCCEEDED(hr); // An empty folder size is authoritative too.
+}
+
+// A namespace row that is a real filesystem item (a library entry, for
+// example) takes its Size from its own filesystem folder, exactly as that
+// folder's view shows it, including Shell size formatting hooks. A
+// container's own Size column may lack or misformat that text.
+bool ReadDelegatedSizeDetail(PCIDLIST_ABSOLUTE identity, std::wstring& text,
+                             ShellSizeBinding& binding, unsigned long long token) {
+    auto storage = std::make_unique<ShellPathStorage>();
+    if (!identity || !SHGetPathFromIDListEx(identity, storage->value, ARRAYSIZE(storage->value), GPFIDL_DEFAULT))
+        return false;
+    const std::wstring path = storage->value;
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    const ShellFindFacts facts{.attributes = data.dwFileAttributes,
+        .folder = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, .sizeKnown = true,
+        .size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow,
+        .created = data.ftCreationTime, .accessed = data.ftLastAccessTime, .modified = data.ftLastWriteTime};
+    return ReadShellSizeDetail(path, nullptr, text, binding, token, &facts);
+}
+
+// Folder sizes exist only through the Size column's provider (for example
+// Better file sizes). Size sorts and groups order folders by the same value
+// the column shows; folders without one keep the Win32 directory size of 0.
+void ResolveFolderContentSizes(std::vector<Entry>& entries, TabBackground& work,
+                               unsigned long long token, FolderSizeSource source) {
+    if (source == FolderSizeSource::Off) return;
+    const auto parentOf = [](const std::wstring& path) {
+        const size_t slash = path.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? std::wstring{} : path.substr(0, slash);
+    };
+    if (source == FolderSizeSource::Recorded) {
+        // No provider call: the names lane must not wait on one.
+        ExclusiveSrwLock lock(work.directoryLock);
+        for (Entry& e : entries) {
+            if (!e.folder || e.contentSizeKnown || _wcsicmp(parentOf(e.path).c_str(), work.folderSizeFolder.c_str()))
+                continue;
+            if (const auto found = work.folderSizes.find(e.path); found != work.folderSizes.end()) {
+                e.contentSize = found->second; e.contentSizeKnown = true;
+            }
+        }
+        return;
+    }
+    ShellSizeBinding binding;
+    std::vector<std::pair<std::wstring, ULONGLONG>> learned;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if ((i & 31u) == 0 && !DirectoryJobCurrent(work, token)) return;
+        Entry& e = entries[i];
+        if (!e.folder || e.contentSizeKnown || e.path.starts_with(L"windhawk:pidl:")) continue;
+        const ShellFindFacts facts{.attributes = e.attributes, .folder = true, .sizeKnown = e.byteSizeKnown,
+            .size = e.byteSize, .created = e.created, .accessed = e.accessed, .modified = e.lastWrite};
+        OwnedPidl owned;
+        const PCUITEMID_CHILD child = BindShellSizeItem(e.path, e.shellIdentity.get(), binding, token,
+            e.byteSizeKnown ? &facts : nullptr, owned);
+        e.contentSizeKnown = child && ReadShellSizeValue(binding, child, e.contentSize);
+        if (e.contentSizeKnown) learned.emplace_back(e.path, e.contentSize);
+    }
+    if (learned.empty()) return;
+    ExclusiveSrwLock lock(work.directoryLock);
+    const std::wstring folder = parentOf(learned.front().first);
+    if (_wcsicmp(folder.c_str(), work.folderSizeFolder.c_str())) {
+        work.folderSizes.clear(); work.folderSizeFolder = folder; // Only the listed folder is kept.
+    }
+    for (auto& [path, size] : learned)
+        if (!_wcsicmp(parentOf(path).c_str(), folder.c_str())) work.folderSizes[std::move(path)] = size;
 }
 
 namespace WindowsIcuAbi {
@@ -8900,8 +9200,13 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
         bool resolved = cached(key) != nullptr;
         if (const auto* value = cached(key)) text = *value;
         else if (SameKey(key, PKEY_Size)) {
-            resolved = !recalled && ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding, job.listing);
-            if (!resolved && job.sizeKnown) { text = FormatSize(job.size); resolved = true; }
+            const ShellFindFacts facts{.attributes = job.attributes, .folder = job.folder,
+                .sizeKnown = job.sizeKnown, .size = job.size, .created = job.created, .modified = job.modified};
+            resolved = !recalled && ((job.namespaceItem &&
+                    ReadDelegatedSizeDetail(job.identity.get(), text, sizeBinding, job.listing)) ||
+                ReadShellSizeDetail(job.path, job.identity.get(), text, sizeBinding,
+                    job.listing, job.sizeKnown && !job.namespaceItem ? &facts : nullptr));
+            if (!resolved && job.sizeKnown && !job.folder) { text = FormatSize(job.size); resolved = true; }
             // Filesystem directory allocation is not its contents' size.
             // Only cached/column-provider text can supply a folder size.
             if (!resolved && job.folder && !job.namespaceItem) resolved = true;
@@ -8914,6 +9219,8 @@ void ResolveItemTip(ItemTipJob& job, ShellSizeBinding& sizeBinding,
                 text = property.vt == VT_FILETIME ? FormatFileTime(property.filetime) : FormatShellDetail(nullptr, key, &property);
             }
             if (text.empty() && SameKey(key, PKEY_ItemTypeText)) text = GetTypeName(typeNames, job.path, job.folder);
+            if (text.empty() && SameKey(key, PKEY_Size) && !job.folder && !job.namespaceItem)
+                text = kUnknownSizeText;
         }
         add(key, std::move(text), false,&property);
         PropVariantClear(&property);
@@ -9133,6 +9440,50 @@ DirectoryResult PrepareItemSnapshot(DirectoryJob& directory,
     return result;
 }
 
+// Shell ID bytes are not item identity: a provider may return a canonically
+// equal item with different bytes (delegate IDs, as in libraries). Rows the
+// previous listing already held keep that identity, so reorders animate as
+// moves and selection, caches and detail cells stay attached to them.
+template<class Current>
+void AdoptPreviousNamespaceIdentities(std::vector<Entry>& names, PCIDLIST_ABSOLUTE parent,
+                                      const NamespaceIdentities& previous, Current current) {
+    ComPtr<IShellFolder> folder;
+    std::unordered_multimap<std::wstring, const NamespaceIdentities::value_type*> byName;
+    const auto parsingName = [&](PCUITEMID_CHILD child) {
+        STRRET name{}; PWSTR text = nullptr; std::wstring result;
+        if (SUCCEEDED(folder->GetDisplayNameOf(child, SHGDN_INFOLDER | SHGDN_FORPARSING, &name)) &&
+            SUCCEEDED(StrRetToStrW(&name, child, &text)) && text) result = text;
+        CoTaskMemFree(text);
+        return result;
+    };
+    for (auto& entry : names) {
+        if (!current()) return;
+        if (!entry.shellIdentity || previous.contains(entry.path)) continue;
+        if (!folder) {
+            // Index the previous listing only once a key actually drifted.
+            if (FAILED(SHBindToObject(nullptr, parent, nullptr, IID_PPV_ARGS(&folder))) || !folder) return;
+            byName.reserve(previous.size());
+            for (const auto& item : previous) {
+                if (!current()) return;
+                if (item.second) byName.emplace(parsingName(item.second.get()), &item);
+            }
+        }
+        const PCUITEMID_CHILD child = entry.shellChild ? entry.shellChild.get() :
+            ILFindLastID(entry.shellIdentity.get());
+        const auto [first, last] = byName.equal_range(parsingName(child));
+        for (auto it = first; it != last; ++it) {
+            const HRESULT order = folder->CompareIDs(SHCIDS_CANONICALONLY, child, it->second->second.get());
+            if (FAILED(order) || HRESULT_CODE(order) != 0) continue;
+            SharedPidl absolute(ILCombine(parent, it->second->second.get()), TaskMemDeleter{});
+            if (!absolute) break;
+            entry.path = it->second->first;
+            entry.shellChild = it->second->second;
+            entry.shellIdentity = std::move(absolute);
+            break;
+        }
+    }
+}
+
 DirectoryResult PrepareDirectoryResult(TabBackground& work, DirectoryJob& directory,
     std::vector<Entry>& names, DWORD error,
     std::optional<DirectorySnapshotIndex> prepared = std::nullopt) {
@@ -9291,6 +9642,7 @@ HRESULT ResolveNativeRowIdentity(const NativeRowIdentity& identity, Entry& entry
             entry.created = data.ftCreationTime;
             entry.accessed = data.ftLastAccessTime;
             entry.byteSize = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+            entry.byteSizeKnown = true;
         }
     }
     if (identity.namespaceItem && item) {
@@ -9365,6 +9717,9 @@ void ResolveNativeRowsJob(TabBackground& work, NativeRowsJob& job, Resolver&& re
         // Recycle Bin uses the SAME background layout and snapshot commit as
         // filesystem directories. No whole-list projection on Explorer's STA.
         auto& directory = *job.presentation;
+        if (directory.previousIdentities && job.folder)
+            AdoptPreviousNamespaceIdentities(rows, job.folder.get(), *directory.previousIdentities,
+                [&] { return DirectoryJobCurrent(work, job.token); });
         directory.enumerated = true;
         directory.enumeratedEntries = std::move(rows);
         directory.enumerationError = error;
@@ -10027,10 +10382,24 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     std::any_of(directory.sort.secondary.begin(),directory.sort.secondary.end(),[](const SORTCOLUMN& c) {
                         return ClassifySort(c.propkey)==SortKind::Type;
                     })) typeNames.clear();
+                // Ask the Size provider about every checked folder before the
+                // first difference ends the loop, so the names lane's next sort
+                // reads a complete record instead of converging over refreshes.
+                const bool sizes = SortUsesSize(directory.sort);
+                if (sizes) {
+                    std::vector<Entry> folders;
+                    for (const auto& previous : directory.sortChecks) if (previous.folder) {
+                        Entry folder; static_cast<EntrySortKey&>(folder)=previous;
+                        folder.contentSizeKnown=false;
+                        folders.push_back(std::move(folder));
+                    }
+                    ResolveFolderContentSizes(folders,work,directory.token,FolderSizeSource::Fresh);
+                }
                 for (const auto& previous : directory.sortChecks) {
                     if (!DirectoryJobCurrent(work,directory.token)) break;
                     Entry current; static_cast<EntrySortKey&>(current)=previous;
                     current.sortText.clear(); current.sortNumber=0; current.sortValueKind=0;
+                    current.contentSizeKnown=false; // Nested changes alter a folder's size.
                     if (current.path.starts_with(L"windhawk:pidl:")) {
                         if (directory.sort.kind == SortKind::Name || directory.sort.kind == SortKind::Extension) {
                             ComPtr<IShellItem> item; PWSTR name=nullptr;
@@ -10049,9 +10418,11 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         current.accessed=data.ftLastAccessTime; current.attributes=data.dwFileAttributes;
                         current.folder=(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
                         current.byteSize=(static_cast<ULONGLONG>(data.nFileSizeHigh)<<32)|data.nFileSizeLow;
+                        current.byteSizeKnown=true;
                     }
                     std::vector<Entry> probe; probe.push_back(std::move(current));
-                    SortDirectoryEntries(probe,directory.sort,typeNames,work,directory.token);
+                    SortDirectoryEntries(probe,directory.sort,typeNames,work,directory.token,false,
+                        sizes ? FolderSizeSource::Recorded : FolderSizeSource::Fresh);
                     SortSpec comparison=directory.sort;
                     comparison.kind=EntrySortKind(comparison,previous);
                     if (EntryPrecedes(previous,probe[0],comparison) ||
@@ -10212,6 +10583,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         e.accessed = data.ftLastAccessTime;
                         e.byteSize = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) |
                                       data.nFileSizeLow;
+                        e.byteSizeKnown = true;
                         ResolveShellFileLabel(e, lane.hiddenExtensions);
                         names.push_back(std::move(e));
                         // In *unsorted and ungrouped* folders the first N results
@@ -10273,7 +10645,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                          ShellItemVisible(data.dwFileAttributes, directory.visibility, data.cFileName));
                 }
             }
-            // Win32 already supplies names, dates and sizes. Keep those sorts
+            // Win32 already supplies names and dates. Keep those sorts
             // independent of an old folder's blocked type/property provider.
             if (namesLane && (directory.grouping.enabled || SortNeedsProvider(directory.sort))) {
                 directory.enumerated = true;
@@ -10288,10 +10660,26 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             }
             // Saved native sorts and header/menu choices share this comparator.
             SortDirectoryEntries(names, directory.sort, typeNames,
-                                 work, directory.token);
+                                 work, directory.token, false,
+                                 namesLane ? FolderSizeSource::Recorded : FolderSizeSource::Fresh);
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             ResolveDirectoryGroups(names, directory.grouping, typeNames,
                                    work, directory.token);
+            // A names-lane Size sort used recorded folder sizes only. The
+            // provider lane checks them afterwards; a changed order refreshes
+            // through the ordinary animated path with the newly recorded sizes.
+            DirectoryJob folderSizeCheck;
+            if (namesLane && error == ERROR_SUCCESS && !directory.checkSort && SortUsesSize(directory.sort)) {
+                for (const auto& entry : names)
+                    if (entry.folder && !entry.path.starts_with(L"windhawk:pidl:"))
+                        folderSizeCheck.sortChecks.push_back(SortEntrySnapshot(entry, true));
+                if (!folderSizeCheck.sortChecks.empty()) {
+                    folderSizeCheck.hwnd = directory.hwnd; folderSizeCheck.token = directory.token;
+                    folderSizeCheck.path = directory.path; folderSizeCheck.sort = directory.sort;
+                    folderSizeCheck.grouping = directory.grouping; folderSizeCheck.visibility = directory.visibility;
+                    folderSizeCheck.checkSort = true;
+                }
+            }
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             std::optional<DirectorySnapshotIndex> prepared;
             if (!directory.checkSort && error == ERROR_SUCCESS) {
@@ -10352,6 +10740,14 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             auto result = PrepareDirectoryResult(work, directory, names, error, std::move(prepared));
             if (!DirectoryJobCurrent(work, directory.token)) continue;
             PublishDirectoryResult(work, std::move(result));
+            if (folderSizeCheck.checkSort) {
+                // Explicit sorts already started this tab's layout lane.
+                ExclusiveSrwLock lock(work.directoryLock);
+                if (DirectoryJobCurrent(work, folderSizeCheck.token)) {
+                    work.layoutJobs.push_back(std::move(folderSizeCheck));
+                    SetEvent(work.layout.wake);
+                }
+            }
         } else if (haveDetail) {
             if (!DirectoryJobCurrent(work, detail.token)) continue;
             DirectoryResult result;
@@ -10376,8 +10772,10 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         ColumnCell cell; cell.key = key;
                         bool resolved=false;
                         if (SameKey(key, PKEY_Size))
-                            resolved = ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text,
-                                sizeBinding, detail.token);
+                            resolved = ReadDelegatedSizeDetail(req.shellIdentity.get(), cell.text,
+                                    sizeBinding, detail.token) ||
+                                ReadShellSizeDetail(req.path, req.shellIdentity.get(), cell.text,
+                                    sizeBinding, detail.token);
                         if (!resolved) {
                             if (!store)
                                 EntryPropertyStore(req.path, req.shellIdentity.get(),
@@ -10405,9 +10803,15 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 };
                 if (hasColumn(PKEY_DateModified)) v.date = FormatFileTime(req.modified);
                 if (hasColumn(PKEY_ItemTypeText)) v.type = GetTypeName(typeNames, req.path, req.folder);
-                if (hasColumn(PKEY_Size) &&
-                    !ReadShellSizeDetail(req.path, nullptr, v.size, sizeBinding, detail.token) && !req.folder)
-                    v.size = FormatSize(req.size);
+                if (hasColumn(PKEY_Size)) {
+                    const ShellFindFacts facts{.attributes = req.attributes, .folder = req.folder,
+                        .sizeKnown = req.sizeKnown, .size = req.size, .created = req.created,
+                        .accessed = req.accessed, .modified = req.modified};
+                    // Never present an unread file size as a measured 0 bytes.
+                    if (!ReadShellSizeDetail(req.path, nullptr, v.size, sizeBinding, detail.token,
+                            req.sizeKnown ? &facts : nullptr) && !req.folder)
+                        v.size = req.sizeKnown ? FormatSize(req.size) : kUnknownSizeText;
+                }
                 v.columnEpoch = detail.columnEpoch;
                 // Only displayed columns are queried on this tab's property
                 // pool, never Explorer's STA or the compositor draw callback.
@@ -10664,8 +11068,11 @@ void AdvanceNativeCatalog(ViewState& state) {
         const HRESULT enumHr=SUCCEEDED(hr) && count>=0 ?
             view->Items(SVGIO_ALLVIEW,IID_PPV_ARGS(&items)) : E_FAIL;
         if (!current()) return;
+        // An empty native model is not proof of an empty folder: a view that
+        // re-enumerates (a library re-sorting, for one) is briefly empty. The
+        // worker's own provider enumeration decides emptiness instead.
         if (SUCCEEDED(hr) && count==0 && enumHr!=E_NOTIMPL && enumHr!=E_NOINTERFACE) {
-            state.nativeCatalogCount=0; complete=available=true;
+            state.nativeCatalogCount=0; complete=true;
         }
         else if (FAILED(enumHr) || !items) complete=true;
         else { state.nativeCatalogCount=count; state.nativeCatalogCapture=std::move(items); }
@@ -10786,6 +11193,7 @@ void CacheRowDetails(ViewState& state, Entry& entry, bool remember) {
     saved.created = entry.created;
     saved.accessed = entry.accessed;
     saved.byteSize = entry.byteSize;
+    saved.byteSizeKnown = entry.byteSizeKnown;
     saved.folder = entry.folder;
     saved.propertyEpoch = entry.propertyEpoch;
     saved.detailsRefreshEpoch = entry.detailsRefreshEpoch;
@@ -11346,6 +11754,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     state.sortRevealPath.clear(); state.sortRevealOldIndex=-1;
     if (UsesNamespaceFolderIdentity(state.folderPath)) {
         newJob.namespaceFolder = state.directoryFolderIdentity;
+        if (state.loaded) newJob.previousIdentities = state.namespaceIdentities;
     }
     // An ancestor return has a known child to reveal. A prefix at row zero
     // cannot position that child in the final layout; publish the complete,
@@ -12064,7 +12473,10 @@ bool HasCachedColumnCell(const Entry& entry, const PROPERTYKEY& key) {
 
 void QueueVisibleDetails(ViewState& state) {
     PipelineScope pipeline(state.background,L"metadata.demand",state.columnEpoch,state.propertyEpoch);
-    if (!state.columnsView || state.columns.empty() ||
+    // Details columns or tile lines name the properties to resolve. Drive
+    // tiles already carry their capacity from the drive-space worker.
+    const bool tileLines = TileLayout(state) && !state.thisPcGpu;
+    if ((!tileLines && (!state.columnsView || state.columns.empty())) ||
         (!state.thisPcGpu && state.directoryPending) ||
         !state.loaded || !state.total ||
         g_unloading.load(std::memory_order_relaxed)) return;
@@ -12074,7 +12486,8 @@ void QueueVisibleDetails(ViewState& state) {
     job.columnEpoch = state.columnEpoch;
     job.thisPc = state.thisPcGpu;
     std::vector<PROPERTYKEY> neededColumns;
-    for (const auto& column : state.columns) {
+    if (tileLines) neededColumns = {PKEY_ItemTypeText, PKEY_Size};
+    else for (const auto& column : state.columns) {
         if (ClassifySort(column.key) == SortKind::Name) continue;
         if (state.thisPcGpu && ThisPcSeededColumn(column.key)) continue;
         neededColumns.push_back(column.key);
@@ -12145,6 +12558,10 @@ void QueueVisibleDetails(ViewState& state) {
         req.path = e.path;
         req.modified = e.lastWrite;
         req.size = e.byteSize;
+        req.sizeKnown = e.byteSizeKnown;
+        req.attributes = e.attributes;
+        req.created = e.created;
+        req.accessed = e.accessed;
         req.folder = e.folder;
         req.shellIdentity = e.shellIdentity;
         job.requests.push_back(std::move(req));
@@ -12963,6 +13380,16 @@ float ListStartX(const ViewState& state) {
 float ListEndX(ViewState& state);
 float ListViewportWidth(ViewState& state);
 
+// Height of a tile's reserved text block: three lines (name, type, size), or
+// for drives two lines around the usage bar. Shared by metrics and layout.
+float TileTextHeight(const ViewState& state, float font, int dpi) {
+    // Whole-pixel line pitch: each line snaps to the pixel grid on its own, so
+    // a fractional pitch would round some gaps up and others down.
+    const float line = std::round(font * 1.5f), gap = float(Scale96(2, dpi));
+    return DriveTiles(state) ? line * 2.f + float(Scale96(kDriveBarHeight96, dpi)) + gap * 2.f :
+        line * 3.f + gap * 2.f;
+}
+
 void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     state.zebraExtentAnimating = false;
     int dpi = ViewDpi(state);
@@ -12983,12 +13410,16 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // well before the tab's zoom preference reaches its storage limit.
     const double iconSize = state.nativeIconSize * (direct ? size96 * dpi / 96. : std::round(size96 * dpi / 96.)) /
         std::max(1, Scale96(g_row96.load(), dpi));
-    const float icon = state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
+    // A tile's icon spans its text block, so both grow together with zoom
+    // and DPI. Every tile reserves all its lines, so two-line items match
+    // three-line neighbours.
+    const float tileText = TileTextHeight(state, font, dpi);
+    const float icon = TileLayout(state) ? (direct ? tileText : std::round(tileText)) :
+        state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
         static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), baseRow - Scale96(6, dpi)));
     const float row = !state.gridView ? static_cast<float>(baseRow) :
-        DriveTiles(state) ? std::max(static_cast<float>(icon),
-            font * 3.f + Scale96(kDriveBarHeight96 + 4, dpi)) + Scale96(12, dpi) :
+        TileLayout(state) ? std::max(static_cast<float>(icon), tileText) + Scale96(12, dpi) :
         state.cachedNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
             icon + font * 2.8f + Scale96(20, dpi);
@@ -13107,6 +13538,7 @@ float NameTextOrigin(const ViewState& state, bool header = false) {
 // Coordinates are logical; the existing Fill/Text/icon paths mirror RTL.
 struct ItemGeometry {
     D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{}, checkbox{};
+    D2D1_RECT_F detail[2]{}; // Tile type and size lines (non-drive tiles).
     bool wrapped = false;
 };
 ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
@@ -13120,30 +13552,40 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float pad = static_cast<float>(Scale96(6, dpi));
         g.cell.left = start + visual.left + inset;
         g.cell.right = start + visual.left + (visual.width > 0.f ? visual.width : state.itemWidth) - inset;
-        const bool tiles = DriveTiles(state);
+        const bool tiles = TileLayout(state);
         const bool compact = tiles || state.cachedNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
         const float iconX = compact ? g.cell.left + pad + SelectionCheckboxSpace(state) :
             (g.cell.left + g.cell.right - side) * .5f;
-        const float iconY = compact ? visual.top + (state.rowPx-side)*.5f : visual.top + pad;
+        // Tile icons and their text share one top edge, with a wider gap
+        // between them; the pair is centered in the cell as one block.
+        const float line = std::round(state.fontPx * 1.5f); // Whole pixels, as TileTextHeight.
+        const float gap = static_cast<float>(Scale96(2, dpi));
+        const float bar = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
+        const bool drive = DriveTiles(state);
+        const float content = TileTextHeight(state, state.fontPx, dpi);
+        const float tileTop = visual.top + (state.rowPx - std::max(side, content)) * .5f;
+        const float iconY = tiles ? tileTop : compact ? visual.top + (state.rowPx-side)*.5f : visual.top + pad;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
-        g.text = compact ? D2D1::RectF(g.icon.right + pad, visual.top,
+        const float textGap = tiles ? static_cast<float>(Scale96(12, dpi)) : pad;
+        g.text = compact ? D2D1::RectF(g.icon.right + textGap, visual.top,
             g.cell.right-pad, visual.top+state.rowPx) :
             D2D1::RectF(g.cell.left+pad, g.icon.bottom+pad,
                 g.cell.right-pad, visual.top+state.rowPx-pad);
         if (tiles) {
-            // Reserve both lines before capacity arrives. Enrichment changes
+            // Reserve every line before its value arrives. Enrichment changes
             // pixels only; packing, hit testing and selection never jump.
-            const float line = state.fontPx * 1.5f;
-            const float gap = static_cast<float>(Scale96(2, dpi));
-            const float bar = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
-            const float top = visual.top + (state.rowPx - (line * 2.f + bar + gap * 2.f)) * .5f;
             g.text.left = std::min(g.text.left, g.text.right);
-            g.text.top = top; g.text.bottom = top + line;
-            g.usage = D2D1::RectF(g.text.left, g.text.bottom + gap,
-                g.text.right, g.text.bottom + gap + bar);
-            g.capacity = D2D1::RectF(g.text.left, g.usage.bottom + gap,
-                g.text.right, g.usage.bottom + gap + line);
+            g.text.top = tileTop; g.text.bottom = tileTop + line;
+            if (drive) {
+                g.usage = D2D1::RectF(g.text.left, g.text.bottom + gap,
+                    g.text.right, g.text.bottom + gap + bar);
+                g.capacity = D2D1::RectF(g.text.left, g.usage.bottom + gap,
+                    g.text.right, g.usage.bottom + gap + line);
+            } else for (int i = 0; i < 2; ++i) {
+                const float lineTop = g.text.bottom + gap + i * (line + gap);
+                g.detail[i] = D2D1::RectF(g.text.left, lineTop, g.text.right, lineTop + line);
+            }
         }
     } else {
         const float iconX = (ColumnsPresented(state) ? NameColumnStart(state) : start) +
@@ -13160,7 +13602,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float size = std::min({SelectionCheckboxSize(state),std::max(0.f,state.rowPx-Scale96(4,dpi)),available});
         const float left = state.gridView ? g.cell.left + inset :
             (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi);
-        const float top = state.gridView && !DriveTiles(state) && state.cachedNativeMode != FVM_SMALLICON ?
+        const float top = state.gridView && !TileLayout(state) && state.cachedNativeMode != FVM_SMALLICON ?
             g.cell.top + Scale96(4,dpi) : visual.top + (state.rowPx-size)*.5f;
         g.checkbox = D2D1::RectF(left,top,left+size,top+size);
     }
@@ -16939,8 +17381,10 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
 
 void Text(ViewState& state, const std::wstring& text, float l, float t,
           float r, float b, unsigned hex, bool header=false, float opacity=1.f,
-          bool sortedHeader=false, bool wrapped=false, UINT32 highlight=0, bool deferCold=false,
+          bool sortedHeader=false, bool wrapped=false,
+          const std::vector<DWRITE_TEXT_RANGE>* highlight=nullptr, bool deferCold=false,
           bool filename=false, bool underline=false) {
+    if (highlight && highlight->empty()) highlight = nullptr;
     if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
     RefreshTextRendering(state);
@@ -16985,14 +17429,18 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         if (SUCCEEDED(layout->GetUnderline(0,&currentUnderline)) && bool(currentUnderline) != underline)
             layout->SetUnderline(underline,{0,static_cast<UINT32>(text.size())});
         if (highlight) {
-            DWRITE_HIT_TEST_METRICS matches[64]{};
-            UINT32 count = 0;
-            if (SUCCEEDED(layout->HitTestTextRange(0, std::min(highlight, static_cast<UINT32>(text.size())),
-                l, t, matches, ARRAYSIZE(matches), &count))) {
-                // The outline includes horizontal padding outside the glyph
-                // box. Keep it inside its own clip, including shortened labels.
-                const auto clip=SnapDrawRect(state.target.Get(),D2D1::RectF(l-1.f,t,r+1.f,b));
-                state.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            // The outline includes horizontal padding outside the glyph
+            // box. Keep it inside its own clip, including shortened labels.
+            const auto clip=SnapDrawRect(state.target.Get(),D2D1::RectF(l-1.f,t,r+1.f,b));
+            state.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            for (const auto& range : *highlight) {
+                const UINT32 size = static_cast<UINT32>(text.size());
+                if (range.startPosition >= size || !range.length) continue;
+                DWRITE_HIT_TEST_METRICS matches[64]{};
+                UINT32 count = 0;
+                if (FAILED(layout->HitTestTextRange(range.startPosition,
+                        std::min(range.length, size - range.startPosition),
+                        l, t, matches, ARRAYSIZE(matches), &count))) continue;
                 for (UINT32 i=0; i<count; ++i) {
                     const auto& m = matches[i];
                     if (!m.isText || m.isTrimmed || m.width <= 0.f || m.height <= 0.f) continue;
@@ -17010,8 +17458,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
                     StrokeRoundedRect(state,rc, state.brush.Get(), 1.f);
                 }
-                state.target->PopAxisAlignedClip();
             }
+            state.target->PopAxisAlignedClip();
             state.brush->SetColor(Packed(hex, opacity));
         }
         if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename)) {
@@ -18769,6 +19217,7 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
         result.visible = result.track.right > result.track.left;
         return result;
     }
+    if (state.gridView) return result; // Icon cells have no usage line.
     const float textLeft = item.text.left, columnRight = item.text.right + NameTrailingGap(state);
     const float margin = static_cast<float>(Scale96(kDriveBarSideMargin96, dpi));
     const float minimum = static_cast<float>(Scale96(kDriveBarMinimumWidth96, dpi));
@@ -18895,6 +19344,23 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
 }
 
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
+// Every occurrence of each search word, matched as Windows Search does:
+// ignoring case and diacritics, with the original text extent of the match.
+void SearchHighlightRanges(const std::wstring& name, const std::vector<std::wstring>& terms,
+                           std::vector<DWRITE_TEXT_RANGE>& ranges) {
+    for (const auto& term : terms) {
+        for (int from = 0; from < static_cast<int>(name.size());) {
+            int found = 0;
+            const int at = FindNLSStringEx(LOCALE_NAME_USER_DEFAULT,
+                FIND_FROMSTART | LINGUISTIC_IGNORECASE | LINGUISTIC_IGNOREDIACRITIC,
+                name.c_str() + from, static_cast<int>(name.size()) - from,
+                term.c_str(), static_cast<int>(term.size()), &found, nullptr, nullptr, 0);
+            if (at < 0 || found <= 0) break;
+            ranges.push_back({static_cast<UINT32>(from + at), static_cast<UINT32>(found)});
+            from += at + found;
+        }
+    }
+}
 
 void ResetItemContentOpacity(ViewState& state) {
     state.itemOpacityRows.clear();
@@ -21396,6 +21862,7 @@ void Paint(ViewState& state) {
         }
     }
     uiComparisonRow=true;
+    std::vector<DWRITE_TEXT_RANGE> highlightRanges; // Reused by every painted name.
     contentTrace.emplace(state.background,L"render.labels");
     for (const auto& item:paintedItems) {
         const int i=item.index;
@@ -21413,11 +21880,16 @@ void Paint(ViewState& state) {
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         const float nameTextRight = usage.visible ? usage.labelRight : geometry.text.right;
-        const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(EntryLabel(e),state.typeSearch) : 0;
+        // Typing to select owns the highlight while visible; otherwise a
+        // search-results folder marks every match of its query words.
+        highlightRanges.clear();
+        if (const UINT32 match = typeSearchVisible ? TypeSearchPrefixLength(EntryLabel(e),state.typeSearch) : 0)
+            highlightRanges.push_back({0, match});
+        else SearchHighlightRanges(EntryLabel(e), state.searchHighlightTerms, highlightRanges);
         if (!(state.rename.editor && i == state.rename.index))
             Text(state, EntryLabel(e), geometry.text.left, geometry.text.top,
                 nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
-                false, geometry.wrapped, match,false,true,
+                false, geometry.wrapped, &highlightRanges,false,true,
                 state.clickPolicy.singleClick && (state.clickPolicy.underlineCold ||
                     (state.clickPolicy.underlineHot && state.hovered==i)));
         if (usage.visible && DriveTiles(state)) {
@@ -21428,6 +21900,15 @@ void Paint(ViewState& state) {
                         usage.caption.right, usage.caption.bottom, nameColor, false,
                         contentOpacity * detailsAlpha);
             }
+        if (TileLayout(state) && !DriveTiles(state)) {
+            // Tile details use the same secondary text as Details columns.
+            const std::wstring* lines[] = {&e.type, &e.size};
+            for (int line = 0; line < 2; ++line)
+                if (!lines[line]->empty())
+                    Text(state, *lines[line], geometry.detail[line].left, geometry.detail[line].top,
+                        geometry.detail[line].right, geometry.detail[line].bottom, nameColor, false,
+                        contentOpacity * detailsAlpha, false, false, nullptr, true);
+        }
         if (details && !state.gridView) {
             if (compositionFrame.active && !compositionFrame.Widths() && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.metadata.bitmap.Get());
             for (size_t columnIndex = 0; columnIndex < state.columns.size()+state.disappearingColumns.size(); ++columnIndex) {
@@ -22782,6 +23263,17 @@ bool VerifyNativeSelection(ViewState& state, const PidlSelection& expected) {
         if (state.folder && SUCCEEDED(SHGetDataFromIDListW(state.folder.Get(), item,
                 SHGDFIL_FINDDATA, &data, sizeof(data))) && data.cFileName[0])
             return SelectionPathHash(data.cFileName);
+        // Delegate IDs (library items) carry volatile bytes; the canonical
+        // comparison below decides equality, so bucket them by parsing name.
+        STRRET name{}; PWSTR text = nullptr;
+        if (state.folder && SUCCEEDED(state.folder->GetDisplayNameOf(item,
+                SHGDN_INFOLDER | SHGDN_FORPARSING, &name)) &&
+            SUCCEEDED(StrRetToStrW(&name, item, &text)) && text && *text) {
+            const size_t hash = SelectionPathHash(text);
+            CoTaskMemFree(text);
+            return hash;
+        }
+        CoTaskMemFree(text);
         size_t hash = static_cast<size_t>(2166136261u);
         const auto bytes = reinterpret_cast<const unsigned char*>(item);
         const UINT size = ILGetSize(item);
@@ -26455,8 +26947,14 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     const bool supported=IsGpuViewMode(mode,state.thisPcGpu), columns=mode==FVM_DETAILS;
     const bool grid=IsIconViewMode(mode,state.thisPcGpu);
     const bool enteringColumns=columns && !state.columnsView;
+    // cachedNativeMode may already hold the observed mode; compare the
+    // layout that was actually applied.
+    const bool tileLinesBefore=state.gridView && state.layoutNativeMode==FVM_TILE;
     if (grid) state.nativeIconSize=requested.iconSize;
     state.cachedNativeMode=mode;
+    // Tile lines and Details columns request different properties. A row
+    // complete for one is not complete for the other.
+    if (tileLinesBefore!=(grid && mode==FVM_TILE)) InvalidateDetailJobs(state);
     const bool changed=state.layoutNativeMode!=mode ||
         (grid && state.layoutIconSize!=state.nativeIconSize) || state.gridView!=grid;
     // Grid-to-grid icon size or mode changes zoom from the presented cells,
@@ -26517,7 +27015,7 @@ bool RefreshNativeViewMode(ViewState& state, bool force = false) {
 }
 
 // Read Explorer's own mode/size; supported item layouts use the GPU overlay.
-// Tiles use the grid pipeline only in This PC. Other Tiles and Content stay native.
+// Tiles use the grid pipeline; Content stays native.
 // On failure, prefer native Explorer to an incorrect GPU layout.
 bool NativeGpuMode(ViewState& state) {
     return RefreshNativeViewMode(state, true) &&
@@ -28255,24 +28753,66 @@ void ItemTipHoverMoved(ViewState& state, int row) {
     if (!tip.suppressed.empty() && (!item || *item != tip.suppressed)) tip.suppressed.clear();
 }
 
+// Explorer's own tooltips use its dark visual style when the app is dark.
+HTHEME OpenItemTipTheme(const ViewState& state, HWND hwnd) {
+    const bool dark = ValidRgb(state.nativeAppBackground) && ColorLuminance(state.nativeAppBackground) < .5;
+    HTHEME theme = dark ? OpenThemeData(hwnd, L"DarkMode_Explorer::Tooltip") : nullptr;
+    return theme ? theme : OpenThemeData(hwnd, L"Tooltip");
+}
+
+// The native tooltip's fill and border are painted by its visual style, not
+// published as colors; sample them from a small rendering of that part.
+// Only the property labels differ from native: muted, for easier scanning.
+// Palette refreshes run for every tab on each theme/settings burst; sampling
+// the tooltip style waits until a tooltip actually shows (once per change).
 void RefreshItemTipPalette(ViewState& state, bool highContrast) {
     auto& tip = state.itemTip;
+    tip.paletteDirty = true; tip.highContrast = highContrast;
+    tip.metricsDpi = 0; // The theme or system fonts may have changed: measure again.
+}
+
+void ResolveItemTipPalette(ViewState& state) {
+    auto& tip = state.itemTip;
+    const bool highContrast = tip.highContrast;
+    tip.paletteDirty = false;
     COLORREF background = GetSysColor(COLOR_INFOBK), foreground = GetSysColor(COLOR_INFOTEXT);
-    COLORREF label = foreground, border = foreground;
-    if (!highContrast && ValidRgb(state.nativeAppBackground)) {
-        background = RaisedSurface(state.nativeAppBackground,
-            ValidRgb(state.nativeAppForeground) ? state.nativeAppForeground : state.nativeTextColor);
-        foreground = ReadableForeground(background, {state.nativeAppForeground, state.nativeTextColor, foreground});
-        label = BlendColor(foreground, background, 35);   // Secondary text, as in Fluent tooltips.
-        border = BlendColor(background, foreground, 16);
+    COLORREF border = GetSysColor(COLOR_WINDOWFRAME);
+    if (!highContrast) {
+        if (HTHEME theme = OpenItemTipTheme(state, IsWindow(tip.hwnd) ? tip.hwnd : state.hwnd)) {
+            COLORREF text = CLR_INVALID;
+            if (SUCCEEDED(GetThemeColor(theme, TTP_STANDARD, 0, TMT_TEXTCOLOR, &text)) && ValidRgb(text))
+                foreground = text;
+            constexpr int width = 32, height = 16;
+            BITMAPINFO info{};
+            info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+            void* bits = nullptr;
+            if (const HDC dc = CreateCompatibleDC(nullptr)) {
+                if (const HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0)) {
+                    const HGDIOBJ previous = SelectObject(dc, bitmap);
+                    RECT rect{0, 0, width, height};
+                    if (SUCCEEDED(DrawThemeBackground(theme, dc, TTP_STANDARD, 0, &rect, nullptr))) {
+                        GdiFlush();
+                        const auto pixel = [&](int x, int y) {
+                            const DWORD bgra = static_cast<const DWORD*>(bits)[y * width + x];
+                            return RGB((bgra >> 16) & 255, (bgra >> 8) & 255, bgra & 255);
+                        };
+                        background = pixel(width / 2, height / 2);
+                        border = pixel(width / 2, 0);
+                    }
+                    SelectObject(dc, previous);
+                    DeleteObject(bitmap);
+                }
+                DeleteDC(dc);
+            }
+            CloseThemeData(theme);
+        }
     }
+    const COLORREF label = highContrast ? foreground : BlendColor(foreground, background, 35);
+    // A muted border suits the subtle corners; high contrast keeps its own.
+    if (!highContrast) border = BlendColor(border, background, 50);
     if (background == tip.background && foreground == tip.foreground && label == tip.label && border == tip.border) return;
     tip.background = background; tip.foreground = foreground; tip.label = label; tip.border = border;
-    if (IsWindow(tip.hwnd)) {
-        const COLORREF frame = tip.border;
-        DwmSetWindowAttribute(tip.hwnd, DWMWA_BORDER_COLOR, &frame, sizeof(frame));
-        InvalidateRect(tip.hwnd, nullptr, FALSE);
-    }
+    if (IsWindow(tip.hwnd)) InvalidateRect(tip.hwnd, nullptr, FALSE);
 }
 
 LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -28287,11 +28827,11 @@ bool EnsureItemTipWindow(ViewState& state) {
     if (!hwnd) return false;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&tip));
     tip.hwnd = hwnd;
-    // Windows 11 draws native tooltip corners and border; older systems keep
-    // square corners and the painted border below.
-    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
+    // Square corners and the visual style's own border, painted below, look
+    // the same wherever DWM would or would not round a popup.
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
-    const COLORREF frame = tip.border;
+    const COLORREF frame = DWMWA_COLOR_NONE;
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &frame, sizeof(frame));
     return true;
 }
@@ -28311,36 +28851,130 @@ RECT ItemTipCursorBounds(const ViewState& state, POINT anchor) {
     return RECT{anchor.x, anchor.y - hotspot, anchor.x, anchor.y - hotspot + height};
 }
 
+// Ink extent of a font, in pixels: how far its tallest letters (ascenders and
+// capitals) rise above the baseline and its descenders fall below it. Read
+// from the glyph outlines' design metrics; text-independent, so one tooltip
+// spacing fits every name.
+bool FontInkExtent(IDWriteTextFormat* format, float& above, float& below) {
+    ComPtr<IDWriteFontCollection> collection;
+    std::wstring family(format->GetFontFamilyNameLength() + 1, L'\0');
+    UINT32 index = 0; BOOL exists = FALSE;
+    ComPtr<IDWriteFontFamily> fonts; ComPtr<IDWriteFont> font; ComPtr<IDWriteFontFace> face;
+    if (FAILED(format->GetFontCollection(&collection)) || !collection) g_writeFactory->GetSystemFontCollection(&collection);
+    if (!collection || FAILED(format->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
+        FAILED(collection->FindFamilyName(family.c_str(), &index, &exists)) || !exists ||
+        FAILED(collection->GetFontFamily(index, &fonts)) ||
+        FAILED(fonts->GetFirstMatchingFont(format->GetFontWeight(), format->GetFontStretch(), format->GetFontStyle(), &font)) ||
+        FAILED(font->CreateFontFace(&face))) return false;
+    DWRITE_FONT_METRICS metrics{};
+    face->GetMetrics(&metrics);
+    if (!metrics.designUnitsPerEm) return false;
+    constexpr wchar_t tall[] = L"bdfhklHIKLMNT", deep[] = L"gjpqy";
+    const auto extent = [&](const wchar_t* text, bool top, int fallback) {
+        const UINT32 count = UINT32(wcslen(text));
+        std::vector<UINT32> points(text, text + count);
+        std::vector<UINT16> glyphs(count);
+        std::vector<DWRITE_GLYPH_METRICS> glyph(count);
+        int best = 0;
+        if (SUCCEEDED(face->GetGlyphIndices(points.data(), count, glyphs.data())) &&
+            SUCCEEDED(face->GetDesignGlyphMetrics(glyphs.data(), count, glyph.data(), FALSE)))
+            for (UINT32 i = 0; i < count; ++i) if (glyphs[i])
+                best = std::max(best, top ? glyph[i].verticalOriginY - glyph[i].topSideBearing :
+                    int(glyph[i].advanceHeight) - glyph[i].bottomSideBearing - glyph[i].verticalOriginY);
+        return float(best > 0 ? best : fallback) * format->GetFontSize() / metrics.designUnitsPerEm;
+    };
+    above = extent(tall, true, metrics.capHeight);
+    below = extent(deep, false, metrics.descent);
+    return true;
+}
+
+// Fonts, ink extents and spacing for the tooltip. Measured only when the DPI,
+// the configured font, reading direction or system theme changes; never per
+// show. The size is the native tooltip font's; the face is the configured
+// font when one is set (as the view resolved it), else the native face.
+bool PrepareItemTipFont(ViewState& state, HWND window) {
+    auto& tip = state.itemTip;
+    const int dpi = DpiOf(window);
+    if (tip.nameFormat && tip.metricsDpi == dpi && tip.metricsFace == state.textFaceSerial &&
+        tip.formatRtl == state.rtlLayout) return true;
+    if (!g_writeFactory || ((!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat)) return false;
+    LOGFONTW font{};
+    HTHEME theme = OpenItemTipTheme(state, window);
+    bool haveFont = theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font));
+    if (theme) CloseThemeData(theme);
+    if (!haveFont) {
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        haveFont = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, UINT(dpi));
+        font = metrics.lfStatusFont;
+    }
+    if (!haveFont || !font.lfFaceName[0]) return false;
+    float em = static_cast<float>(-font.lfHeight);
+    if (font.lfHeight >= 0) {
+        // A positive height is the cell height; DirectWrite needs the em size.
+        if (const HDC dc = GetDC(nullptr)) {
+            if (const HFONT gdi = CreateFontIndirectW(&font)) {
+                const HGDIOBJ previous = SelectObject(dc, gdi);
+                TEXTMETRICW metrics{};
+                if (GetTextMetricsW(dc, &metrics)) em = float(metrics.tmHeight - metrics.tmInternalLeading);
+                SelectObject(dc, previous); DeleteObject(gdi);
+            }
+            ReleaseDC(nullptr, dc);
+        }
+    }
+    if (em <= 0.f) return false;
+    // The configured font, exactly as the view resolved it (including fonts
+    // loaded from a file); otherwise the native tooltip face.
+    const bool configured = !ConfiguredFontFamily().empty();
+    std::wstring family = font.lfFaceName;
+    ComPtr<IDWriteFontCollection> collection;
+    if (configured) {
+        family.assign(state.headerFormat->GetFontFamilyNameLength() + 1, L'\0');
+        if (FAILED(state.headerFormat->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
+            FAILED(state.headerFormat->GetFontCollection(&collection))) return false;
+        family.resize(wcslen(family.c_str()));
+    }
+    const DWRITE_FONT_WEIGHT body = configured ? DWRITE_FONT_WEIGHT_NORMAL :
+        static_cast<DWRITE_FONT_WEIGHT>(std::clamp<LONG>(font.lfWeight ? font.lfWeight : 400, 1, 999));
+    const DWRITE_FONT_STYLE style = !configured && font.lfItalic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
+    ComPtr<IDWriteTextFormat> formats[3];
+    // The name line has no native counterpart; it stays semi-bold.
+    const DWRITE_FONT_WEIGHT weights[3]{DWRITE_FONT_WEIGHT_SEMI_BOLD, body, body};
+    for (int i = 0; i < 3; ++i) {
+        if (FAILED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(), weights[i], style,
+                DWRITE_FONT_STRETCH_NORMAL, em, L"", &formats[i]))) return false;
+        formats[i]->SetReadingDirection(state.rtlLayout ?
+            DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+        formats[i]->SetWordWrapping(i == 0 ? DWRITE_WORD_WRAPPING_EMERGENCY_BREAK : DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    // Where ink sits inside a line box: space above the tallest letters and
+    // below the deepest descenders, from the same GDI-compatible layout used
+    // to draw. Rounded, as drawing origins are whole pixels.
+    const auto slack = [&](IDWriteTextFormat* format, float& above, float& below) {
+        float inkAbove = 0.f, inkBelow = 0.f;
+        ComPtr<IDWriteTextLayout> line;
+        DWRITE_LINE_METRICS metrics{}; UINT32 count = 0;
+        if (!FontInkExtent(format, inkAbove, inkBelow) ||
+            FAILED(g_writeFactory->CreateGdiCompatibleTextLayout(L"Hg", 2, format, 1e6f, 1e6f, 1.f, nullptr, FALSE, &line)) ||
+            FAILED(line->GetLineMetrics(&metrics, 1, &count)) || !count) return false;
+        above = std::max(0.f, std::round(metrics.baseline - inkAbove));
+        below = std::max(0.f, std::round(metrics.height - metrics.baseline - inkBelow));
+        return true;
+    };
+    if (!slack(formats[0].Get(), tip.nameAbove, tip.nameBelow) ||
+        !slack(formats[2].Get(), tip.rowAbove, tip.rowBelow)) return false;
+    tip.nameFormat = formats[0]; tip.labelFormat = formats[1]; tip.valueFormat = formats[2];
+    // One spacing unit, measured ink to ink: every edge, the name to the
+    // details, and property names to their values.
+    tip.padX = tip.padY = float(Scale96(8, dpi));
+    tip.metricsDpi = dpi; tip.metricsFace = state.textFaceSerial; tip.formatRtl = state.rtlLayout;
+    return true;
+}
+
 bool LayoutItemTip(ViewState& state, const RECT& work) {
     auto& tip = state.itemTip;
-    if (!g_writeFactory || (!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat) return false;
-    const int dpi = DpiOf(state.hwnd);
-    // The header face follows the font option and Explorer's UI font; its
-    // size is already in this view's physical pixels.
-    if (!tip.nameFormat || tip.formatSerial != state.textFaceSerial || tip.formatRtl != state.rtlLayout) {
-        const auto& source = state.headerFormat;
-        std::wstring family(source->GetFontFamilyNameLength() + 1, L'\0');
-        std::wstring locale(source->GetLocaleNameLength() + 1, L'\0');
-        ComPtr<IDWriteFontCollection> collection;
-        if (FAILED(source->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
-            FAILED(source->GetLocaleName(locale.data(), UINT32(locale.size()))) ||
-            FAILED(source->GetFontCollection(&collection))) return false;
-        ComPtr<IDWriteTextFormat> formats[3];
-        const DWRITE_FONT_WEIGHT weights[3]{DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            DWRITE_FONT_WEIGHT_NORMAL};
-        for (int i = 0; i < 3; ++i) {
-            if (FAILED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(), weights[i],
-                    source->GetFontStyle(), source->GetFontStretch(), source->GetFontSize(), locale.c_str(),
-                    &formats[i]))) return false;
-            formats[i]->SetReadingDirection(state.rtlLayout ?
-                DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
-            formats[i]->SetWordWrapping(i == 0 ? DWRITE_WORD_WRAPPING_EMERGENCY_BREAK : DWRITE_WORD_WRAPPING_NO_WRAP);
-        }
-        tip.nameFormat = formats[0]; tip.labelFormat = formats[1]; tip.valueFormat = formats[2];
-        tip.formatSerial = state.textFaceSerial; tip.formatRtl = state.rtlLayout;
-    }
-    tip.padX = float(Scale96(10, dpi)); tip.padY = float(Scale96(7, dpi));
-    const float columnGap = float(Scale96(16, dpi)), nameGap = float(Scale96(5, dpi));
+    if (!g_writeFactory) return false;
+    if (!PrepareItemTipFont(state, IsWindow(tip.hwnd) ? tip.hwnd : state.hwnd)) return false;
+    const float spacing = tip.padX, columnGap = spacing;
     const float available = std::max(1.f, float(work.right - work.left) - 2.f * tip.padX);
     const RECT cursor = ItemTipCursorBounds(state, tip.anchor);
     const float maxHeight = std::max(1.f, float(std::min(work.bottom - work.top,
@@ -28350,8 +28984,10 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
     const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
     const auto layout = [&](const std::wstring& text, IDWriteTextFormat* format, float width,
                             ComPtr<IDWriteTextLayout>& out, DWRITE_TEXT_METRICS& metrics) {
-        if (FAILED(g_writeFactory->CreateTextLayout(text.c_str(), UINT32(text.size()), format,
-            width, 1e6f, &out))) return false;
+        // GDI-compatible layout: whole-pixel advances, drawn with GDI-classic
+        // ClearType like native tooltips, instead of fractional natural text.
+        if (FAILED(g_writeFactory->CreateGdiCompatibleTextLayout(text.c_str(), UINT32(text.size()), format,
+            width, 1e6f, 1.f, nullptr, FALSE, &out))) return false;
         if (ellipsis) out->SetTrimming(&trimming, ellipsis.Get());
         return SUCCEEDED(out->GetMetrics(&metrics));
     };
@@ -28370,7 +29006,7 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
             !layout(bounded(row.value), tip.valueFormat.Get(), available, value, valueMetrics)) return false;
         labelWidth = std::max(labelWidth, labelMetrics.widthIncludingTrailingWhitespace);
         valueWidth = std::max(valueWidth, valueMetrics.widthIncludingTrailingWhitespace);
-        heights.push_back(std::max(labelMetrics.height, valueMetrics.height));
+        heights.push_back(std::ceil(std::max(labelMetrics.height, valueMetrics.height)));
         tip.rowLayouts.emplace_back(std::move(label), std::move(value));
     }
     labelWidth = std::min(std::ceil(labelWidth), std::max(1.f, (available - columnGap) * .45f));
@@ -28381,15 +29017,21 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
     if (!layout(tip.name, tip.nameFormat.Get(), nameLimit, tip.nameLayout, nameMetrics)) return false;
     const float content = std::ceil(std::max(tableWidth, nameMetrics.widthIncludingTrailingWhitespace));
     tip.nameLayout->SetMaxWidth(content);
-    tip.nameHeight = std::min(nameMetrics.height, std::max(1.f, maxHeight - 2.f * tip.padY));
+    tip.nameHeight = std::min(std::ceil(nameMetrics.height), std::max(1.f, maxHeight - 2.f * spacing));
     tip.nameLayout->SetMaxHeight(tip.nameHeight);
-    float y = tip.padY + tip.nameHeight + nameGap;
+    // Vertical gaps are measured ink to ink: the name's tallest letters sit
+    // one unit below the edge, the details' tallest letters one unit below the
+    // name's descenders, and the bottom edge one unit below the last row's.
+    tip.nameTop = spacing - tip.nameAbove;
+    const float nameInkBottom = tip.nameTop + tip.nameHeight - tip.nameBelow;
+    float y = nameInkBottom + spacing - tip.rowAbove;
+    const float bottomGap = spacing - tip.rowBelow; // Last row's line box to the edge.
     ComPtr<IDWriteTextLayout> line; DWRITE_TEXT_METRICS lineMetrics{};
     if (!layout(L" ", tip.valueFormat.Get(), available, line, lineMetrics)) return false;
-    tip.rowCapacity = size_t(std::max(0.f, std::floor((maxHeight - y - tip.padY) / std::max(1.f, lineMetrics.height))));
+    tip.rowCapacity = size_t(std::max(0.f, std::floor((maxHeight - y - bottomGap) / std::max(1.f, lineMetrics.height))));
     const float valueBox = std::max(1.f, content - labelWidth - columnGap);
     for (size_t i = 0; i < tip.rowLayouts.size(); ++i) {
-        if (y + heights[i] + tip.padY > maxHeight) { tip.rowLayouts.resize(i); break; }
+        if (y + heights[i] + bottomGap > maxHeight) { tip.rowLayouts.resize(i); break; }
         tip.rowLayouts[i].first->SetMaxWidth(std::max(1.f, labelWidth));
         tip.rowLayouts[i].first->SetMaxHeight(heights[i]);
         tip.rowLayouts[i].second->SetMaxWidth(valueBox);
@@ -28400,9 +29042,9 @@ bool LayoutItemTip(ViewState& state, const RECT& work) {
     // Leading alignment inside each column box mirrors with the reading order.
     tip.labelX = state.rtlLayout ? tip.padX + content - labelWidth : tip.padX;
     tip.valueX = state.rtlLayout ? tip.padX : tip.padX + labelWidth + columnGap;
-    if (tip.rowLayouts.empty()) y = tip.padY + tip.nameHeight;
+    const float bottom = tip.rowLayouts.empty() ? nameInkBottom + spacing : y + bottomGap;
     tip.size = SIZE{std::min(work.right - work.left, LONG(std::ceil(content + 2.f * tip.padX))),
-        std::min(LONG(maxHeight), LONG(std::ceil(y + tip.padY)))};
+        std::min(LONG(maxHeight), LONG(std::ceil(bottom)))};
     return true;
 }
 
@@ -28420,11 +29062,17 @@ POINT ItemTipPosition(const ViewState& state, POINT anchor, SIZE size, const REC
 void PresentItemTip(ViewState& state, const ItemTipJob& facts) {
     auto& tip = state.itemTip;
     tip.rows = facts.rows;
-    if (!ValidRgb(tip.background) || !ValidRgb(tip.foreground)) RefreshNativePalette(state);
+    if (!state.nativePaletteResolved) RefreshNativePalette(state);
+    if (tip.paletteDirty || !ValidRgb(tip.background) || !ValidRgb(tip.foreground)) ResolveItemTipPalette(state);
     MONITORINFO monitor{sizeof(monitor)};
     if (!GetMonitorInfoW(MonitorFromPoint(tip.anchor, MONITOR_DEFAULTTONEAREST), &monitor) ||
         !EnsureItemTipWindow(state) || !LayoutItemTip(state, monitor.rcWork)) { HideItemTip(state); return; }
     const POINT at = ItemTipPosition(state, tip.anchor, tip.size, monitor.rcWork);
+    // Subtle corners of our own, identical wherever DWM does or does not
+    // round popups. The window owns the region once it is set.
+    tip.corner = float(Scale96(3, DpiOf(tip.hwnd)));
+    const int diameter = int(tip.corner * 2.f) + 1;
+    SetWindowRgn(tip.hwnd, CreateRoundRectRgn(0, 0, tip.size.cx + 1, tip.size.cy + 1, diameter, diameter), FALSE);
     InvalidateRect(tip.hwnd, nullptr, FALSE);
     SetWindowPos(tip.hwnd, HWND_TOPMOST, at.x, at.y, tip.size.cx, tip.size.cy,
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
@@ -28465,7 +29113,7 @@ void ShowItemTip(ViewState& state, POINT client) {
         facts.created = entry.created;
         facts.modified = entry.lastWrite;
         facts.size = entry.byteSize;
-        facts.sizeKnown = !entry.folder && !state.thisPcGpu;
+        facts.sizeKnown = entry.byteSizeKnown && !state.thisPcGpu;
     }
     // No Shell/COM calls here. Measure the available row budget without showing
     // a partial popup: the worker returns one completed result for this mode.
@@ -28550,15 +29198,14 @@ void PaintItemTip(ItemTip& tip, HWND hwnd) {
         ComPtr<ID2D1SolidColorBrush> text, label;
         tip.target->CreateSolidColorBrush(color(tip.foreground), &text);
         tip.target->CreateSolidColorBrush(color(tip.label), &label);
-        // Windows 11 DWM supplies the rounded border; earlier systems need one.
-        DWM_WINDOW_CORNER_PREFERENCE corners{};
-        if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners)))) {
-            ComPtr<ID2D1SolidColorBrush> border;
-            if (SUCCEEDED(tip.target->CreateSolidColorBrush(color(tip.border), &border)))
-                tip.target->DrawRectangle(D2D1::RectF(.5f, .5f, client.right - .5f, client.bottom - .5f), border.Get());
-        }
+        // The native tooltip's one-pixel border, on whole pixels, following
+        // the window region's corners.
+        ComPtr<ID2D1SolidColorBrush> border;
+        if (SUCCEEDED(tip.target->CreateSolidColorBrush(color(tip.border), &border)))
+            tip.target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(.5f, .5f, client.right - .5f,
+                client.bottom - .5f), tip.corner, tip.corner), border.Get());
         if (text && label) {
-            tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.padY), tip.nameLayout.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.nameTop), tip.nameLayout.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             for (size_t i = 0; i < tip.rowLayouts.size() && i < tip.rowTops.size(); ++i) {
                 tip.target->DrawTextLayout(D2D1::Point2F(tip.labelX, tip.rowTops[i]), tip.rowLayouts[i].first.Get(), label.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
                 tip.target->DrawTextLayout(D2D1::Point2F(tip.valueX, tip.rowTops[i]), tip.rowLayouts[i].second.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -32251,6 +32898,24 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s && updatedItem && !created.empty())
             QueueShellItemUpdate(*s, created);
+        if (s && (structural || (event & SHCNE_UPDATEITEM))) {
+            // A change below a listed folder changes that row's contents and
+            // provider-backed size, though not this folder's membership.
+            std::wstring root = s->directoryWatch && !s->directoryWatch->path.empty() ?
+                s->directoryWatch->path : s->folderPath;
+            if (!root.empty() && root.back() != L'\\') root += L'\\';
+            const auto containingRow = [&](const std::wstring& path) {
+                if (root.size() < 2 || path.size() <= root.size() ||
+                    _wcsnicmp(path.c_str(), root.c_str(), root.size()) != 0) return;
+                const size_t end = path.find(L'\\', root.size());
+                if (end != std::wstring::npos) QueueShellItemUpdate(*s, path.substr(0, end));
+            };
+            containingRow(created);
+            auto nestedStorage = std::make_unique<ShellPathStorage>();
+            if (renamedIdentity && SHGetPathFromIDListEx(renamedIdentity.get(), nestedStorage->value,
+                    ARRAYSIZE(nestedStorage->value), GPFIDL_DEFAULT))
+                containingRow(nestedStorage->value);
+        }
         if (s && structural) {
             const auto directChild = [&](const std::wstring& path) {
                 const size_t slash=path.find_last_of(L"\\/");
@@ -36482,6 +37147,21 @@ void PrepareInitialOverlay(ViewState& state) {
             afterGraphics - beforeGraphics, state.total, state.loaded);
 }
 
+// Explorer can keep one native view and swap the folder it shows (refining a
+// search replaces the results folder each keystroke). Between two namespace
+// folders that are not each other's ancestor, that is new content for the
+// same place, not a navigation: the displayed rows are kept and compared.
+bool ReplacesFolderInPlace(const ViewState& state, IShellFolder* folder, const std::wstring& path,
+                           bool sameViewNewPath) {
+    if (!sameViewNewPath || !state.loaded || !folder || !state.directoryFolderIdentity ||
+        !UsesNamespaceFolderIdentity(path) || !UsesNamespaceFolderIdentity(state.folderPath)) return false;
+    PIDLIST_ABSOLUTE raw = nullptr;
+    if (FAILED(SHGetIDListFromObject(folder, &raw))) return false;
+    OwnedPidl incoming(raw);
+    const auto current = state.directoryFolderIdentity.get();
+    return incoming && !ILIsParent(current, incoming.get(), FALSE) && !ILIsParent(incoming.get(), current, FALSE);
+}
+
 void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 ComPtr<IShellFolder>& folder, ComPtr<IShellBrowser>& shellBrowser,
                 const std::wstring& path, bool prepareTab = false) {
@@ -36684,6 +37364,17 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             if (g_perf.load(std::memory_order_relaxed))
                 Wh_Log(L"[GPU overlay] optimistic display confirmed: native ready after %llu ms (%s)",
                     static_cast<unsigned long long>(optimisticElapsed), path.c_str());
+        } else if (ReplacesFolderInPlace(*s, folder.Get(), path, changedPath && !changedView && !wasOutside &&
+                       !optimistic && oldTabHost == newTabHost)) {
+            // Explorer kept its view and swapped the folder inside it, as a
+            // refined search does. Keep the displayed rows; the refresh
+            // compares the new listing to them and animates the difference.
+            s->folderPath = path;
+            s->folder = folder;
+            s->directoryFolderIdentity.reset();
+            RefreshSortFromExplorer(*s, false, true);
+            WatchDirectory(*s);
+            QueueDirectoryRefresh(*s, true, true);
         } else if (changedPath || changedBinding || wasOutside || s->folderPath.empty() || optimistic) {
             // A redirected/failed prediction is never allowed to remain visible
             // after Explorer reports its actual folder.
@@ -38307,7 +38998,10 @@ void RequestStatusButtonGeometry(ViewState& state,const StatusButtonQuery& query
 // Restyled only when that tooltip or the theme changes.
 void StyleViewToggle(ViewState& state, HWND frame, int dpi) {
     const HWND stock = StockFrameTooltip(frame, state.viewToggleGeometry.providerHost);
-    if (state.viewToggleStyled && stock == state.viewToggleTipSource) return;
+    // Explorer may set its tooltip's final font only when that tooltip first
+    // shows; a changed font restyles ours too.
+    const HFONT stockFont = stock ? reinterpret_cast<HFONT>(SendMessageW(stock, WM_GETFONT, 0, 0)) : nullptr;
+    if (state.viewToggleStyled && stock == state.viewToggleTipSource && stockFont == state.viewToggleTipSourceFont) return;
     const bool optIn = !stock || DarkModeOptedIn(stock);
     if (optIn != DarkModeOptedIn(state.viewToggle)) {
         OptIntoDarkMode(state.viewToggle, optIn);
@@ -38320,11 +39014,21 @@ void StyleViewToggle(ViewState& state, HWND frame, int dpi) {
         const std::wstring ids = stock ? WindowThemeName(stock, kThemeSubIdListProperty) : std::wstring{};
         OptIntoDarkMode(tip, optIn);
         SetWindowTheme(tip, subApp.empty() ? nullptr : subApp.c_str(), ids.empty() ? nullptr : ids.c_str());
+        // Explorer's own tooltip font (the system tooltip font when it has
+        // none yet). It can change when Explorer first initializes that
+        // tooltip, possibly while ours is showing; see the re-measure below.
         LOGFONTW face{};
         const auto font = stock ? reinterpret_cast<HFONT>(SendMessageW(stock, WM_GETFONT, 0, 0)) : nullptr;
-        if (font && GetObjectW(font, sizeof(face), &face)) {
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        const bool haveFace = (font && GetObjectW(font, sizeof(face), &face)) ||
+            (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, UINT(dpi)) &&
+             (face = metrics.lfStatusFont, true));
+        if (haveFace) {
             if (const HFONT copy = CreateFontIndirectW(&face)) {
-                SendMessageW(tip, WM_SETFONT, reinterpret_cast<WPARAM>(copy), FALSE);
+                // A shown tip sized for the previous font must re-measure, or it
+                // draws the new font clipped in the old bounds.
+                SendMessageW(tip, WM_SETFONT, reinterpret_cast<WPARAM>(copy), TRUE);
+                SendMessageW(tip, TTM_UPDATE, 0, 0);
                 if (state.viewToggleTipFont) DeleteObject(state.viewToggleTipFont);
                 state.viewToggleTipFont = copy;
             }
@@ -38339,7 +39043,7 @@ void StyleViewToggle(ViewState& state, HWND frame, int dpi) {
             SendMessageW(tip, TTM_SETMARGIN, 0, reinterpret_cast<LPARAM>(&margin));
         } else SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, Scale96(360, dpi));
     }
-    state.viewToggleTipSource = stock;
+    state.viewToggleTipSource = stock; state.viewToggleTipSourceFont = stockFont;
     state.viewToggleStyled = true;
     InvalidateRect(state.viewToggle, nullptr, FALSE);
 }

@@ -5,12 +5,21 @@
 - **ADDED** Batch renaming of multiple selected files and folders, with native numbering and undo support.
 - **ADDED** Click-to-rename behavior, matching native Explorer.
 - **ADDED** Automatic renaming when creating new files or folders.
+- **ADDED** Tiles view in every folder, showing each item's name, type and size.
+- **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
+- **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
 - **IMPROVED** Rename field appearance to match the list's font, scaling, and text rendering.
 - **IMPROVED** Build validation reliability with additional retries and diagnostics.
 - **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.
 - **IMPROVED** Thumbnails in the drag pile have rounded corners, sized for the pile like grid thumbnails are for the grid.
 - **IMPROVED** The log now records sort, navigation and GPU device details that help diagnose a stuck or blank view.
+- **IMPROVED** Sorting by Size orders folders by their size when another mod provides folder sizes.
+- **IMPROVED** Folder sizes update when files are added, removed or changed inside them.
+- **IMPROVED** Refining a search updates the results in place, animating added and removed items instead of reloading.
+- **IMPROVED** This PC in Large icons is now a plain icon grid; its Tiles view keeps the drive usage bars.
+- **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
+- **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
@@ -21,6 +30,10 @@
 - **FIXED** Opening a drive from This PC could leave the view stuck on This PC or blank, when Explorer had saved that drive without a sort column.
 - **FIXED** Double-clicking while a folder was still loading could jump back to the parent folder.
 - **FIXED** The view could stay blank after being hidden and shown again while a folder was loading.
+- **FIXED** File sizes showed as 0 bytes on USB and other removable drives. Sizes that cannot be read now show "--".
+- **FIXED** Library folders that would not open on double-click, sizes shown as raw byte counts, and sorting that redrew the whole list.
+- **FIXED** Apps with small icons appeared boxed and tiny in grid views; their icons now fill the icon space.
+- **FIXED** The view switch button's tooltip could appear clipped the first time it showed after Explorer started.
 
 ## 1.0.4 — Public release
 - **FIXED** ARM64 compatibility.

@@ -806,7 +806,13 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         state.entries[0].driveTotal=1000; state.entries[0].driveUsed=750;
         state.entries[0].cells.push_back({PKEY_Computer_DecoratedFreeSpace,L"250 GB free of 1 TB"});
         state.entries[2].driveUsedPercent=35; // Device with no byte count.
-        for(UINT mode : {FVM_TILE,FVM_ICON,FVM_SMALLICON,FVM_THUMBNAIL}) {
+        // Tiles carry the usage bar; This PC's icon modes are ordinary grids.
+        for(UINT mode : {FVM_ICON,FVM_SMALLICON,FVM_THUMBNAIL}) {
+            state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
+            Check(!DriveTiles(state) && !LayoutDriveBar(state,0,LayoutItem(state,LayoutRowVisual(state,0,1.f))).visible,
+                "This PC icon grid drew drive usage bars");
+        }
+        for(UINT mode : {FVM_TILE}) {
             state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
             const auto item=LayoutItem(state,LayoutRowVisual(state,0,1.f));
             const auto bar=LayoutDriveBar(state,0,item);

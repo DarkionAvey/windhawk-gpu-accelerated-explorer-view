@@ -20,8 +20,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
-- **Shell Size Text** — The Size column uses Shell formatting and can pick up folder sizes from [Better file sizes in Explorer details](https://windhawk.net/mods/explorer-details-better-file-sizes). Refresh after changing that mod's settings. Size sorting and grouping use the overlay's own rules.
-- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags. On by default.
+- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 

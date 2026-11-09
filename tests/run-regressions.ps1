@@ -7,7 +7,8 @@ param(
     [string[]]$Tests = @(),
     [string]$MinifiedSourceFile,
     [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
-    [ValidateRange(1,86400)][int]$TestTimeoutSeconds = 900,
+    # A hard ceiling: may be lowered for diagnosis, never raised. See tests/README.md.
+    [ValidateRange(1,120)][int]$TestTimeoutSeconds = 120,
     [switch]$KeepArtifacts,
     [switch]$Coverage,
     [string]$LlvmToolsDirectory,
@@ -32,6 +33,7 @@ New-RegressionResultDirectory $outputDirectory
 Write-Output "Build artifacts and results: $outputDirectory"
 try {
     Assert-RegressionExecutionContext
+    Assert-NoModuleInjection # Before compiling: an injected engine invalidates every result.
     $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
     $compilerDirectory = Join-Path $WindhawkDirectory 'Compiler'
     $compiler = Join-Path $compilerDirectory 'bin\clang++.exe'

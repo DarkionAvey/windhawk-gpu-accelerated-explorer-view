@@ -205,7 +205,7 @@ static void ItemTipScenario(const std::wstring& directory) {
     state.clickPolicy.itemTips = true;
     state.nativeAppBackground = RGB(25, 25, 25); state.nativeAppForeground = RGB(255, 255, 255);
     state.nativeTextColor = RGB(255, 255, 255);
-    RefreshItemTipPalette(state, false);
+    RefreshItemTipPalette(state, false); ResolveItemTipPalette(state);
     const auto rowOf = [&](const std::wstring& name) {
         for (int row = 0; row < state.total; ++row)
             if (state.entries[size_t(row)].name == name) return row;
@@ -330,8 +330,8 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check((ex & WS_EX_NOACTIVATE) && (ex & WS_EX_TOOLWINDOW) &&
         GetWindow(tip.hwnd, GW_OWNER) == view, "item tip window is activatable or unowned");
     DWM_WINDOW_CORNER_PREFERENCE corners{};
-    if (SUCCEEDED(DwmGetWindowAttribute(tip.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners))))
-        Check(corners == DWMWCP_ROUNDSMALL, "item tip does not use the system tooltip corners");
+    Check(SUCCEEDED(DwmGetWindowAttribute(tip.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners))) &&
+        corners == DWMWCP_DONOTROUND, "item tip corners depend on whether DWM rounds popups");
     Check(SendMessageW(tip.hwnd, WM_NCHITTEST, 0, MAKELPARAM(window.left + 1, window.top + 1)) == HTTRANSPARENT,
         "item tip intercepts the pointer");
     UpdateWindow(tip.hwnd);
@@ -401,16 +401,46 @@ static void ItemTipScenario(const std::wstring& directory) {
     }
     state.visible = true; state.mousePressActive = false; state.clickPolicy.itemTips = true;
 
-    // Theme: a raised surface on dark and light pages, muted labels between
-    // background and text, and the exact system colors in high contrast.
+    // Theme: the native tooltip visual style (dark when Explorer is dark),
+    // sampled independently here at another size; labels stay muted.
     for (const auto& [page, text] : {std::pair{RGB(25, 25, 25), RGB(255, 255, 255)},
                                      std::pair{RGB(255, 255, 255), RGB(0, 0, 0)}}) {
         state.nativeAppBackground = page; state.nativeAppForeground = state.nativeTextColor = text;
-        RefreshItemTipPalette(state, false);
-        Check(tip.background == RaisedSurface(page, text) && tip.background != page && tip.foreground == text &&
-            tip.label != text && tip.label != tip.background, "item tip theme colors");
+        RefreshItemTipPalette(state, false); ResolveItemTipPalette(state);
+        const bool dark = page == RGB(25, 25, 25);
+        HTHEME theme = dark ? OpenThemeData(tip.hwnd, L"DarkMode_Explorer::Tooltip") : nullptr;
+        if (!theme) theme = OpenThemeData(tip.hwnd, L"Tooltip");
+        Check(theme != nullptr, "native tooltip visual style");
+        COLORREF themeText = CLR_INVALID;
+        Check(SUCCEEDED(GetThemeColor(theme, TTP_STANDARD, 0, TMT_TEXTCOLOR, &themeText)), "native tooltip text color");
+        BITMAPINFO info{}; info.bmiHeader = {sizeof(BITMAPINFOHEADER), 60, -24, 1, 32, BI_RGB};
+        void* bits = nullptr; const HDC dc = CreateCompatibleDC(nullptr);
+        const HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        const HGDIOBJ previous = SelectObject(dc, bitmap); RECT rect{0, 0, 60, 24};
+        Check(SUCCEEDED(DrawThemeBackground(theme, dc, TTP_STANDARD, 0, &rect, nullptr)), "native tooltip background");
+        GdiFlush();
+        const auto pixel = [&](int x, int y) { const DWORD v = static_cast<const DWORD*>(bits)[y * 60 + x];
+            return RGB((v >> 16) & 255, (v >> 8) & 255, v & 255); };
+        const COLORREF fill = pixel(30, 12), edge = pixel(30, 0);
+        SelectObject(dc, previous); DeleteObject(bitmap); DeleteDC(dc); CloseThemeData(theme);
+        Check(tip.background == fill && tip.border == BlendColor(edge, fill, 50) && tip.foreground == themeText &&
+            tip.label != tip.foreground && tip.label != tip.background, "item tip differs from the native tooltip style");
     }
-    RefreshItemTipPalette(state, true);
+    {
+        // Native text size: the visual style's tooltip font at this DPI.
+        HTHEME theme = OpenThemeData(tip.hwnd, L"Tooltip");
+        LOGFONTW font{};
+        Check(theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font)) && font.lfHeight < 0,
+            "native tooltip font");
+        if (theme) CloseThemeData(theme);
+        Check(tip.valueFormat != nullptr, "item tip formats");
+        std::wstring family(tip.valueFormat->GetFontFamilyNameLength() + 1, L'\0');
+        Check(SUCCEEDED(tip.valueFormat->GetFontFamilyName(family.data(), UINT32(family.size()))) &&
+            _wcsicmp(family.c_str(), font.lfFaceName) == 0 &&
+            std::fabs(tip.valueFormat->GetFontSize() - float(-font.lfHeight)) < .01f,
+            "item tip text is not the native tooltip font and size");
+    }
+    RefreshItemTipPalette(state, true); ResolveItemTipPalette(state);
     Check(tip.background == GetSysColor(COLOR_INFOBK) && tip.foreground == GetSysColor(COLOR_INFOTEXT),
         "item tip ignores high contrast colors");
 

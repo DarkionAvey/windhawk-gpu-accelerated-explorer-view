@@ -839,7 +839,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             "List/Details/grid switches lost independent zoom, text metrics or native suppression");
     }
     std::cout << "PASS: independent list/grid wheel and pinch zoom survives interrupted zoom, repeated native view switches and text-size changes\n";
-    userMode(FVM_TILE);
+    userMode(FVM_CONTENT);
     Check(!IsWindowVisible(overlay) && (GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE),
           "native-only mode did not restore native content");
     userMode(FVM_DETAILS);
@@ -1160,10 +1160,12 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     for (UINT mode : {FVM_TILE,FVM_ICON,FVM_SMALLICON,FVM_THUMBNAIL}) {
         userMode(mode,48); FinishColumnTransition(*state);
         const auto item=LayoutItem(*state,LayoutRowVisual(*state,0,1.f));
-        Check(state->detailsViewActive && DriveTiles(*state) && !state->columnsView &&
+        // Tiles carry drive bars; This PC's icon modes are ordinary GPU grids.
+        Check(state->detailsViewActive && state->gridView && !state->columnsView &&
             IsWindowVisible(overlay) && !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE) &&
-            !item.wrapped && item.text.left>=item.icon.right && item.capacity.top>item.text.bottom,
-            "This PC Tile/icon view did not retain exclusive GPU drive tiles");
+            DriveTiles(*state)==(mode==FVM_TILE) &&
+            (mode!=FVM_TILE || (!item.wrapped && item.text.left>=item.icon.right && item.capacity.top>item.text.bottom)),
+            "This PC Tile/icon view lost exclusive GPU presentation or its drive tiles");
     }
     userMode(FVM_CONTENT);
     Check(!IsWindowVisible(overlay) && (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
@@ -1188,10 +1190,14 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     Check(state->inScope && state->visible && !state->thisPcGpu &&
         Eventually([&] { pump(); return state->loaded || state->total>0; }),
         "Recycle Bin did not publish names without an already populated native model");
-    userMode(FVM_TILE);
+    userMode(FVM_TILE); FinishColumnTransition(*state);
+    Check(state->detailsViewActive && state->gridView && !DriveTiles(*state) && IsWindowVisible(overlay) &&
+        !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
+        "Recycle Bin Tiles did not use the GPU grid, or drew drive tiles");
+    userMode(FVM_CONTENT);
     Check(!state->detailsViewActive && !state->gridView && !IsWindowVisible(overlay) &&
         (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
-        "This PC Tile exception leaked into Recycle Bin");
+        "Recycle Bin Content view left the native view");
     for (UINT mode : {FVM_LIST,FVM_DETAILS,FVM_ICON}) {
         userMode(mode,96); FinishColumnTransition(*state);
         Check(IsWindowVisible(overlay) && state->detailsViewActive &&
@@ -1272,7 +1278,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         "enabling the switch did not create it for a tab that started with it hidden");
     DestroyWindow(tileStartup);
     response->folder.Reset(); bindFolder(destination);
-    response->mode = FVM_TILE;
+    response->mode = FVM_CONTENT;
     AttachView(native, view, response->folder, browser, destination);
     const HWND nativeFirst = OverlayForTab(frame);
     state = nativeFirst ? State(nativeFirst) : nullptr;

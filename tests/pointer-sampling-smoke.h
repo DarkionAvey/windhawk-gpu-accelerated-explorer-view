@@ -246,6 +246,9 @@ static void TestSampledPointer() {
             const auto geometry = Scrollbar(state);
             const float raw = ScrollFractionAt(geometry, float(point.y), state.scrollbarGrabY) * geometry.scrollRange;
             const float expected = snapped ? std::round(raw/state.rowPx)*state.rowPx : raw;
+            if (fabsf(state.scrollTarget-expected) >= .1f)
+                std::cout << "THUMB capture=" << (GetCapture() == state.hwnd) << " active=" << state.draggingScrollbar
+                    << " target=" << state.scrollTarget << " expected=" << expected << " step=" << i << std::endl;
             Check(fabsf(state.scrollTarget-expected) < .1f, "frame held a stale thumb destination without mouse messages");
             if (snapped)
                 Check(fabsf(state.scrollNow-expected)<.1f && !state.animationActive,

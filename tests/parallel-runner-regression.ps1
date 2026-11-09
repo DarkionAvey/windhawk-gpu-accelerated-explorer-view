@@ -23,7 +23,7 @@ if($Mode -eq 'pipes') {
     [Console]::Out.Write([string]::new([char]'O',131072))
     [Console]::Error.Write([string]::new([char]'E',131072))
 }
-if($Mode -eq 'hang') { $null=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$Identity+'-never').WaitOne() }
+if($Mode -eq 'hang' -or $Mode -eq 'gate-hang') { $null=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$Identity+'-never').WaitOne() }
 if($Mode -eq 'interfered') {
     Add-Type -Name PrivateModuleLoader -Namespace Regression -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)] public static extern System.IntPtr LoadLibraryW(string path);'
     if([Regression.PrivateModuleLoader]::LoadLibraryW((Join-Path $Root 'windhawk-fixture.dll')) -eq [IntPtr]::Zero) {throw 'Could not load private observation fixture'}
@@ -100,52 +100,31 @@ if($Mode -like 'retry-*') {
     Invoke-RegressionTasks -Tasks @((Task 'serial-a'),(Task 'serial-b')) -OutputDirectory $fixture -Jobs 1 *> $null
     $a = Record 'serial-a'; $b = Record 'serial-b'
     if ($b.Start -lt $a.End) { throw '-Jobs 1 overlapped children' }
+    # The gate runs each test once; the first failure cancels a running peer
+    # (here one that would otherwise hang to its timeout) and starts nothing
+    # else, including the serial phase.
     $gateDirectory = Join-Path $fixture 'gate'
     $null=New-Item -ItemType Directory -Path $gateDirectory
-    $matrix=@('retry-clean','retry-recover','retry-one','retry-two','retry-persistent')
     $rejected=$false
+    $clock=[Diagnostics.Stopwatch]::StartNew()
     try {
-        Invoke-RegressionGate -Tasks @($matrix | ForEach-Object { Task $_ }) -OutputDirectory $gateDirectory -Jobs 4 *> $null
-    } catch { $rejected=$_.Exception.Message -like 'FAIL:*' }
+        Invoke-RegressionGate -Tasks @((Task 'retry-two'),(Task 'gate-hang'),(Task 'gate-serial' $true)) -OutputDirectory $gateDirectory -Jobs 2 -TimeoutSeconds 60 *> $null
+    } catch { $rejected=$_.Exception.Message -like 'FAIL:*retry-two*' }
+    $clock.Stop()
     $report=Get-Content -LiteralPath (Join-Path $gateDirectory 'regression-report.json') -Raw | ConvertFrom-Json
-    if(!$rejected -or $report.Status -ne 'Fail' -or $report.Failed -ne 2 -or $report.Passed -ne 3 -or $report.Pending -ne 0) {
-        throw 'Isolated retry threshold did not accept zero/one failures and reject two/three failures'
+    if(!$rejected -or $report.Failed -ne 1 -or $report.Passed -ne 0 -or $clock.Elapsed.TotalSeconds -ge 60 -or
+        [int][IO.File]::ReadAllText((Join-Path $fixture 'retry-two.count')) -ne 1 -or
+        (Test-Path -LiteralPath (Join-Path $fixture 'gate-serial.json'))) {
+        throw 'A failed test was retried, or did not cancel its running peer and the remaining tests'
     }
-    foreach($name in $matrix) {
-        $expected=if($name -eq 'retry-clean') {1} else {4}
-        if([int][IO.File]::ReadAllText((Join-Path $fixture ($name+'.count'))) -ne $expected) {
-            throw "Did not collect every required attempt for $name"
-        }
-    }
-    $initialEnd=($matrix | ForEach-Object {
-        (Get-Content -LiteralPath (Join-Path $fixture ($_+'.0.json')) -Raw | ConvertFrom-Json).End
-    } | Measure-Object -Maximum).Maximum
-    $previousEnd=$initialEnd
-    foreach($name in $matrix | Where-Object {$_ -ne 'retry-clean'}) {
-        foreach($attempt in 1..3) {
-            $entry=Get-Content -LiteralPath (Join-Path $fixture ($name+'.'+$attempt+'.json')) -Raw | ConvertFrom-Json
-            if($entry.Start -lt $previousEnd) {throw 'Isolated attempts overlapped or started before the parallel phase completed'}
-            $previousEnd=$entry.End
-            $log=Join-Path $gateDirectory ("isolated-$attempt\$name\$name.stdout.log")
-            if([IO.File]::ReadAllText($log) -notlike "*$name attempt $attempt*") {throw 'Isolated logs were overwritten or lost'}
-        }
-    }
-    # Exercise the successful gate independently; no later isolated pass may
-    # hide two isolated failures in the rejected matrix above.
-    $passDirectory=Join-Path $fixture 'pass-gate'
-    $null=New-Item -ItemType Directory -Path $passDirectory
-    Remove-Item -LiteralPath (Join-Path $fixture 'retry-one.count')
-    Invoke-RegressionGate -Tasks @((Task 'retry-one')) -OutputDirectory $passDirectory -Jobs 1 *> $null
-    $pass=Get-Content -LiteralPath (Join-Path $passDirectory 'regression-report.json') -Raw | ConvertFrom-Json
-    if($pass.Status -ne 'Pass' -or !$pass.Tests[0].Recovered -or $pass.Tests[0].FailedRetries -ne 1) {throw 'Recovered test did not pass the gate'}
     $pendingDirectory=Join-Path $fixture 'pending-gate'
     $null=New-Item -ItemType Directory -Path $pendingDirectory
     $rejected=$false
     try { Invoke-RegressionGate -Tasks @($missing) -OutputDirectory $pendingDirectory *> $null }
     catch {$rejected=$_.Exception.Message -like 'PENDING:*'}
     $pendingReport=Get-Content -LiteralPath (Join-Path $pendingDirectory 'regression-report.json') -Raw | ConvertFrom-Json
-    if(!$rejected -or $pendingReport.Failed -ne 0 -or $pendingReport.Pending -ne 1 -or $pendingReport.Attempts.Count -ne 4) {
-        throw 'Infrastructure problems were not retained as pending across all attempts'
+    if(!$rejected -or $pendingReport.Failed -ne 0 -or $pendingReport.Pending -ne 1 -or @($pendingReport.Attempts).Count -ne 1) {
+        throw 'Infrastructure problems were not retained as pending'
     }
     # Load a harmless copy of the OS version DLL under a Windhawk-shaped name
     # in a private child. Exercise actual module enumeration, not log matching
@@ -169,7 +148,7 @@ if($Mode -like 'retry-*') {
         throw "Observed module interference did not cancel the run immediately: $message"
     }
     Write-Output 'PASS: parallel rendezvous, parallel-before-serial phases, isolated serial tasks, -Jobs 1, timeouts, Windows argument quoting, stdout/stderr draining, failure propagation and peer cleanup'
-    Write-Output 'PASS: three isolated retries, zero/one versus two/three failure threshold, no retry overlap, preserved attempt logs, recovered success and infrastructure pending'
+    Write-Output 'PASS: one attempt per test; the first failure cancels running peers and unstarted tests; infrastructure pending'
     Write-Output 'PASS: real private module observation cancels the whole run at once, with no retries or orphaned tests'
     $passed=$true
 } finally {

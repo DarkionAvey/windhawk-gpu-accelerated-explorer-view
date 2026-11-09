@@ -123,7 +123,7 @@ void RenameSet(const std::filesystem::path& root, const std::vector<Item>& renam
         return !state.nativeRenameHold && xs == renamed.size() && items.size() == renamed.size() + kept.size();
     }, 60000);
     if (!done) for (const auto& item : items) std::wcout << L"RESULT " << item.name << L"\n";
-    Check(done, "Explorer did not rename the whole selected set");
+    Check(done, "Regression: Explorer's own bulk rename works, but the GPU view's rename did not rename the whole selected set");
     for (const auto& name : kept)
         Check(std::any_of(items.begin(), items.end(), [&](const Item& i) { return i.name == name; }),
             "unselected item was renamed");
@@ -238,6 +238,59 @@ static void TestNativeMultipleRename(const std::wstring& fixture) {
         return;
     }
     ReportApiFixture::suppressRenameError = true; ReportApiFixture::renameErrors = 0;
+    {
+        // Windows' own bulk rename first. If it fails too, Explorer's Shell is
+        // in a stale state (a stuck rename or file operation) and no mod
+        // result below would mean anything; a later failure is a regression.
+        // A plain Explorer view with no GPU overlay: select two files, start
+        // DefView's own label edit, type a name and commit by moving focus.
+        const auto probe = std::filesystem::path(fixture) / L"multiple-rename-native";
+        CreateFiles(probe, {L"p.txt", L"q.txt"});
+        const HWND frame = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"native rename probe",
+            WS_POPUP | WS_VISIBLE, -32000, -32000, 640, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        const auto pump = [] { MSG message{}; while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message); DispatchMessageW(&message); } };
+        ComPtr<IExplorerBrowser> browser; ComPtr<IFolderView2> view;
+        RECT bounds{0, 0, 640, 400}; FOLDERSETTINGS settings{FVM_DETAILS, FWF_NOBROWSERVIEWSTATE};
+        PIDLIST_ABSOLUTE folder = nullptr;
+        bool renamed = frame && SUCCEEDED(CoCreateInstance(CLSID_ExplorerBrowser, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&browser))) && SUCCEEDED(browser->Initialize(frame, &bounds, &settings)) &&
+            SUCCEEDED(browser->SetOptions(EBO_NOBORDER | EBO_NOTRAVELLOG)) &&
+            SUCCEEDED(SHParseDisplayName(probe.c_str(), nullptr, &folder, 0, nullptr)) &&
+            SUCCEEDED(browser->BrowseToIDList(folder, SBSP_ABSOLUTE));
+        CoTaskMemFree(folder);
+        renamed = renamed && Eventually([&] {
+            pump(); int count = 0;
+            return SUCCEEDED(browser->GetCurrentView(IID_PPV_ARGS(&view))) && view &&
+                SUCCEEDED(view->ItemCount(SVGIO_ALLVIEW, &count)) && count == 2;
+        }) && SUCCEEDED(view->SelectItem(0, SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_FOCUSED)) &&
+            SUCCEEDED(view->SelectItem(1, SVSI_SELECT)) && SUCCEEDED(view->DoRename());
+        HWND editor = nullptr;
+        renamed = renamed && Eventually([&] {
+            pump();
+            EnumChildWindows(frame, [](HWND child, LPARAM out) {
+                wchar_t name[16]{};
+                if (GetClassNameW(child, name, ARRAYSIZE(name)) && !_wcsicmp(name, L"Edit") && IsWindowVisible(child)) {
+                    *reinterpret_cast<HWND*>(out) = child; return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&editor));
+            return editor != nullptr;
+        });
+        if (renamed) { SetWindowTextW(editor, L"x"); SetFocus(frame); }
+        renamed = renamed && Eventually([&] {
+            pump();
+            const auto listing = Listing(probe);
+            return listing.size() == 2 && std::all_of(listing.begin(), listing.end(),
+                [](const Item& i) { return i.name.starts_with(L"x"); });
+        }, 20000);
+        view.Reset();
+        if (browser) browser->Destroy();
+        browser.Reset();
+        if (frame) DestroyWindow(frame);
+        Check(renamed, "Explorer is stale: Windows' own multi-item rename also failed. Restart Explorer (or sign out), "
+            "check that renaming several files works in native Explorer, then rerun");
+    }
     const auto label = [](Commit commit) {
         return commit == Commit::Enter ? std::wstring(L"enter") : commit == Commit::Row ? L"row" : L"empty";
     };
