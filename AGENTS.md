@@ -69,6 +69,8 @@
   DirectWrite measurement; not the mod's own helpers) and a
   `OptionEffects::kCoverage` entry. The live sweep derives its values from the
   schema automatically.
+- Do not write documents or thoughts or discoveries to 'tests/'. This dir is 
+  strictly for tests. Move your thoughts to 'docs'.
 
 ## Source and release workflow
 
@@ -106,8 +108,10 @@
   Windhawk README. Keep it clean, minimal and focused on use and installation.
   **Do not turn README.md into a changelog, audit dump or test report.**
 - Add user-readable changes to `CHANGELOG.md`. Keep technical
-  investigations in `tests/` or `docs/`. Do not make it verbose.
-  Add change code for each changelog item, like ADDED/FIXED/IMPROVED/REMOVED.
+  investigations in `docs/`. Do not make it verbose.
+  Do not write documents or thoughts or discoveries to 'tests/'. This dir is 
+  strictly for tests.
+ - For `CHANGELOG.md`, add change code for each changelog item, like ADDED/FIXED/IMPROVED/REMOVED.
   Group these with others, so that all ADDED items are together, then line break, 
   then IMPROVED items together, then line break, then FIXED items together, then line
   break, then REMOVED items together. This makes it easier for the user to read.
@@ -116,4 +120,4 @@
   root `README.md`. Avoid C++ comment terminators in README content.
 - Distinguish offscreen component tests and CPU submission measurements from
   live Explorer behavior and actual displayed frame rates.
-
+- For `docs/`, name the document as "(drafted mod version)-(description of contents).md"
