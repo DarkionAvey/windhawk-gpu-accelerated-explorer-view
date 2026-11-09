@@ -1392,6 +1392,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 
 
 #include "animation-smoke.h"
+#include "zebra-snapshot-smoke.h"
 #include "column-fit-composition-smoke.h"
 #include "drive-bar-smoke.h"
 #include "row-composition-smoke.h"
@@ -1504,7 +1505,6 @@ static void TestGraphicsIsolation(const std::wstring& fixture) {
         TestLiveSorting(frame, fixture);
         TestRecycleIdentities(frame, fixture);
         TestColumnEntrance(frame);
-        TestZebraBackground(a);
         TestBatchedDeletion(a, fixture);
         TestIconUploadBatches();
         TestColdScrollDelivery();

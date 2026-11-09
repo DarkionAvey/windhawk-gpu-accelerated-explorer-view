@@ -11,6 +11,7 @@
 - **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
+- **IMPROVED** Zebra stripes animate between snapshots of the visible bands, respecting group boundaries and empty-row stripes.
 - **IMPROVED** Thumbnail overlays now match Explorer's sizes: shortcut arrows and app badges no longer cover large thumbnails. Video frames get film strips in Explorer's proportions, drawn over the image edges with see-through holes.
 - **IMPROVED** Item tooltips now look like the modern tooltips in Explorer's Gallery: subtly rounded, no border and a soft centered shadow. Their text follows the view's text size, between the native tooltip size and twice it.
 - **IMPROVED** Default text size now matches the Windows 11 right-click menu. The defaults follow that menu's sizes rather than usability testing.
@@ -26,6 +27,7 @@
 - **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
+- **FIXED** Deleting a striped row in a grouped list could animate a stripe beneath an unrelated collapsed group.
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
 - **FIXED** View switch tooltip flickering and moving while shown.

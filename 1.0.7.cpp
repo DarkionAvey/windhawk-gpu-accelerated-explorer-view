@@ -3545,7 +3545,14 @@ struct ViewState {
     std::vector<GroupHeaderMotion> groupHeaderMotion;
     std::vector<CapturedGroupHeader> disappearingHeaders;
     float rowTransitionOldScroll = 0.f;
-    // Background geometry belongs to this tab, independently of item motion.
+    // Presentation-lane history: never copied from an owner model over a
+    // newer submitted snapshot. Each tab owns its bands and animation clock.
+    struct ZebraBand { std::wstring section; int slot; float top, bottom; };
+    std::vector<ZebraBand> zebraBands, zebraFromBands, zebraTargetBands;
+    unsigned long long zebraSnapshotToken = 0;
+    bool zebraSnapshotInitialized = false;
+    float zebraSnapshotScroll = 0.f, zebraSnapshotRow = 0.f;
+    bool zebraSnapshotGrouped = false, zebraSnapshotEmpty = false;
     bool zebraExtentAnimating = false;
     float zebraExtentFrom = 0.f, zebraExtentTo = 0.f, zebraExtentPresented = 0.f;
     LARGE_INTEGER zebraExtentStartedQpc{};
@@ -4312,8 +4319,7 @@ struct SwipeFeedbackSnapshot {
     X(columnWiggleAwaitRelease) X(grouping) X(groupAnimating) X(hotSection) X(keyboardSectionKey) X(sort) \
     X(rowTransitionActive) X(groupingLayoutTransition) X(zoomLayoutTransition) X(reflowLayoutTransition) X(rowTransitionStartedQpc) \
     X(rowTransitionPresentedProgress) X(rowSceneRevision) X(rowMotion) X(rowMotionFirst) X(disappearingRows) \
-    X(groupHeaderMotion) X(disappearingHeaders) X(rowTransitionOldScroll) X(zebraExtentAnimating) \
-    X(zebraExtentFrom) X(zebraExtentTo) X(zebraExtentPresented) X(zebraExtentStartedQpc) \
+    X(groupHeaderMotion) X(disappearingHeaders) X(rowTransitionOldScroll) \
     X(namesPreview) X(enumerationError) X(token) X(directoryToken) X(iconToken) X(scrollNow) X(scrollTarget) \
     X(qpcFrequency) X(refreshHz) X(frameIntervalMs) X(animationActive) X(smoothStart) X(smoothDelta) X(smoothStartedQpc) \
     X(selectionFadeRows) X(selectionFadeStartedQpc) X(selectionFadeActive) X(keyboardSelectionAnimating) \
@@ -5075,7 +5081,8 @@ bool LayoutAnimationActive(const ViewState& state, bool includeDirectInput = fal
 
 bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, bool includeForeground = true,
                          bool includeClipboard = true) {
-    return LayoutAnimationActive(state) || state.zebraExtentAnimating || state.selectionFadeActive ||
+    return LayoutAnimationActive(state) || (state.zebraExtentAnimating && g_zebra.load(std::memory_order_relaxed) &&
+        g_zebraOpacity.load(std::memory_order_relaxed)>0) || state.selectionFadeActive ||
         (state.columnPresentationPending && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.sectionBadgeAnimating && state.visible && state.inScope && state.detailsViewActive &&
@@ -5331,21 +5338,19 @@ void QueueVisibleDataFrame(ViewState& state) {
         RegisterViewAnimation(state);
 }
 
+// Layout only invalidates disabled decoration. The renderer discovers the
+// complete destination bands after layout; it never infers them from height.
 void RetargetZebraExtent(ViewState& state, float previous) {
-    const float target = DocumentHeight(state);
-    if (state.zebraExtentAnimating && fabsf(target-state.zebraExtentTo) < .01f) return;
-    state.zebraExtentAnimating = !state.startupAnimationsSuppressed && previous >= 0.f && state.visible &&
-        state.detailsViewActive && state.loaded && g_zebra.load(std::memory_order_relaxed) &&
-        !g_emptyRows.load(std::memory_order_relaxed) &&
-        g_zebraOpacity.load(std::memory_order_relaxed) > 0 && fabsf(target-previous) > .01f;
-    if (!state.zebraExtentAnimating) {
-        UnregisterAnimationWhenIdle(state);
+    if(!state.loaded || !state.visible || state.gridView ||
+        !g_zebra.load(std::memory_order_relaxed) || g_zebraOpacity.load(std::memory_order_relaxed)<=0) {
+        state.zebraExtentAnimating=false;
+        state.zebraBands.clear(); state.zebraFromBands.clear(); state.zebraTargetBands.clear();
+        state.zebraSnapshotToken=0; state.zebraSnapshotInitialized=false;
         return;
     }
-    state.zebraExtentFrom = state.zebraExtentPresented = previous;
-    state.zebraExtentTo = target;
-    state.zebraExtentStartedQpc = {};
-    RegisterViewAnimation(state);
+    // Extents remain diagnostic receipt data, not stripe geometry.
+    state.zebraExtentFrom=previous;
+    state.zebraExtentTo=DocumentHeight(state);
 }
 
 void ScheduleNavigationProbe(ViewState& state) {
@@ -12906,7 +12911,8 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         }
         return false;
     }
-    const float previousZebraExtent = state.loaded ?
+    const float previousZebraExtent = state.loaded && g_zebra.load(std::memory_order_relaxed) &&
+        g_zebraOpacity.load(std::memory_order_relaxed)>0 ?
         (state.zebraExtentAnimating ? state.zebraExtentPresented : DocumentHeight(state)) : -1.f;
     std::wstring focused;
     const int oldFocusedIndex = state.selected;
@@ -21764,82 +21770,124 @@ void Paint(ViewState& state) {
         visibleItems.erase(std::unique(visibleItems.begin(), visibleItems.end()), visibleItems.end());
     }
     const bool emptyRows = g_emptyRows.load(std::memory_order_relaxed);
-    if (emptyRows || !zebra || zebraAlpha <= 0.f) state.zebraExtentAnimating = false;
-    const float zebraProgress = LayoutTransitionProgress(state,
-        state.zebraExtentAnimating, state.zebraExtentStartedQpc);
-    const float zebraExtent = state.zebraExtentAnimating ? state.zebraExtentFrom +
-        (state.zebraExtentTo-state.zebraExtentFrom)*zebraProgress : DocumentHeight(state);
     const HoverVisual hover = state.inputFocusIndicators || state.shellDropHotRow >= 0 ?
         CurrentHoverVisual(state) : HoverVisual{};
-    // Background slots stay independent of item identities, motion and ghosts.
-    // Each section starts its pattern after the blank heading; ungrouped views
-    // retain the document origin. Only the trailing clip animates on deletion.
-    if (!state.gridView && zebra && zebraAlpha > 0.f && row > 0.f) {
-        const float bottom = emptyRows ? contentBottom :
-            std::min(contentBottom, header + zebraExtent - state.scrollNow);
-        if (bottom > header) {
-            state.target->PushAxisAlignedClip(D2D1::RectF(0.f, header, w, bottom),
-                D2D1_ANTIALIAS_MODE_ALIASED);
-            const float documentBottom = state.scrollNow + bottom - header;
-            const auto bands = [&](float from, float to, bool clip) {
-                if (to <= from) return;
-                if (clip) state.target->PushAxisAlignedClip(D2D1::RectF(0.f,
-                    header+from-state.scrollNow,w,header+to-state.scrollNow),D2D1_ANTIALIAS_MODE_ALIASED);
-                // Blank clipping can split a section body (sticky/retiring
-                // headers), but must not restart its pattern at each fragment.
-                const int group = GroupAtDocument(state,from);
-                const float origin = state.sections.empty() ? 0.f :
-                    state.sections[group < 0 ? state.sections.size()-1 : static_cast<size_t>(group)].documentTop +
-                        GroupHeadingHeight(state) - row;
-                const int first = std::max(0, static_cast<int>(std::floor((from-origin) / row)));
-                for (int slot = first; origin+slot*row < to; ++slot) {
-                    const float documentTop = origin + slot*row;
-                    const float top = header + documentTop - state.scrollNow;
-                    if ((slot & 1) && top+row > header)
-                        DrawZebraBand(state, top, emptyRows ? row :
-                            std::min(row, zebraExtent-documentTop), nameColor, zebraAlpha*.5f);
-                }
-                if (clip) state.target->PopAxisAlignedClip();
-            };
-            if (state.sections.empty() && state.disappearingHeaders.empty()) {
-                bands(state.scrollNow,documentBottom,false);
-            } else {
-                // Exclude headings and real section spacing from this pass
-                // only. Selection/marquee/content keep their normal rendering,
-                // and the stripes remain fixed document slots, not item fills.
-                std::vector<std::pair<float,float>> blank;
-                blank.reserve(16);
-                const auto exclude = [&](float from, float to) {
-                    from=std::max(from,state.scrollNow); to=std::min(to,documentBottom);
-                    if (to>from) blank.emplace_back(from,to);
-                };
-                const float heading = GroupHeadingHeight(state);
-                const float pad = row*kRowTransitionOverscan;
-                const int first = GroupAtDocument(state,std::max(0.f,state.scrollNow-pad));
-                for (size_t i=static_cast<size_t>(std::max(0,first));i<state.sections.size();++i) {
-                    const auto& section=state.sections[i];
-                    if (section.documentTop>documentBottom+pad) break;
-                    exclude(section.documentTop,section.documentTop+heading);
-                    exclude(section.documentEnd-heading*section.fraction,section.documentEnd);
-                    const auto visual=LayoutGroupHeader(state,i,headerProgress);
-                    const float top=visual.top-header+state.scrollNow;
-                    exclude(top,top+visual.height);
-                }
-                if (state.groupingLayoutTransition) for (const auto& old : state.disappearingHeaders) {
-                    const float top=old.oldTop+state.rowTransitionOldScroll-header;
-                    exclude(top,top+heading*(1.f-headerProgress));
-                }
-                std::sort(blank.begin(),blank.end());
-                float from=state.scrollNow;
-                for (const auto& [start,end] : blank) {
-                    bands(from,start,true);
-                    from=std::max(from,end);
-                }
-                bands(from,documentBottom,true);
-            }
-            state.target->PopAxisAlignedClip();
+    // The presentation lane snapshots visible section bands after layout.
+    // Provider work and item motion never determine stripe identity or parity.
+    std::vector<ViewState::ZebraBand> zebraPresented;
+    if(state.gridView || !zebra || zebraAlpha<=0.f || row<=0.f) {
+        state.zebraBands.clear(); state.zebraFromBands.clear(); state.zebraTargetBands.clear();
+        state.zebraExtentAnimating=false; state.zebraSnapshotToken=0; state.zebraSnapshotInitialized=false;
+    } else if(row>0.f) {
+        std::vector<ViewState::ZebraBand> next;
+        const float low=state.scrollNow, high=low+contentBottom-header;
+        const float heading=GroupHeadingHeight(state);
+        const int first=GroupAtDocument(state,std::max(0.f,low));
+        if(state.sections.empty()) {
+            const float end=emptyRows?high:DocumentHeight(state);
+            const int begin=std::max(0,int(std::floor(low/row)));
+            for(int slot=begin;slot*row<std::min(end,high);++slot)
+                if(slot&1) next.push_back({L"",slot,slot*row,std::min((slot+1)*row,end)});
         }
+        for(size_t i=size_t(std::max(0,first));i<state.sections.size();++i) {
+            const auto& section=state.sections[i];
+            if(section.documentTop>high) break;
+            const float origin=section.documentTop+heading;
+            const float end=section.documentEnd-heading*section.fraction;
+            const float limit=emptyRows && i+1==state.sections.size() && !section.collapsed ? std::max(end,high) : end;
+            if(section.fraction<=0.f || limit<=origin) continue;
+            const int begin=std::max(0,int(std::floor((low-origin)/row)));
+            for(int slot=begin;origin+slot*row<std::min(limit,high);++slot)
+                if(!(slot&1)) next.push_back({section.key,slot,origin+slot*row,std::min(origin+(slot+1)*row,limit)});
+        }
+        const auto same=[](const auto& x,const auto& y) {
+            if(x.size()!=y.size()) return false;
+            for(size_t i=0;i<x.size();++i) if(x[i].section!=y[i].section || x[i].slot!=y[i].slot ||
+                x[i].top!=y[i].top || x[i].bottom!=y[i].bottom) return false;
+            return true;
+        };
+        if(!state.zebraSnapshotInitialized || state.zebraSnapshotToken!=state.token || state.startupAnimationsSuppressed ||
+            state.zebraSnapshotScroll!=state.scrollNow || state.zebraSnapshotRow!=row ||
+            state.zebraSnapshotGrouped!=(!state.sections.empty()) || state.zebraSnapshotEmpty!=emptyRows ||
+            state.groupAnimating || state.zoomAnimating) {
+            state.zebraBands=state.zebraTargetBands=next; state.zebraFromBands.clear();
+            state.zebraExtentAnimating=false; state.zebraSnapshotToken=state.token; state.zebraSnapshotInitialized=true;
+        } else if(!same(next,state.zebraTargetBands)) {
+            state.zebraFromBands=state.zebraBands; state.zebraTargetBands=next;
+            state.zebraExtentAnimating=!state.zebraFromBands.empty() || !next.empty(); state.zebraExtentStartedQpc={};
+            if(state.zebraExtentAnimating) RegisterViewAnimation(state);
+        }
+        state.zebraSnapshotScroll=state.scrollNow; state.zebraSnapshotRow=row;
+        state.zebraSnapshotGrouped=!state.sections.empty(); state.zebraSnapshotEmpty=emptyRows;
+        const float progress=LayoutTransitionProgress(state,state.zebraExtentAnimating,state.zebraExtentStartedQpc);
+        const float zebraExtent=DocumentHeight(state);
+        if(!state.zebraExtentAnimating) state.zebraExtentFrom=state.zebraExtentTo=zebraExtent;
+        else if(state.zebraExtentTo!=zebraExtent) {
+            state.zebraExtentFrom=state.zebraExtentPresented; state.zebraExtentTo=zebraExtent;
+        }
+        using BandKey=std::pair<std::wstring,int>;
+        std::map<BandKey,const ViewState::ZebraBand*> previous, target;
+        for(const auto& band:state.zebraFromBands) previous.emplace(BandKey{band.section,band.slot},&band);
+        for(const auto& band:next) target.emplace(BandKey{band.section,band.slot},&band);
+        for(const auto& band:next) {
+            auto old=previous.find({band.section,band.slot});
+            const float top=old==previous.end()?band.top:old->second->top;
+            const float bottom=old==previous.end()?band.top:old->second->bottom;
+            zebraPresented.push_back({band.section,band.slot,top+(band.top-top)*progress,bottom+(band.bottom-bottom)*progress});
+        }
+        if(state.zebraExtentAnimating) for(const auto& band:state.zebraFromBands)
+            if(!target.count({band.section,band.slot}) && band.bottom>band.top)
+                zebraPresented.push_back({band.section,band.slot,band.top,band.bottom+(band.top-band.bottom)*progress});
+        // Heading clips include sticky and outgoing headings. Old bands can
+        // shift and close gaps, but never fill a collapsed section's space.
+        std::vector<std::pair<float,float>> blank;
+        std::map<std::wstring,std::pair<float,float>> bodies;
+        for(size_t i=size_t(std::max(0,first));i<state.sections.size();++i) {
+            const auto& section=state.sections[i];
+            if(section.documentTop>high) break;
+            if(section.fraction>0.f) bodies.emplace(section.key,std::pair{
+                section.documentTop+heading, i+1<state.sections.size()?state.sections[i+1].documentTop:high});
+            blank.emplace_back(section.documentTop,section.documentTop+heading);
+            blank.emplace_back(section.documentEnd-heading*section.fraction,section.documentEnd);
+            const auto visual=LayoutGroupHeader(state,i,headerProgress);
+            const float top=visual.top-header+state.scrollNow;
+            blank.emplace_back(top,top+visual.height);
+        }
+        if(state.groupingLayoutTransition) for(const auto& old:state.disappearingHeaders) {
+            const float top=old.oldTop+state.rowTransitionOldScroll-header;
+            blank.emplace_back(top,top+heading*(1.f-headerProgress));
+        }
+        std::sort(blank.begin(),blank.end());
+        std::vector<std::pair<float,float>> fills;
+        for(const auto& band:zebraPresented) {
+            float top=std::max(band.top,low), bottom=std::min(band.bottom,high);
+            if(!state.sections.empty()) {
+                auto body=bodies.find(band.section);
+                if(body==bodies.end()) continue;
+                top=std::max(top,body->second.first); bottom=std::min(bottom,body->second.second);
+            }
+            for(const auto& [start,end]:blank) {
+                if(end<=top) continue;
+                if(start>=bottom) break;
+                if(start>top && bottom>top) fills.emplace_back(top,std::min(start,bottom));
+                top=std::max(top,end);
+                if(top>=bottom) break;
+            }
+            if(bottom>top) fills.emplace_back(top,bottom);
+        }
+        // Union moving bands before drawing: fusing stripes must not double
+        // their opacity where independently moving snapshots overlap.
+        std::sort(fills.begin(),fills.end());
+        float from=0.f,to=0.f;
+        for(const auto& band:fills) {
+            if(band.first>to) {
+                if(to>from) DrawZebraBand(state,header+from-state.scrollNow,to-from,nameColor,zebraAlpha*.5f);
+                from=band.first; to=band.second;
+            } else to=std::max(to,band.second);
+        }
+        if(to>from) DrawZebraBand(state,header+from-state.scrollNow,to-from,nameColor,zebraAlpha*.5f);
     }
+
     state.target->PopAxisAlignedClip(); // zebra background margins
     state.target->PushAxisAlignedClip(state.rtlLayout ?
         D2D1::RectF(w-rowBgEnd,itemClipTop,w-rowBgStart,contentBottom) :
@@ -22534,12 +22582,15 @@ void Paint(ViewState& state) {
             RegisterViewAnimation(state);
         }
         if (state.frameProfile.recording) state.frameProfile.accepted = true;
-        if (state.zebraExtentAnimating) {
-            state.zebraExtentPresented = zebraExtent;
-            if (!state.zebraExtentStartedQpc.QuadPart)
-                QueryPerformanceCounter(&state.zebraExtentStartedQpc);
-            else if (zebraProgress >= 1.f)
-                state.zebraExtentAnimating = false;
+        if(zebra && zebraAlpha>0.f && !state.gridView && row>0.f) {
+            state.zebraBands=std::move(zebraPresented);
+            state.zebraExtentPresented=DocumentHeight(state);
+            if(state.zebraExtentAnimating) {
+                if(!state.zebraExtentStartedQpc.QuadPart) QueryPerformanceCounter(&state.zebraExtentStartedQpc);
+                else if(LayoutTransitionProgress(state,true,state.zebraExtentStartedQpc)>=1.f) {
+                    state.zebraExtentAnimating=false; state.zebraFromBands.clear();
+                }
+            }
         }
         UnregisterAnimationWhenIdle(state);
     }
