@@ -958,6 +958,125 @@ static void TestRenameTyping(const std::wstring& fixture) {
         "each edit and the caret stays on the shown text\n";
 }
 
+// The rename field edits like Explorer's own rename box: Ctrl+Backspace and
+// the other standard editing shortcuts travel the real TranslateMessage /
+// DispatchMessageW path, so Windows generates the WM_CHARs (U+007F for
+// Ctrl+Backspace) and the field's native and Shell handlers act on them.
+static void TestRenameEditingShortcuts(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    const auto root = std::filesystem::path(fixture) / L"rename-editing-shortcuts";
+    CreateFiles(root, {L"PhotoCraft Notes draft.txt"});
+    ProviderSelectionFixture::Browser host;
+    auto& state = host.state;
+    FocusFixture::Session focus(host.frame, state.hwnd);
+    host.Navigate(root.wstring(), 1);
+    const auto factoryBefore = g_writeFactory;
+    struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
+    if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "rename shortcut fonts");
+    Check(MakeTextFormats(state) && state.textFormat, "rename shortcut list format");
+    // Explorer's own EDIT class: COMCTL32 v6 through its manifest.
+    const auto manifest = std::filesystem::path(__FILE__).parent_path() / L"rename-native-controls.manifest";
+    ACTCTXW settings{sizeof(settings)}; settings.lpSource = manifest.c_str();
+    const HANDLE context = CreateActCtxW(&settings);
+    ULONG_PTR cookie = 0;
+    Check(context != INVALID_HANDLE_VALUE && ActivateActCtx(context, &cookie), "themed native controls");
+    state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
+    Check(SyncNativeSelection(state), "rename shortcut selection");
+    BeginRename(state, 0);
+    DeactivateActCtx(0, cookie); ReleaseActCtx(context);
+    const HWND editor = state.rename.editor;
+    Check(editor != nullptr, "rename shortcut editor");
+    ::SetFocus(editor); FocusFixture::focus = editor;
+    // Modifiers live in this thread's own key state, which every handler's
+    // GetKeyState reads; the user's keyboard and other processes are untouched.
+    BYTE saved[256]{};
+    Check(GetKeyboardState(saved) != FALSE, "keyboard state snapshot");
+    struct RestoreKeys { BYTE* keys; ~RestoreKeys() { SetKeyboardState(keys); } } restoreKeys{saved};
+    const auto press = [&](UINT vk, bool control, bool shift) {
+        BYTE keys[256]{};
+        if (control) keys[VK_CONTROL] = keys[VK_LCONTROL] = 0x80;
+        if (shift) keys[VK_SHIFT] = keys[VK_LSHIFT] = 0x80;
+        const bool extended = vk == VK_LEFT || vk == VK_RIGHT || vk == VK_HOME || vk == VK_END || vk == VK_DELETE;
+        const LPARAM down = LPARAM(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16) | (extended ? 1 << 24 : 0) | 1;
+        for (const bool pressed : {true, false}) {
+            keys[vk] = pressed ? 0x80 : 0;
+            Check(SetKeyboardState(keys) && PostMessageW(editor, pressed ? WM_KEYDOWN : WM_KEYUP, vk,
+                pressed ? down : down | (LPARAM(3) << 30)), "post editing key");
+            MSG msg{};
+            while (PeekMessageW(&msg, editor, 0, 0, PM_REMOVE)) {
+                ::TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        Check(SetKeyboardState(saved) != FALSE, "restore keyboard state");
+    };
+    using Range = std::pair<DWORD, DWORD>;
+    const auto selection = [&] {
+        DWORD start = 0, end = 0;
+        SendMessageW(editor, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+        return Range{start, end};
+    };
+    const auto clean = [&](const char* step) {
+        const std::wstring text = Text(editor);
+        const Range range = selection();
+        std::wcout << L"SHORTCUT " << step << L" text='" << text << L"' sel=" << range.first << L"-"
+            << range.second << std::endl;
+        Check(std::none_of(text.begin(), text.end(), [](wchar_t c) { return c < 0x20 || c == 0x7f; }),
+            (std::string(step) + " inserted a control character into the name").c_str());
+        return text;
+    };
+    const std::wstring original = L"PhotoCraft Notes draft";
+    const DWORD length = DWORD(original.size());
+    SetWindowTextW(editor, original.c_str());
+    SendMessageW(editor, EM_SETSEL, length, length);
+    // Word movement and word selection.
+    press(VK_LEFT, true, false); clean("Ctrl+Left");
+    Check(selection() == Range{17, 17}, "Ctrl+Left did not move to the previous word");
+    press(VK_LEFT, true, false); clean("Ctrl+Left twice");
+    Check(selection() == Range{11, 11}, "Ctrl+Left did not move by words");
+    press(VK_RIGHT, true, false); clean("Ctrl+Right");
+    Check(selection() == Range{17, 17}, "Ctrl+Right did not move to the next word");
+    press(VK_LEFT, true, true); clean("Ctrl+Shift+Left");
+    Check(selection() == Range{11, 17}, "Ctrl+Shift+Left did not select the previous word");
+    // Line movement and selection.
+    press(VK_HOME, false, false); clean("Home");
+    Check(selection() == Range{0, 0}, "Home did not move to the start");
+    press(VK_RIGHT, true, true); clean("Ctrl+Shift+Right");
+    Check(selection() == Range{0, 11}, "Ctrl+Shift+Right did not select the next word");
+    press(VK_END, false, true); clean("Shift+End");
+    Check(selection() == Range{0, length}, "Shift+End did not select to the end");
+    press(VK_END, false, false); clean("End");
+    Check(selection() == Range{length, length}, "End did not move to the end");
+    press('A', true, false); clean("Ctrl+A");
+    Check(selection() == Range{0, length}, "Ctrl+A did not select the name");
+    // Ctrl+Backspace deletes the word before the caret (the reported bug).
+    SendMessageW(editor, EM_SETSEL, length, length);
+    press(VK_BACK, true, false);
+    const std::wstring once = clean("Ctrl+Backspace");
+    Check(once == L"PhotoCraft Notes " || once == L"PhotoCraft Notes",
+        "Ctrl+Backspace did not delete the previous word");
+    press(VK_BACK, true, false);
+    const std::wstring twice = clean("Ctrl+Backspace twice");
+    Check(twice == L"PhotoCraft " || twice == L"PhotoCraft",
+        "a second Ctrl+Backspace did not delete the next word");
+    // Plain Backspace and Delete still edit one character; Ctrl+Z undoes it.
+    SetWindowTextW(editor, original.c_str());
+    SendMessageW(editor, EM_SETSEL, length, length);
+    press(VK_BACK, false, false);
+    Check(clean("Backspace") == original.substr(0, length - 1), "Backspace did not delete one character");
+    press('Z', true, false);
+    Check(clean("Ctrl+Z") == original, "Ctrl+Z did not undo the deletion");
+    SendMessageW(editor, EM_SETSEL, length, length);
+    press(VK_BACK, false, false);
+    press(VK_HOME, false, false); press(VK_DELETE, false, false);
+    Check(clean("Delete") == original.substr(1, length - 2), "Delete did not delete one character");
+    FocusFixture::focus = state.hwnd;
+    CancelRename(state);
+    std::cout << "PASS: the rename field edits by word and character like Explorer's rename box through "
+        "the real message translation path\n";
+}
+
 // A click in the field past the shown text ends at the text's end, also where
 // GDI advances run wider than the list's layout, with Explorer's EDIT given the
 // real pointer position (GetCursorPos/GetMessagePos) as well as the message's:

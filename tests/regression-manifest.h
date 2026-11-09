@@ -167,6 +167,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("rename-text-metrics", PARALLEL, TestRenameTextMetrics(fixture)),
     REGRESSION("created-item-rename", PARALLEL, TestCreatedItemRename(fixture)),
     REGRESSION("rename-typing", PARALLEL, TestRenameTyping(fixture)),
+    REGRESSION("rename-editing-shortcuts", PARALLEL, TestRenameEditingShortcuts(fixture)),
     REGRESSION("rename-click-end", PARALLEL, TestRenameClickEnd(fixture)),
     REGRESSION("rename-vacated-surface", PARALLEL, TestRenameVacatedSurface(fixture)),
     REGRESSION("burst-row-continuity", PARALLEL, TestBurstRowContinuity(fixture)),
