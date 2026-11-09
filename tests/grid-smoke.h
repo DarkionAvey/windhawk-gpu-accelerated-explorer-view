@@ -54,8 +54,10 @@ static void TestThumbnailDecorations(ViewState& state) {
     IconRecord decorated, plain;
     decorated.pixels=DecorateThumbnail(IconPixels(image),style);
     plain.pixels=image;
-    Check(decorated.pixels.thumbnailWidth==88 && decorated.pixels.thumbnailHeight==40 &&
-        decorated.pixels.badgeSize==16 && decorated.pixels.width==88 && decorated.pixels.height==58,
+    // Rails follow Explorer's measured proportion: 0.155 of the frame height each.
+    const UINT rail=0; // Film rails overlay the image; the frame keeps its size.
+    Check(decorated.pixels.thumbnailWidth==80+2*rail && decorated.pixels.thumbnailHeight==40 &&
+        decorated.pixels.badgeSize==16 && decorated.pixels.width==80+2*rail && decorated.pixels.height==58,
         "film/badge atlas lost source aspect or isolated badge band");
     Check(UploadIconBitmap(state,decorated) && UploadIconBitmap(state,plain),"decoration upload");
     auto draw=[&](IconRecord& record,float opacity=1.f,float angle=0.f,IconRecord* overlay=nullptr) {
@@ -77,15 +79,16 @@ static void TestThumbnailDecorations(ViewState& state) {
     for(int dpi : {96,192}) {
         state.textFormatDpi=dpi; state.iconPx=96.f*dpi/96;
         const int left=static_cast<int>(state.rtlLayout ? 320-40-state.iconPx : 40);
-        const float h=state.iconPx*40/88;
+        const float h=state.iconPx*40/(80+2*rail);
         const int top=static_cast<int>(40+(state.iconPx-h)*.5f);
         const int bottom=static_cast<int>(40+(state.iconPx+h)*.5f);
         const int middle=left+static_cast<int>(state.iconPx*.5f);
         draw(decorated);
         auto center=pixel(middle,top+static_cast<int>(h*.5f));
         auto corner=pixel(left+1,top+1);
-        // Sample above the badge, which covers the left rail in RTL.
-        auto rail=pixel(left+2*dpi/96,top+static_cast<int>(h*.25f));
+        // Sample a rail bar between two holes (holes are centred at (k+.5)/7 of
+        // the height, bars at k/7), above the badge that covers it in RTL.
+        auto rail=pixel(left+2*dpi/96,top+static_cast<int>(h*2.f/7.f));
         const int badgeX=state.rtlLayout ? left+8*dpi/96 : left+static_cast<int>(state.iconPx)-8*dpi/96;
         auto badge=pixel(badgeX,bottom-8*dpi/96);
         auto shadow=pixel(middle,bottom+2*dpi/96);
@@ -97,7 +100,8 @@ static void TestThumbnailDecorations(ViewState& state) {
         Check(corner[3]<120 && rail[0]==rail[1] && rail[1]==rail[2] && rail[3]==255,
             "rounded thumbnail failed to clip complete film rails");
         Check(badge==std::array<BYTE,4>{250,0,0,255},"app badge missed trailing LTR/RTL corner");
-        Check(shadow[3]>0 && shadow[3]<80 && shadow[0]==0,"cheap thumbnail shadow absent/opaque");
+        // The film overlay keeps the image's cheap thumbnail shadow.
+        Check(shadow[3]>0 && shadow[3]<80 && shadow[0]==0,"film frame lost its cheap thumbnail shadow");
         draw(decorated,.5f,5.f); // Includes film, badge and shadow in Cut transform/alpha.
         draw(decorated,.5f);
         const auto dim=pixel(middle,top+static_cast<int>(h*.5f));
@@ -106,7 +110,7 @@ static void TestThumbnailDecorations(ViewState& state) {
             dimBadge[3]<230,"thumbnail/badge lost shared Cut opacity");
         // The global test radius is independent of either selection setting.
         g_thumbnailCornerRadius96=0; draw(decorated);
-        Check(pixel(left+1,top+1)[3]>240,"global thumbnail radius did not control film corners");
+        Check(pixel(left,top)[3]>240,"global thumbnail radius did not control film corners");
         g_thumbnailCornerRadius96=oldRadius;
     }
     // A transparent Shell canvas must cap its visible glyph, not its padding.
@@ -126,17 +130,20 @@ static void TestThumbnailDecorations(ViewState& state) {
         StyleFixture::Session styleMetrics; StyleFixture::dpi=dpi;
         state.textFormatDpi=dpi; state.iconPx=272;
         const int left=state.rtlLayout ? 8:40;
-        const int bottom=int(40+(272.f+272.f*40/88)*.5f);
-        // Independent OS metric expectation, rather than the mod's cap helper.
-        const int cap=2*std::max(GetSystemMetricsForDpi(SM_CXICON,dpi),GetSystemMetricsForDpi(SM_CXSMICON,dpi));
-        const int appSize=std::min(272/4,cap);
+        const int bottom=int(40+(272.f+272.f*40/(80+2*rail))*.5f);
+        // Explorer's own sizes, measured on its view at 96 and 120 DPI: the app
+        // badge is 6.2 DIP + 0.2 of the thumbnail height, the overlay plate
+        // 5 DIP + 0.13 of its long side (here the 272-pixel width).
+        const float frameHeight=272.f*40/(80+2*rail);
+        const int cap=int(std::round(dpi/96.f*5.f+.13f*272.f));
+        const int appSize=int(std::round(dpi/96.f*6.2f+.2f*frameHeight));
         draw(decorated,1.f,0.f,&overlay);
         const int appEdge=state.rtlLayout ? left:left+272;
         const int shellEdge=state.rtlLayout ? left+272:left;
         const int appDirection=state.rtlLayout ? 1:-1;
         Check(pixel(appEdge+appDirection*(appSize-4),bottom-8)[0]>230 &&
             pixel(appEdge+appDirection*(appSize+2),bottom-8)[0]<100,
-            "large thumbnail app badge exceeded or failed to reach its DPI cap");
+            "large thumbnail app badge is not Explorer's measured size");
         // Locate the half-coverage edge in rendered pixels. Magnified native
         // artwork is filtered, so a near-edge texel need not be solid green.
         D2D1_MAPPED_RECT capMap{};
@@ -154,7 +161,7 @@ static void TestThumbnailDecorations(ViewState& state) {
             std::cout<<"OVERLAY CAP dpi="<<dpi<<" cap="<<cap<<" first="<<first<<" end="<<end
                 <<" expected-first="<<expectedFirst<<std::endl;
         Check(std::abs(first-expectedFirst)<=2 && std::abs(end-first-cap)<=2,
-            "large thumbnail Shell glyph exceeded its DPI cap or shrank with transparent padding");
+            "large thumbnail Shell overlay is not Explorer's measured plate size or shrank with transparent padding");
     }
     state.iconPx=96; state.textFormatDpi=96;
     draw(plain);
@@ -167,12 +174,12 @@ static void TestThumbnailDecorations(ViewState& state) {
     const bool listThumbnails=g_listThumbnails.exchange(true);
     state.gridView=false; state.iconPx=32; draw(decorated);
     const int listLeft=state.rtlLayout ? 320-40-32 : 40;
-    // The app badge keeps Windows' small-icon minimum, taller than this short
-    // thumbnail; sample the rounded corner on the leading side, away from it.
+    // Sample the rounded corner on the leading side, away from the app badge;
+    // the film overlay keeps the image's shadow below.
     const int leadingCorner=state.rtlLayout ? listLeft+31 : listLeft;
     Check(pixel(listLeft+16,56)[3]>240 && pixel(leadingCorner,49)[3]<230 &&
         pixel(listLeft+16,65)[3]>0 && pixel(listLeft+16,65)[3]<80,
-        "list thumbnail lost aspect, rounded corners or cheap shadow at icon size");
+        "list film thumbnail lost aspect, rounded corners or its shadow at icon size");
     // The same opaque 2:1 image isolates small-thumbnail corner geometry from
     // film rails/badges. A quarter-edge sample must retain a straight top;
     // half-edge radii turn this area into the end of a pill.

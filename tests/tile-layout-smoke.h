@@ -238,21 +238,24 @@ static void TestCompactRows(const std::wstring&) {
 static void TestSortChevronFlip(const std::wstring&) {
     PresentationFixture::Tab tab(L"sort chevron", 5);
     auto& state = tab.state;
+    // Each paint samples the clock once, then tracks the sort; do the same.
+    const auto paint = [&] { QueryPerformanceCounter(&state.itemOpacityNow); TrackSortChevron(state); };
     state.sort.explicitOrder = true; state.sort.key = PKEY_ItemNameDisplay; state.sort.direction = SORT_ASCENDING;
-    TrackSortChevron(state);
+    paint();
     Check(!SortChevronFlipping(state) && SortChevronFlip(state) == 1.f, "the first sort animated its chevron");
-    state.sort.direction = SORT_DESCENDING; TrackSortChevron(state);
+    state.sort.direction = SORT_DESCENDING; paint();
     Check(SortChevronFlipping(state) && SortChevronFlip(state) < -.9f, "reversing the column did not start from the old direction");
-    state.sort.direction = SORT_ASCENDING; TrackSortChevron(state);
+    state.sort.direction = SORT_ASCENDING; paint();
     Check(SortChevronFlip(state) > .9f, "a reversal during the flip jumped instead of continuing from the presented pose");
-    state.sort.direction = SORT_DESCENDING; TrackSortChevron(state);
+    state.sort.direction = SORT_DESCENDING; paint();
     LARGE_INTEGER started = state.sortChevronFlipStarted;
-    Check(Eventually([&] { return !SortChevronFlipping(state); }) && SortChevronFlip(state) == 1.f,
+    Check(Eventually([&] { return !SortChevronFlipping(state); }) &&
+        (paint(), SortChevronFlip(state) == 1.f),
         "the chevron flip did not settle");
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
     Check((now.QuadPart - started.QuadPart) * 1000. / state.qpcFrequency >= double(kHoverAnimationDurationMs) - 1.,
         "the chevron flip ended before the hover duration");
-    state.sort.key = PKEY_Size; TrackSortChevron(state);
+    state.sort.key = PKEY_Size; paint();
     Check(!SortChevronFlipping(state) && SortChevronFlip(state) == 1.f, "sorting a new column animated its chevron");
     std::cout << "PASS: sort chevron flips through flat on reversal only, continues mid-flip and settles on the hover clock\n";
 }
@@ -275,8 +278,47 @@ static void TestThumbnailShadowShape(const std::wstring&) {
         "an edge-to-edge image lost its rectangular shadow");
     Check(!DecorateThumbnail(image(96, 96, 12), ThumbnailStyle{}).thumbnailOpaque,
         "a shaped preview with transparent margins kept a rectangular shadow");
+    // Film rails follow Explorer's own view, measured at 96 and 120 DPI: the
+    // rail is 0.121 of the frame's long side, holes 0.056 of it tall every
+    // 0.109 of it, so frames of one slot share a hole size and taller frames
+    // show more holes. The end slots stay closed (no hole meets a rounded
+    // corner). Rails overlay the image's edges: the composite keeps the
+    // image's size and shadow, and the holes show the image beneath.
     ThumbnailStyle film; film.filmstrip = true;
-    Check(DecorateThumbnail(image(96, 54, 0), film).thumbnailOpaque,
-        "a filmstrip frame lost its rectangular shadow");
-    std::cout << "PASS: thumbnail shadows only frame images that reach their rectangle's edge\n";
+    std::vector<int> holeHeights;
+    for (const UINT height : {140u, 240u}) {
+        auto source = image(320, height, 0);
+        for (size_t i = 0; i < source.data.size(); i += 4) { source.data[i] = 220; source.data[i + 1] = 40; source.data[i + 2] = 30; }
+        const auto frame = DecorateThumbnail(std::move(source), film);
+        const UINT rail = UINT(std::lround(320 * .121));
+        Check(frame.thumbnailOpaque && frame.thumbnailWidth == 320 && frame.thumbnailHeight == height,
+            "film rails changed the image's size or removed its shadow");
+        const auto at = [&](UINT x, UINT y) { return frame.data.data() + size_t(y) * frame.stride + size_t(x) * 4; };
+        const auto shows = [&](UINT x, UINT y) { const auto* p = at(x, y); return p[0] == 220 && p[1] == 40 && p[2] == 30 && p[3] == 255; };
+        // Explorer's count (the last hole needs only its own height) less one for the corners.
+        const int expected = int(std::floor((height - 320 * .056) / (320 * .109)));
+        const UINT hole = rail / 2; // Holes are centered across the rail.
+        for (const UINT column : {hole, 319 - hole}) {
+            int holes = 0, run = 0, tallest = 0; bool open = false;
+            for (UINT y = 0; y < height; ++y) {
+                const bool clear = shows(column, y);
+                if (clear && !open) { ++holes; run = 0; }
+                if (clear) tallest = std::max(tallest, ++run);
+                open = clear;
+            }
+            Check(holes == expected, "a film rail does not repeat its holes to fit the frame minus the corner slots");
+            Check(!shows(column, 0) && !shows(column, height - 1), "a film hole meets the frame's top or bottom corner");
+            holeHeights.push_back(tallest);
+        }
+        // Across a hole's middle row, the rail on either side is equally wide.
+        UINT row = 0; while (row < height && !shows(rail / 2, row)) ++row;
+        int holeLeft = -1, holeRight = -1;
+        for (UINT x = 0; x < rail; ++x) if (shows(x, row + 2)) { if (holeLeft < 0) holeLeft = int(x); holeRight = int(x); }
+        Check(holeLeft >= 0 && std::abs(holeLeft - (int(rail) - 1 - holeRight)) <= 1, "film holes are not centered across the rail");
+        const auto* bar = at(1, 4);
+        Check(bar[0] == bar[1] && bar[1] == bar[2] && bar[0] == 28 && bar[3] == 255 && shows(rail + 1, height / 2),
+            "film rail is not its near-black grey, or covered the image beyond it");
+    }
+    Check(std::abs(holeHeights.front() - holeHeights.back()) <= 1, "film holes changed size with the frame's height");
+    std::cout << "PASS: thumbnail shadows frame edge-to-edge images; film rails overlay them with slot-sized holes repeated to fit\n";
 }

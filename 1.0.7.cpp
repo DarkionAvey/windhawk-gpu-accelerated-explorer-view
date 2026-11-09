@@ -7295,43 +7295,69 @@ IconPixels DecorateThumbnail(IconPixels&& source, const ThumbnailStyle& style,
                             UINT textureLimit = kPlatformImageDimension, size_t byteLimit = SIZE_MAX) {
     if (!source.Ready()) return {};
     source.thumbnailWidth=source.width; source.thumbnailHeight=source.height; source.badgeSize=0;
+    // The rails below are an overlay on the image, so the composite keeps the
+    // image's outline and casts the same shadow.
     source.thumbnailOpaque=ThumbnailEdgeOpaque(source);
-    // Rasterize the film rails once on the worker. Both rails belong to the
-    // thumbnail rectangle, so one rounded fill clips the complete frame.
-    const UINT rail = style.filmstrip ? std::max(3u, std::max(source.width,source.height)/20) : 0;
+    // Film rails in Explorer's proportions, measured on its own view at 96 and
+    // 120 DPI: sized by the frame's long side (the icon slot it fits), so
+    // every frame in a view shows the same rail and hole size. Rasterized once
+    // on the worker into the texture, so zoom scales them for free.
+    const float longSide = float(std::max(source.width, source.height));
+    const UINT rail = style.filmstrip ? std::min(source.width / 2, std::max(2u, UINT(std::lround(longSide * .121f)))) : 0;
     const UINT badge = style.badge.Ready() ? std::max(style.badge.width,style.badge.height) : 0;
-    const auto width=std::max<ULONGLONG>(ULONGLONG(source.width)+2*rail,badge);
+    const auto width=std::max<ULONGLONG>(source.width,badge);
     const auto height=ULONGLONG(source.height)+(badge ? badge+2 : 0);
     if(width>textureLimit || height>textureLimit || width*height>byteLimit/4) return std::move(source);
     IconPixels atlas;
-    if (!rail && source.width >= badge && source.stride == source.width*4) {
-        // Most images need no rails or wider atlas: retain WIC's decoded
-        // allocation, appending only a small badge band when one exists.
+    if (source.width >= badge && source.stride == source.width*4) {
+        // Retain WIC's decoded allocation, appending only a small badge band
+        // when one exists.
         try { source.data.resize(static_cast<size_t>(source.stride)*height); }
         catch (const std::bad_alloc&) { return std::move(source); }
         atlas = std::move(source);
-        atlas.thumbnailWidth = atlas.width;
-        atlas.thumbnailHeight = atlas.height;
         atlas.height += badge ? badge+2 : 0;
     } else {
-        atlas.thumbnailWidth = source.width + 2*rail;
-        atlas.thumbnailOpaque = source.thumbnailOpaque; // Rails are opaque too.
+        atlas.thumbnailWidth = source.width;
+        atlas.thumbnailOpaque = source.thumbnailOpaque;
         atlas.thumbnailHeight = source.height;
-        atlas.width = std::max(atlas.thumbnailWidth,badge);
+        atlas.width = std::max(source.width,badge);
         atlas.height = source.height + (badge ? badge+2 : 0);
         atlas.stride = atlas.width*4;
         try { atlas.data.resize(static_cast<size_t>(atlas.stride)*atlas.height); }
         catch (const std::bad_alloc&) { return std::move(source); }
-        for (UINT y=0; y<source.height; ++y) {
-            memcpy(atlas.data.data()+y*atlas.stride+rail*4,
-                source.data.data()+y*source.stride,source.width*4);
+        for (UINT y=0; y<source.height; ++y)
+            memcpy(atlas.data.data()+y*atlas.stride,source.data.data()+y*source.stride,source.width*4);
+    }
+    if (rail) {
+        // Explorer's holes are a fixed size for the slot (0.056 of the long
+        // side tall, every 0.109 of it, 0.53 of the rail wide, centered in it,
+        // rounded), repeated as far as the frame's height
+        // allows: as many as Explorer fits (the last needs only its own height)
+        // less one, centered, so the ends clear the rounded corners. They show
+        // the image beneath. The rail is a near-black film grey: drawn over the
+        // image, it reads against the picture rather than the page.
+        const float frame = float(atlas.thumbnailHeight);
+        const float pitch = longSide * .109f, holeH = longSide * .056f;
+        const float holes = std::max(0.f, std::floor((frame - holeH) / pitch)); // Explorer fits floor(..)+1.
+        const float first = (frame - ((holes - 1.f) * pitch + holeH)) * .5f + holeH * .5f; // First hole's center.
+        const float holeW = rail * .53f, radius = holeH * .3f;
+        const auto holeCoverage = [&](float x, float y) {
+            if (holes < 1.f) return 0.f;
+            const float slot = std::clamp(std::round((y - first) / pitch), 0.f, holes - 1.f);
+            const float cy = first + slot * pitch, cx = rail * .5f; // Centered across the rail.
+            const float qx = std::fabs(x - cx) - (holeW * .5f - radius), qy = std::fabs(y - cy) - (holeH * .5f - radius);
+            const float outside = std::hypot(std::max(qx, 0.f), std::max(qy, 0.f)) + std::min(std::max(qx, qy), 0.f) - radius;
+            return std::clamp(.5f - outside, 0.f, 1.f);
+        };
+        for (UINT y=0; y<atlas.thumbnailHeight; ++y) {
+            const float grey = 28.f;
             for (UINT x=0; x<rail; ++x) {
-                const UINT holeWidth = std::max(1u,rail/2), pitch = std::max(4u,rail*2);
-                const bool hole = x >= (rail-holeWidth)/2 && x < (rail+holeWidth)/2 &&
-                    y%pitch >= pitch/4 && y%pitch < pitch*3/4;
-                for (UINT column : {x,atlas.thumbnailWidth-rail+x}) {
+                const float cover = 1.f - holeCoverage(x + .5f, y + .5f);
+                // The right rail mirrors the left, measured from its outer edge.
+                for (UINT column : {x,atlas.thumbnailWidth-1-x}) {
                     auto* p = atlas.data.data()+y*atlas.stride+column*4;
-                    p[0]=p[1]=p[2]=hole ? 216 : 28; p[3]=255;
+                    for (int c=0; c<3; ++c) p[c] = BYTE(std::lround(grey * cover + p[c] * (1.f - cover)));
+                    p[3] = BYTE(std::lround(255.f * cover + p[3] * (1.f - cover)));
                 }
             }
         }
@@ -17708,9 +17734,10 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
 // previous direction, 0 flat and 1 at rest. Sampled at the paint's clock.
 float SortChevronFlip(const ViewState& state) {
     if (!state.sortChevronFlipStarted.QuadPart) return 1.f;
-    return state.sortChevronFlipFrom + (1.f - state.sortChevronFlipFrom) *
-        EaseOutCubic(UiTransitionProgress(state, state.sortChevronFlipStarted,
-            kHoverAnimationDurationMs, state.itemOpacityNow));
+    const float progress = UiTransitionProgress(state, state.sortChevronFlipStarted,
+        kHoverAnimationDurationMs, state.itemOpacityNow);
+    return progress >= 1.f ? 1.f :
+        state.sortChevronFlipFrom + (1.f - state.sortChevronFlipFrom) * EaseOutCubic(progress);
 }
 bool SortChevronFlipping(const ViewState& state) {
     return state.sortChevronFlipStarted.QuadPart &&
@@ -18347,10 +18374,9 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     const auto rect=SnapDrawRect(state.target.Get(),D2D1::RectF(iconX,y,iconX+width,y+height));
     if(rect.right<=rect.left || rect.bottom<=rect.top) return true;
     if (drawn) *drawn = rect;
-    // Corner adornments grow with the slot only up to the DPI-aware indicator
-    // cap. They may extend past small artwork; damage includes them.
+    // Corner adornments follow Explorer's measured sizes (see the overlay and
+    // badge below). They may extend past small artwork; damage includes them.
     const float smallestAdornment = static_cast<float>(GetSystemMetricsForDpi(SM_CXSMICON, ViewDpi(state)));
-    const float largestAdornment = static_cast<float>(IconAdornmentMaxSize(ViewDpi(state)));
     const auto adorn = [&](const D2D1_RECT_F& area) {
         if (!drawn) return;
         drawn->left=std::min(drawn->left,area.left); drawn->top=std::min(drawn->top,area.top);
@@ -18399,7 +18425,10 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // The reusable brush must not pin an evicted bitmap or obsolete device.
         state.thumbnailBrush->SetBitmap(nullptr);
         if (artwork.badgeSize) {
-            const float badge = std::clamp(side*.25f, smallestAdornment, largestAdornment);
+            // Explorer's app badge, measured on its own view at 96 and 120 DPI:
+            // 6.2 DIP + 0.2 of the thumbnail height, so it grows slower than
+            // the image and keeps that relation through continuous zoom.
+            const float badge = std::round(dpi * 6.2f + .2f * height); // Whole pixels: crisp.
             const float left = state.rtlLayout ? rect.left : rect.right-badge;
             const float top = static_cast<float>(artwork.thumbnailHeight+2);
             const float size = static_cast<float>(artwork.badgeSize);
@@ -18428,8 +18457,14 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // Cap the glyph, not its transparent canvas. Retain the provider's
         // corner placement and proportions without scanning pixels on paint.
         const float extent=overlayPixels.overlayExtent;
-        const float edge=extent>0.f ? std::min(std::max(side,smallestAdornment),
-            largestAdornment/extent) : std::min(side,largestAdornment);
+        // Explorer's overlay plate (measured on its own view at 96 and 120 DPI)
+        // is 5 DIP + 0.13 of the artwork's long side, for icons and thumbnails
+        // alike, never below the glyph Windows draws on its small-icon canvas.
+        // The canvas is sized so its visible glyph is exactly that, in whole
+        // pixels.
+        const float plate=std::round(std::max(std::max(96,state.textFormatDpi)/96.f*5.f+.13f*std::max(width,height),
+            extent>0.f ? smallestAdornment*extent : smallestAdornment));
+        const float edge=extent>0.f ? plate/extent : plate;
         const float left=state.rtlLayout ? rect.right-edge : rect.left;
         const auto overlayRect=SnapDrawRect(state.target.Get(),
             D2D1::RectF(left,rect.bottom-edge,left+edge,rect.bottom));
@@ -29533,8 +29568,11 @@ void RenderItemTip(ItemTip& tip) {
     };
     bool drawn = false;
     if (bitmap && SUCCEEDED(tip.target->BindDC(dc, &bounds))) {
-        // Text over a translucent target is grayscale, as XAML draws it.
-        tip.target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        // The view's text policy (system, smooth or aliased), in its form for a
+        // translucent target: ClearType needs an opaque one.
+        RefreshTextRenderingForWindow(tip.textStyle, tip.hwnd, true);
+        SetCompatibleTextRendering(tip.target.Get(), tip.textStyle.textRenderingParams.Get(),
+            tip.textStyle.textAntialiasMode);
         tip.target->BeginDraw();
         tip.target->Clear(D2D1::ColorF(0, 0.f));
         const auto body = D2D1::RoundedRect(D2D1::RectF(float(margin), float(margin),
@@ -29588,7 +29626,8 @@ LRESULT CALLBACK ItemTipProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     auto* tip = reinterpret_cast<ItemTip*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
     case WM_PAINT:
-        if (tip) { ValidateRect(hwnd, nullptr); return 0; } // Drawn by RenderItemTip (layered).
+        // Layered: a repaint request (policy or palette change) re-renders.
+        if (tip) { ValidateRect(hwnd, nullptr); RenderItemTip(*tip); return 0; }
         break;
     case WM_ERASEBKGND: return 1;
     case WM_NCHITTEST: return HTTRANSPARENT; // The pointer passes to the view beneath.

@@ -383,7 +383,7 @@ static void ItemTipScenario(const std::wstring& directory) {
     ItemTipHoverMoved(state, -1);
     Check(hover(note) && tip.valueX < tip.labelX, "RTL item tip columns are not mirrored");
     GetWindowRect(tip.hwnd, &window);
-    Check(window.right == viewRect.left + client.x, "RTL item tip is not anchored at the cursor's right");
+    Check(window.right - tip.margin == viewRect.left + client.x, "RTL item tip body is not anchored at the cursor's right");
     state.rtlLayout = false;
 
     // Moving to another item hides it; input dismisses an item until the
@@ -471,8 +471,9 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(tip.background == GetSysColor(COLOR_INFOBK) && tip.foreground == GetSysColor(COLOR_INFOTEXT),
         "item tip ignores high contrast colors");
 
-    // The opaque popup uses exactly the same system/subpixel or explicit
-    // smooth/aliased policy as the view, including changes while it is open.
+    // The translucent popup uses the view's system or explicit
+    // smooth/aliased policy in its translucent-target form (ClearType needs an
+    // opaque target), including changes while it is open.
     Check(hover(note), "font policy tooltip");
     const auto oldAntialiasing = g_textAntialiasing.load();
     for (auto mode : {TextAntialiasing::System, TextAntialiasing::Smooth, TextAntialiasing::Aliased}) {
@@ -483,7 +484,7 @@ static void ItemTipScenario(const std::wstring& directory) {
         ComPtr<IDWriteRenderingParams> effective; tip.target->GetTextRenderingParams(&effective);
         // A native font customizer (MacType) rewrites the target's policy, as
         // the list and drag-preview suites already recognize.
-        if (tip.target->GetTextAntialiasMode() != tip.textStyle.opaqueTextAntialiasMode ||
+        if (tip.target->GetTextAntialiasMode() != tip.textStyle.textAntialiasMode ||
             effective.Get() != tip.textStyle.textRenderingParams.Get())
             Check(GetModuleHandleW(L"MacType64.dll") || GetModuleHandleW(L"MacType64.Core.dll"),
                 "unexplained tooltip text policy override");
