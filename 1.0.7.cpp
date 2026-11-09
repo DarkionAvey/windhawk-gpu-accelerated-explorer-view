@@ -3991,6 +3991,7 @@ struct ViewState {
     float zoomToIconPx = 0.f, zoomToFontPx = 0.f, zoomToRowPx = 0.f, zoomFromScroll = 0.f;
     float zoomAnchorRow = 0.f; // Fractional document row at the viewport center.
     LARGE_INTEGER zoomStartedQpc{};
+    float zoomFromContent = 0.f; // Content-line reveal presented when the zoom began.
     float smoothStart = 0.f;
     float smoothDelta = 0.f;
     LARGE_INTEGER smoothStartedQpc{};
@@ -4298,7 +4299,7 @@ struct SwipeFeedbackSnapshot {
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
-    X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(horizontalAnimating) \
+    X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
     X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
     X(nativeTextColor) X(nativeHeaderTextColor) X(cachedNativeMode) X(folderPath) X(selectedFlags) \
@@ -4564,15 +4565,19 @@ float EdgeMarginPx(const ViewState& state);
 int VerticalScrollbarClearance(int dpi);
 
 // Grid modes share one cell pipeline. Tiles are compact cells with stacked
-// detail lines; Content still stays native.
+// detail lines. Content is a List derivative: one item per row, with type
+// beneath the name and modified date and size in a second text column.
 bool IsIconViewMode(UINT mode, bool = false) {
     return mode == FVM_ICON || mode == FVM_SMALLICON || mode == FVM_THUMBNAIL || mode == FVM_TILE;
 }
 bool IsGpuViewMode(UINT mode, bool thisPc = false) {
-    return mode == FVM_DETAILS || mode == FVM_LIST || IsIconViewMode(mode, thisPc);
+    return mode == FVM_DETAILS || mode == FVM_LIST || mode == FVM_CONTENT || IsIconViewMode(mode, thisPc);
 }
 bool TileLayout(const ViewState& state) {
     return state.gridView && state.cachedNativeMode == FVM_TILE;
+}
+bool ContentLayout(const ViewState& state) {
+    return !state.gridView && state.cachedNativeMode == FVM_CONTENT;
 }
 // This PC tiles show each drive's usage bar and free space as their details.
 bool DriveTiles(const ViewState& state) {
@@ -4834,6 +4839,16 @@ float UiTransitionProgress(const ViewState& state, LARGE_INTEGER started,
         (1000. / state.qpcFrequency);
     return std::clamp(static_cast<float>(elapsedMs /
         static_cast<double>(std::max<ULONGLONG>(1, durationMs))), 0.f, 1.f);
+}
+
+// How much of Content's line layout the list presents: 1 in Content, 0 in
+// List/Details, and in between while a zoom carries one into the other.
+float ContentReveal(const ViewState& state) {
+    if (state.gridView) return 0.f;
+    const float to = state.layoutNativeMode == FVM_CONTENT ? 1.f : 0.f;
+    if (!state.zoomAnimating) return to;
+    return state.zoomFromContent +
+        (to - state.zoomFromContent) * EaseOutCubic(UiTransitionProgress(state, state.zoomStartedQpc));
 }
 
 bool AdvanceGroupAnimation(ViewState& state, LARGE_INTEGER sampled = {}) {
@@ -12486,10 +12501,12 @@ bool HasCachedColumnCell(const Entry& entry, const PROPERTYKEY& key) {
 
 void QueueVisibleDetails(ViewState& state) {
     PipelineScope pipeline(state.background,L"metadata.demand",state.columnEpoch,state.propertyEpoch);
-    // Details columns or tile lines name the properties to resolve. Drive
-    // tiles already carry their capacity from the drive-space worker.
+    // Details columns, tile or Content lines name the properties to resolve.
+    // This PC rows (drive tiles, Content) already carry their type and
+    // capacity from the drive-space worker.
     const bool tileLines = TileLayout(state) && !state.thisPcGpu;
-    if ((!tileLines && (!state.columnsView || state.columns.empty())) ||
+    const bool contentLines = ContentLayout(state) && !state.thisPcGpu;
+    if ((!tileLines && !contentLines && (!state.columnsView || state.columns.empty())) ||
         (!state.thisPcGpu && state.directoryPending) ||
         !state.loaded || !state.total ||
         g_unloading.load(std::memory_order_relaxed)) return;
@@ -12500,6 +12517,7 @@ void QueueVisibleDetails(ViewState& state) {
     job.thisPc = state.thisPcGpu;
     std::vector<PROPERTYKEY> neededColumns;
     if (tileLines) neededColumns = {PKEY_ItemTypeText, PKEY_Size};
+    else if (contentLines) neededColumns = {PKEY_ItemTypeText, PKEY_DateModified, PKEY_Size};
     else for (const auto& column : state.columns) {
         if (ClassifySort(column.key) == SortKind::Name) continue;
         if (state.thisPcGpu && ThisPcSeededColumn(column.key)) continue;
@@ -13402,6 +13420,11 @@ float TileTextHeight(const ViewState& state, float font, int dpi) {
     return DriveTiles(state) ? line * 2.f + float(Scale96(kDriveBarHeight96, dpi)) + gap * 2.f :
         line * 3.f + gap * 2.f;
 }
+// A Content row's text block: two lines on each side (name over type; date
+// over size). Same whole-pixel pitch as tiles.
+float ContentTextHeight(float font, int dpi) {
+    return std::round(font * 1.5f) * 2.f + float(Scale96(2, dpi));
+}
 
 void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     state.zebraExtentAnimating = false;
@@ -13427,11 +13450,16 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // and DPI. Every tile reserves all its lines, so two-line items match
     // three-line neighbours.
     const float tileText = TileTextHeight(state, font, dpi);
+    // Content rows follow the same rule with their two lines, from the list
+    // zoom's font, so Ctrl+wheel grows the icon and text together.
+    const float contentText = ContentTextHeight(font, dpi);
     const float icon = TileLayout(state) ? (direct ? tileText : std::round(tileText)) :
+        ContentLayout(state) ? (direct ? contentText : std::round(contentText)) :
         state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
         static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), baseRow - Scale96(6, dpi)));
-    const float row = !state.gridView ? static_cast<float>(baseRow) :
+    const float row = ContentLayout(state) ? std::max(static_cast<float>(icon), contentText) + Scale96(12, dpi) :
+        !state.gridView ? static_cast<float>(baseRow) :
         TileLayout(state) ? std::max(static_cast<float>(icon), tileText) + Scale96(12, dpi) :
         state.cachedNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
@@ -13569,7 +13597,8 @@ float NameTextOrigin(const ViewState& state, bool header = false) {
 // Coordinates are logical; the existing Fill/Text/icon paths mirror RTL.
 struct ItemGeometry {
     D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{}, checkbox{};
-    D2D1_RECT_F detail[2]{}; // Tile type and size lines (non-drive tiles).
+    D2D1_RECT_F detail[2]{}; // Tile type and size lines; Content's type line is detail[0].
+    D2D1_RECT_F aside[2]{};  // Content's second text column: date modified, then size.
     bool wrapped = false;
 };
 ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
@@ -13626,6 +13655,27 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
             NameContentEnd(state)-NameTrailingGap(state),
             visual.top+state.rowPx);
+        if (const float reveal = ContentReveal(state); reveal > 0.f) {
+            // Name over type on the leading side; date over size in a second
+            // text column. Icon and text share one top edge, as in tiles, and
+            // every line is reserved before its value arrives. Entering or
+            // leaving Content moves the icon and name from their list places
+            // on the zoom clock that also carries the row height.
+            const float line = std::round(state.fontPx * 1.5f);
+            const float gap = static_cast<float>(Scale96(2, dpi));
+            const float block = ContentTextHeight(state.fontPx, dpi);
+            const float top = visual.top + std::max(0.f, state.rowPx - std::max(side, block)) * .5f;
+            const auto blend = [reveal](float from, float to) { return from + (to - from) * reveal; };
+            g.icon.top = blend(g.icon.top, top); g.icon.bottom = g.icon.top + side;
+            const float end = g.text.right;
+            const float split = g.text.left + std::max(0.f, end - g.text.left) * .55f;
+            const float columnGap = static_cast<float>(Scale96(16, dpi));
+            g.text = D2D1::RectF(g.text.left, blend(g.text.top, top),
+                blend(g.text.right, std::max(g.text.left, split - columnGap)), blend(g.text.bottom, top + line));
+            g.detail[0] = D2D1::RectF(g.text.left, top + line + gap, g.text.right, top + 2.f * line + gap);
+            for (int i = 0; i < 2; ++i)
+                g.aside[i] = D2D1::RectF(split, top + i * (line + gap), std::max(split, end), top + i * (line + gap) + line);
+        }
     }
     if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
         // Boxes slide with the band they lead, like the section badges.
@@ -17411,6 +17461,19 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
         PipelineEvent(*state.background,{.operation=L"ui.text.scaled[opacity,width,height,scale]",
             .a=state.uiTraceItem,.b=reinterpret_cast<ULONG_PTR>(bitmap),.v={opacity,width,height,scale}},true);
     return true;
+}
+
+// The property system's localized display name, resolved once per key.
+const std::wstring& PropertyLabel(REFPROPERTYKEY key) {
+    static std::vector<std::pair<PROPERTYKEY, std::wstring>> labels;
+    for (const auto& known : labels) if (SameKey(known.first, key)) return known.second;
+    std::wstring label;
+    ComPtr<IPropertyDescription> description;
+    PWSTR text = nullptr;
+    if (SUCCEEDED(PSGetPropertyDescription(key, IID_PPV_ARGS(&description))) &&
+        SUCCEEDED(description->GetDisplayName(&text)) && text) label = text;
+    CoTaskMemFree(text);
+    return labels.emplace_back(key, std::move(label)).second;
 }
 
 void Text(ViewState& state, const std::wstring& text, float l, float t,
@@ -21945,6 +22008,25 @@ void Paint(ViewState& state) {
                     Text(state, *lines[line], geometry.detail[line].left, geometry.detail[line].top,
                         geometry.detail[line].right, geometry.detail[line].bottom, nameColor, false,
                         contentOpacity * detailsAlpha, false, false, nullptr, true);
+        }
+        if (const float reveal = ContentReveal(state); reveal > 0.f) {
+            // Content lines use the same secondary text as tile lines. Date
+            // and size carry the property's localized name, as columns do; they
+            // fade with the zoom that enters or leaves Content.
+            if (!e.type.empty())
+                Text(state, e.type, geometry.detail[0].left, geometry.detail[0].top,
+                    geometry.detail[0].right, geometry.detail[0].bottom, nameColor, false,
+                    contentOpacity * detailsAlpha * reveal, false, false, nullptr, true);
+            const std::pair<const PROPERTYKEY*, const std::wstring*> aside[] =
+                {{&PKEY_DateModified, &e.date}, {&PKEY_Size, &e.size}};
+            for (int line = 0; line < 2; ++line) {
+                if (aside[line].second->empty()) continue;
+                const std::wstring& label = PropertyLabel(*aside[line].first);
+                Text(state, label.empty() ? *aside[line].second : label + L": " + *aside[line].second,
+                    geometry.aside[line].left, geometry.aside[line].top,
+                    geometry.aside[line].right, geometry.aside[line].bottom, nameColor, false,
+                    contentOpacity * detailsAlpha * reveal, false, false, nullptr, true);
+            }
         }
         if (details && !state.gridView) {
             if (compositionFrame.active && !compositionFrame.Widths() && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.metadata.bitmap.Get());
@@ -26992,24 +27074,30 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     const bool enteringColumns=columns && !state.columnsView;
     // cachedNativeMode may already hold the observed mode; compare the
     // layout that was actually applied.
-    const bool tileLinesBefore=state.gridView && state.layoutNativeMode==FVM_TILE;
+    const auto lineSet=[](bool grid,UINT mode){ return grid && mode==FVM_TILE ? 1 : !grid && mode==FVM_CONTENT ? 2 : 0; };
+    const int linesBefore=lineSet(state.gridView,state.layoutNativeMode);
     if (grid) state.nativeIconSize=requested.iconSize;
     state.cachedNativeMode=mode;
-    // Tile lines and Details columns request different properties. A row
-    // complete for one is not complete for the other.
-    if (tileLinesBefore!=(grid && mode==FVM_TILE)) InvalidateDetailJobs(state);
+    // Tile lines, Content lines and Details columns request different
+    // properties. A row complete for one is not complete for another.
+    if (linesBefore!=lineSet(grid,mode)) InvalidateDetailJobs(state);
     const bool changed=state.layoutNativeMode!=mode ||
         (grid && state.layoutIconSize!=state.nativeIconSize) || state.gridView!=grid;
-    // Grid-to-grid icon size or mode changes zoom from the presented cells,
-    // exactly like Ctrl+wheel, while packing and hit testing switch at once.
-    const bool zoom=changed && reflow && animate && state.gridView && grid &&
+    // Grid-to-grid icon size or mode changes, and list changes into or out of
+    // Content's taller rows, zoom from the presented image exactly like
+    // Ctrl+wheel, while packing and hit testing switch at once.
+    const bool zoom=changed && reflow && animate && state.gridView==grid &&
+        (grid || linesBefore==2 || lineSet(grid,mode)==2) &&
         state.detailsViewActive && state.visible && state.inScope && state.loaded &&
         !state.optimisticStartedAt && !state.pendingNavigationPaint &&
         g_smooth.load(std::memory_order_relaxed);
     if (zoom) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
+        const float reveal=ContentReveal(state);
         state.layoutNativeMode=mode; state.layoutIconSize=state.nativeIconSize;
         BeginAnimatedZoom(state,-1);
+        state.zoomFromContent=reveal;
+        if (!grid) QueueVisibleDataFrame(state);
         Redraw(state);
     } else if (changed) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
@@ -27058,7 +27146,7 @@ bool RefreshNativeViewMode(ViewState& state, bool force = false) {
 }
 
 // Read Explorer's own mode/size; supported item layouts use the GPU overlay.
-// Tiles use the grid pipeline; Content stays native.
+// Tiles use the grid pipeline and Content the list pipeline.
 // On failure, prefer native Explorer to an incorrect GPU layout.
 bool NativeGpuMode(ViewState& state) {
     return RefreshNativeViewMode(state, true) &&
@@ -27494,6 +27582,7 @@ void BeginAnimatedZoom(ViewState& state, int height96) {
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     if (state.gridView) AdvanceRowHeight(state);
+    state.zoomFromContent = ContentReveal(state);
     if (!state.zoomAnimating)
         state.zoomAnchorRow = (state.scrollNow + ViewHeight(state) * .5f) /
             std::max(1.f, state.rowPx) * (state.gridView ? state.itemsPerRow : 1);

@@ -6,6 +6,7 @@
 - **ADDED** Click-to-rename behavior, matching native Explorer.
 - **ADDED** Automatic renaming when creating new files or folders.
 - **ADDED** Tiles view in every folder, showing each item's name, type and size.
+- **ADDED** Content view, showing each item's name, type, date modified and size. Switching to or from List and Details animates.
 - **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 

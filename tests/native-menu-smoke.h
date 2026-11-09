@@ -570,11 +570,11 @@ static void TestComViewModeChange(const std::wstring& fixture) {
         FinishColumnTransition(state); StopRowTransition(state);
         Check(state.gridView == icons && state.columnsView == (step.mode == FVM_DETAILS),
             "the GPU layout does not match the requested view");
-        const bool gpu = step.mode != FVM_CONTENT;
-        Check(bool(IsWindowVisible(state.nativeHwnd)) != gpu && bool(IsWindowVisible(state.hwnd)) == gpu,
+        // Every Explorer layout, Content included, is drawn by the GPU list.
+        Check(!IsWindowVisible(state.nativeHwnd) && IsWindowVisible(state.hwnd),
             "a COM view change broke exclusive native/GPU presentation");
     }
     DropTarget(state);
     std::cout << "PASS: view and icon-size changes made through IFolderView2 alone (as the command bar does) reach "
-        "the GPU layout, including size-only changes and native-only modes\n";
+        "the GPU layout, including size-only changes and Content\n";
 }

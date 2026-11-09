@@ -839,7 +839,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             "List/Details/grid switches lost independent zoom, text metrics or native suppression");
     }
     std::cout << "PASS: independent list/grid wheel and pinch zoom survives interrupted zoom, repeated native view switches and text-size changes\n";
-    userMode(FVM_CONTENT);
+    userMode(FVM_THUMBSTRIP); // A host mode the GPU list does not lay out.
     Check(!IsWindowVisible(overlay) && (GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE),
           "native-only mode did not restore native content");
     userMode(FVM_DETAILS);
@@ -1167,9 +1167,9 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
             (mode!=FVM_TILE || (!item.wrapped && item.text.left>=item.icon.right && item.capacity.top>item.text.bottom)),
             "This PC Tile/icon view lost exclusive GPU presentation or its drive tiles");
     }
-    userMode(FVM_CONTENT);
+    userMode(FVM_THUMBSTRIP);
     Check(!IsWindowVisible(overlay) && (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
-        "This PC tiles accidentally admitted Content view");
+        "This PC admitted a layout the GPU list does not draw");
     userMode(FVM_TILE); FinishColumnTransition(*state);
     Check(IsWindowVisible(overlay) && state->detailsViewActive && DriveTiles(*state),
         "This PC tiles did not reactivate after native fallback");
@@ -1194,10 +1194,10 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     Check(state->detailsViewActive && state->gridView && !DriveTiles(*state) && IsWindowVisible(overlay) &&
         !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
         "Recycle Bin Tiles did not use the GPU grid, or drew drive tiles");
-    userMode(FVM_CONTENT);
+    userMode(FVM_THUMBSTRIP);
     Check(!state->detailsViewActive && !state->gridView && !IsWindowVisible(overlay) &&
         (GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),
-        "Recycle Bin Content view left the native view");
+        "Recycle Bin unsupported layout left the native view");
     for (UINT mode : {FVM_LIST,FVM_DETAILS,FVM_ICON}) {
         userMode(mode,96); FinishColumnTransition(*state);
         Check(IsWindowVisible(overlay) && state->detailsViewActive &&
@@ -1278,7 +1278,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         "enabling the switch did not create it for a tab that started with it hidden");
     DestroyWindow(tileStartup);
     response->folder.Reset(); bindFolder(destination);
-    response->mode = FVM_CONTENT;
+    response->mode = FVM_THUMBSTRIP;
     AttachView(native, view, response->folder, browser, destination);
     const HWND nativeFirst = OverlayForTab(frame);
     state = nativeFirst ? State(nativeFirst) : nullptr;

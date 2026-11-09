@@ -126,30 +126,26 @@ static void TestNativeReturnRoutesCore(const std::wstring& fixture) {
         DispatchHook(&key); live.Pump();
         Check(!live.state->visible,"Ctrl+Alt+F9 did not choose native view");
         NativeReturnFixture::CheckNative(live);
+        Check(::IsWindowVisible(live.state->viewToggle) && IsWindowEnabled(live.state->viewToggle),
+            "native view lost the enabled switch button");
+        g_showNativeViewToggleButton=false; RefreshViewToggleForFrame(live.frame);
+        Check(!::IsWindowVisible(live.state->viewToggle),"button ignored its explicit hide option");
+        g_showNativeViewToggleButton=true; RefreshViewToggleForFrame(live.frame);
+        Check(::IsWindowVisible(live.state->viewToggle),"button could not return during native view");
         DispatchHook(&key); live.Pump();
         modifiers.keys[VK_CONTROL]=modifiers.keys[VK_MENU]=0;
         g_dispatchOriginal=dispatch;
         Check(live.state->visible,"Ctrl+Alt+F9 did not restore GPU mode");
+        // Content is a GPU layout: Explorer's own mode change keeps the GPU
+        // list and the native list hidden.
         {
             NativeViewInput input(live.state,true);
-            Check(SUCCEEDED(live.folderView->SetViewModeAndIconSize(FVM_CONTENT,48)),"native-only view mode");
+            Check(SUCCEEDED(live.folderView->SetViewModeAndIconSize(FVM_CONTENT,48)),"Content view mode");
         }
-        Check(Eventually([&] {live.Pump(); return !live.state->detailsViewActive && !::IsWindowVisible(live.overlay);}),"native-only mode did not concede presentation");
-        NativeReturnFixture::CheckNative(live);
-        Check(::IsWindowVisible(live.state->viewToggle) && IsWindowEnabled(live.state->viewToggle),
-            "native fallback lost the enabled presence button needed for hover hints");
-        wchar_t caption[128]{}; GetWindowTextW(live.state->viewToggle,caption,ARRAYSIZE(caption));
-        Check(wcsstr(caption,L"unavailable"),"fallback button did not explain refusal");
-        wchar_t hint[512]{};
-        TOOLINFOW tool{static_cast<UINT>(TTTOOLINFOW_V2_SIZE)};
-        tool.hwnd=live.frame; tool.uId=reinterpret_cast<UINT_PTR>(live.state->viewToggle); tool.lpszText=hint;
-        Check(SendMessageW(live.state->viewToggleTooltip,TTM_GETTOOLINFOW,0,reinterpret_cast<LPARAM>(&tool)) &&
-            tool.lpszText && !wcscmp(tool.lpszText,L"GPU view unavailable in this Explorer layout."),
-            "native fallback toggle did not expose its unavailable-layout hover hint");
-        g_showNativeViewToggleButton=false; RefreshViewToggleForFrame(live.frame);
-        Check(!::IsWindowVisible(live.state->viewToggle),"button ignored its explicit hide option");
-        g_showNativeViewToggleButton=true; RefreshViewToggleForFrame(live.frame);
-        Check(::IsWindowVisible(live.state->viewToggle),"button could not return during native fallback");
+        Check(Eventually([&] {live.Pump(); return live.state->layoutNativeMode==FVM_CONTENT;}),
+            "Content view did not reach the GPU layout");
+        Check(live.state->detailsViewActive && ::IsWindowVisible(live.overlay) && !::IsWindowVisible(live.native),
+            "Content view conceded presentation to native Explorer");
     }
     g_showNativeViewToggleButton=button;
 }
