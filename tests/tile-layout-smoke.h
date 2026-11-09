@@ -169,9 +169,90 @@ static void TestContentLayout(const std::wstring& directory) {
         AdvanceRowHeight(state, true); FinishColumnTransition(state);
         Check(!state.zoomAnimating && ContentReveal(state) == 0.f && state.rowPx < contentRow,
             "Content to Details did not settle on list rows");
+        // Details to Medium icons morphs each item: its icon and name start
+        // where the list drew them and end in the grid cell.
+        const auto row = LayoutItem(state, LayoutRowVisual(state, 0, 1.f));
+        ApplyViewLayout(state, {FVM_ICON, 48}, true, true);
+        FinishColumnTransition(state);
+        Check(state.gridView && state.rowTransitionActive && state.reflowLayoutTransition,
+            "Details to Medium icons did not start a layout morph");
+        const auto first = LayoutItem(state, LayoutRowVisual(state, 0, 0.f));
+        const auto same = [](D2D1_RECT_F a, D2D1_RECT_F b) {
+            return std::fabs(a.left - b.left) < .5f && std::fabs(a.top - b.top) < .5f &&
+                std::fabs(a.right - b.right) < .5f && std::fabs(a.bottom - b.bottom) < .5f;
+        };
+        Check(same(first.icon, row.icon) && same(first.text, row.text),
+            "Details to Medium icons replaced the list item instead of moving its icon and name");
+        StopRowTransition(state);
+        const auto cell = LayoutItem(state, LayoutRowVisual(state, 0, 1.f));
+        Check(cell.icon.right - cell.icon.left > row.icon.right - row.icon.left &&
+            cell.text.top >= cell.icon.bottom - .01f, "the morph did not settle on a grid cell");
     }
     Check(root.parent_path() == std::filesystem::path(directory), "content fixture cleanup boundary");
     Check(ReleasePrivateFixture(root), "content fixture cleanup");
     std::cout << "PASS: Content in ordinary folders: top-aligned name/type and date/size columns, folder's own values, "
         "List/Details zoom in and out from the presented layout (LTR/RTL)\n";
+}
+
+// Explorer's Compact view: list rows take Explorer's measured compact
+// fraction of the configured row (DPI arithmetic), keep their text size and
+// zoom there from the presented row; grids are unaffected.
+static void TestCompactRows(const std::wstring&) {
+    {
+        Regression::Scope scope("compact rows");
+        PresentationFixture::Tab tab(L"compact rows", 40, false, false, false, 900, 600);
+        auto& state = tab.state; state.compactRows = false; const int dpi = ViewDpi(state);
+        ApplyViewLayout(state, {FVM_DETAILS, 16}, false); UpdateMetrics(state);
+        const float row = state.rowPx, font = state.fontPx;
+        Check(row == float(MulDiv(g_row96.load(), dpi, 96)), "fixture row is not the DPI-scaled setting");
+        struct Reset { ~Reset() { ExplorerSettingsFixture::compact = false; } } reset;
+        ExplorerSettingsFixture::compact = true;
+        ReconcileCompactRows(state);
+        Check(state.zoomAnimating && std::fabs(state.rowPx - row) < .01f, "Compact view did not zoom from the presented row");
+        AdvanceRowHeight(state, true);
+        Check(state.rowPx == std::round(row * 27.f / 37.f), "Compact rows differ from Explorer's measured 27/37 fraction");
+        Check(state.fontPx == font, "Compact view changed the text size");
+        // Compact highlights touch; a check box stays inside its highlight
+        // with the same margin proportion it has in a relaxed row.
+        const float top = LayoutRowVisual(state, 0, 1.f).top;
+        const auto band = RowHighlightRect(state, top, state.rowPx);
+        Check(band.top == top && band.bottom == top + state.rowPx, "Compact rows kept a gap between highlights");
+        state.clickPolicy.checkSelect = true; state.checkboxRevealStarted = {};
+        const auto box = LayoutItem(state, LayoutRowVisual(state, 0, 1.f)).checkbox;
+        const float side = box.bottom - box.top;
+        Check(box.top >= band.top && box.bottom <= band.bottom &&
+            std::fabs(side / (band.bottom - band.top) - 20.f / 28.f) < .01f,
+            "the check box overflows or loses its proportion in a compact row");
+        state.clickPolicy.checkSelect = false;
+        ApplyViewLayout(state, {FVM_ICON, 48}, false);
+        const float compactGrid = state.rowPx;
+        ExplorerSettingsFixture::compact = false; ReconcileCompactRows(state);
+        Check(state.rowPx == compactGrid, "Compact view changed grid cells");
+    }
+    std::cout << "PASS: Compact view shrinks list rows by Explorer's fraction with unchanged text, animated, grids unchanged\n";
+}
+
+// Reversing the sorted column folds its chevron through flat on the short
+// hover clock; a new column shows its chevron at rest, and a reversal during
+// a flip continues from the presented pose.
+static void TestSortChevronFlip(const std::wstring&) {
+    PresentationFixture::Tab tab(L"sort chevron", 5);
+    auto& state = tab.state;
+    state.sort.explicitOrder = true; state.sort.key = PKEY_ItemNameDisplay; state.sort.direction = SORT_ASCENDING;
+    TrackSortChevron(state);
+    Check(!SortChevronFlipping(state) && SortChevronFlip(state) == 1.f, "the first sort animated its chevron");
+    state.sort.direction = SORT_DESCENDING; TrackSortChevron(state);
+    Check(SortChevronFlipping(state) && SortChevronFlip(state) < -.9f, "reversing the column did not start from the old direction");
+    state.sort.direction = SORT_ASCENDING; TrackSortChevron(state);
+    Check(SortChevronFlip(state) > .9f, "a reversal during the flip jumped instead of continuing from the presented pose");
+    state.sort.direction = SORT_DESCENDING; TrackSortChevron(state);
+    LARGE_INTEGER started = state.sortChevronFlipStarted;
+    Check(Eventually([&] { return !SortChevronFlipping(state); }) && SortChevronFlip(state) == 1.f,
+        "the chevron flip did not settle");
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    Check((now.QuadPart - started.QuadPart) * 1000. / state.qpcFrequency >= double(kHoverAnimationDurationMs) - 1.,
+        "the chevron flip ended before the hover duration");
+    state.sort.key = PKEY_Size; TrackSortChevron(state);
+    Check(!SortChevronFlipping(state) && SortChevronFlip(state) == 1.f, "sorting a new column animated its chevron");
+    std::cout << "PASS: sort chevron flips through flat on reversal only, continues mid-flip and settles on the hover clock\n";
 }

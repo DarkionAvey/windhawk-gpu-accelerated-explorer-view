@@ -7,9 +7,11 @@
 - **ADDED** Automatic renaming when creating new files or folders.
 - **ADDED** Tiles view in every folder, showing each item's name, type and size.
 - **ADDED** Content view, showing each item's name, type, date modified and size. Switching to or from List and Details animates.
+- **ADDED** Support for Explorer's Compact view. List and Details rows shrink with an animation, like Ctrl+wheel zoom, and keep their text size.
 - **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
+- **IMPROVED** Default text size now matches the Windows 11 right-click menu. The defaults follow that menu's sizes rather than usability testing.
 - **IMPROVED** Rename field appearance to match the list's font, scaling, and text rendering.
 - **IMPROVED** Build validation reliability with additional retries and diagnostics.
 - **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.

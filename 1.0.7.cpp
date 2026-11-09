@@ -57,10 +57,10 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 - Appearance:
     - rowHeight: 32
       $name: Row height
-      $description: Higher = taller file rows; lower = more files on screen.
-    - fontSizePercent: 52
+      $description: Higher = taller file rows; lower = more files on screen. The default matches the Windows 11 right-click menu.
+    - fontSizePercent: 44
       $name: List text size (% of row height)
-      $description: Text size in List and Details views. Ctrl+wheel also changes size.
+      $description: Text size in List and Details views. Ctrl+wheel also changes size. The default matches the Windows 11 right-click menu text (about 14 px).
     - gridFontSizePercent: 42
       $name: Grid text size (% of row height)
       $description: Text size in icon grids and drive tiles. Ctrl+wheel also changes size.
@@ -575,7 +575,7 @@ constexpr unsigned kColumnWiggleWindowDoubleClickIntervals = 4;
 
 std::atomic<bool> g_unloading{false};
 std::atomic<int> g_row96{32};
-std::atomic<int> g_fontPercent{52}; // List/Details; keep the existing settings key.
+std::atomic<int> g_fontPercent{44}; // List/Details; keep the existing settings key.
 std::atomic<int> g_gridFontPercent{42};
 std::atomic<bool> g_autoRefitColumns{true};
 std::atomic<bool> g_preSort{true};
@@ -995,6 +995,8 @@ struct CapturedRow {
     float oldWidth = 0.f;
     float oldOpacity = 1.f;
     float selectedNameWidth = -1.f; // existing painted-width cache, no measurement
+    bool shaped = false; // Icon/name rectangles below were captured for a layout morph.
+    D2D1_RECT_F oldIcon{}, oldText{};
 };
 
 // All row movement is visual; hit testing, selection, indices and scrollbars
@@ -1007,12 +1009,16 @@ struct RowMotion {
     float oldWidth = 0.f;
     bool entering = false;
     float oldOpacity = 1.f;
+    bool shaped = false; // A list/grid morph moves the icon and name themselves.
+    D2D1_RECT_F oldIcon{}, oldText{};
 };
 
 struct RowVisual {
     float top = 0.f, height = 0.f, opacity = 1.f;
     float left = 0.f; // Logical document X; zero for single-column layouts.
     float width = 0.f; // Zero uses the current single-column/item width.
+    float morph = 1.f; // Below 1, icon and name still travel from the rectangles below.
+    D2D1_RECT_F fromIcon{}, fromText{};
 };
 
 // DirectWrite layouts are device-independent. Keep shaping and trimming state
@@ -1221,6 +1227,18 @@ struct ShellClickPolicy {
     bool checkSelect = false;
     bool itemTips = true; // Folder Options: "Show pop-up description for folder and desktop items".
 };
+// Explorer's View > Compact view. Native compact Details rows measured
+// 27 px against 37 px (125% scale, Windows 11), with unchanged text. List
+// rows take that fraction of the current zoom, so Ctrl+wheel and the user's
+// row height keep working; grids, tiles and Content are unaffected, as in
+// Explorer.
+constexpr float kCompactRowFraction = 27.f / 37.f;
+bool ReadCompactMode() {
+    DWORD compact = 0, bytes = sizeof(compact);
+    return SHRegGetUSValueW(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+        L"UseCompactMode", nullptr, &compact, &bytes, FALSE, nullptr, 0) == ERROR_SUCCESS &&
+        bytes == sizeof(compact) && compact != 0;
+}
 ShellClickPolicy ReadShellClickPolicy() {
     SHELLSTATE settings{}; settings.fDoubleClickInWebView = -1;
     SHGetSetSettings(&settings,SSF_DOUBLECLICKINWEBVIEW | SSF_AUTOCHECKSELECT | SSF_SHOWINFOTIP,FALSE);
@@ -3403,6 +3421,7 @@ struct ViewState {
     SharedPidl directoryFolderIdentity; // Captured once per binding, never per refresh/hover.
     std::wstring folderPath;
     ShellVisibilityPolicy visibility;
+    bool compactRows = false; // Explorer's View > Compact view, for list rows.
     bool visibilitySignalQueued = false;
     bool visibilitySelectionSyncPending = false;
     // A GPU-only speculative destination while Explorer builds the next
@@ -3633,6 +3652,9 @@ struct ViewState {
     // from checkboxRevealFrom toward clickPolicy.checkSelect. The header box
     // keeps its last state while leaving.
     LARGE_INTEGER checkboxRevealStarted{};
+    // The header sort chevron flips through flat when one column reverses.
+    LARGE_INTEGER sortChevronFlipStarted{}; float sortChevronFlipFrom = -1.f;
+    PROPERTYKEY sortChevronKey{}; int sortChevronDirection = 0;
     float checkboxRevealFrom = 0.f;
     int checkboxRevealHeaderState = -1;
     PointingDevice pointingDevice = PointingDevice::Mouse;
@@ -3992,6 +4014,7 @@ struct ViewState {
     float zoomAnchorRow = 0.f; // Fractional document row at the viewport center.
     LARGE_INTEGER zoomStartedQpc{};
     float zoomFromContent = 0.f; // Content-line reveal presented when the zoom began.
+    float zoomFromCompact = 0.f; // Compact-row reveal presented when the zoom began.
     float smoothStart = 0.f;
     float smoothDelta = 0.f;
     LARGE_INTEGER smoothStartedQpc{};
@@ -4295,11 +4318,11 @@ struct SwipeFeedbackSnapshot {
     X(hoverFromLeft) X(hoverFromRight) X(hoverToLeft) X(hoverToRight) X(hoverFromStrength) X(hoverToStrength) \
     X(hoverFromHeight) X(hoverToHeight) \
     X(hoverLabelRow) X(hoverStartedQpc) X(marqueeFading) X(marqueeEndTick) X(verticalScrollbarHot) X(horizontalScrollbarHot) \
-    X(hovered) X(clickPolicy) X(checkboxRevealStarted) X(checkboxRevealFrom) X(checkboxRevealHeaderState)X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
+    X(hovered) X(clickPolicy) X(checkboxRevealStarted) X(sortChevronFlipStarted) X(sortChevronFlipFrom) X(checkboxRevealFrom) X(checkboxRevealHeaderState)X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
-    X(rowHeight96) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
+    X(rowHeight96) X(compactRows) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
     X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
-    X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(horizontalAnimating) \
+    X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(zoomFromCompact) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
     X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
     X(nativeTextColor) X(nativeHeaderTextColor) X(cachedNativeMode) X(folderPath) X(selectedFlags) \
@@ -4603,6 +4626,7 @@ int ItemLineCount(const ViewState& state, int count) {
 }
 float SelectionCheckboxSpace(const ViewState& state, bool settled = false);
 bool SelectionCheckboxRevealMoving(const ViewState& state);
+bool SortChevronFlipping(const ViewState& state);
 void LayoutGroupSections(ViewState& state) {
     state.itemsPerRow = 1;
     if (state.gridView) {
@@ -4850,6 +4874,20 @@ float ContentReveal(const ViewState& state) {
     return state.zoomFromContent +
         (to - state.zoomFromContent) * EaseOutCubic(UiTransitionProgress(state, state.zoomStartedQpc));
 }
+// How compact the presented list rows are: 1 in Compact view, 0 otherwise,
+// and in between while the zoom that toggles it runs.
+float CompactReveal(const ViewState& state) {
+    const float to = state.compactRows && !state.gridView ? 1.f : 0.f;
+    if (!state.zoomAnimating) return to;
+    return state.zoomFromCompact +
+        (to - state.zoomFromCompact) * EaseOutCubic(UiTransitionProgress(state, state.zoomStartedQpc));
+}
+// The gap a list row leaves above and below its highlight. Compact rows drop
+// it, as they drop their padding; grid cells keep it between items.
+float RowInset(const ViewState& state) {
+    const float inset = static_cast<float>(Scale96(2, ViewDpi(state)));
+    return state.gridView ? inset : inset * (1.f - CompactReveal(state));
+}
 
 bool AdvanceGroupAnimation(ViewState& state, LARGE_INTEGER sampled = {}) {
     if (!state.groupAnimating) return false;
@@ -5036,6 +5074,8 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
         (state.columnPresentationPending && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.sectionBadgeAnimating && state.visible && state.inScope && state.detailsViewActive &&
+            PresentationVisible(state) && !PresentationMinimized(state)) ||
+        (SortChevronFlipping(state) && state.columnsView && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (SelectionCheckboxRevealMoving(state) && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
@@ -12149,7 +12189,9 @@ void UnbindNativeViewInput(HWND native, HWND overlay) {
     if (GetPropW(native, kOverlayProperty) == overlay) RemovePropW(native, kOverlayProperty);
 }
 
+void ReconcileCompactRows(ViewState& state);
 void ReconcileShellVisibility(ViewState& state) {
+    ReconcileCompactRows(state);
     const ShellVisibilityPolicy current = ReadShellVisibilityPolicy();
     if (current == state.visibility) return;
     state.visibility = current;
@@ -13453,13 +13495,16 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // Content rows follow the same rule with their two lines, from the list
     // zoom's font, so Ctrl+wheel grows the icon and text together.
     const float contentText = ContentTextHeight(font, dpi);
+    // Compact list rows drop padding, not text: the font keeps the full row.
+    const float listRow = state.compactRows && !ContentLayout(state) ?
+        (direct ? baseRow * kCompactRowFraction : std::round(baseRow * kCompactRowFraction)) : baseRow;
     const float icon = TileLayout(state) ? (direct ? tileText : std::round(tileText)) :
         ContentLayout(state) ? (direct ? contentText : std::round(contentText)) :
         state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
-        static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), baseRow - Scale96(6, dpi)));
+        static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), listRow - Scale96(6, dpi)));
     const float row = ContentLayout(state) ? std::max(static_cast<float>(icon), contentText) + Scale96(12, dpi) :
-        !state.gridView ? static_cast<float>(baseRow) :
+        !state.gridView ? listRow :
         TileLayout(state) ? std::max(static_cast<float>(icon), tileText) + Scale96(12, dpi) :
         state.cachedNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
@@ -13606,7 +13651,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     const float side = IconPixelSize(state);
     const float start = ListStartX(state), end = ListEndX(state);
     ItemGeometry g;
-    const float inset = static_cast<float>(Scale96(2, dpi)); // Between rows and grid items.
+    const float inset = RowInset(state); // Between rows and grid items.
     g.cell = D2D1::RectF(start, visual.top + inset, end, visual.top + visual.height - inset);
     if (state.gridView) {
         const float pad = static_cast<float>(Scale96(6, dpi));
@@ -13677,12 +13722,26 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
                 g.aside[i] = D2D1::RectF(split, top + i * (line + gap), std::max(split, end), top + i * (line + gap) + line);
         }
     }
+    if (visual.morph < 1.f) {
+        // A list/grid switch moves the presented icon and name to their new
+        // places, so each item visibly becomes its new row or cell.
+        const auto blend = [t = visual.morph](D2D1_RECT_F from, D2D1_RECT_F to) {
+            return D2D1::RectF(from.left + (to.left - from.left) * t, from.top + (to.top - from.top) * t,
+                from.right + (to.right - from.right) * t, from.bottom + (to.bottom - from.bottom) * t);
+        };
+        g.icon = blend(visual.fromIcon, g.icon);
+        g.text = blend(visual.fromText, g.text);
+    }
     if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
         // Boxes slide with the band they lead, like the section badges.
         const float slide = SelectionCheckboxBand(state)*(1.f-reveal);
         const float inset = state.gridView ? std::min(float(Scale96(6,dpi)),std::max(0.f,g.cell.right-g.cell.left)*.125f) : 0.f;
         const float available = state.gridView ? std::max(0.f,(g.cell.right-g.cell.left)*.5f-inset) : SelectionCheckboxSize(state);
-        const float size = std::min({SelectionCheckboxSize(state),std::max(0.f,state.rowPx-Scale96(4,dpi)),available});
+        // A list box keeps its proportion to the row's highlight band (20 in 28
+        // at rest), so short rows shrink it instead of letting it overflow.
+        const float band = std::max(0.f,(state.gridView ? state.rowPx-Scale96(4,dpi) : state.rowPx-2.f*RowInset(state)));
+        const float size = std::min({SelectionCheckboxSize(state),
+            state.gridView ? band : band*SelectionCheckboxSize(state)/SelectionCheckboxBand(state),available});
         const float left = (state.gridView ? g.cell.left + inset :
             (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi)) - slide;
         const float top = state.gridView && !TileLayout(state) && state.cachedNativeMode != FVM_SMALLICON ?
@@ -14031,6 +14090,8 @@ void StartGroupingTransition(ViewState& state,
             motion.oldLeft = old->oldLeft;
             motion.oldWidth = old->oldWidth;
             motion.oldOpacity = old->oldOpacity;
+            motion.shaped = old->shaped;
+            motion.oldIcon = old->oldIcon; motion.oldText = old->oldText;
         } else {
             // Newly exposed rows are not necessarily new files: they may
             // simply have moved in from beyond the old viewport. A modest
@@ -14126,17 +14187,28 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
     const float oldHeight = motion.entering ? 0.f : motion.oldHeight;
     const float opacity = state.groupingLayoutTransition ?
         height / std::max(1.f, row) : 1.f;
-    return {top, oldHeight + (height - oldHeight) * progress,
+    RowVisual visual{top, oldHeight + (height - oldHeight) * progress,
         motion.oldOpacity + (opacity - motion.oldOpacity) * progress,
         motion.oldLeft + (DocumentRowLeft(state, index)-motion.oldLeft) * progress,
         motion.oldWidth > 0.f ? motion.oldWidth + (state.itemWidth-motion.oldWidth)*progress : state.itemWidth};
+    if (motion.shaped && progress < 1.f) {
+        // The captured icon and name scroll with the document, like the row.
+        const float shift = fromTop - motion.oldTop;
+        const auto moved = [shift](D2D1_RECT_F r) { r.top += shift; r.bottom += shift; return r; };
+        visual.morph = progress;
+        visual.fromIcon = moved(motion.oldIcon); visual.fromText = moved(motion.oldText);
+    }
+    return visual;
 }
 
 // Samples the grid cells as currently presented, including in-flight motion,
 // so a retargeted layout always starts from the image on screen.
-std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state) {
+// A list/grid switch (shapes) also captures list rows, as wide as the list,
+// with each item's presented icon and name for the morph to start from.
+std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes = false) {
     std::vector<CapturedRow> captures;
-    if (!state.gridView || !g_smooth.load(std::memory_order_relaxed)) return captures;
+    if ((!state.gridView && !shapes) || !g_smooth.load(std::memory_order_relaxed)) return captures;
+    RECT client{}; ViewClientRect(state, &client);
     auto rows = VisibleItemRows(state, static_cast<float>(kRowTransitionOverscan));
     if (state.rowTransitionActive && state.groupingLayoutTransition)
         for (const auto& motion : state.rowMotion) rows.push_back(motion.newIndex);
@@ -14151,8 +14223,13 @@ std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state) {
         CapturedRow capture;
         capture.oldIndex = capture.newIndex = index;
         capture.oldTop = visual.top; capture.oldHeight = visual.height;
-        capture.oldLeft = visual.left; capture.oldWidth = visual.width;
         capture.oldOpacity = visual.opacity;
+        capture.oldLeft = state.gridView ? visual.left : 0.f;
+        capture.oldWidth = state.gridView ? visual.width : float(client.right - client.left);
+        if (shapes) {
+            const auto item = LayoutItem(state, visual);
+            capture.shaped = true; capture.oldIcon = item.icon; capture.oldText = item.text;
+        }
         captures.push_back(std::move(capture));
     }
     return captures;
@@ -17008,6 +17085,20 @@ void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColor
     static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawLine(SnapDrawPoint(state.target.Get(),a,phase),
         SnapDrawPoint(state.target.Get(),b,phase),brush,width);
 }
+// A chevron's two pixel-snapped strokes meet at one tip point, closed by a
+// disc of the stroke's width: a round join, so the tip is one continuous
+// corner instead of two square line ends with a notch between them.
+void StrokeChevron(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F tip,D2D1_POINT_2F b,
+                   ID2D1SolidColorBrush* brush,float width=1.f) {
+    if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
+    width=std::max(1.f,roundf(width));
+    const float phase=(static_cast<int>(width)&1) ? .5f : 0.f;
+    auto* target=static_cast<ID2D1RenderTarget*>(state.target.Get());
+    const auto corner=SnapDrawPoint(target,tip,phase);
+    target->DrawLine(SnapDrawPoint(target,a,phase),corner,brush,width);
+    target->DrawLine(corner,SnapDrawPoint(target,b,phase),brush,width);
+    target->FillEllipse(D2D1::Ellipse(corner,width*.5f,width*.5f),brush);
+}
 void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBrush* brush,float width=1.f) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
     rect.rect=SnapDrawRect(state.target.Get(),rect.rect);
@@ -17595,6 +17686,32 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
 }
 
+// The chevron's vertical extent relative to the current direction: -1 is the
+// previous direction, 0 flat and 1 at rest. Sampled at the paint's clock.
+float SortChevronFlip(const ViewState& state) {
+    if (!state.sortChevronFlipStarted.QuadPart) return 1.f;
+    return state.sortChevronFlipFrom + (1.f - state.sortChevronFlipFrom) *
+        EaseOutCubic(UiTransitionProgress(state, state.sortChevronFlipStarted,
+            kHoverAnimationDurationMs, state.itemOpacityNow));
+}
+bool SortChevronFlipping(const ViewState& state) {
+    return state.sortChevronFlipStarted.QuadPart &&
+        UiTransitionProgress(state, state.sortChevronFlipStarted, kHoverAnimationDurationMs) < 1.f;
+}
+// Flip when the sorted column keeps its key and reverses; a reversal during
+// a flip continues from the presented extent. A new column, or the first
+// sort, shows its chevron at rest.
+void TrackSortChevron(ViewState& state) {
+    const int direction = state.sort.explicitOrder ? (state.sort.direction == SORT_DESCENDING ? -1 : 1) : 0;
+    if (direction == state.sortChevronDirection && SameKey(state.sort.key, state.sortChevronKey)) return;
+    if (direction && state.sortChevronDirection == -direction && SameKey(state.sort.key, state.sortChevronKey)) {
+        state.sortChevronFlipFrom = -SortChevronFlip(state);
+        QueryPerformanceCounter(&state.sortChevronFlipStarted);
+        RegisterViewAnimation(state);
+    } else state.sortChevronFlipStarted = {};
+    state.sortChevronKey = state.sort.key; state.sortChevronDirection = direction;
+}
+
 // Draw a quiet, independent sort chevron at the physical trailing edge of
 // its logical column. It does not take space in the localized header title.
 void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
@@ -17607,15 +17724,14 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
         static_cast<float>(Scale96(kHeader96, dpi)) * .5f;
     // Match the expanded section chevron's 2:1 width/height, retaining the bold sort stroke.
     const float halfWidth = static_cast<float>(Scale96(4, dpi));
-    const float halfHeight = halfWidth*.5f;
+    // A reversal folds the chevron through flat about its own center.
+    const float halfHeight = halfWidth*.5f*SortChevronFlip(state);
     const float wingY = cy + (descending ? -halfHeight : halfHeight);
     const float tipY = cy + (descending ? halfHeight : -halfHeight);
     const float thickness = std::max(1.f, Scale96(1, dpi) * 1.5f);
     state.brush->SetColor(Packed(color, opacity));
-    StrokeLine(state,D2D1::Point2F(cx-halfWidth, wingY),
-                           D2D1::Point2F(cx, tipY), state.brush.Get(), thickness);
-    StrokeLine(state,D2D1::Point2F(cx, tipY),
-                           D2D1::Point2F(cx+halfWidth, wingY), state.brush.Get(), thickness);
+    StrokeChevron(state,D2D1::Point2F(cx-halfWidth, wingY),D2D1::Point2F(cx, tipY),
+        D2D1::Point2F(cx+halfWidth, wingY),state.brush.Get(),thickness);
 }
 
 // Cheap GPU upload from an already decoded CPU buffer. Only called from
@@ -18806,7 +18922,7 @@ float SelectionRadius(ViewState& state, float width, float height) {
 // The scrollbar is reserved in both modes. Text/icons remain inside the
 // inset list viewport regardless of the corner-radius setting.
 D2D1_RECT_F RowHighlightRect(ViewState& state, float top, float rowHeight) {
-    const float inset = static_cast<float>(Scale96(2, ViewDpi(state)));
+    const float inset = RowInset(state);
     return D2D1::RectF(RowBackgroundStartX(state), top + inset,
                        RowBackgroundEndX(state), top + rowHeight - inset);
 }
@@ -19424,8 +19540,7 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
             centerY+unit*(x*sine+y*cosine));
     };
     const auto start=rotate(-.5f,-1.f), tip=rotate(.5f,0.f), end=rotate(-.5f,1.f);
-    StrokeLine(state,start,tip,state.brush.Get(),thickness);
-    StrokeLine(state,tip,end,state.brush.Get(),thickness);
+    StrokeChevron(state,start,tip,end,state.brush.Get(),thickness);
     auto text = GroupHeadingTextRect(state,top,height,listEnd);
     // The paint's single clock sample, shared with item opacity motion.
     const auto badge = LayoutGroupBadge(state,section,text,state.itemOpacityNow);
@@ -21281,6 +21396,7 @@ bool RenderSwipeFeedback(ViewState& state) {
 }
 
 void Paint(ViewState& state) {
+    if(!state.presentationOnly) TrackSortChevron(state);
     if(state.presenter && !state.presentationOnly) { SubmitPresentation(state); return; }
     // A cold navigation has no replacement names yet. Keep the accepted image;
     // confirmed empty folders (loaded=true) still replace it immediately.
@@ -21873,7 +21989,13 @@ void Paint(ViewState& state) {
         paintedItems.push_back({i,v,geometry,usage,contentOpacity});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
-        DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
+        if (v.morph < 1.f) {
+            // A morphing icon is drawn at its travelling size.
+            const float side = state.iconPx;
+            state.iconPx = geometry.icon.right - geometry.icon.left;
+            DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
+            state.iconPx = side;
+        } else DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
         const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
         const float checkboxReveal = SelectionCheckboxReveal(state);
         if (checkboxReveal > 0.f && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
@@ -27091,17 +27213,33 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         state.detailsViewActive && state.visible && state.inScope && state.loaded &&
         !state.optimisticStartedAt && !state.pendingNavigationPaint &&
         g_smooth.load(std::memory_order_relaxed);
+    std::vector<CapturedRow> morphCells; std::vector<CapturedGroupHeader> morphHeadings; float morphRow=0.f;
     if (zoom) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
         const float reveal=ContentReveal(state);
+        const float compactReveal=CompactReveal(state);
         state.layoutNativeMode=mode; state.layoutIconSize=state.nativeIconSize;
         BeginAnimatedZoom(state,-1);
         state.zoomFromContent=reveal;
+        state.zoomFromCompact=compactReveal;
         if (!grid) QueueVisibleDataFrame(state);
         Redraw(state);
     } else if (changed) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
         const float header=state.headerPx;
+        // Between list rows and grid cells, every presented item moves from
+        // its captured rectangle to its new one on the shared row clock.
+        const bool morph=reflow && animate && state.gridView!=grid &&
+            state.detailsViewActive && state.visible && state.inScope && state.loaded &&
+            !state.optimisticStartedAt && !state.pendingNavigationPaint;
+        auto cells=morph ? CapturePresentedGridCells(state,true) : std::vector<CapturedRow>{};
+        auto headings=cells.empty() ? std::vector<CapturedGroupHeader>{} : CaptureVisibleGroupHeaders(state);
+        const float oldRow=state.rowPx;
+        // The first item fully inside the old viewport keeps its screen top.
+        const auto anchor=std::find_if(cells.begin(),cells.end(),
+            [&](const CapturedRow& cell) { return cell.oldTop>=state.headerPx; });
+        const int anchorIndex=anchor!=cells.end() ? anchor->newIndex : -1;
+        const float anchorTop=anchor!=cells.end() ? anchor->oldTop : 0.f;
         StopHoverAnimation(state); StopRowTransition(state); StopKeyboardSelectionAnimation(state);
         AdvanceRowHeight(state,true); StopScrollAnimation(state);
         const float font=state.fontPx;
@@ -27116,13 +27254,20 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
             if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
         }
         if (state.columnsView!=columns) state.headerPx=header;
-        UpdateColumns(state); ClampScroll(state); QueueVisibleDataFrame(state);
+        UpdateColumns(state);
+        if (anchorIndex>=0)
+            state.scrollNow=state.scrollTarget=DocumentRowTop(state,anchorIndex)-(anchorTop-state.headerPx);
+        ClampScroll(state);
+        morphCells=std::move(cells); morphHeadings=std::move(headings); morphRow=oldRow;
+        QueueVisibleDataFrame(state);
     }
     if (state.columnsView!=columns) {
         if (!columns) CancelAutoRefit(state);
         state.columnFitPendingEpoch=0; CancelColumnDrag(state);
         SetColumnViewMode(state,columns,animate && supported && state.detailsViewActive && state.graphicsReady);
     }
+    // After the column change: entering or leaving Details stops row motion.
+    if (!morphCells.empty()) StartGroupingTransition(state,std::move(morphCells),std::move(morphHeadings),morphRow,false,true);
     state.detailsViewActive=supported;
     if (enteringColumns) ArmAutoRefit(state);
     if (changed) TraceUiState(state,L"ui.layout.after[layout,native,header,selected]");
@@ -27583,6 +27728,7 @@ void BeginAnimatedZoom(ViewState& state, int height96) {
     // arriving between paints. Repeated zoom must start at the current image.
     if (state.gridView) AdvanceRowHeight(state);
     state.zoomFromContent = ContentReveal(state);
+    state.zoomFromCompact = CompactReveal(state);
     if (!state.zoomAnimating)
         state.zoomAnchorRow = (state.scrollNow + ViewHeight(state) * .5f) /
             std::max(1.f, state.rowPx) * (state.gridView ? state.itemsPerRow : 1);
@@ -27625,6 +27771,25 @@ void BeginAnimatedZoom(ViewState& state, int height96) {
         RegisterViewAnimation(state);
     else
         AdvanceRowHeight(state, true);
+}
+
+// Compact view changes list rows like Ctrl+wheel: the presented rows zoom to
+// the new height on the shared clock; grids and Content do not change.
+void ReconcileCompactRows(ViewState& state) {
+    const bool compact = ReadCompactMode();
+    if (compact == state.compactRows) return;
+    const float presented = CompactReveal(state);
+    state.compactRows = compact;
+    if (!state.gridView && state.visible && state.inScope && state.detailsViewActive && state.loaded &&
+        !state.startupAnimationsSuppressed && g_smooth.load(std::memory_order_relaxed)) {
+        RenameZoomUpdate renameZoom(state);
+        BeginAnimatedZoom(state, -1);
+        state.zoomFromCompact = presented; // The flag changed before the zoom sampled it.
+    } else {
+        UpdateMetrics(state); ClampScroll(state); RepositionRenameEdit(state);
+    }
+    QueueVisibleDataFrame(state);
+    Redraw(state);
 }
 
 // Keep the deliberate history gesture reachable on narrow/high-DPI tabs.
@@ -33165,6 +33330,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 const float reveal=SelectionCheckboxReveal(*s);
                 const int headerState=checkSelect ? HeaderSelectionCheckboxState(*s) : s->checkboxRevealHeaderState;
                 s->clickPolicy = ReadShellClickPolicy();
+                ReconcileCompactRows(*s);
                 if (s->checkboxPress!=-1 && GetCapture()==hwnd) ReleaseCapture();
                 ResetMouseClickSequence(*s);
                 if (checkSelect!=s->clickPolicy.checkSelect) {
@@ -35988,6 +36154,7 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.directoryFolderIdentity = cachedPreviewOnly ? destinationIdentity : SharedPidl{};
     RetireCachedEntries(state, state.namespaceIdentities);
     state.visibility = ReadShellVisibilityPolicy();
+    state.compactRows = ReadCompactMode();
     state.clickPolicy = ReadShellClickPolicy();
     state.checkboxRevealStarted = {};
     state.visibilitySelectionSyncPending = false;
@@ -37274,6 +37441,7 @@ void PrepareInitialOverlay(ViewState& state) {
         return;
     }
     state.visibility = ReadShellVisibilityPolicy();
+    state.compactRows = ReadCompactMode();
     state.clickPolicy = ReadShellClickPolicy();
     state.checkboxRevealStarted = {};
     UpdateMetrics(state);

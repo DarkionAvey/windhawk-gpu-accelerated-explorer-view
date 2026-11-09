@@ -35,7 +35,7 @@ static void TestOptionConsumers(Set set) {
         }
         state.presentationOnly=false; state.rowHeight96[true]=0;
         ApplyViewLayout(state,{FVM_DETAILS,48},false);
-        set(L"Appearance.rowHeight",L"32"); set(L"Appearance.fontSizePercent",L"52");
+        set(L"Appearance.rowHeight",L"32"); set(L"Appearance.fontSizePercent",L"44");
         set(L"Appearance.gridFontSizePercent",L"42"); UpdateMetrics(state);
         set(L"Appearance.fontFamily",L"Segoe UI"); Check(MakeTextFormats(state),"configured font formats");
         for(auto* format:{state.textFormat.Get(),state.headerFormat.Get(),state.sortedHeaderFormat.Get()}) {
@@ -115,7 +115,7 @@ struct Integer {
 };
 inline const Integer integers[]={
     {L"Appearance.rowHeight",32,24,96,&g_row96},
-    {L"Appearance.fontSizePercent",52,20,80,&g_fontPercent},
+    {L"Appearance.fontSizePercent",44,20,80,&g_fontPercent},
     {L"Appearance.gridFontSizePercent",42,20,80,&g_gridFontPercent},
     {L"Appearance.secondaryTextOpacity",45,0,100,&g_secondaryOpacity},
     {L"Appearance.zebraOpacity",4,0,100,&g_zebraOpacity},

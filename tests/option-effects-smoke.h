@@ -563,7 +563,7 @@ static void TestZoomInputs(const std::wstring& fixture) {
             Regression::Scope step("Ctrl+wheel "+std::to_string(notches));
             wheel(notches); row96=std::clamp(row96+2*notches,24,96);
             Check(std::abs(state.rowPx-float(Scale96(row96,dpi)))<.01f,"Ctrl+wheel did not change row height by two pixels per notch within limits");
-            CheckFont(canvas,ListFont(row96,52,dpi),L"H","Ctrl+wheel did not keep the list text size ratio");
+            CheckFont(canvas,ListFont(row96,44,dpi),L"H","Ctrl+wheel did not keep the list text size ratio");
             CheckFilenameHighlight(canvas,L"Wide WWWW name.txt","Ctrl+wheel");
         }
         for(float scale:{1.5f,.5f}) {
@@ -580,7 +580,7 @@ static void TestZoomInputs(const std::wstring& fixture) {
         Check(std::abs(state.rowPx-float(Scale96(32,dpi)))<.01f,"settings change kept the old zoom");
         CheckFont(canvas,ListFont(32,60,dpi),L"H","settings change after zoom did not apply the new text size");
         CheckRowPitch(canvas,32);
-        canvas.Apply(settings,L"Appearance.fontSizePercent",L"52");
+        canvas.Apply(settings,L"Appearance.fontSizePercent",L"44");
         // Grid zoom scales icons proportionally and caps caption text.
         canvas.Layout(FVM_ICON,48);
         const float icon=state.iconPx;

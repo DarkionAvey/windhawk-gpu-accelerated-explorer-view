@@ -11,6 +11,7 @@
 #include "icon-fixture.h"
 #include "pointer-fixture.h"
 #include "focus-fixture.h"
+#include "explorer-settings-fixture.h"
 #include "frame-input-fixture.h"
 #include "audit-fixture.h"
 #include "locale-fixture.h"
