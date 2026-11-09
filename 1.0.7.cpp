@@ -1433,6 +1433,10 @@ struct IconPixels {
     // The badge occupies a separate atlas band, never the provider's pixels.
     // Zero dimensions retain the ordinary icon path, including fallbacks.
     UINT thumbnailWidth = 0, thumbnailHeight = 0, badgeSize = 0;
+    // The thumbnail fills its rectangle to the edge (photos, video frames),
+    // so a rectangular shadow follows its outline. Shaped previews with
+    // transparent margins (fonts, documents) draw no rectangular shadow.
+    bool thumbnailOpaque = false;
     // Visible fraction of a Shell overlay's full canvas, measured on its worker.
     float overlayExtent = 1.f;
     bool Ready() const {
@@ -3141,9 +3145,9 @@ struct ItemTip {
     ComPtr<ID2D1DCRenderTarget> target;
     ComPtr<IDWriteTextFormat> nameFormat, labelFormat, valueFormat;
     // Font measurements, redone only when the DPI, configured face, reading
-    // direction, text-size setting or theme changes. Line-box space above the tallest letters and
+    // direction, view text size or theme changes. Line-box space above the tallest letters and
     // below the deepest descenders, in whole pixels.
-    int metricsDpi = 0; unsigned long long metricsFace = 0; DWORD metricsTextScale = 0;
+    int metricsDpi = 0; unsigned long long metricsFace = 0; float metricsViewEm = 0.f;
     float nameAbove = 0.f, nameBelow = 0.f, rowAbove = 0.f, rowBelow = 0.f;
     bool formatRtl = false;
     ComPtr<IDWriteTextLayout> nameLayout;
@@ -7276,10 +7280,22 @@ ThumbnailStyle LoadThumbnailStyle(IWICImagingFactory* factory,
     return style;
 }
 
+// Whether the image reaches its rectangle's edge: nearly every perimeter pixel
+// is opaque. One pass over the border on the decode worker, never per paint.
+bool ThumbnailEdgeOpaque(const IconPixels& pixels) {
+    if (!pixels.Ready() || pixels.width < 2 || pixels.height < 2) return false;
+    size_t clear = 0, total = 0;
+    const auto alpha = [&](UINT x, UINT y) { return pixels.data.data()[size_t(y)*pixels.stride + size_t(x)*4 + 3]; };
+    for (UINT x = 0; x < pixels.width; ++x) { clear += (alpha(x,0) < 250) + (alpha(x,pixels.height-1) < 250); total += 2; }
+    for (UINT y = 1; y + 1 < pixels.height; ++y) { clear += (alpha(0,y) < 250) + (alpha(pixels.width-1,y) < 250); total += 2; }
+    return clear * 50 <= total; // Antialiased corners of a rectangle stay well under 2%.
+}
+
 IconPixels DecorateThumbnail(IconPixels&& source, const ThumbnailStyle& style,
                             UINT textureLimit = kPlatformImageDimension, size_t byteLimit = SIZE_MAX) {
     if (!source.Ready()) return {};
     source.thumbnailWidth=source.width; source.thumbnailHeight=source.height; source.badgeSize=0;
+    source.thumbnailOpaque=ThumbnailEdgeOpaque(source);
     // Rasterize the film rails once on the worker. Both rails belong to the
     // thumbnail rectangle, so one rounded fill clips the complete frame.
     const UINT rail = style.filmstrip ? std::max(3u, std::max(source.width,source.height)/20) : 0;
@@ -7299,6 +7315,7 @@ IconPixels DecorateThumbnail(IconPixels&& source, const ThumbnailStyle& style,
         atlas.height += badge ? badge+2 : 0;
     } else {
         atlas.thumbnailWidth = source.width + 2*rail;
+        atlas.thumbnailOpaque = source.thumbnailOpaque; // Rails are opaque too.
         atlas.thumbnailHeight = source.height;
         atlas.width = std::max(atlas.thumbnailWidth,badge);
         atlas.height = source.height + (badge ? badge+2 : 0);
@@ -18355,10 +18372,16 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // Three small translucent fills approximate a soft shadow. No blur
         // effect, offscreen surface, extra texture or per-item geometry exists.
         // Whole-pixel spreads keep each band's straight edges on the grid.
-        const float drop = roundf(2*dpi);
-        for (int spread=3; spread>=1; --spread) {
-            const float out = std::max(1.f,roundf(spread*dpi));
-            state.brush->SetColor(D2D1::ColorF(0.f,0.f,0.f,opacity*.055f));
+        // The shadow keeps its proportion to the image: full at a 48-DIP
+        // short side, smaller (and fainter) below, so small or wide images
+        // are not swamped. Shaped previews with transparent margins have no
+        // rectangle to shadow.
+        const float unit = dpi * std::min(1.f, std::min(width, height) / (48.f * dpi));
+        const float drop = roundf(2*unit);
+        if (artwork.thumbnailOpaque) for (int spread=3; spread>=1; --spread) {
+            const float out = roundf(spread*unit);
+            if (out < 1.f) continue;
+            state.brush->SetColor(D2D1::ColorF(0.f,0.f,0.f,opacity*.055f*std::min(1.f,unit/dpi*2.f)));
             state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(
                 rect.left-out,rect.top-out+drop,rect.right+out,rect.bottom+out+drop),
                 radius+out,radius+out),state.brush.Get());
@@ -20656,7 +20679,7 @@ bool RenderedDragInk(ID2D1Factory* factory,IDWriteTextLayout* layout,COLORREF fo
         release{dc,dib,dib ? SelectObject(dc,dib) : nullptr};
     if(!bits) return false;
     const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f); // Pixel units.
     ComPtr<ID2D1DCRenderTarget> software; ComPtr<ID2D1DeviceContext> context; ComPtr<ID2D1SolidColorBrush> brush;
     const RECT bounds{0,0,side,side};
     if(FAILED(factory->CreateDCRenderTarget(&properties,&software)) || FAILED(software->BindDC(dc,&bounds)) ||
@@ -29183,20 +29206,17 @@ bool FontInkExtent(IDWriteTextFormat* format, float& above, float& below) {
 }
 
 // Fonts, ink extents and spacing for the tooltip. Measured only when the DPI,
-// the configured font, reading direction, text size or system theme changes;
-// never per show. The size and face follow Gallery's tooltips; the face is the configured
+// the configured font, reading direction, view text size or system theme changes;
+// never per show. The size is the view's text size (floored at the native tooltip font); the face is the configured
 // font when one is set (as the view resolved it), else the XAML face.
 bool PrepareItemTipFont(ViewState& state, HWND window) {
     auto& tip = state.itemTip;
     const int dpi = DpiOf(window);
-    // Accessibility > Text size, the percentage UISettings.TextScaleFactor
-    // reports; a cheap read, so a changed setting applies on the next show.
-    DWORD textScale = 100, bytes = sizeof(textScale);
-    if (SHRegGetUSValueW(L"Software\\Microsoft\\Accessibility", L"TextScaleFactor", nullptr, &textScale, &bytes,
-            FALSE, nullptr, 0) != ERROR_SUCCESS || bytes != sizeof(textScale) || textScale < 100 || textScale > 225)
-        textScale = 100;
+    // The view's current text size, as the user set and zoomed it, at this
+    // window's DPI. The native tooltip font below is its legibility floor.
+    const float viewEm = state.fontPx * float(dpi) / float(std::max(1, ViewDpi(state)));
     if (tip.nameFormat && tip.metricsDpi == dpi && tip.metricsFace == state.textFaceSerial &&
-        tip.formatRtl == state.rtlLayout && tip.metricsTextScale == textScale) return true;
+        tip.formatRtl == state.rtlLayout && tip.metricsViewEm == viewEm) return true;
     if (!g_writeFactory || ((!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat)) return false;
     LOGFONTW font{};
     HTHEME theme = OpenItemTipTheme(state, window);
@@ -29222,10 +29242,12 @@ bool PrepareItemTipFont(ViewState& state, HWND window) {
         }
     }
     if (em <= 0.f) return false;
-    // Gallery's XAML tooltips (probed with UI Automation) use 14 px control
-    // text in Segoe UI Variable, scaled by Accessibility > Text size; the
-    // classic tooltip font above remains the fallback face.
-    em = 14.f * float(dpi) / 96.f * float(textScale) / 100.f;
+    // Tooltip text matches the view's text, between the native tooltip font
+    // and twice it. The face is the configured font, else the XAML face of
+    // Gallery's tooltips (Segoe UI Variable), else the native tooltip face.
+    // Pinch zoom can grow grid captions to photo-viewing sizes; a tooltip
+    // stops at twice the native tooltip font so it stays a tooltip.
+    em = std::clamp(viewEm, em, 2.f * em);
     // The configured font, exactly as the view resolved it (including fonts
     // loaded from a file); otherwise the XAML text face where installed.
     const bool configured = !ConfiguredFontFamily().empty();
@@ -29276,7 +29298,7 @@ bool PrepareItemTipFont(ViewState& state, HWND window) {
     // One spacing unit, measured ink to ink: every edge, the name to the
     // details, and property names to their values.
     tip.padX = tip.padY = float(Scale96(8, dpi));
-    tip.metricsDpi = dpi; tip.metricsFace = state.textFaceSerial; tip.formatRtl = state.rtlLayout; tip.metricsTextScale = textScale;
+    tip.metricsDpi = dpi; tip.metricsFace = state.textFaceSerial; tip.formatRtl = state.rtlLayout; tip.metricsViewEm = viewEm;
     return true;
 }
 
@@ -29494,7 +29516,8 @@ void RenderItemTip(ItemTip& tip) {
     if (!tip.factory) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, tip.factory.GetAddressOf());
     if (!tip.target && tip.factory) {
         const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.f, 96.f); // Pixels: layouts are measured at the window's DPI, not the process's.
         tip.factory->CreateDCRenderTarget(&properties, tip.target.GetAddressOf());
     }
     if (!tip.target) return;

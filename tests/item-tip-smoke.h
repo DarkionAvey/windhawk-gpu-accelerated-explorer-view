@@ -346,6 +346,10 @@ static void ItemTipScenario(const std::wstring& directory) {
         "item tip intercepts the pointer");
     UpdateWindow(tip.hwnd);
     Check(tip.target != nullptr, "item tip did not paint through Direct2D");
+    // Layouts are measured in the window's pixels; a process-DPI target would
+    // draw them enlarged and clip the body at its window edge.
+    float targetDpiX = 0.f, targetDpiY = 0.f; tip.target->GetDpi(&targetDpiX, &targetDpiY);
+    Check(targetDpiX == 96.f && targetDpiY == 96.f, "item tip draws in DIPs instead of the pixels it measured");
 
     // A provider may report a folder size, including a size supplied by another
     // mod. Do not assume folders must be blank. Cached empty cells are checked below.
@@ -437,27 +441,30 @@ static void ItemTipScenario(const std::wstring& directory) {
             tip.label != tip.foreground && tip.label != tip.background, "item tip differs from the native tooltip style");
     }
     {
-        // Gallery's XAML tooltip text: 14 DIP at this DPI, scaled by the
-        // Accessibility text size, in the XAML face where it is installed
-        // (else the visual style's tooltip face).
+        // Tooltip text is the view's current text size, from the native
+        // tooltip font up to twice it, in the XAML face where installed (else the visual
+        // style's tooltip face).
         HTHEME theme = OpenThemeData(tip.hwnd, L"Tooltip");
         LOGFONTW font{};
-        Check(theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font)), "native tooltip font");
+        Check(theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font)) && font.lfHeight < 0,
+            "native tooltip font");
         if (theme) CloseThemeData(theme);
         std::wstring expectedFamily = font.lfFaceName;
         ComPtr<IDWriteFontCollection> system; UINT32 index = 0; BOOL exists = FALSE;
         if (SUCCEEDED(g_writeFactory->GetSystemFontCollection(&system)) &&
             SUCCEEDED(system->FindFamilyName(L"Segoe UI Variable Text", &index, &exists)) && exists)
             expectedFamily = L"Segoe UI Variable Text";
-        struct Reset { ~Reset() { ExplorerSettingsFixture::textScale = 100; } } reset;
-        for (const DWORD scale : {100u, 150u}) {
-            ExplorerSettingsFixture::textScale = scale;
+        const float native = float(-font.lfHeight), viewFont = state.fontPx;
+        const float scale = float(DpiOf(tip.hwnd)) / float(ViewDpi(state));
+        struct Reset { ViewState& s; float f; ~Reset() { s.fontPx = f; } } reset{state, viewFont};
+        for (const float view : {native * 1.5f / scale, native * .5f / scale, native * 8.f / scale}) {
+            state.fontPx = view;
             Check(PrepareItemTipFont(state, tip.hwnd) && tip.valueFormat != nullptr, "item tip formats");
             std::wstring family(tip.valueFormat->GetFontFamilyNameLength() + 1, L'\0');
             Check(SUCCEEDED(tip.valueFormat->GetFontFamilyName(family.data(), UINT32(family.size()))) &&
                 _wcsicmp(family.c_str(), expectedFamily.c_str()) == 0 &&
-                std::fabs(tip.valueFormat->GetFontSize() - 14.f * float(DpiOf(tip.hwnd)) / 96.f * float(scale) / 100.f) < .01f,
-                "item tip text is not Gallery's font, size and text scale");
+                std::fabs(tip.valueFormat->GetFontSize() - std::clamp(view * scale, native, 2.f * native)) < .01f,
+                "item tip text is not the view's text size within one to two native tooltip fonts");
         }
     }
     RefreshItemTipPalette(state, true); ResolveItemTipPalette(state);

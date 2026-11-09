@@ -181,6 +181,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("content-layout", PARALLEL, TestContentLayout(fixture)),
     REGRESSION("compact-rows", PARALLEL, TestCompactRows(fixture)),
     REGRESSION("sort-chevron-flip", PARALLEL, TestSortChevronFlip(fixture)),
+    REGRESSION("thumbnail-shadow-shape", PARALLEL, TestThumbnailShadowShape(fixture)),
     REGRESSION("item-tips", PARALLEL, TestItemTips(fixture)),
     REGRESSION("item-tip-relative-dates", PARALLEL, TestItemTipRelativeDates()),
     REGRESSION("cloud-item-tip", PARALLEL, TestCloudItemTip(fixture)),

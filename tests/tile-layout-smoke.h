@@ -256,3 +256,27 @@ static void TestSortChevronFlip(const std::wstring&) {
     Check(!SortChevronFlipping(state) && SortChevronFlip(state) == 1.f, "sorting a new column animated its chevron");
     std::cout << "PASS: sort chevron flips through flat on reversal only, continues mid-flip and settles on the hover clock\n";
 }
+
+// Thumbnail shadows follow the image's outline: edge-to-edge images (photos,
+// filmstrip frames) are marked for a rectangular shadow; shaped previews with
+// transparent margins (fonts, documents) are not.
+static void TestThumbnailShadowShape(const std::wstring&) {
+    const auto image = [](UINT width, UINT height, UINT margin) {
+        IconPixels pixels; pixels.width = width; pixels.height = height; pixels.stride = width * 4;
+        pixels.data.resize(size_t(pixels.stride) * height);
+        for (UINT y = margin; y + margin < height; ++y)
+            for (UINT x = margin; x + margin < width; ++x) {
+                auto* p = pixels.data.data() + size_t(y) * pixels.stride + size_t(x) * 4;
+                p[0] = p[1] = p[2] = 128; p[3] = 255;
+            }
+        return pixels;
+    };
+    Check(DecorateThumbnail(image(96, 54, 0), ThumbnailStyle{}).thumbnailOpaque,
+        "an edge-to-edge image lost its rectangular shadow");
+    Check(!DecorateThumbnail(image(96, 96, 12), ThumbnailStyle{}).thumbnailOpaque,
+        "a shaped preview with transparent margins kept a rectangular shadow");
+    ThumbnailStyle film; film.filmstrip = true;
+    Check(DecorateThumbnail(image(96, 54, 0), film).thumbnailOpaque,
+        "a filmstrip frame lost its rectangular shadow");
+    std::cout << "PASS: thumbnail shadows only frame images that reach their rectangle's edge\n";
+}
