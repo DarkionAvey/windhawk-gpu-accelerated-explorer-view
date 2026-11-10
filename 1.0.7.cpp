@@ -4609,10 +4609,12 @@ bool IsGpuViewMode(UINT mode, bool thisPc = false) {
     return mode == FVM_DETAILS || mode == FVM_LIST || mode == FVM_CONTENT || IsIconViewMode(mode, thisPc);
 }
 bool TileLayout(const ViewState& state) {
-    return state.gridView && state.cachedNativeMode == FVM_TILE;
+    // Shell observation can already name the destination while we capture
+    // the outgoing layout. Geometry follows only the applied mode.
+    return state.gridView && state.layoutNativeMode == FVM_TILE;
 }
 bool ContentLayout(const ViewState& state) {
-    return !state.gridView && state.cachedNativeMode == FVM_CONTENT;
+    return !state.gridView && state.layoutNativeMode == FVM_CONTENT;
 }
 // This PC tiles show each drive's usage bar and free space as their details.
 bool DriveTiles(const ViewState& state) {
@@ -4623,7 +4625,7 @@ bool ViewOptionEnabled(const ViewState& state, const std::atomic<ViewOption>& op
     return value == ViewOption::AlwaysOn || (value == ViewOption::GridOnly && state.gridView);
 }
 bool FileThumbnails(const ViewState& state) {
-    return state.gridView ? state.cachedNativeMode != FVM_SMALLICON :
+    return state.gridView ? state.layoutNativeMode != FVM_SMALLICON :
         g_listThumbnails.load(std::memory_order_relaxed);
 }
 bool UsesThumbnails(const ViewState& state, const Entry& entry) {
@@ -4649,11 +4651,11 @@ void LayoutGroupSections(ViewState& state) {
         // integer column boundary partway through an otherwise smooth zoom.
         const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
         const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float checkboxSpace = (TileLayout(state) || state.cachedNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
+        const float checkboxSpace = (TileLayout(state) || state.layoutNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
         const float minimum = checkboxSpace + (TileLayout(state) ?
             std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
                 icon + font * 12.f + Scale96(24, dpi)) :
-            state.cachedNativeMode == FVM_SMALLICON ?
+            state.layoutNativeMode == FVM_SMALLICON ?
             std::max(Scale96(180, dpi) * font / std::max(1.f, static_cast<float>(Scale96(15, dpi))),
                 icon + font * 6.f) :
             std::max(static_cast<float>(Scale96(96, dpi)), icon + Scale96(32, dpi)));
@@ -13591,7 +13593,7 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // Display size is independent of the bounded Shell image request tiers.
     // Keep this arithmetic floating point: MulDiv/int casts would overflow
     // well before the tab's zoom preference reaches its storage limit.
-    const double iconSize = state.nativeIconSize * (direct ? size96 * dpi / 96. : std::round(size96 * dpi / 96.)) /
+    const double iconSize = state.layoutIconSize * (direct ? size96 * dpi / 96. : std::round(size96 * dpi / 96.)) /
         std::max(1, Scale96(g_row96.load(), dpi));
     // A tile's icon spans its text block, so both grow together with zoom
     // and DPI. Every tile reserves all its lines, so two-line items match
@@ -13611,7 +13613,7 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     const float row = ContentLayout(state) ? std::max(static_cast<float>(icon), contentText) + Scale96(12, dpi) :
         !state.gridView ? listRow :
         TileLayout(state) ? std::max(static_cast<float>(icon), tileText) + Scale96(12, dpi) :
-        state.cachedNativeMode == FVM_SMALLICON ?
+        state.layoutNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
             icon + font * 2.8f + Scale96(20, dpi);
     state.zoomToIconPx = static_cast<float>(icon);
@@ -13763,7 +13765,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         g.cell.left = start + visual.left + inset;
         g.cell.right = start + visual.left + (visual.width > 0.f ? visual.width : state.itemWidth) - inset;
         const bool tiles = TileLayout(state);
-        const bool compact = tiles || state.cachedNativeMode == FVM_SMALLICON;
+        const bool compact = tiles || state.layoutNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
         const float iconX = compact ? g.cell.left + pad + SelectionCheckboxSpace(state) :
             (g.cell.left + g.cell.right - side) * .5f;
@@ -13849,7 +13851,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
             state.gridView ? band : band*SelectionCheckboxSize(state)/SelectionCheckboxBand(state),available});
         const float left = (state.gridView ? g.cell.left + inset :
             (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi)) - slide;
-        const float top = state.gridView && !TileLayout(state) && state.cachedNativeMode != FVM_SMALLICON ?
+        const float top = state.gridView && !TileLayout(state) && state.layoutNativeMode != FVM_SMALLICON ?
             g.cell.top + Scale96(4,dpi) : visual.top + (state.rowPx-size)*.5f;
         g.checkbox = D2D1::RectF(left,top,left+size,top+size);
     }
@@ -14311,6 +14313,10 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
 // A list/grid switch (shapes) also captures list rows, as wide as the list,
 // with each item's presented icon and name for the morph to start from.
 std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes = false) {
+    // Retargeting zoom/resize must retain a travelling icon/name, even when
+    // the caller only requested cell geometry for an ordinary reflow.
+    shapes |= state.rowTransitionActive && std::any_of(state.rowMotion.begin(),state.rowMotion.end(),
+        [](const RowMotion& motion) { return motion.shaped; });
     std::vector<CapturedRow> captures;
     if ((!state.gridView && !shapes) || !g_smooth.load(std::memory_order_relaxed)) return captures;
     RECT client{}; ViewClientRect(state, &client);
@@ -27380,7 +27386,7 @@ void QueueInputFocusUpdate(HWND overlay, HWND viewControl) {
     if (!state->inputFocusMessageQueued) state->viewControlFocusReturn=nullptr;
 }
 
-void BeginAnimatedZoom(ViewState& state, int height96);
+void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested = nullptr);
 
 // One GPU layout transaction for cached navigation, initial native mode and
 // explicit user changes. It never interrogates the Shell or publishes rows.
@@ -27396,13 +27402,12 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     // layout that was actually applied.
     const auto lineSet=[](bool grid,UINT mode){ return grid && mode==FVM_TILE ? 1 : !grid && mode==FVM_CONTENT ? 2 : 0; };
     const int linesBefore=lineSet(state.gridView,state.layoutNativeMode);
-    if (grid) state.nativeIconSize=requested.iconSize;
     state.cachedNativeMode=mode;
     // Tile lines, Content lines and Details columns request different
     // properties. A row complete for one is not complete for another.
     if (linesBefore!=lineSet(grid,mode)) InvalidateDetailJobs(state);
     const bool changed=state.layoutNativeMode!=mode ||
-        (grid && state.layoutIconSize!=state.nativeIconSize) || state.gridView!=grid;
+        (grid && state.layoutIconSize!=requested.iconSize) || state.gridView!=grid;
     // Grid-to-grid icon size or mode changes, and list changes into or out of
     // Content's taller rows, zoom from the presented image exactly like
     // Ctrl+wheel, while packing and hit testing switch at once.
@@ -27414,12 +27419,7 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     std::vector<CapturedRow> morphCells; std::vector<CapturedGroupHeader> morphHeadings; float morphRow=0.f;
     if (zoom) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
-        const float reveal=ContentReveal(state);
-        const float compactReveal=CompactReveal(state);
-        state.layoutNativeMode=mode; state.layoutIconSize=state.nativeIconSize;
-        BeginAnimatedZoom(state,-1);
-        state.zoomFromContent=reveal;
-        state.zoomFromCompact=compactReveal;
+        BeginAnimatedZoom(state,-1,&requested);
         if (!grid) QueueVisibleDataFrame(state);
         Redraw(state);
     } else if (changed) {
@@ -27430,6 +27430,7 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         const bool morph=reflow && animate && state.gridView!=grid &&
             state.detailsViewActive && state.visible && state.inScope && state.loaded &&
             !state.optimisticStartedAt && !state.pendingNavigationPaint;
+        AdvanceRowHeight(state);
         auto cells=morph ? CapturePresentedGridCells(state,true) : std::vector<CapturedRow>{};
         auto headings=cells.empty() ? std::vector<CapturedGroupHeader>{} : CaptureVisibleGroupHeaders(state);
         const float oldRow=state.rowPx;
@@ -27445,6 +27446,7 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
             state.wheelRemainder=0; state.touchpadPinching=false;
         }
         state.gridView=grid;
+        if (grid) state.nativeIconSize=requested.iconSize;
         state.layoutNativeMode=mode; state.layoutIconSize=state.nativeIconSize;
         UpdateMetrics(state);
         if (state.fontPx!=font) {
@@ -27921,16 +27923,15 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
 // one zoom. The destination packs once for hit testing; metrics and cells
 // interpolate from the presented image on the zoom clock. A negative height
 // keeps the zoom preference: the caller already chose a new native layout.
-void BeginAnimatedZoom(ViewState& state, int height96) {
+void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested) {
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
-    if (state.gridView) AdvanceRowHeight(state);
-    state.zoomFromContent = ContentReveal(state);
-    state.zoomFromCompact = CompactReveal(state);
+    AdvanceRowHeight(state);
+    const float content = ContentReveal(state), compact = CompactReveal(state);
     if (!state.zoomAnimating)
         state.zoomAnchorRow = (state.scrollNow + ViewHeight(state) * .5f) /
             std::max(1.f, state.rowPx) * (state.gridView ? state.itemsPerRow : 1);
-    auto captures = CapturePresentedGridCells(state);
+    auto captures = CapturePresentedGridCells(state,requested && requested->mode!=state.layoutNativeMode);
     auto headers = CaptureVisibleGroupHeaders(state);
     const float oldRow = state.rowPx, oldScroll = state.scrollNow;
     StopHoverAnimation(state);
@@ -27943,12 +27944,21 @@ void BeginAnimatedZoom(ViewState& state, int height96) {
     state.zoomFromFontPx = state.fontPx;
     state.zoomFromIconPx = state.iconPx;
     state.zoomFromScroll = oldScroll;
+    // Only now adopt the destination. All source geometry above belongs to
+    // the applied layout, independently of an earlier Shell observation.
+    if (requested) {
+        state.layoutNativeMode=requested->mode;
+        if (state.gridView) state.nativeIconSize=requested->iconSize;
+        state.layoutIconSize=state.nativeIconSize;
+    }
+    state.zoomFromContent = content;
+    state.zoomFromCompact = compact;
     if (height96 >= 0) {
         state.rowHeight96[state.gridView] = height96;
         if (IsWindow(state.activeTabHost))
             state.tabPresentations[state.activeTabHost].zoomHeight96[state.gridView] = height96;
     }
-    if (state.gridView && !captures.empty()) {
+    if (!captures.empty()) {
         // Discover the final visible cells once. Geometry changes immediately
         // for hit testing; the shared sparse row motion carries both old and
         // new visible cells through the same 180 ms zoom, including widths.
@@ -28217,7 +28227,8 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
                 state.gridView ? double(std::numeric_limits<int>::max()) : 96.);
             state.rowHeight96[state.gridView] = int(std::llround(state.preciseRowHeight96[state.gridView]));
             state.zoomAnimating = false;
-            StopRowTransition(state);
+            // ApplyRowHeight captures the current cells before replacing
+            // this zoom's row motion, including any icon/name morph.
         }
         // Decided once per gesture: a cell outgrowing the viewport must not
         // lose its protection partway through the same pinch.
@@ -34571,13 +34582,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // moving across resize steps that do not change the column count.
             const int oldColumns = s->itemsPerRow;
             const int revealed = s->gridView ? FullyVisibleSelection(*s) : -1;
-            auto cells = s->zoomAnimating ? std::vector<CapturedRow>{} : CapturePresentedGridCells(*s);
+            AdvanceRowHeight(*s);
+            auto cells = CapturePresentedGridCells(*s);
             auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
                 CaptureVisibleGroupHeaders(*s);
+            const bool retarget = s->zoomLayoutTransition || std::any_of(cells.begin(),cells.end(),
+                [](const CapturedRow& cell) { return cell.shaped; });
             if (cells.empty()) StopRowTransition(*s);
             UpdateMetrics(*s);
             UpdateColumns(*s);
-            if (s->itemsPerRow != oldColumns) {
+            if (s->itemsPerRow != oldColumns || retarget) {
                 // Repacking may carry the selected cell past the viewport.
                 ClampScroll(*s);
                 KeepSelectionRevealed(*s, revealed);
