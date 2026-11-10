@@ -216,6 +216,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("graphics-isolation", PARALLEL, TestGraphicsIsolation(fixture)),
     REGRESSION("graphics-resource-lifecycle", PARALLEL, TestGraphicsResourceLifecycle()),
     // Presentation, rename and timing.
+    REGRESSION("keyboard-arrow-headers", PARALLEL, TestKeyboardArrowSelection(true)),
+    REGRESSION("keyboard-arrow-hover-seed", PARALLEL, TestKeyboardArrowSelection(false)),
     REGRESSION("presentation-owners", PARALLEL, TestPresentationOwners()),
     REGRESSION("timing-readiness", PARALLEL, TestTimingReadiness(fixture)),
     REGRESSION("mirrored-window-coordinates", PARALLEL, TestMirroredWindowCoordinates(fixture)),

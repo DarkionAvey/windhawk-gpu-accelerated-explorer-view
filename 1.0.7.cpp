@@ -24847,7 +24847,7 @@ void SyncNativeKeyboardCaret(ViewState& state) {
 // lists (or else it could be handled only when the overlay has focus).
 bool IsKeyboardMovementKey(UINT key, bool grid = false) {
     switch (key) {
-    case VK_LEFT: case VK_RIGHT: return grid;
+    case VK_LEFT: case VK_RIGHT: return true;
     case VK_UP: case VK_DOWN: case VK_HOME: case VK_END:
     case VK_PRIOR: case VK_NEXT:
         return true;
@@ -24899,6 +24899,12 @@ int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge =
         }
         origin=section.first; // Page movement starts here; Home/End remain absolute.
     }
+    const bool arrow = key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN;
+    if (arrow && focused < 0 && origin < 0 &&
+        state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0) {
+        // The first arrow selects the seed itself in every view and grouping.
+        return DisplayedRow(state, state.hovered) ? state.hovered : NextDisplayedRow(state, 0, true);
+    }
     bool fromBulk = false;
     if (useSelectionEdge && focused<0) {
         const int edge=KeyboardBulkSelectionEdge(state,key);
@@ -24912,18 +24918,12 @@ int KeyboardNavigationTarget(ViewState& state, UINT key, bool useSelectionEdge =
     switch (key) {
     case VK_LEFT:
     case VK_RIGHT:
-        if (!state.gridView) return -1;
         forward = (key == VK_RIGHT) != state.rtlLayout;
         candidate = std::clamp(base + (forward ? 1 : -1), 0, state.total-1);
         break;
     case VK_UP:
     case VK_DOWN:
         forward = key == VK_DOWN;
-        if (origin < 0 && state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0) {
-            // The first key selects the seed itself; later keys move from it.
-            candidate = DisplayedRow(state, state.hovered) ? state.hovered : NextDisplayedRow(state, 0, true);
-            break;
-        }
         candidate = ArrowSelectionTarget(origin, state.vacantKeyboardRow,
             state.restoredKeyboardRow, state.total, forward);
         if (state.gridView && origin >= 0) {
@@ -24979,34 +24979,29 @@ void FocusGroupHeader(ViewState& state,int index) {
         target+=visual.top+visual.height-(state.headerPx+ViewHeight(state)-ScrollBottomPadding(state));
     MoveScroll(state,target); Redraw(state);
 }
-bool HandleGroupKeyboardDirection(ViewState& state,UINT key,bool control,bool shift) {
-    if(control || shift || state.sections.empty() || (key!=VK_LEFT && key!=VK_RIGHT)) return false;
-    const int focused=KeyboardFocusedSection(state);
-    int group=focused;
-    if(group<0) {
-        const int row=state.selected>=0 ? state.selected:state.restoredKeyboardRow;
-        group=row>=0 && size_t(row)<state.rowGroup.size() ? state.rowGroup[size_t(row)]:0;
-        if(group<0 || size_t(group)>=state.sections.size()) return false;
-        FocusGroupHeader(state,group);
-    }
-    const bool expand=(key==VK_RIGHT)!=state.rtlLayout;
-    // Collapse first focuses/reveals the header, then collapses on the next
-    // press. Expansion is immediate; neither action changes item selection.
-    if((expand || focused>=0) && state.sections[size_t(group)].collapsed==expand)
-        ToggleGroupSection(state,group);
-    return true;
-}
 void NavigateKeyboardSelection(ViewState& state, UINT key,
                                bool control, bool shift) {
     state.typeSearchWaiting=false;
     TraceSelectionIdentity(state, L"key.before-target");
     if (state.optimisticStartedAt) return;
-    if(HandleGroupKeyboardDirection(state,key,control,shift)) return;
+    const int focusedSection = KeyboardFocusedSection(state);
+    if (!control && !shift && focusedSection >= 0 && (key == VK_LEFT || key == VK_RIGHT)) {
+        const bool expand = (key == VK_RIGHT) != state.rtlLayout;
+        // Direction commands belong only to an explicitly focused heading.
+        // Repeated keys keep the requested state instead of toggling it back.
+        if (state.sections[size_t(focusedSection)].collapsed == expand)
+            ToggleGroupSection(state, focusedSection);
+        return;
+    }
+    const bool initialArrow = KeyboardFocusedSection(state) < 0 && state.selected < 0 &&
+        state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0 &&
+        (key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN);
+    if (initialArrow) RefreshHoverUnderCursor(state);
     const bool bulkSelection=!control && !shift && KeyboardFocusedSection(state)<0 &&
         KeyboardBulkSelectionEdge(state,key)>=0;
     // First collapse a multi-selection at its existing directional edge;
     // subsequent single-item movement can stop on section headers.
-    if(!control && !shift && !bulkSelection && !state.sections.empty()) {
+    if(!control && !shift && !bulkSelection && !initialArrow && !state.sections.empty()) {
         const int focused=KeyboardFocusedSection(state);
         const auto focusHeader=[&](int index) {FocusGroupHeader(state,index);};
         if(key==VK_HOME) {focusHeader(0); return;}
@@ -25035,9 +25030,6 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
             }
         }
     }
-    if (KeyboardFocusedSection(state)<0 && (key == VK_UP || key == VK_DOWN) && state.selected < 0 &&
-        state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0)
-        RefreshHoverUnderCursor(state);
     const int target = KeyboardNavigationTarget(state, key, !control && !shift);
     // Resolve the initial hover seed before keyboard input retires its visual
     // and point-to-select tracking. Subsequent keys use the keyboard selection.
@@ -35885,12 +35877,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s) {
             const MSG key=NativeFileWindowKey(hwnd,msg,wParam,lParam);
-            if(!(GetKeyState(VK_MENU)&0x8000) && HandleGroupKeyboardDirection(*s,UINT(wParam),
-                (GetKeyState(VK_CONTROL)&0x8000)!=0,(GetKeyState(VK_SHIFT)&0x8000)!=0)) return 0;
             const int focusedSection=KeyboardFocusedSection(*s);
             if(focusedSection>=0 && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) {
                 if(wParam==VK_RETURN || wParam==VK_SPACE) {
-                    if(!(lParam&(1LL<<30))) ToggleGroupSection(*s,focusedSection);
+                    if(wParam==VK_SPACE && !(lParam&(1LL<<30))) ToggleGroupSection(*s,focusedSection);
                     return 0;
                 }
             }
@@ -38779,8 +38769,6 @@ bool IsOverlayKeyboardCommand(const MSG& msg, bool grid = false, bool searching 
     if (msg.message != WM_KEYDOWN) return false;
     if (GetKeyState(VK_MENU) & 0x8000) return false;
     if(sectionFocused && !(GetKeyState(VK_CONTROL)&0x8000) && msg.wParam==VK_SPACE) return true;
-    if((grouped || sectionFocused) && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_SHIFT)&0x8000) &&
-        (msg.wParam==VK_LEFT || msg.wParam==VK_RIGHT)) return true;
     if (IsNativeFileKey(msg)) return true;
     if (IsKeyboardMovementKey(static_cast<UINT>(msg.wParam), grid))
         return true; // Includes Shift ranges and Ctrl focus-only movement.

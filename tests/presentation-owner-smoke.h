@@ -500,13 +500,13 @@ static void TestPresentationOwners() {
         const UINT collapse=rtl ? VK_RIGHT:VK_LEFT, expand=rtl ? VK_LEFT:VK_RIGHT;
         Select(s,s.sections[0].end-1);
         s.scrollNow=s.scrollTarget=std::min(MaxScrollPx(s),DocumentRowTop(s,s.selected));
+        NavigateKeyboardSelection(s,expand,false,false);
+        Check(KeyboardFocusedSection(s)<0 && s.selected==s.sections[1].first && !s.sections[0].collapsed,
+            "item direction key was captured by its section header");
+        FocusGroupHeader(s,0);
         const auto directionalSelection=s.selectedFlags;
         NavigateKeyboardSelection(s,collapse,false,false);
-        Check(KeyboardFocusedSection(s)==0 && !s.sections[0].collapsed &&
-            s.scrollTarget<=s.sections[0].documentTop && s.selectedFlags==directionalSelection,
-            "first collapse-direction key did not reveal/focus the header without collapsing or replacing selection");
-        NavigateKeyboardSelection(s,collapse,false,false);
-        Check(s.sections[0].collapsed,"second collapse-direction key did not collapse the focused header");
+        Check(s.sections[0].collapsed,"collapse-direction key did not collapse the focused header");
         NavigateKeyboardSelection(s,expand,false,false);
         Check(!s.sections[0].collapsed && s.selectedFlags==directionalSelection,
             "expand-direction key did not expand the header while preserving selection");
@@ -568,6 +568,92 @@ static void TestPresentationOwners() {
     g_writeFactory.Reset();
     std::cout<<"PASS: independent tab-owned GPU lanes; blocked startup/coalescing, immutable large names/selection/images/clipboard, revision-consistent content, unpumped-owner scroll and grid zoom, stale receipts, warm hide/resume and drained teardown\n";
 }
+// Input ownership is exercised synchronously with private USER windows. No GPU
+// lane, desktop input, provider lookup, elapsed-time assertion or queued key is needed.
+static void TestKeyboardArrowSelection(bool headers) {
+    WorkerComApartment apartment;
+    StyleFixture::Session style;
+    ModifierFixture::Session modifiers;
+    PointerFixture::Session pointer; PointerFixture::held=false;
+    AnimationClockFixture::Freeze clock;
+    const bool smooth=g_smooth.exchange(false);
+    Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"keyboard fixture fonts");
+    for(UINT mode:{FVM_DETAILS,FVM_LIST,FVM_SMALLICON,FVM_ICON,FVM_THUMBNAIL,FVM_TILE,FVM_CONTENT})
+    for(bool rtl:{false,true}) for(bool grouped:{false,true}) {
+        Regression::Scope scope("keyboard mode="+std::to_string(mode)+" rtl="+std::to_string(rtl)+
+            " grouped="+std::to_string(grouped)+" headers="+std::to_string(headers));
+        PresentationFixture::Tab tab(L"isolated keyboard",60,rtl,false,grouped);
+        auto& s=tab.state;
+        FocusFixture::Session focus(tab.frame,s.hwnd);
+        ApplyViewLayout(s,{mode,48},false); UpdateMetrics(s); LayoutGroupSections(s);
+        const UINT previous=rtl ? VK_RIGHT:VK_LEFT, next=rtl ? VK_LEFT:VK_RIGHT;
+        const auto fresh=[&] {
+            s.keyboardSectionKey.reset(); s.selected=s.anchor=-1;
+            s.selectedFlags.Fill(0); ClearPostDeletionCaret(s);
+            ClearPointerHover(s,false); SetScrollImmediate(s,0.f);
+        };
+        const auto single=[&](int expected) {
+            Check(s.selected==expected && s.anchor==expected && s.selectedFlags[size_t(expected)] &&
+                s.selectedFlags.Count(0,s.selectedFlags.size())==1 && KeyboardFocusedSection(s)<0,
+                "arrow did not select the independently expected single item");
+        };
+        if(headers) {
+            if(!grouped) continue;
+            fresh(); Select(s,19);
+            NavigateKeyboardSelection(s,next,false,false); single(20);
+            NavigateKeyboardSelection(s,previous,false,false); single(19);
+            Check(std::none_of(s.sections.begin(),s.sections.end(),[](const auto& g){return g.collapsed;}),
+                "item arrow collapsed a section");
+            // Skip hidden rows and a collapsed group in both directions.
+            ToggleGroupSection(s,1); Select(s,19);
+            NavigateKeyboardSelection(s,next,false,false); single(40);
+            NavigateKeyboardSelection(s,previous,false,false); single(19);
+            FocusGroupHeader(s,0);
+            const auto selected=s.selectedFlags; const int row=s.selected,anchor=s.anchor;
+            for(UINT key:{previous,previous,next,next}) {
+                NavigateKeyboardSelection(s,key,false,false);
+                Check(s.sections[0].collapsed==(key==previous) && s.sections[1].collapsed &&
+                    KeyboardFocusedSection(s)==0 && s.selectedFlags==selected && s.selected==row && s.anchor==anchor,
+                    "focused header direction changed selection, another group, or reversed on repeat");
+            }
+            continue;
+        }
+        for(UINT key:{VK_LEFT,VK_RIGHT,VK_UP,VK_DOWN}) {
+            fresh();
+            const int seed=grouped ? 21 : 5;
+            // Keep the seed below the sticky heading's reserved body band.
+            SetScrollImmediate(s,DocumentRowTop(s,seed)-(grouped ? GroupHeadingHeight(s) : 0.f));
+            POINT point{LONG(ListStartX(s)+DocumentRowLeft(s,seed)+
+                (s.gridView ? s.itemWidth*.5f : 100.f)),
+                LONG(s.headerPx+DocumentRowTop(s,seed)-s.scrollNow+s.rowPx*.5f)};
+            if (rtl) {RECT client{}; ViewClientRect(s,&client); point.x=client.right-point.x;}
+            Check(RowFromPoint(s,point.y,point.x)==seed,"hover fixture cursor is not over the intended visible item" );
+            PointerFixture::At(s.hwnd,point);
+            NavigateKeyboardSelection(s,key,false,false); single(seed);
+            Check(s.hovered<0 && s.pointerHoverSuppressed,"keyboard retained a pointer selection highlight");
+            // Subsequent horizontal keys must move, even across group boundaries.
+            NavigateKeyboardSelection(s,next,false,false); single(seed+1);
+            NavigateKeyboardSelection(s,previous,false,false); single(seed);
+            RefreshHoverUnderCursor(s);
+            Check(s.hovered<0,"stationary pointer reclaimed keyboard ownership");
+            fresh(); PointerFixture::At(s.hwnd,POINT{-20,-20});
+            NavigateKeyboardSelection(s,key,false,false); single(0);
+        }
+        fresh(); s.hovered=s.total+10;
+        for(UINT key:{VK_LEFT,VK_RIGHT,VK_UP,VK_DOWN})
+            Check(KeyboardNavigationTarget(s,key)==0,"stale hover defeated the first-item fallback");
+        s.hovered=5; s.restoredKeyboardRow=8;
+        Check(KeyboardNavigationTarget(s,previous)==7 && KeyboardNavigationTarget(s,next)==9,
+            "hover displaced the restored keyboard position");
+        s.restoredKeyboardRow=-1; s.vacantKeyboardRow=8;
+        Check(KeyboardNavigationTarget(s,previous)==7 && KeyboardNavigationTarget(s,next)==9,
+            "hover displaced the vacant keyboard position");
+    }
+    ShutDownFrames(); g_frameStopping=false; g_smooth=smooth; g_writeFactory.Reset();
+    std::cout<<"PASS: isolated keyboard arrows headers="<<headers<<" across view modes, grouping and RTL\n";
+}
 #else
+static void TestKeyboardArrowSelection(bool) {Check(false,"keyboard grouping model unavailable");}
 static void TestPresentationOwners() {Check(false,"presentation still runs on Explorer's owner thread");}
 #endif
