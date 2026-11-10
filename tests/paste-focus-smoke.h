@@ -248,7 +248,18 @@ static void TestPasteFocus(const std::wstring& fixture) {
         const auto calls = target.background->calls.size();
         target.view->navigateDuringResolve = &target.state;
         press(target.frame);
-        Check(TranslateAcceleratorHook(target.frame, nullptr, &key) == TRUE && target.background->calls.size() == calls,
+        const auto navigationHandled=TranslateAcceleratorHook(target.frame, nullptr, &key);
+        if(navigationHandled!=TRUE || target.background->calls.size()!=calls)
+            std::cout<<"PASTE NAVIGATION handled="<<navigationHandled<<" calls="<<target.background->calls.size()
+                <<" expected="<<calls<<" token="<<target.state.token<<" expected-token="<<token
+                <<" resolves="<<target.view->resolves<<" key="<<key.wParam<<" message="<<key.message
+                <<" modifiers="<<unsigned(modifiers[VK_CONTROL])<<","<<unsigned(modifiers[VK_SHIFT])
+                <<","<<unsigned(modifiers[VK_MENU])<<" focus="<<OverlayHasInputFocus(target.state)
+                <<" keyboard-target="<<(OverlayKeyboardTarget(key,true)==target.state.hwnd)
+                <<" active="<<TabOwnsActiveView(target.state)<<" visible="<<IsWindowVisible(target.state.hwnd)
+                <<" scope="<<target.state.inScope<<" details="<<target.state.detailsViewActive
+                <<" optimistic="<<target.state.optimisticStartedAt<<std::endl;
+        Check(navigationHandled == TRUE && target.background->calls.size() == calls,
             "native Paste menu resolution invoked a departed folder's command");
         target.view->navigateDuringResolve = nullptr;
         target.state.token = token;

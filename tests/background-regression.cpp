@@ -723,6 +723,7 @@ static void TestLayoutWatchAndCache(const std::wstring& directory) {
 }
 
 #include "filesystem-mutation-smoke.h"
+#include "status-property-smoke.h"
 
 static void TestSortDetails(const std::wstring& directory) {
     ComPtr<IPropertyStore> emptyStore;
@@ -1413,6 +1414,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 #include "item-drag-hit-smoke.h"
 #include "column-fit-composition-smoke.h"
 #include "drive-bar-smoke.h"
+#include "status-render-smoke.h"
 #include "row-composition-smoke.h"
 #include "presentation-owner-smoke.h"
 #include "group-heading-smoke.h"
