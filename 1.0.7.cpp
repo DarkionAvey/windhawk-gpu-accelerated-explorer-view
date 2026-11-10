@@ -470,6 +470,7 @@ constexpr UINT kMsgNativeRenameStep = WM_APP + 82;
 // every mode and size change, whatever their source (menus, command bar,
 // shortcuts, automation). A size-only change raises IconSizeChanged alone.
 constexpr UINT kMsgShellViewModeEvent = WM_APP + 83;
+constexpr UINT kMsgBindShellViewEvents = WM_APP + 84;
 UINT g_releaseFrameHooksMessage = 0;
 bool RegisterFrameHookReleaseMessage() {
     g_releaseFrameHooksMessage=RegisterWindowMessageW(L"" WH_MOD_ID L"-release-frame-hooks");
@@ -3458,6 +3459,7 @@ struct ViewState {
     ComPtr<IDispatch> selectionEventSource;
     DWORD selectionEventCookie = 0;
     HWND selectionEventNativeView = nullptr;
+    unsigned long long selectionEventEpoch = 0;
     // Re-subscribe after navigation when ShellWindows still exposes the same
     // browser but its Document changes. Backoff regulates unresolved attempts;
     // only successful Advise or an explicit unsupported interface settles it.
@@ -12189,6 +12191,36 @@ bool ReadNativeViewMode(ViewState& state, FolderViewMode& result) {
 // Capture the native baseline around input and native menu dispatch. A frame
 // command/reorder alone cannot authorize a layout. The probe accepts a real change
 // made to this SAME folder/view. Navigation discards its pending baseline.
+void TraceViewInputRoute(HWND target, UINT message, WPARAM wp, const wchar_t* stage,
+                         const ViewState* state = nullptr) {
+    if (!g_perf.load(std::memory_order_relaxed) && !g_pipelineTracing.load(std::memory_order_relaxed)) return;
+    const bool key = message == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_SPACE ||
+        (wp >= '1' && wp <= '8' && (GetKeyState(VK_CONTROL)&0x8000) && (GetKeyState(VK_SHIFT)&0x8000)));
+    if (!key && message != WM_COMMAND && message != WM_LBUTTONUP &&
+        message != WM_POINTERUP && message != WM_CONTEXTMENU) return;
+    const HWND root = GetAncestor(target,GA_ROOT), owner = GetAncestor(target,GA_ROOTOWNER);
+    wchar_t cls[80]{}, rootClass[80]{}, ownerClass[80]{};
+    GetClassNameW(target,cls,ARRAYSIZE(cls));
+    GetClassNameW(root,rootClass,ARRAYSIZE(rootClass));
+    GetClassNameW(owner,ownerClass,ARRAYSIZE(ownerClass));
+    Wh_Log(L"[GPU view route] %s msg=0x%X wp=0x%llX target=%p class=%s target-thread=%lu current-thread=%lu root=%p/%s owner=%p/%s gpu=%p token=%llu thisPc=%d pinned=%d optimistic=%llu depth=%u layout=%u observed=%u",
+        stage,message,static_cast<unsigned long long>(wp),target,cls,GetWindowThreadProcessId(target,nullptr),
+        GetCurrentThreadId(),root,rootClass,owner,ownerClass,state ? state->hwnd : nullptr,
+        state ? state->token : 0,state && state->thisPcGpu,state && state->directoryModePinned,
+        state ? state->optimisticStartedAt : 0,state ? state->viewControlDispatchDepth : 0,
+        state ? state->layoutNativeMode : 0,state ? state->cachedNativeMode : 0);
+    POINT point{}; RECT bounds{};
+    const bool hasPoint = GetCursorPos(&point) != FALSE;
+    const HWND hit = hasPoint ? WindowFromPoint(point) : nullptr, focus = GetFocus();
+    wchar_t hitClass[80]{}, focusClass[80]{};
+    GetClassNameW(hit,hitClass,ARRAYSIZE(hitClass));
+    GetClassNameW(focus,focusClass,ARRAYSIZE(focusClass));
+    GetWindowRect(target,&bounds);
+    Wh_Log(L"[GPU view route] pointer-focus stage=%s pointer-valid=%d screen=(%ld,%ld) hit=%p/%s focus=%p/%s target-rect=(%ld,%ld,%ld,%ld)",
+        stage,hasPoint,point.x,point.y,hit,hitClass,focus,focusClass,
+        bounds.left,bounds.top,bounds.right,bounds.bottom);
+}
+
 struct NativeViewInput {
     HWND overlay = nullptr, native = nullptr;
     HWND viewControl = nullptr;
@@ -12219,6 +12251,7 @@ struct NativeViewInput {
     }
     static InputOwner Owner(const MSG* message) {
         if (!message || !message->hwnd || g_unloading.load(std::memory_order_relaxed)) return {};
+        TraceViewInputRoute(message->hwnd,message->message,message->wParam,L"dispatch-candidate");
         const bool buttonCommand=message->message==WM_COMMAND && HIWORD(message->wParam)==BN_CLICKED && message->lParam;
         const HWND target=buttonCommand ? reinterpret_cast<HWND>(message->lParam) : message->hwnd;
         const bool shortcut=message->message==WM_KEYDOWN && message->wParam>='1' && message->wParam<='8' &&
@@ -12230,6 +12263,7 @@ struct NativeViewInput {
         const HWND frame=GetAncestor(target,GA_ROOTOWNER);
         if (!IsExplorerFrame(frame)) return {};
         auto* state=State(OverlayUnder(frame));
+        TraceViewInputRoute(target,message->message,message->wParam,L"frame-resolved",state);
         if (!state || (!shortcut && (target==state->hwnd || target==state->viewToggle))) return {};
         if (!shortcut && message->message!=WM_CONTEXTMENU &&
             (target==state->nativeHwnd || IsChild(state->nativeHwnd,target))) return {};
@@ -12265,6 +12299,8 @@ struct NativeViewInput {
             }
         }
         if (buttonCommand && !viewControl) return {};
+        TraceViewInputRoute(target,message->message,message->wParam,
+            explicitMode ? L"explicit-mode" : L"baseline-input",state);
         return {state,explicitMode,viewControl};
     }
     ~NativeViewInput() {
@@ -33712,6 +33748,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && !s->pendingCreatedItemPath.empty())
             TryStartCreatedItemRename(*s);
         return 0;
+    case kMsgBindShellViewEvents:
+        // Navigation has committed the new native view and folder epoch.
+        // Bind from this owner-thread continuation, not from a XAML input
+        // thread or an assumed delay after navigation.
+        if (s && s->nativeHwnd == reinterpret_cast<HWND>(wParam) &&
+            s->token == static_cast<unsigned long long>(lParam) && s->visible && s->inScope &&
+            s->firstContentSubmittedAt && !s->optimisticStartedAt && TabOwnsActiveView(*s))
+            AttachShellSelectionEvents(*s,s->shellAutomationBrowser.Get());
+        return 0;
     case kMsgShellViewModeEvent:
         // Commands DefView receives through COM (the command bar's View menu)
         // bypass the input/WM_COMMAND baselines. Treat the shown layout as the
@@ -36214,6 +36259,9 @@ LRESULT CALLBACK NativeSurfaceMessages(int code, WPARAM wp, LPARAM lp) {
     WindowCallbackGuard callback;
     if(code>=0 && lp && !g_unloading.load(std::memory_order_acquire)) {
         const auto& message=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        // Includes directly sent toolbar/XAML input which has no queued MSG
+        // for DispatchHook. Trace HWND provenance only; never query Shell here.
+        TraceViewInputRoute(message.hwnd,message.message,message.wParam,L"owner-thread-message");
         ObserveInitialLoadingInput(message.hwnd);
         DWORD event=message.message==WM_CREATE ? EVENT_OBJECT_CREATE :
             message.message==WM_SHOWWINDOW ? (message.wParam ? EVENT_OBJECT_SHOW:EVENT_OBJECT_HIDE) :
@@ -36972,9 +37020,12 @@ public:
         WindowCallbackGuard callback;
         if (id == DISPID_FILELISTENUMDONE && enumerationQueued_)
             enumerationQueued_->store(true, std::memory_order_release);
-        if ((id == DISPID_VIEWMODECHANGED || id == DISPID_ICONSIZECHANGED) && !g_unloading.load(std::memory_order_relaxed) && IsWindow(overlay_))
+        if ((id == DISPID_VIEWMODECHANGED || id == DISPID_ICONSIZECHANGED) && !g_unloading.load(std::memory_order_relaxed) && IsWindow(overlay_)) {
+            if (g_perf.load(std::memory_order_relaxed) || g_pipelineTracing.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU view event] id=%ld native=%p token=%llu thread=%lu",id,native_,epoch_,GetCurrentThreadId());
             PostMessageW(overlay_, kMsgShellViewModeEvent, reinterpret_cast<WPARAM>(native_),
                 static_cast<LPARAM>(epoch_));
+        }
         if ((id == DISPID_SELECTIONCHANGED || (id == DISPID_FILELISTENUMDONE && enumerationQueued_)) &&
             !g_unloading.load(std::memory_order_relaxed) &&
             IsWindow(overlay_) && !queued_->exchange(true, std::memory_order_acq_rel)) {
@@ -36998,6 +37049,7 @@ void DetachShellSelectionEvents(ViewState& state) {
     state.selectionEventSink.Reset();
     state.selectionEventSource.Reset();
     state.selectionEventNativeView = nullptr;
+    state.selectionEventEpoch = 0;
     state.selectionEventMessageQueued.reset();
     state.enumerationEventMessageQueued.reset();
 }
@@ -37008,31 +37060,45 @@ bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
     const HWND hwnd=state.hwnd,native=state.nativeHwnd;
     const auto token=state.token;
     const auto view=state.folderView;
+    const ComPtr<IDispatch> automation=browser; // Keep the fallback alive across reentrant Shell calls.
+    browser=automation.Get();
     const auto current=[&] { return IsWindow(hwnd) && State(hwnd)==&state && state.token==token &&
         state.nativeHwnd==native && state.folderView.Get()==view.Get() && TabOwnsActiveView(state); };
     state.selectionEventBindAttempts=std::min(state.selectionEventBindAttempts+1,4u);
     state.selectionEventBindNext=GetTickCount64()+(200u<<state.selectionEventBindAttempts);
     const auto settled=[&] { if(current()) { state.selectionEventBindAttempts=0; state.selectionEventBindNext=0; } return true; };
-    ComPtr<IWebBrowser2> webBrowser;
     ComPtr<IDispatch> document;
-    const HRESULT webResult=browser ? browser->QueryInterface(IID_PPV_ARGS(&webBrowser)) : E_NOINTERFACE;
+    // The frame's browser Document can still describe the departing tab/view
+    // during Back or a native-view replacement. The native view supplies its
+    // own automation source, without any toolbar HWND or thread assumptions.
+    ComPtr<IShellView> nativeView;
+    if (SUCCEEDED(view.As(&nativeView)))
+        nativeView->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&document));
     if (!current()) return false;
-    if (SUCCEEDED(webResult) && webBrowser)
-        webBrowser->get_Document(document.GetAddressOf());
-    if (!current()) return false;
+    const bool nativeSource = document != nullptr;
     if (!document) {
-        // ExplorerBrowser and some tabs expose the same automation source on
-        // their native view without an IWebBrowser2 document. Bind once here,
-        // after first content, rather than querying it during input or paint.
-        ComPtr<IShellView> nativeView;
-        if (SUCCEEDED(view.As(&nativeView)))
-            nativeView->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&document));
+        // Retain the browser fallback only when its active view is this
+        // exact native HWND; a successful get_Document alone proves no match.
+        ComPtr<IServiceProvider> services;
+        ComPtr<IShellBrowser> sourceBrowser;
+        ComPtr<IShellView> sourceView;
+        HWND sourceHwnd = nullptr;
+        if (!browser) return settled(); // BindShellAutomation will supply a later browser source.
+        if (FAILED(browser->QueryInterface(IID_PPV_ARGS(&services))) || !services ||
+            FAILED(services->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&sourceBrowser))) || !sourceBrowser ||
+            FAILED(sourceBrowser->QueryActiveShellView(&sourceView)) || !sourceView ||
+            FAILED(sourceView->GetWindow(&sourceHwnd)) || sourceHwnd != native) return false;
         if (!current()) return false;
-        if (!document) return browser && webResult!=E_NOINTERFACE ? false : settled();
+        ComPtr<IWebBrowser2> webBrowser;
+        if (SUCCEEDED(browser->QueryInterface(IID_PPV_ARGS(&webBrowser))) && webBrowser)
+            webBrowser->get_Document(document.GetAddressOf());
+        if (!current()) return false;
+        if (!document) return settled();
     }
     if (state.selectionEventCookie &&
         state.selectionEventSource.Get() == document.Get() &&
-        state.selectionEventNativeView == state.nativeHwnd) return settled();
+        state.selectionEventNativeView == state.nativeHwnd &&
+        state.selectionEventEpoch == token) return settled();
     DetachShellSelectionEvents(state);
     ComPtr<IConnectionPointContainer> source;
     const HRESULT sourceResult=document.As(&source);
@@ -37069,9 +37135,10 @@ bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
     state.enumerationEventMessageQueued = std::move(enumerationQueued);
     state.selectionEventCookie = cookie;
     state.selectionEventNativeView = state.nativeHwnd;
+    state.selectionEventEpoch = token;
     if (g_perf.load(std::memory_order_relaxed))
-        Wh_Log(L"[GPU selection] ShellFolderView.SelectionChanged subscribed native=%p",
-            state.nativeHwnd);
+        Wh_Log(L"[GPU selection] ShellFolderView events subscribed native=%p token=%llu source=%s",
+            state.nativeHwnd,token,nativeSource ? L"native-view" : L"verified-browser");
     QueueNativeSelectionHint(state); // Read any selection existing before Advise.
     return settled();
 }
@@ -37985,6 +38052,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 QueueNativeRows(*s);
             }
             ApplyNativePresentation(*s);
+            if ((changedView || changedPath || wasOutside) && IsWindow(overlay) && State(overlay)==s)
+                PostMessageW(overlay,kMsgBindShellViewEvents,reinterpret_cast<WPARAM>(s->nativeHwnd),static_cast<LPARAM>(s->token));
             return;
         }
         if (s->thisPcGpu) {
@@ -38090,6 +38159,8 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
             Wh_Log(L"[GPU overlay] rebound tab-owned surface %p to %s (native=%p)",
                    overlay, path.c_str(), native);
         if (s->visible) ApplyNativePresentation(*s);
+        if ((changedView || changedPath || wasOutside) && IsWindow(overlay) && State(overlay)==s)
+            PostMessageW(overlay,kMsgBindShellViewEvents,reinterpret_cast<WPARAM>(s->nativeHwnd),static_cast<LPARAM>(s->token));
         if (changedView || changedPath || wasOutside)
             TraceUiState(*s,L"ui.native.rebind[layout,native,header,selected]");
         RefreshViewToggleForFrame(frame);
@@ -39936,6 +40007,7 @@ void ReleaseOverlayClass() {
 
 BOOL Wh_ModInit() {
     LoadSettings();
+    Wh_Log(L"[GPU draft] 1.0.7 view-events-3 loaded; native-view event binding and generation checks active");
     g_unloading.store(false);
     g_backgroundShutdown = false;
     const auto failedInitialization=[]() -> BOOL {

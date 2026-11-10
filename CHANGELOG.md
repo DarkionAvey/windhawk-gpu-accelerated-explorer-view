@@ -30,6 +30,7 @@
 
 - **FIXED** Icons leaving Tiles for Content or Details could animate from the wrong position. View changes and interrupted layout animations now retain the outgoing icon and filename positions.
 - **FIXED** Switching from Details to an icon grid could send icons sideways before settling. Icon and filename motion now uses destination cell bounds, and folder updates retain an interrupted view transition's geometry.
+- **FIXED** View changes, selection and folder events could stop being observed after navigation. Event subscriptions now follow the current native view and folder generation, including when returning to This PC.
 - **FIXED** Collapsing a sticky group now scrolls to that group's own heading, keeping the collapsed group visible instead of skipping ahead.
 - **FIXED** Touchscreen pinch zoom in Content and Tiles could resize icons in visible steps. Taking over a wheel or trackpad zoom with touch now uses the current zoom scale instead of estimating it from the row or icon size.
 - **FIXED** Deleting a striped row in a grouped list could animate a stripe beneath an unrelated collapsed group.
