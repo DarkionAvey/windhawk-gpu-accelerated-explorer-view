@@ -5027,6 +5027,7 @@ int KeyboardFocusedSection(const ViewState& state) {
 }
 void FinishRename(ViewState& state, bool commit);
 ViewState* State(HWND hwnd);
+void MoveScroll(ViewState& state, float target);
 void ToggleGroupSection(ViewState& state, int index) {
     if (index < 0 || index >= static_cast<int>(state.sections.size())) return;
     // Toggling a section is input outside an open rename field: commit it
@@ -5042,6 +5043,14 @@ void ToggleGroupSection(ViewState& state, int index) {
         if (index < 0) return;
     }
     auto& group = state.sections[static_cast<size_t>(index)];
+    if (!group.collapsed && state.scrollNow > group.documentTop &&
+        state.scrollNow < group.documentEnd) {
+        // A sticky heading hides how far into its body the viewport is.
+        // Discard that depth when collapsing and retain this group's own
+        // heading at the top, so its identity remains visible. Ordinary
+        // viewport clamping still applies near the end of the document.
+        MoveScroll(state,group.documentTop);
+    }
     group.from = group.fraction;
     group.collapsed = !group.collapsed;
     group.to = group.collapsed ? 0.f : 1.f;
