@@ -54,10 +54,20 @@ function Invoke-RegressionGate {
         [Parameter(Mandatory=$true)][string]$OutputDirectory,
         [ValidateRange(1,32)][int]$Jobs = 1,
         [ValidateRange(1,120)][int]$TimeoutSeconds = 120, # Fixed per-test ceiling; never raised.
-        [switch]$ObserveInterference
+        [switch]$ObserveInterference,
+        [switch]$Diagnostic,
+        [scriptblock]$ProgressAction
     )
+    if ($Diagnostic) { $Jobs = 1 }
     $results = @(Invoke-RegressionTasks -Tasks $Tasks -OutputDirectory $OutputDirectory -Jobs $Jobs `
-        -Phase regression -TimeoutSeconds $TimeoutSeconds -CollectResults -StopOnFailure -ObserveInterference:$ObserveInterference)
+        -Phase regression -TimeoutSeconds $TimeoutSeconds -CollectResults -StopOnFailure:(!$Diagnostic) -ObserveInterference:$ObserveInterference -ProgressAction $ProgressAction)
+    if ($Diagnostic) {
+        foreach ($result in $results | Where-Object Status -eq Pass) {
+            foreach ($log in @($result.Stdout,$result.Stderr)) {
+                if ($log -and (Test-Path -LiteralPath $log)) { Remove-Item -LiteralPath $log }
+            }
+        }
+    }
     $summary = foreach ($task in $Tasks) {
         $result = $results | Where-Object Name -eq $task.Name | Select-Object -First 1
         [pscustomobject]@{ Name=$task.Name; Status=$(if ($result) { $result.Status } else { 'Pending' })
@@ -69,7 +79,7 @@ function Invoke-RegressionGate {
     $failedTests = @($summary | Where-Object Status -eq Fail)
     $pendingTests = @($summary | Where-Object Status -eq Pending)
     $status = if ($failedTests.Count) { 'Fail' } elseif ($pendingTests.Count) { 'Pending' } else { 'Pass' }
-    $report = [pscustomobject]@{ Status=$status; Failed=$failedTests.Count; Pending=$pendingTests.Count
+    $report = [pscustomobject]@{ Status=$status; Diagnostic=[bool]$Diagnostic; Failed=$failedTests.Count; Pending=$pendingTests.Count
         Passed=@($summary | Where-Object Status -eq Pass).Count; Tests=@($summary); Attempts=$results }
     $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'regression-report.json') -Encoding UTF8
     $summary | Where-Object Status -ne Pass | Format-Table Name,Status,Seconds,Reason -AutoSize | Out-Host
@@ -174,7 +184,8 @@ function Invoke-RegressionTasks {
         [ValidateRange(1,60)][int]$CleanupTimeoutSeconds = 10,
         [switch]$ObserveInterference,
         [switch]$CollectResults,
-        [switch]$StopOnFailure
+        [switch]$StopOnFailure,
+        [scriptblock]$ProgressAction
     )
     $names = @{}
     foreach ($task in $Tasks) {
@@ -192,6 +203,7 @@ function Invoke-RegressionTasks {
     $batchClock = [Diagnostics.Stopwatch]::StartNew()
     $startFailure = $null
     $stopFailure = $null # First failed test under -StopOnFailure.
+    $startedCount = 0
     try {
         while ($pending.Count -or $running.Count) {
             while (!$startFailure -and !$stopFailure -and $pending.Count -and $running.Count -lt $Jobs) {
@@ -199,6 +211,8 @@ function Invoke-RegressionTasks {
                 if ($pending.Peek().Serial -and $running.Count) { break }
                 if ($running.Count -and $running[0].Task.Serial) { break }
                 $task = $pending.Dequeue()
+                ++$startedCount
+                if ($ProgressAction) { & $ProgressAction "[$Phase $startedCount/$($Tasks.Count)] $($task.Name)" }
                 if ($task.Serial) { Write-Host "SERIAL: $($task.Name) (no other test running)" }
                 $process = [Diagnostics.Process]::new()
                 $process.StartInfo = [Diagnostics.ProcessStartInfo]::new()

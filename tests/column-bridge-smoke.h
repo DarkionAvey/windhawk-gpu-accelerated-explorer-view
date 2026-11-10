@@ -243,10 +243,19 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
         ConsumePresentation(*state);
         for(unsigned scan=0;scan<3;++scan) {
             QueueDirectoryRefresh(*state);
-            wait([&] {return !state->directoryPending && lastReceipt && lastReceipt->accepted &&
-                lastReceipt->directoryToken==state->directoryToken &&
-                state->presentationAcceptedSequence>=lastReceipt->sequence;},
-                "unchanged revalidation left only obsolete presentation generations");
+            // Deliver the real worker result without dispatching owner messages.
+            // Pumping here can consume a generation-only receipt between the
+            // observer's sample and OverlayProc's exchange, losing the witness.
+            Check(Eventually([&] {
+                ReceiveDirectoryResults(*state);
+                return !state->directoryPending;
+            }), "unchanged revalidation never completed its directory scan");
+            lastReceipt=PresentationFixture::Await(*state,[&](const auto& r) {
+                return r.accepted && r.token==state->token && r.directoryToken==state->directoryToken;
+            });
+            ConsumePresentation(*state);
+            Check(state->presentationAcceptedSequence>=lastReceipt->sequence,
+                "unchanged revalidation acknowledgement was not accepted by its owner");
             Check(lastReceipt->device==accepted->device && lastReceipt->swapchain==accepted->swapchain,
                 "unchanged readiness publication replaced the warm GPU domain");
         }

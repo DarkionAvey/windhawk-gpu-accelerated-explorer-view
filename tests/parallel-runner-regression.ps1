@@ -32,6 +32,11 @@ if($Mode -eq 'interfered') {
 $record=@{Start=$start; End=[Diagnostics.Stopwatch]::GetTimestamp(); Value=$Value}
 [IO.File]::WriteAllText((Join-Path $Root ($Mode+'.json')),($record | ConvertTo-Json))
 if($Mode -eq 'failure') { exit 7 }
+if($Mode -eq 'diagnostic-failure') {
+    Write-Output 'diagnostic stdout evidence'
+    [Console]::Error.WriteLine('diagnostic stderr evidence')
+    exit 9
+}
 if($Mode -like 'retry-*') {
     $counter=Join-Path $Root ($Mode+'.count')
     $attempt=if(Test-Path -LiteralPath $counter) { [int][IO.File]::ReadAllText($counter) } else { 0 }
@@ -117,6 +122,33 @@ if($Mode -like 'retry-*') {
         (Test-Path -LiteralPath (Join-Path $fixture 'gate-serial.json'))) {
         throw 'A failed test was retried, or did not cancel its running peer and the remaining tests'
     }
+    # The opt-in local diagnostic runs sequentially through ordinary failures,
+    # records each result once and retains only failing child output.
+    $diagnosticDirectory=Join-Path $fixture 'diagnostic'
+    $null=New-Item -ItemType Directory -Path $diagnosticDirectory
+    $diagnosticFailed=$false
+    $diagnosticProgress=[Collections.Generic.List[string]]::new()
+    try {
+        Invoke-RegressionGate -Tasks @((Task 'diagnostic-failure'),(Task 'diagnostic-after')) `
+            -OutputDirectory $diagnosticDirectory -Jobs 2 -Diagnostic -ProgressAction {
+                param($message) $diagnosticProgress.Add($message)
+            } *> $null
+    } catch { $diagnosticFailed=$true }
+    $diagnostic=Get-Content -LiteralPath (Join-Path $diagnosticDirectory 'regression-report.json') -Raw | ConvertFrom-Json
+    if(($diagnosticProgress -join '|') -ne '[regression 1/2] diagnostic-failure|[regression 2/2] diagnostic-after') {
+        throw 'Diagnostic progress did not report actual test starts in order with the correct total'
+    }
+    if(!$diagnosticFailed -or !$diagnostic.Diagnostic -or $diagnostic.Failed -ne 1 -or
+        $diagnostic.Passed -ne 1 -or $diagnostic.Pending -ne 0 -or $diagnostic.Attempts.Count -ne 2 -or
+        (Record 'diagnostic-after').Start -lt (Record 'diagnostic-failure').End) {
+        throw 'Diagnostic mode did not run each child sequentially through failure exactly once'
+    }
+    if([IO.File]::ReadAllText((Join-Path $diagnosticDirectory 'diagnostic-failure.stdout.log')).Trim() -ne 'diagnostic stdout evidence' -or
+        [IO.File]::ReadAllText((Join-Path $diagnosticDirectory 'diagnostic-failure.stderr.log')).Trim() -ne 'diagnostic stderr evidence' -or
+        (Test-Path -LiteralPath (Join-Path $diagnosticDirectory 'diagnostic-after.stdout.log')) -or
+        (Test-Path -LiteralPath (Join-Path $diagnosticDirectory 'diagnostic-after.stderr.log'))) {
+        throw 'Diagnostic mode lost failure evidence or kept passing output'
+    }
     $pendingDirectory=Join-Path $fixture 'pending-gate'
     $null=New-Item -ItemType Directory -Path $pendingDirectory
     $rejected=$false
@@ -149,6 +181,7 @@ if($Mode -like 'retry-*') {
     }
     Write-Output 'PASS: parallel rendezvous, parallel-before-serial phases, isolated serial tasks, -Jobs 1, timeouts, Windows argument quoting, stdout/stderr draining, failure propagation and peer cleanup'
     Write-Output 'PASS: one attempt per test; the first failure cancels running peers and unstarted tests; infrastructure pending'
+    Write-Output 'PASS: opt-in diagnostic mode continues sequentially after failure and retains only failing child logs'
     Write-Output 'PASS: real private module observation cancels the whole run at once, with no retries or orphaned tests'
     $passed=$true
 } finally {

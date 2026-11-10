@@ -10,11 +10,15 @@ param(
     # A hard ceiling: may be lowered for diagnosis, never raised. See tests/README.md.
     [ValidateRange(1,120)][int]$TestTimeoutSeconds = 120,
     [switch]$KeepArtifacts,
+    # Local diagnosis only: sequential, one attempt each, collect all failures.
+    [switch]$Diagnostic,
+    [scriptblock]$ProgressAction,
     [switch]$Coverage,
     [string]$LlvmToolsDirectory,
     [string]$OutputDirectory
 )
 if ($Tests.Count -and $TestArguments.Count) { throw 'Use either -Tests or -TestArguments' }
+if ($Diagnostic) { $Jobs = 1; $KeepArtifacts = $true }
 # Comma-separated names arrive as one string through powershell -File.
 $Tests = @($Tests | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $compileUnload = (!$Tests.Count -and !$TestArguments.Count) -or $TestArguments -contains '--unload' -or $Tests -contains 'unload'
@@ -32,8 +36,10 @@ $outputDirectory = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirecto
 New-RegressionResultDirectory $outputDirectory
 Write-Output "Build artifacts and results: $outputDirectory"
 try {
+    if ($ProgressAction) { & $ProgressAction 'Checking execution environment and Windhawk injection...' }
     Assert-RegressionExecutionContext
     Assert-NoModuleInjection # Before compiling: an injected engine invalidates every result.
+    if ($ProgressAction) { & $ProgressAction 'Locating the compiler and preparing binaries...' }
     $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
     $compilerDirectory = Join-Path $WindhawkDirectory 'Compiler'
     $compiler = Join-Path $compilerDirectory 'bin\clang++.exe'
@@ -138,8 +144,8 @@ try {
     # at two while allowing the separately isolated test suites to use -Jobs.
     # ARM64 is a mandatory compile/link gate, never executed on this x64 host.
     # Fail before compiling/running the x64 suite or allowing release publication.
-    Invoke-RegressionTasks -Tasks $arm64CompileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile-arm64
-    Invoke-RegressionTasks -Tasks $compileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile
+    Invoke-RegressionTasks -Tasks $arm64CompileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile-arm64 -ProgressAction $ProgressAction
+    Invoke-RegressionTasks -Tasks $compileTasks -OutputDirectory $outputDirectory -Jobs ([Math]::Min(2,$Jobs)) -Phase compile -ProgressAction $ProgressAction
     if ($MinifiedSourceFile) {
         & (Join-Path $testDirectory 'minification-regression.ps1') -Compiler $compiler -OutputDirectory $outputDirectory
     }
@@ -193,9 +199,10 @@ try {
                 if ($unknown.Count) { throw "Unknown regression(s): $($unknown -join ', ')" }
             }
         }
-        Invoke-RegressionGate -Tasks $testTasks -OutputDirectory $outputDirectory -Jobs $Jobs -TimeoutSeconds $TestTimeoutSeconds -ObserveInterference
+        Invoke-RegressionGate -Tasks $testTasks -OutputDirectory $outputDirectory -Jobs $Jobs -TimeoutSeconds $TestTimeoutSeconds -ObserveInterference -Diagnostic:$Diagnostic -ProgressAction $ProgressAction
         $testsPassed = $true
-        Write-Output ('PASS: complete regression gate in {0:N2}s (compile and execution)' -f $totalClock.Elapsed.TotalSeconds)
+        $runKind = if ($Diagnostic) { 'diagnostic sweep' } else { 'regression gate' }
+        Write-Output ('PASS: complete {0} in {1:N2}s (compile and execution)' -f $runKind,$totalClock.Elapsed.TotalSeconds)
         if ($KeepArtifacts) { Write-Output "Artifacts retained at $outputDirectory" }
     } finally {
         $env:LLVM_PROFILE_FILE = $previousProfile
@@ -229,11 +236,11 @@ try {
             # Receipts/logs remain available even after a clean successful run.
         }
     }
-    [pscustomobject]@{Status='Pass'; Source=$sourcePath; Seconds=$totalClock.Elapsed.TotalSeconds} |
+    [pscustomobject]@{Status='Pass'; Diagnostic=[bool]$Diagnostic; Source=$sourcePath; Seconds=$totalClock.Elapsed.TotalSeconds} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputDirectory 'test-run-report.json') -Encoding UTF8
 } catch {
     $status = if ($_.Exception.Message -match '^PENDING:') { 'Pending' } else { 'Fail' }
-    [pscustomobject]@{Status=$status; Source=$sourcePath; Error=$_.Exception.Message; Seconds=$totalClock.Elapsed.TotalSeconds} |
+    [pscustomobject]@{Status=$status; Diagnostic=[bool]$Diagnostic; Source=$sourcePath; Error=$_.Exception.Message; Seconds=$totalClock.Elapsed.TotalSeconds} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputDirectory 'test-run-report.json') -Encoding UTF8
     Write-Host "RESULT: $status. Reports retained at $outputDirectory"
     throw

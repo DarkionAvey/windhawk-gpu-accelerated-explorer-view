@@ -52,6 +52,22 @@ testing.
 
 ## Parallel execution
 
+For a quiet local diagnosis, double-click root `test-mod.bat` and enter or drag
+in the mod `.cpp` path. It performs the normal toolchain and injection checks,
+compiles the test binaries once, then runs the standard regression manifest and
+DLL-unload test sequentially. Each test runs once with the same 120-second limit.
+Ordinary failures are collected while later tests continue. Injection or unsafe
+process cleanup still stops the run. The final console lists failures/pending
+tests and the temporary results folder; passing child logs are discarded.
+Preparation stages and `[current/total]` test starts are printed as they happen;
+compiler diagnostics and detailed test output stay in the logs.
+Compiler output, failure stdout/stderr, reports and binaries remain there.
+No sources, version archives or release exports are changed. Specialized opt-in
+probes remain available through `-Tests` rather than being added to this sweep.
+`scripts/test-mod.ps1 -SourceFile <source> -Tests name1,name2` also supports a
+focused diagnosis. This diagnostic mode does not replace the release gate,
+which continues to stop at the first failure.
+
 Every regression is one entry in `tests/regression-manifest.h` and runs in its
 own process, with its own mod globals, COM apartments, window classes, workers
 and private fixture directory. No test can depend on another test's state.

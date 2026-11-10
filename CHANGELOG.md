@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.
 - **ADDED** Support for Explorer's file extension visibility settings, including live updates.
 - **ADDED** Batch renaming of multiple selected files and folders, with native numbering and undo support.
 - **ADDED** Click-to-rename behavior, matching native Explorer.
