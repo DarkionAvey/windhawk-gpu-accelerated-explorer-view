@@ -168,6 +168,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("touch-zoom-fractional-144", PARALLEL, TestFractionalTouchZoom(144)),
     REGRESSION("sticky-group-collapse-anchor", PARALLEL, TestStickyGroupCollapseAnchor()),
     REGRESSION("selection-ui-work", PARALLEL, TestSelectionUiWork(fixture)),
+    REGRESSION("recycle-display-labels", PARALLEL, TestRecycleDisplayLabels(fixture)),
+    REGRESSION("gallery-native-scope", PARALLEL, TestGalleryNativeScope(fixture)),
     REGRESSION("provider-navigation", PARALLEL, TestProviderNavigation(fixture)),
     REGRESSION("paste-focus", PARALLEL, TestPasteFocus(fixture)),
     REGRESSION("shell-file-labels", PARALLEL, TestShellFileLabels(fixture)),

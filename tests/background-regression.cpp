@@ -2006,6 +2006,7 @@ static void TestPreviewInput() {
 #include "preprocessing-benchmark.h"
 #include "profile-identity-smoke.h"
 #include "provider-navigation-smoke.h"
+#include "special-view-smoke.h"
 #include "paste-focus-smoke.h"
 #include "selection-ui-smoke.h"
 #include "touch-smoke.h"

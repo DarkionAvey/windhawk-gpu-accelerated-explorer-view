@@ -901,6 +901,8 @@ bool ValidPidlBatch(HRESULT hr, ULONG requested, ULONG fetched, PITEMID_CHILD co
     return true;
 }
 using SharedPidl = std::shared_ptr<const ITEMIDLIST>;
+// Immutable after initialization; contains no live COM interface.
+SharedPidl g_galleryFolderIdentity;
 // Published by the names worker. Keep each complete relative child beside its
 // opaque cache key for canonical selection lookup, including cached revisits.
 using NamespaceIdentities = std::unordered_map<std::wstring, SharedPidl>;
@@ -7929,6 +7931,10 @@ const wchar_t* NamespaceLocation(PCIDLIST_ABSOLUTE pidl) {
 
 std::wstring FolderLocation(PCIDLIST_ABSOLUTE pidl) {
     if (!pidl) return kUnsupportedShellLocation;
+    // Gallery owns a modern native image layout. Exclude its exact namespace
+    // identity before the general Shell-folder capability check.
+    if (g_galleryFolderIdentity && ILIsEqual(pidl, g_galleryFolderIdentity.get()))
+        return kUnsupportedShellLocation;
     auto storage = std::make_unique<ShellPathStorage>();
     auto& path = storage->value;
     if (SHGetPathFromIDListEx(pidl, path, ARRAYSIZE(path), GPFIDL_DEFAULT)) return path;
@@ -10013,7 +10019,7 @@ bool SeedNativeRow(const NativeRowIdentity& identity, Entry& entry) {
 
 HRESULT ResolveNativeRowIdentity(const NativeRowIdentity& identity, Entry& entry,
                                  IShellFolder* parent = nullptr,
-                                 bool preferFilesystemIdentity = false) {
+                                 bool preferFilesystemIdentity = false, bool recycleBin = false) {
     if (SeedNativeRow(identity, entry)) return S_OK;
     ComPtr<IShellItem> item;
     // Enumeration already owns the parent in this apartment. Rebinding the
@@ -10054,6 +10060,15 @@ HRESULT ResolveNativeRowIdentity(const NativeRowIdentity& identity, Entry& entry
         }
     }
     if (FAILED(hr)) return hr;
+    // Recycle Bin can return an original absolute path as its normal display
+    // name. Shorten only the presentation label; name, path and both PIDLs
+    // remain intact, including duplicate basenames from different locations.
+    if (recycleBin && IsTargetPath(entry.name)) {
+        const size_t last = entry.name.find_last_not_of(L"\\/");
+        const size_t separator = entry.name.find_last_of(L"\\/", last);
+        if (last != std::wstring::npos && separator != std::wstring::npos && last > separator)
+            entry.label = entry.name.substr(separator + 1, last - separator);
+    }
     return !entry.name.empty() && !entry.path.empty() ? S_OK : E_PENDING;
 }
 
@@ -10222,7 +10237,8 @@ void EnumerateNativeRowsJob(TabBackground& work, NativeRowsJob& job,
     ComPtr<IEnumIDList> enumeration;
     if (SUCCEEDED(hr)) hr = folder->EnumObjects(nullptr, ShellEnumerationFlags(job.visibility), &enumeration);
     const auto resolve = [&](const NativeRowIdentity& identity, Entry& entry) {
-        return ResolveNativeRowIdentity(identity, entry, folder.Get(), preferFilesystemIdentity);
+        return ResolveNativeRowIdentity(identity, entry, folder.Get(), preferFilesystemIdentity,
+            job.presentation && IsRecycleBinLocation(job.presentation->path));
     };
     // UPDATEDIR is an ambiguous hint, often repeated by namespace providers.
     // Check raw identities without resolving 800 names/properties, publishing
@@ -10906,7 +10922,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         job.identities.push_back(std::move(identity));
                     }
                     const auto resolve=[&](const NativeRowIdentity& identity,Entry& entry) {
-                        return ResolveNativeRowIdentity(identity,entry,provider.Get(),filesystem);
+                        return ResolveNativeRowIdentity(identity,entry,provider.Get(),filesystem,
+                            IsRecycleBinLocation(job.presentation->path));
                     };
                     ResolveNativeRowsJob(work,job,resolve);
                 } else if (job.folder) EnumerateNativeRowsJob(work, job, provider.Get(), filesystem);
@@ -40275,7 +40292,21 @@ void ReleaseOverlayClass() {
 }
 }
 
+void ResolveGalleryFolderIdentity() {
+    // Resolve once on Windhawk's initialization thread, before installing hooks.
+    // Folder inspection on Explorer's STA only compares immutable PIDL bytes.
+    {
+        WorkerComApartment apartment;
+        PIDLIST_ABSOLUTE gallery = nullptr;
+        if (SUCCEEDED(apartment.result) && SUCCEEDED(SHParseDisplayName(
+                L"::{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}", nullptr, &gallery, 0, nullptr)))
+            g_galleryFolderIdentity = SharedPidl(gallery, TaskMemDeleter{});
+        else CoTaskMemFree(gallery);
+    }
+}
+
 BOOL Wh_ModInit() {
+    ResolveGalleryFolderIdentity();
     LoadSettings();
     g_unloading.store(false);
     g_backgroundShutdown = false;
@@ -40374,6 +40405,7 @@ void Wh_ModUninit() {
     ReleaseSRWLockExclusive(&g_tabRegistryLock);
     ShutDownFrames();
     ShutDownBackgroundWorkers();
+    g_galleryFolderIdentity.reset();
     g_systemRelativeTime.Reset();
     ReleaseTextRuntime();
     ReleaseOverlayClass();
