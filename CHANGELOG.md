@@ -28,6 +28,8 @@
 - **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
+- **FIXED** File hover tooltip shadows now fall below the tooltip with a tighter blur instead of forming a glow around it.
+- **FIXED** File hover tooltips now use the list's actual font and weight, including custom fonts, while keeping the existing minimum and maximum text sizes.
 - **FIXED** Arrow keys now start from the hovered item in every view when there is no selection or saved keyboard position. Left and Right move between items across groups, and collapse or expand a group only when its heading has keyboard focus. Space toggles the focused heading.
 - **FIXED** Icons leaving Tiles for Content or Details could animate from the wrong position. View changes and interrupted layout animations now retain the outgoing icon and filename positions.
 - **FIXED** Cloud folder Status columns showed hexadecimal data instead of sync icons. Status icons now follow Windows' property definitions and provider custom states, with text kept when icons cannot be loaded.

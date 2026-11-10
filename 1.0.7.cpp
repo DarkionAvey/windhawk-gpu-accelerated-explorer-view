@@ -29751,8 +29751,8 @@ bool FontInkExtent(IDWriteTextFormat* format, float& above, float& below) {
 
 // Fonts, ink extents and spacing for the tooltip. Measured only when the DPI,
 // the configured font, reading direction, view text size or system theme changes;
-// never per show. The size is the view's text size (floored at the native tooltip font); the face is the configured
-// font when one is set (as the view resolved it), else the XAML face.
+// never per show. Use the view's resolved typography and text size, bounded
+// by the native tooltip font's legibility limits.
 bool PrepareItemTipFont(ViewState& state, HWND window) {
     auto& tip = state.itemTip;
     const int dpi = DpiOf(window);
@@ -29761,7 +29761,7 @@ bool PrepareItemTipFont(ViewState& state, HWND window) {
     const float viewEm = state.fontPx * float(dpi) / float(std::max(1, ViewDpi(state)));
     if (tip.nameFormat && tip.metricsDpi == dpi && tip.metricsFace == state.textFaceSerial &&
         tip.formatRtl == state.rtlLayout && tip.metricsViewEm == viewEm) return true;
-    if (!g_writeFactory || ((!state.headerFormat && !MakeTextFormats(state)) || !state.headerFormat)) return false;
+    if (!g_writeFactory || ((!state.textFormat && !MakeTextFormats(state)) || !state.textFormat)) return false;
     LOGFONTW font{};
     HTHEME theme = OpenItemTipTheme(state, window);
     bool haveFont = theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font));
@@ -29786,38 +29786,21 @@ bool PrepareItemTipFont(ViewState& state, HWND window) {
         }
     }
     if (em <= 0.f) return false;
-    // Tooltip text matches the view's text, between the native tooltip font
-    // and twice it. The face is the configured font, else the XAML face of
-    // Gallery's tooltips (Segoe UI Variable), else the native tooltip face.
-    // Pinch zoom can grow grid captions to photo-viewing sizes; a tooltip
-    // stops at twice the native tooltip font so it stays a tooltip.
+    // Preserve the native tooltip's legibility bounds, but use the list's
+    // actual resolved face and style. A different family or semibold filename
+    // has different ink dimensions even at the same nominal em size.
     em = std::clamp(viewEm, em, 2.f * em);
-    // The configured font, exactly as the view resolved it (including fonts
-    // loaded from a file); otherwise the XAML text face where installed.
-    const bool configured = !ConfiguredFontFamily().empty();
-    std::wstring family = font.lfFaceName;
-    if (!configured) {
-        ComPtr<IDWriteFontCollection> system; UINT32 index = 0; BOOL exists = FALSE;
-        if (SUCCEEDED(g_writeFactory->GetSystemFontCollection(&system)) &&
-            SUCCEEDED(system->FindFamilyName(L"Segoe UI Variable Text", &index, &exists)) && exists)
-            family = L"Segoe UI Variable Text";
-    }
+    const auto& source = state.textFormat;
+    std::wstring family(source->GetFontFamilyNameLength() + 1, L'\0');
     ComPtr<IDWriteFontCollection> collection;
-    if (configured) {
-        family.assign(state.headerFormat->GetFontFamilyNameLength() + 1, L'\0');
-        if (FAILED(state.headerFormat->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
-            FAILED(state.headerFormat->GetFontCollection(&collection))) return false;
-        family.resize(wcslen(family.c_str()));
-    }
-    const DWRITE_FONT_WEIGHT body = configured ? DWRITE_FONT_WEIGHT_NORMAL :
-        static_cast<DWRITE_FONT_WEIGHT>(std::clamp<LONG>(font.lfWeight ? font.lfWeight : 400, 1, 999));
-    const DWRITE_FONT_STYLE style = !configured && font.lfItalic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
+    if (FAILED(source->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
+        FAILED(source->GetFontCollection(&collection))) return false;
+    family.resize(wcslen(family.c_str()));
     ComPtr<IDWriteTextFormat> formats[3];
-    // The name line has no native counterpart; it stays semi-bold.
-    const DWRITE_FONT_WEIGHT weights[3]{DWRITE_FONT_WEIGHT_SEMI_BOLD, body, body};
     for (int i = 0; i < 3; ++i) {
-        if (FAILED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(), weights[i], style,
-                DWRITE_FONT_STRETCH_NORMAL, em, L"", &formats[i]))) return false;
+        if (FAILED(g_writeFactory->CreateTextFormat(family.c_str(), collection.Get(),
+                source->GetFontWeight(), source->GetFontStyle(), source->GetFontStretch(),
+                em, L"", &formats[i]))) return false;
         formats[i]->SetReadingDirection(state.rtlLayout ?
             DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
         formats[i]->SetWordWrapping(i == 0 ? DWRITE_WORD_WRAPPING_EMERGENCY_BREAK : DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -30046,15 +30029,16 @@ void ConsumeItemTip(ViewState& state) {
     PresentItemTip(state, *result);
 }
 
-// Like Gallery's XAML tooltips: a 4-DIP rounded body and a centered soft
-// shadow drawn into a per-pixel-alpha window, so the corners are the same
+// A 4-DIP rounded body with a soft shadow cast below it, drawn into a
+// per-pixel-alpha window, so the corners are the same
 // DIP size on every display (DWM's popup radius is not). The window extends
 // past the body by the shadow's reach; the body sits at tip.position.
 void RenderItemTip(ItemTip& tip) {
     if (!IsWindow(tip.hwnd) || !tip.nameLayout || tip.size.cx <= 0 || tip.size.cy <= 0) return;
     const int dpi = DpiOf(tip.hwnd);
-    const float sigma = float(Scale96(4, dpi)), radius = float(Scale96(4, dpi));
-    const int margin = int(std::ceil(3.f * sigma));
+    const float sigma = float(Scale96(2, dpi)), radius = float(Scale96(4, dpi));
+    const float shadowY = float(Scale96(2, dpi));
+    const int margin = int(std::ceil(3.f * sigma + shadowY));
     tip.margin = margin;
     const SIZE full{tip.size.cx + 2 * margin, tip.size.cy + 2 * margin};
     if (!tip.factory) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, tip.factory.GetAddressOf());
@@ -30098,7 +30082,7 @@ void RenderItemTip(ItemTip& tip) {
             mask->BeginDraw(); mask->Clear(D2D1::ColorF(0, 0.f)); mask->FillRoundedRectangle(body, solid.Get());
             if (SUCCEEDED(mask->EndDraw()) && SUCCEEDED(mask->GetBitmap(&silhouette))) {
                 shadow->SetInput(0, silhouette.Get());
-                context->DrawImage(shadow.Get());
+                context->DrawImage(shadow.Get(), D2D1::Point2F(0.f, shadowY));
             }
         }
         ComPtr<ID2D1SolidColorBrush> fill, text, label;

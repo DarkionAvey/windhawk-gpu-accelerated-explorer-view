@@ -23,6 +23,7 @@
 #include "touch-packet-fixture.h"
 #include "tab-activation-fixture.h"
 #include "repaint-fixture.h"
+#include "layered-pixels-fixture.h"
 #include GPU_OVERLAY_SOURCE
 // Only the mod's own repaint requests are recorded; test code calls USER directly.
 #undef InvalidateRect

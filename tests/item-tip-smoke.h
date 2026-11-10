@@ -325,8 +325,8 @@ static void ItemTipScenario(const std::wstring& directory) {
     RECT window{}, viewRect{};
     GetWindowRect(tip.hwnd, &window); GetWindowRect(view, &viewRect);
     // Gallery-style: the window extends past the drawn body by the shadow's
-    // reach (three 4-DIP blur deviations); the body sits below the cursor.
-    const int reach = int(std::ceil(3.f * float(MulDiv(4, DpiOf(tip.hwnd), 96))));
+    // reach (three 2-DIP blur deviations plus the 2-DIP downward offset).
+    const int reach = 4 * MulDiv(2, DpiOf(tip.hwnd), 96);
     Check(tip.margin == reach && window.right - window.left == tip.size.cx + 2 * reach &&
         window.bottom - window.top == tip.size.cy + 2 * reach &&
         window.left + reach == viewRect.left + client.x && window.top + reach > viewRect.top + client.y,
@@ -449,11 +449,9 @@ static void ItemTipScenario(const std::wstring& directory) {
         Check(theme && SUCCEEDED(GetThemeFont(theme, nullptr, TTP_STANDARD, 0, TMT_FONT, &font)) && font.lfHeight < 0,
             "native tooltip font");
         if (theme) CloseThemeData(theme);
-        std::wstring expectedFamily = font.lfFaceName;
-        ComPtr<IDWriteFontCollection> system; UINT32 index = 0; BOOL exists = FALSE;
-        if (SUCCEEDED(g_writeFactory->GetSystemFontCollection(&system)) &&
-            SUCCEEDED(system->FindFamilyName(L"Segoe UI Variable Text", &index, &exists)) && exists)
-            expectedFamily = L"Segoe UI Variable Text";
+        std::wstring expectedFamily(state.textFormat->GetFontFamilyNameLength()+1,L'\0');
+        Check(SUCCEEDED(state.textFormat->GetFontFamilyName(expectedFamily.data(),UINT32(expectedFamily.size()))),
+            "list font family" );
         const float native = float(-font.lfHeight), viewFont = state.fontPx;
         const float scale = float(DpiOf(tip.hwnd)) / float(ViewDpi(state));
         struct Reset { ViewState& s; float f; ~Reset() { s.fontPx = f; } } reset{state, viewFont};
@@ -594,4 +592,76 @@ static void TestItemTips(const std::wstring& directory) {
     }).join();
     if (failure) std::rethrow_exception(failure);
     std::cout << "PASS: localized basic/file-only detailed tooltips, real JPEG/WAV metadata, column-cache reuse, deduplication, completed-only display, rendering policy, bounds, RTL and cancellation on a private desktop\n";
+}
+
+static void TestItemTipTypographyAndShadow(bool shadow) {
+    WorkerComApartment apartment;
+    StyleFixture::Session style;
+    ModifierFixture::Session modifiers;
+    LayeredPixelsFixture::Session capture;
+    Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"tooltip appearance fonts");
+    HWND window=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private tooltip pixels",
+        WS_POPUP,-32000,-32000,400,200,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    Check(window!=nullptr,"tooltip appearance window");
+    {
+        ViewState state; state.hwnd=window; state.itemTip.hwnd=window;
+        auto& tip=state.itemTip;
+        for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true}) {
+            Regression::Scope scope("tooltip dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl)+
+                " shadow="+std::to_string(shadow));
+            StyleFixture::dpi=dpi; state.rtlLayout=rtl;
+            auto& font=StyleFixture::themeFont; font={}; font.lfHeight=-MulDiv(12,dpi,96);
+            font.lfWeight=FW_NORMAL; wcscpy_s(font.lfFaceName,L"Segoe UI");
+            const float native=float(-font.lfHeight);
+            for(bool custom:{false,true}) for(float factor:{.5f,1.5f,8.f}) {
+                // Deliberately differ from the old tooltip's automatic family,
+                // semibold name and discarded custom style/stretch.
+                const WCHAR* family=custom ? L"Arial" : L"Segoe UI";
+                const auto weight=custom ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
+                const auto italic=custom ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
+                const auto stretch=custom ? DWRITE_FONT_STRETCH_CONDENSED : DWRITE_FONT_STRETCH_NORMAL;
+                state.fontPx=native*factor; ++state.textFaceSerial;
+                Check(SUCCEEDED(g_writeFactory->CreateTextFormat(family,nullptr,weight,italic,stretch,
+                    state.fontPx,L"",state.textFormat.ReleaseAndGetAddressOf())),"independent list font");
+                Check(PrepareItemTipFont(state,window),"tooltip appearance formats");
+                const float expected=factor<1.f ? native : factor>2.f ? native*2.f : state.fontPx;
+                for(auto* format:{tip.nameFormat.Get(),tip.labelFormat.Get(),tip.valueFormat.Get()}) {
+                    std::wstring actual(format->GetFontFamilyNameLength()+1,L'\0');
+                    Check(SUCCEEDED(format->GetFontFamilyName(actual.data(),UINT32(actual.size()))) &&
+                        wcscmp(actual.c_str(),family)==0 && format->GetFontWeight()==weight &&
+                        format->GetFontStyle()==italic && format->GetFontStretch()==stretch &&
+                        format->GetFontSize()==expected,"tooltip typography differs from list or legibility bounds");
+                }
+                if(!shadow || custom || factor!=1.5f) continue;
+                Check(SUCCEEDED(g_writeFactory->CreateTextLayout(L"Tooltip",7,tip.nameFormat.Get(),
+                    300.f,100.f,tip.nameLayout.ReleaseAndGetAddressOf())),"tooltip pixel layout");
+                tip.size={MulDiv(160,dpi,96),MulDiv(60,dpi,96)};
+                for(COLORREF background:{RGB(248,248,248),RGB(24,24,24)}) {
+                    tip.background=background; tip.foreground=RGB(100,100,100); tip.label=tip.foreground;
+                    RenderItemTip(tip);
+                    const auto extent=LayeredPixelsFixture::size;
+                    const auto& pixels=LayeredPixelsFixture::pixels;
+                    const int margin=4*MulDiv(2,dpi,96);
+                    Check(extent.cx==tip.size.cx+2*margin && extent.cy==tip.size.cy+2*margin &&
+                        pixels.size()==size_t(extent.cx)*extent.cy,"tooltip shadow clipped its allocated extent");
+                    const int x=margin+tip.size.cx/2;
+                    unsigned above=0,below=0;
+                    for(int y=0;y<margin;++y) {
+                        above+=pixels[size_t(y)*extent.cx+x]>>24;
+                        below+=pixels[size_t(extent.cy-1-y)*extent.cx+x]>>24;
+                    }
+                    if(!(below>above && below>0))
+                        std::cerr<<"SHADOW above="<<above<<" below="<<below<<" center="
+                            <<(pixels[size_t(margin+tip.size.cy/2)*extent.cx+x]>>24)<<"\n";
+                    Check(below>above && below>0,"tooltip shadow is centered like a glow or missing");
+                    Check((pixels[x]>>24)==0 && (pixels[size_t(extent.cy-1)*extent.cx+x]>>24)==0,
+                        "tooltip shadow reaches the clipping edge");
+                }
+            }
+        }
+        tip.hwnd=nullptr;
+    }
+    DestroyWindow(window); g_writeFactory.Reset();
+    std::cout<<"PASS: isolated tooltip typography and rendered shadow shadow="<<shadow<<"\n";
 }
