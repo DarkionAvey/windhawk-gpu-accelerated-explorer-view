@@ -48,6 +48,7 @@ RECT GlyphBounds(int image,UINT width,int& canvas,BYTE alpha=128) {
 
 static void TestShellOverlays(const std::wstring& fixture) {
     using namespace ShellOverlayFixture;
+    StyleFixture::Session styleMetrics; StyleFixture::dpi=96;
     const auto target=std::filesystem::path(fixture)/L"overlay-target.txt";
     const auto link=std::filesystem::path(fixture)/L"overlay-link.lnk";
     HANDLE file=CreateFileW(target.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -141,9 +142,12 @@ static void TestShellOverlays(const std::wstring& fixture) {
             state.target->SetTarget(surface.Get()); state.paintWidth=400;
             // Adornments never shrink below Windows' small-icon size for the window's DPI.
             const float smallest=float(GetSystemMetricsForDpi(SM_CXSMICON,GetDpiForWindow(state.hwnd)));
-            const float largest=2.f*std::max(smallest,float(GetSystemMetricsForDpi(SM_CXICON,GetDpiForWindow(state.hwnd))));
             bool floored=false;
-            for(bool rtl:{false,true}) for(float side:{8.f,32.f,96.f,256.f}) {
+            // Rounded samples of Explorer's measured 96-DPI overlay plate
+            // (5 DIP + 13% of the artwork side), independent of draw helpers.
+            state.textFormatDpi=96;
+            for(bool rtl:{false,true}) for(const auto [side,plate] :
+                {std::pair{8.f,6.f},std::pair{32.f,9.f},std::pair{96.f,17.f},std::pair{256.f,38.f}}) {
                 Regression::Scope scope(std::string("rtl=")+(rtl ? "1" : "0")+" side="+std::to_string(int(side)));
                 state.rtlLayout=rtl; state.iconPx=side;
                 state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
@@ -154,10 +158,10 @@ static void TestShellOverlays(const std::wstring& fixture) {
                 for(int y=0;y<400;++y) for(int x=0;x<400;++x) if(image.data[size_t(y)*image.stride+x*4+3]>=128) {
                     left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
                 }
-                // Derive the capped canvas from independent GDI alpha bounds
-                // and OS metrics, keeping its artwork corner anchored.
-                const float drawn=float(IconPixelSize(state));
-                const float edge=std::min(std::max(drawn,smallest),largest/extent),scale=edge/float(canvas);
+                // Derive the canvas from native plate samples, GDI alpha
+                // bounds and the OS small-icon minimum.
+                const float drawn=side;
+                const float edge=std::round(std::max(plate,smallest*extent))/extent,scale=edge/float(canvas);
                 floored|=drawn<smallest;
                 const float origin=rtl ? float(state.paintWidth)-40.f-drawn : 40.f, bottomEdge=40.f+drawn;
                 // RTL mirrors the corner, as the thumbnail type badge does.
@@ -166,12 +170,12 @@ static void TestShellOverlays(const std::wstring& fixture) {
                 Check(right>left && fabsf(left-expectedLeft)<=2.f && fabsf(right-expectedRight)<=2.f &&
                     fabsf(top-(bottomEdge-edge+glyph.top*scale))<=2.f &&
                     fabsf(bottom-(bottomEdge-edge+glyph.bottom*scale))<=2.f,
-                    "overlay glyph missed its DPI-capped image-list corner of the drawn icon");
+                    "overlay glyph missed Explorer's measured plate size or native image-list corner");
             }
             Check(floored,"no overlay draw exercised the small-icon minimum");
 
-            // A thumbnail's type badge: a quarter of the slot, never below the
-            // small-icon size, at the thumbnail's bottom corner.
+            // Rounded samples of Explorer's 96-DPI app badge measurements:
+            // 6.2 DIP + 20% of the thumbnail height, at its bottom corner.
             IconPixels photo; photo.width=96; photo.height=64; photo.stride=photo.width*4;
             photo.data.assign(size_t(photo.stride)*photo.height,0);
             for(size_t i=0;i<photo.data.size();i+=4) {photo.data[i+2]=200; photo.data[i+3]=255;}
@@ -182,8 +186,8 @@ static void TestShellOverlays(const std::wstring& fixture) {
             Check(thumb.pixels.badgeSize==48 && UploadIconBitmap(state,thumb),"badged thumbnail upload");
             Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(400,400),nullptr,0,&props,&surface)),"badge surface");
             state.target->SetTarget(surface.Get());
-            bool badgeFloored=false;
-            for(bool rtl:{false,true}) for(float side:{32.f,96.f,256.f}) {
+            for(bool rtl:{false,true}) for(const auto [side,expected] :
+                {std::pair{32.f,10.f},std::pair{96.f,19.f},std::pair{256.f,40.f}}) {
                 Regression::Scope scope(std::string("badge rtl=")+(rtl ? "1" : "0")+" side="+std::to_string(int(side)));
                 state.rtlLayout=rtl; state.iconPx=side;
                 state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
@@ -197,16 +201,14 @@ static void TestShellOverlays(const std::wstring& fixture) {
                         left=std::min(left,x); right=std::max(right,x+1); top=std::min(top,y); bottom=std::max(bottom,y+1);
                     }
                 }
-                const float drawn=float(IconPixelSize(state)), expected=std::clamp(drawn*.25f,smallest,largest);
-                badgeFloored|=drawn*.25f<smallest;
+                const float drawn=side;
                 const float thumbHeight=drawn*64.f/96.f, thumbBottom=40.f+(drawn-thumbHeight)*.5f+thumbHeight;
                 const float thumbLeft=rtl ? float(state.paintWidth)-40.f-drawn : 40.f;
                 const float expectedLeft=rtl ? thumbLeft : thumbLeft+drawn-expected;
                 Check(right>left && fabsf(float(right-left)-expected)<=2.f && fabsf(float(bottom-top)-expected)<=2.f &&
                     fabsf(left-expectedLeft)<=2.f && fabsf(bottom-thumbBottom)<=2.f,
-                    "thumbnail badge is not slot-scaled with the small-icon minimum at its corner");
+                    "thumbnail badge missed Explorer's measured size or thumbnail corner");
             }
-            Check(badgeFloored,"no badge draw exercised the small-icon minimum");
             surface.Reset();
             // An item update re-resolves the overlay; the displayed one stays
             // until the replacement answer is accepted.
@@ -221,6 +223,6 @@ static void TestShellOverlays(const std::wstring& fixture) {
     g_writeFactory=fonts;
     Check(DeleteFileW(link.c_str()) && DeleteFileW(target.c_str()),"overlay fixture cleanup");
     std::cout<<"PASS: Shell overlays resolve per item off the UI thread, match Windows' own composition, share "
-        "image-list artwork, reach the presentation lane, draw DPI-capped at their corner in LTR/RTL, survive item "
-        "refresh and are never doubled by base artwork; overlays and type badges keep the small-icon minimum\n";
+        "image-list artwork, reach the presentation lane, draw at Explorer's measured size and their native corner in LTR/RTL, survive item "
+        "refresh and are never doubled by base artwork; overlays keep their native small-icon minimum and type badges track thumbnail height\n";
 }

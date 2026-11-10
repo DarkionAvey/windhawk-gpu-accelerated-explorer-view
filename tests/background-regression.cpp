@@ -494,8 +494,18 @@ static void TestNativeSuppression() {
     other.nativeHwnd = native;
     Check(!SuppressNativeContent(other), "two overlays acquired the same native host");
     // A transient empty layout must not erase usable restoration bounds.
-    NativeSetWindowPosHook(list,nullptr,3,27,260,220,
-        SWP_NOACTIVATE | SWP_NOZORDER);
+    // The default-procedure fixture deliberately does not lay out its hidden
+    // Shell child when the host grows. Restoration must preserve list insets
+    // against that repaired parent, rather than preserve its obsolete size.
+    RECT layoutParent{}; GetClientRect(native,&layoutParent);
+    {
+        // A real child layout can arrive synchronously inside our parent
+        // visibility/resize transaction. The visibility guard must not erase
+        // native geometry intent; only writes to our exact viewport are echoes.
+        ScopedFlag internal(t_nativeVisibilityInternal);
+        Check(NativeSetWindowPosHook(list,nullptr,3,27,260,220,
+            SWP_NOACTIVATE | SWP_NOZORDER),"nested native layout request");
+    }
     NativeSetWindowPosHook(list,nullptr,0,0,0,0,
         SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
     RECT suppressed{}; GetClientRect(list,&suppressed);
@@ -504,7 +514,11 @@ static void TestNativeSuppression() {
     RestoreNativeContent(state);
     RECT restored{}; GetWindowRect(list,&restored);
     MapWindowPoints(nullptr,native,reinterpret_cast<POINT*>(&restored),2);
-    Check(restored.left==3 && restored.top==27 && restored.right-restored.left==260 && restored.bottom-restored.top==220,
+    RECT restoredParent{},hostClient{}; GetClientRect(native,&restoredParent); GetClientRect(host,&hostClient);
+    Check(EqualRect(&restoredParent,&hostClient),"restoration retained a stale hidden Shell parent size");
+    Check(restored.left==3 && restored.top==27 &&
+        restored.right-restored.left==260+restoredParent.right-layoutParent.right &&
+        restored.bottom-restored.top==220+restoredParent.bottom-layoutParent.bottom,
         "native restoration replayed a zero-size suppression echo instead of usable list bounds");
     Check(!hidden() && !GetPropW(host, kSuppressedHostProperty), "native visibility intent was not restored");
     Check(IsWindowVisible(header), "native header visibility was not restored");
@@ -1980,6 +1994,7 @@ static void TestPreviewInput() {
 #include "namespace-search-smoke.h"
 #include "tile-layout-smoke.h"
 #include "provider-selection-smoke.h"
+#include "native-viewport-resize-smoke.h"
 #include "initial-sort-smoke.h"
 #include "empty-sort-key-smoke.h"
 #include "preprocessing-benchmark.h"

@@ -35,8 +35,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
-- **Shell Size Text** — The Size column uses Shell formatting and can pick up folder sizes from [Better file sizes in Explorer details](https://windhawk.net/mods/explorer-details-better-file-sizes). Refresh after changing that mod's settings. Size sorting and grouping use the overlay's own rules.
-- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags. On by default.
+- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
@@ -4096,6 +4095,7 @@ struct ViewState {
     struct NativeViewportOwnership {
         HWND hwnd = nullptr, parent = nullptr, owner = nullptr;
         RECT bounds{}; // Latest nonempty parent-relative layout, before suppression.
+        RECT parentClient{}; // Client size against which the recorded edge insets were laid out.
         bool inputLayout = false; // Real size for a native menu session; otherwise 0x0.
     };
     std::vector<std::unique_ptr<NativeViewportOwnership>> suppressedNativeViewports;
@@ -5797,6 +5797,17 @@ static void ResizeTouchpad(ViewState& state) {
 // intercepted before USER applies them; resize/paint events are not suppression.
 // Only HWND properties are shared with API-hook threads, never ViewState pointers.
 thread_local bool t_nativeVisibilityInternal = false;
+// Visibility transactions can synchronously cause genuine Shell child layout.
+// Ignore geometry only for the exact viewport we are writing ourselves.
+thread_local HWND t_nativeViewportLayoutWrite = nullptr;
+class NativeViewportLayoutWrite {
+    HWND previous=t_nativeViewportLayoutWrite;
+public:
+    explicit NativeViewportLayoutWrite(HWND target) { t_nativeViewportLayoutWrite=target; }
+    ~NativeViewportLayoutWrite() { t_nativeViewportLayoutWrite=previous; }
+    NativeViewportLayoutWrite(const NativeViewportLayoutWrite&)=delete;
+    NativeViewportLayoutWrite& operator=(const NativeViewportLayoutWrite&)=delete;
+};
 decltype(&ShowWindow) g_showWindowOriginal = ShowWindow;
 decltype(&ShowWindowAsync) g_showWindowAsyncOriginal = ShowWindowAsync;
 decltype(&SetWindowPos) g_setWindowPosOriginal = SetWindowPos;
@@ -6045,6 +6056,8 @@ HRESULT WINAPI RaiseStructureEventHook(IRawElementProviderSimple* provider,Struc
     return g_raiseStructureEventOriginal(provider,kind,runtimeId,count);
 }
 
+RECT CurrentNativeViewportBounds(ViewState::NativeViewportOwnership& viewport);
+
 LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                     UINT_PTR id, DWORD_PTR owner) {
     WindowCallbackGuard callback;
@@ -6064,7 +6077,8 @@ LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         const auto constrainViewport = [&](bool record) {
             if (msg != WM_WINDOWPOSCHANGING || !lp) return;
             auto& pos = *reinterpret_cast<WINDOWPOS*>(lp);
-            if (record && !t_nativeVisibilityInternal) {
+            if (record && hwnd!=t_nativeViewportLayoutWrite) {
+                CurrentNativeViewportBounds(*viewport);
                 const int width = (pos.flags & SWP_NOSIZE) ?
                     viewport->bounds.right - viewport->bounds.left : pos.cx;
                 const int height = (pos.flags & SWP_NOSIZE) ?
@@ -6141,6 +6155,26 @@ static HWND FolderContentHost(HWND native) {
     return native; // Never hide a shared navigation-tree parent.
 }
 
+// A hidden Shell view can skip its child's resize. Rebase the saved rectangle
+// against the current parent client size, preserving the native edge insets.
+// Only direct Shell presentation children have this layout relationship;
+// nested/shared controls retain their independently observed native bounds.
+RECT CurrentNativeViewportBounds(ViewState::NativeViewportOwnership& viewport) {
+    RECT parent{};
+    if(GetParent(viewport.hwnd)!=viewport.parent || !FolderContentHost(viewport.parent) ||
+        !GetClientRect(viewport.parent,&parent) || parent.right<=0 || parent.bottom<=0) return viewport.bounds;
+    RECT next=viewport.bounds;
+    if(next.right<=next.left || next.bottom<=next.top) next=parent;
+    else if(viewport.parentClient.right>0 && viewport.parentClient.bottom>0) {
+        const long long right=static_cast<long long>(next.right)+parent.right-viewport.parentClient.right;
+        const long long bottom=static_cast<long long>(next.bottom)+parent.bottom-viewport.parentClient.bottom;
+        if(right<=next.left || bottom<=next.top || right>std::numeric_limits<LONG>::max() || bottom>std::numeric_limits<LONG>::max()) return viewport.bounds;
+        next.right=static_cast<LONG>(right); next.bottom=static_cast<LONG>(bottom);
+    }
+    viewport.bounds=next; viewport.parentClient=parent;
+    return next;
+}
+
 // Our intentionally hidden ancestor does not invalidate the live Shell view.
 // Explicitly hidden Shell views still fail this test before that ancestor.
 bool NativeViewAvailable(HWND hwnd, HWND backgroundTab = nullptr) {
@@ -6179,6 +6213,7 @@ void SuppressNativeViewport(ViewState& state, HWND child) {
     auto viewport = std::make_unique<ViewState::NativeViewportOwnership>();
     viewport->hwnd = child; viewport->parent = GetParent(child); viewport->owner = state.hwnd;
     viewport->inputLayout = state.nativeInputLayout;
+    GetClientRect(viewport->parent, &viewport->parentClient);
     GetWindowRect(child, &viewport->bounds);
     MapWindowPoints(nullptr, viewport->parent, reinterpret_cast<POINT*>(&viewport->bounds), 2);
     if (!SetPropW(child, kNativeViewportProperty, viewport.get())) return;
@@ -6195,6 +6230,7 @@ void SuppressNativeViewport(ViewState& state, HWND child) {
     state.suppressedNativeViewports.push_back(std::move(viewport));
     if (collapse) {
         ScopedFlag internal(t_nativeVisibilityInternal);
+        NativeViewportLayoutWrite write(child);
         g_setWindowPosOriginal(child, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
     }
@@ -6226,6 +6262,8 @@ void SuppressDispatchedNativeViewport(HWND target) {
 // sessions and restoration; it is sized only while input layout is active.
 // Run only after suppression, using the dedicated host and direct list child.
 void PreserveNativeContentLayout(ViewState& state, HWND native, HWND host) {
+    if (!host || GetPropW(host,kSuppressedHostProperty)!=state.hwnd ||
+        GetAncestor(native,GA_ROOT)!=state.frameHwnd) return;
     ScopedFlag internal(t_nativeVisibilityInternal);
     RECT bounds{};
     if (native != host && GetParent(native) == host && GetClientRect(host, &bounds) &&
@@ -6240,13 +6278,21 @@ void PreserveNativeContentLayout(ViewState& state, HWND native, HWND host) {
         if (!IsWindow(viewport->hwnd) || GetParent(viewport->hwnd) != native ||
             viewport->parent != native) continue;
         if (!GetClientRect(native, &bounds) || bounds.right <= 0 || bounds.bottom <= 0) continue;
-        if (viewport->bounds.right <= viewport->bounds.left || viewport->bounds.bottom <= viewport->bounds.top)
-            viewport->bounds = bounds;
+        const RECT previous=viewport->bounds;
+        const RECT desired=CurrentNativeViewportBounds(*viewport);
+        if(!EqualRect(&previous,&desired))
+            PipelineEvent(*state.background,{.operation=L"native.viewport.layout[oldW,oldH,width,height]",
+                .a=reinterpret_cast<UINT_PTR>(viewport->hwnd),.b=reinterpret_cast<UINT_PTR>(native),
+                .v={double(previous.right-previous.left),double(previous.bottom-previous.top),
+                    double(desired.right-desired.left),double(desired.bottom-desired.top)}});
         if (!viewport->inputLayout) continue;
-        RECT actual{}; GetClientRect(viewport->hwnd, &actual);
-        if (actual.right > 0 && actual.bottom > 0) continue;
-        if (g_setWindowPosOriginal(viewport->hwnd, nullptr, 0, 0, bounds.right, bounds.bottom,
-                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE)) viewport->bounds = bounds;
+        RECT actual{}; GetWindowRect(viewport->hwnd,&actual);
+        MapWindowPoints(nullptr,native,reinterpret_cast<POINT*>(&actual),2);
+        if(EqualRect(&actual,&desired)) continue;
+        NativeViewportLayoutWrite write(viewport->hwnd);
+        g_setWindowPosOriginal(viewport->hwnd,nullptr,desired.left,desired.top,
+            desired.right-desired.left,desired.bottom-desired.top,
+            SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_NOACTIVATE);
     }
 }
 
@@ -6255,15 +6301,20 @@ void PreserveNativeContentLayout(ViewState& state, HWND native, HWND host) {
 // subclass never records these internal transitions as native layout.
 void SetNativeInputLayout(ViewState& state, bool expanded) {
     state.nativeInputLayoutCollapseQueued = false;
+    // Refresh even when another menu already owns input layout. Its nonempty
+    // child can still have the size of an earlier frame or tab activation.
+    if(expanded) if(const HWND host=FolderContentHost(state.nativeHwnd))
+        PreserveNativeContentLayout(state,state.nativeHwnd,host);
     if (state.nativeInputLayout == expanded) return;
     state.nativeInputLayout = expanded;
     ScopedFlag internal(t_nativeVisibilityInternal);
     for (const auto& viewport : state.suppressedNativeViewports) {
         if (!IsWindow(viewport->hwnd) || GetPropW(viewport->hwnd, kNativeViewportProperty) != viewport.get()) continue;
         viewport->inputLayout = expanded;
-        RECT r = viewport->bounds;
+        RECT r = CurrentNativeViewportBounds(*viewport);
         if (expanded && (r.right <= r.left || r.bottom <= r.top) &&
             (viewport->parent != state.nativeHwnd || !GetClientRect(viewport->parent, &r))) continue;
+        NativeViewportLayoutWrite write(viewport->hwnd);
         g_setWindowPosOriginal(viewport->hwnd, nullptr, r.left, r.top,
             expanded ? r.right - r.left : 0, expanded ? r.bottom - r.top : 0,
             SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | (expanded ? 0 : SWP_NOMOVE));
@@ -6344,18 +6395,21 @@ void RestoreNativeContent(ViewState& state) {
     ScopedFlag restoring(t_nativeVisibilityInternal);
     state.nativePresentationPending = false;
     if (IsWindow(state.hwnd)) SetPresentationVisibility(state.hwnd, false);
-    // Restoration uses each list's recorded real bounds below.
+    if(const HWND host=FolderContentHost(state.nativeHwnd))
+        PreserveNativeContentLayout(state,state.nativeHwnd,host);
+    // Resolve each list against its current parent before releasing ownership.
     state.nativeInputLayout = state.nativeInputLayoutCollapseQueued = false;
     auto viewports = std::move(state.suppressedNativeViewports);
     state.suppressedNativeViewports.clear();
     for (const auto& viewport : viewports) {
         if (!IsWindow(viewport->hwnd) ||
             GetPropW(viewport->hwnd, kNativeViewportProperty) != viewport.get()) continue;
+        const RECT currentBounds=CurrentNativeViewportBounds(*viewport);
         RemovePropW(viewport->hwnd, kNativeViewportProperty);
         RemoveWindowSubclass(viewport->hwnd, NativeHostSubclass, reinterpret_cast<UINT_PTR>(state.hwnd));
         if (GetParent(viewport->hwnd) != viewport->parent ||
             GetAncestor(viewport->hwnd, GA_ROOT) != state.frameHwnd) continue;
-        RECT r = viewport->bounds;
+        RECT r = currentBounds;
         // An early creation event can acquire a list before its first layout.
         // Only a direct Shell presentation child may inherit the view's client
         // bounds; never guess geometry for a nested/shared navigation control.

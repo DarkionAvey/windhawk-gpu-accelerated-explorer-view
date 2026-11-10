@@ -496,17 +496,24 @@ void Child(const std::wstring& fixture, const std::wstring& provider) {
                     for (const auto& item : popup.items) std::wcout << L"HIDDEN " << item.text << L" state=" << item.state << L'\n';
                 }
             }
-            if(observed!=reference) {
-                // Failure-only control: distinguish a host-visibility effect
-                // from changing commands/states in the native provider itself.
+            bool matchesNative = observed == reference;
+            if (!matchesNative) {
+                // Shell commands such as Undo can change while other tests
+                // mutate files. Compare with a freshly displayed native menu
+                // to distinguish that shared state from a visibility defect.
                 RestoreNativeContent(state);
-                Popup control(state.nativeHwnd,host.frame);
-                NativeContextMenu(state,point,false);
-                std::cout<<"NATIVE CONTROL displayed="<<control.Displayed()<<std::endl;
-                for(const auto& item:control.items)
-                    std::wcout<<L"NATIVE CONTROL "<<item.text<<L" state="<<item.state<<L'\n';
+                {
+                    Popup control(state.nativeHwnd,host.frame);
+                    NativeContextMenu(state,point,false);
+                    std::cout<<"NATIVE CONTROL displayed="<<control.Displayed()<<std::endl;
+                    for(const auto& item:control.items)
+                        std::wcout<<L"NATIVE CONTROL "<<item.text<<L" state="<<item.state<<L'\n';
+                    matchesNative = control.Displayed() && observed == control.items;
+                }
+                Check(SuppressNativeContent(state), "restore suppression after native control menu");
+                SetPresentationVisibility(state.hwnd, true);
             }
-            Check(observed==reference,"displayed popup commands/submenus/states differ with the native host hidden");
+            Check(matchesNative,"displayed popup commands/submenus/states differ with the native host hidden");
             Check(!IsWindowVisible(state.nativeHwnd), "popup exposed the suppressed native list");
             int selected = -1;
             Check(SUCCEEDED(state.folderView->ItemCount(SVGIO_SELECTION, &selected)) &&

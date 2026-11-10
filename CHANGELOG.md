@@ -29,6 +29,7 @@
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
 - **FIXED** Deleting a striped row in a grouped list could animate a stripe beneath an unrelated collapsed group.
+- **FIXED** A hidden native list could keep an old window size after resizing, leaving a strip where right-click menus did not open and restoring a cropped native view. Native child layout updates are also retained during parent resize and visibility changes.
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
 - **FIXED** View switch tooltip flickering and moving while shown.

@@ -122,6 +122,9 @@ function Get-ExitDescription([int]$Code) {
 # that a private test executable was injected. Observation is best effort.
 function Get-TestInterference([Diagnostics.Process]$Process) {
     try {
+        # Modules cannot be sampled after exit. Windows retries that query,
+        # stalling collection for every completed peer at high concurrency.
+        if ($Process.HasExited) { return @() }
         $Process.Refresh()
         @($Process.Modules | Where-Object {
             $_.ModuleName -match '^(windhawk(?:[._-].*)?|local@.*)\.dll$'

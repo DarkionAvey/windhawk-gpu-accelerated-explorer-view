@@ -186,6 +186,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("item-tip-relative-dates", PARALLEL, TestItemTipRelativeDates()),
     REGRESSION("cloud-item-tip", PARALLEL, TestCloudItemTip(fixture)),
     // Graphics and native view integration.
+    REGRESSION("native-viewport-resize", PARALLEL, TestNativeViewportResize(fixture)),
     REGRESSION("real-native-viewport", PARALLEL, TestRealNativeViewport(fixture)),
     REGRESSION("native-return-routes", PARALLEL, TestNativeReturnRoutes(fixture)),
     REGRESSION("native-return-unload", PARALLEL, TestNativeReturnUnload(fixture)),

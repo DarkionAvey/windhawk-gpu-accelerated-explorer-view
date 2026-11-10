@@ -120,8 +120,14 @@ static void TestColdAttachWake() {
         Check(PeekMessageW(&msg, frame, g_bootstrapAttachMessage, g_bootstrapAttachMessage, PM_NOREMOVE) &&
             msg.message == g_bootstrapAttachMessage && GetPropW(frame, kBootstrapQueuedProperty),
             "non-removing peek consumed the startup transaction");
-        Check(PeekMessageW(&msg, frame, g_bootstrapAttachMessage, g_bootstrapAttachMessage, PM_REMOVE) &&
-            msg.message == WM_NULL && !GetPropW(frame, kBootstrapQueuedProperty),
+        const BOOL removed = PeekMessageW(&msg, frame, g_bootstrapAttachMessage,
+            g_bootstrapAttachMessage, PM_REMOVE);
+        if (!removed || msg.message != WM_NULL || GetPropW(frame, kBootstrapQueuedProperty))
+            std::cout << "COLD WAKE removal=" << removed << " message=" << msg.message
+                << " expected=" << g_bootstrapAttachMessage << " queued="
+                << bool(GetPropW(frame, kBootstrapQueuedProperty)) << " frame=" << frame
+                << " thread=" << GetCurrentThreadId() << std::endl;
+        Check(removed && msg.message == WM_NULL && !GetPropW(frame, kBootstrapQueuedProperty),
             "startup wake depended on DispatchMessage/mouse input; queue latch remained stuck");
         if (!minimized) {
             const auto began=GetTickCount64();

@@ -1563,6 +1563,8 @@ static void TestTouchInput(const std::wstring& fixture) {
         state.columns[0].width=1400; UpdateColumns(state);
         point={LogicalX(state,100),LONG(state.headerPx+160)};
         SetScrollImmediate(state,300);
+        const auto selectionBeforePan=state.selectedFlags;
+        const int selectedBeforePan=state.selected, anchorBeforePan=state.anchor;
         input.Next(); input.Send(state,{input.Packet(state,input.primary,point,down)});
         moved=point; moved.y-=80;
         input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,move)});
@@ -1573,7 +1575,8 @@ static void TestTouchInput(const std::wstring& fixture) {
         FeedTouchFrames(state,state.touchRecognizer,1,1,&duplicate);
         Check(TouchFixture::processCalls==count && state.scrollNow==once,"same pointer frame was processed twice");
         input.Next(); input.Send(state,{input.Packet(state,input.primary,moved,up)});
-        Check(state.swipeReleased && state.selected==selected,"pan release selected a passing item or missed release");
+        Check(state.swipeReleased && state.selected==selectedBeforePan && state.anchor==anchorBeforePan &&
+            state.selectedFlags==selectionBeforePan,"pan release changed selection or missed release");
         StopTouch(state);
 
         Reset(state,input); SetScrollImmediate(state,0);
