@@ -1018,6 +1018,7 @@ struct RowVisual {
     float width = 0.f; // Zero uses the current single-column/item width.
     float morph = 1.f; // Below 1, icon and name still travel from the rectangles below.
     D2D1_RECT_F fromIcon{}, fromText{};
+    D2D1_RECT_F destinationCell{}; // Logical destination bounds, before cell interpolation.
 };
 
 // DirectWrite layouts are device-independent. Keep shaping and trimming state
@@ -4935,6 +4936,7 @@ bool AdvanceGroupAnimation(ViewState& state, LARGE_INTEGER sampled = {}) {
 }
 
 RowVisual LayoutRowVisual(const ViewState& state, int index, float progress);
+void CaptureItemMorph(ViewState& state, const RowVisual& visual, CapturedRow& capture);
 
 // Zoom and grid reflow move cells toward metrics that keep changing under
 // input (zoom clock, pinch, resize). They repaint every frame at live
@@ -11781,6 +11783,7 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
             capture.oldWidth = visual.width;
             capture.oldHeight = visual.height;
             capture.oldOpacity = visual.opacity;
+            CaptureItemMorph(state,visual,capture);
             capture.entry = state.entries[static_cast<size_t>(i)];
             capture.selected = i < static_cast<int>(state.selectedFlags.size()) &&
                 state.selectedFlags[static_cast<size_t>(i)] != 0;
@@ -13031,6 +13034,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         old.oldWidth = visual.width;
         old.oldHeight = visual.height;
         old.oldOpacity = visual.opacity;
+        CaptureItemMorph(state,visual,old);
     }
     if (state.rowTransitionActive && !groupingChanged) {
         // Keep still-visible ghosts from the preceding batch. They already
@@ -13851,14 +13855,19 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         }
     }
     if (visual.morph < 1.f) {
-        // A list/grid switch moves the presented icon and name to their new
-        // places, so each item visibly becomes its new row or cell.
+        // Component endpoints belong to the destination cell, not the cell
+        // already interpolated above. Centering a grid icon inside a shrinking
+        // full-width list row makes the endpoint move sideways, then blending
+        // toward it a second time sends the icon out and back.
+        const auto& cell = visual.destinationCell;
+        const auto destination = LayoutItem(state,{cell.top,cell.bottom-cell.top,visual.opacity,
+            cell.left,cell.right-cell.left});
         const auto blend = [t = visual.morph](D2D1_RECT_F from, D2D1_RECT_F to) {
             return D2D1::RectF(from.left + (to.left - from.left) * t, from.top + (to.top - from.top) * t,
                 from.right + (to.right - from.right) * t, from.bottom + (to.bottom - from.bottom) * t);
         };
-        g.icon = blend(visual.fromIcon, g.icon);
-        g.text = blend(visual.fromText, g.text);
+        g.icon = blend(visual.fromIcon, destination.icon);
+        g.text = blend(visual.fromText, destination.text);
     }
     if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
         // Boxes slide with the band they lead, like the section badges.
@@ -13877,6 +13886,13 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         g.checkbox = D2D1::RectF(left,top,left+size,top+size);
     }
     return g;
+}
+
+void CaptureItemMorph(ViewState& state, const RowVisual& visual, CapturedRow& capture) {
+    capture.shaped = visual.morph < 1.f;
+    if (!capture.shaped) return;
+    const auto item = LayoutItem(state,visual);
+    capture.oldIcon = item.icon; capture.oldText = item.text;
 }
 
 D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item,const RowVisual& visual) {
@@ -14070,8 +14086,10 @@ void StopRowTransition(ViewState& state) {
 // of false insertions. Every search below is bounded by the visible sample.
 void StartRowTransition(ViewState& state, std::vector<CapturedRow>&& captures,
                         int oldTotal, float oldRowPx, float oldScroll) {
-    if (state.gridView) {
-        StartGroupingTransition(state, std::move(captures), {}, oldRowPx);
+    const bool shaped = std::any_of(captures.begin(),captures.end(),
+        [](const CapturedRow& capture) { return capture.shaped; });
+    if (state.gridView || shaped) {
+        StartGroupingTransition(state, std::move(captures), {}, oldRowPx,false,shaped);
         return;
     }
     StopSelectionFade(state);
@@ -14179,6 +14197,10 @@ void StartGroupingTransition(ViewState& state,
     std::vector<CapturedRow>&& captures,
     std::vector<CapturedGroupHeader>&& oldHeaders, float oldRowPx, bool zoomLayout, bool reflow) {
     StopSelectionFade(state);
+    // A namespace diff can interrupt a list/grid morph after matching its
+    // items by identity. Retain that component geometry through the diff.
+    reflow |= std::any_of(captures.begin(),captures.end(),
+        [](const CapturedRow& capture) { return capture.shaped; });
     // Zoom and reflow captures are presented visuals of the same items, so
     // their row height may differ and cells leaving the viewport keep moving.
     const bool presented = zoomLayout || reflow;
@@ -14189,7 +14211,8 @@ void StartGroupingTransition(ViewState& state,
     auto newRows = VisibleItemRows(state,
         static_cast<float>(kRowTransitionOverscan));
     if (presented) {
-        for (const auto& capture : captures) newRows.push_back(capture.newIndex);
+        for (const auto& capture : captures)
+            if (capture.newIndex >= 0 && capture.newIndex < state.total) newRows.push_back(capture.newIndex);
         std::sort(newRows.begin(), newRows.end());
         newRows.erase(std::unique(newRows.begin(), newRows.end()), newRows.end());
     }
@@ -14325,6 +14348,8 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
         const auto moved = [shift](D2D1_RECT_F r) { r.top += shift; r.bottom += shift; return r; };
         visual.morph = progress;
         visual.fromIcon = moved(motion.oldIcon); visual.fromText = moved(motion.oldText);
+        const float left = DocumentRowLeft(state,index);
+        visual.destinationCell = D2D1::RectF(left,targetTop,left+state.itemWidth,targetTop+height);
     }
     return visual;
 }
