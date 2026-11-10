@@ -32,7 +32,7 @@ static void TestItemDragHitZones(const std::wstring& fixture) {
         const RowVisual row{state.headerPx,DisplayRowHeight(state,0),1.f,DocumentRowLeft(state,0),state.itemWidth};
         const auto item=LayoutItem(state,row);
         const auto hit=[&](float x,float y) {
-            return PointOnItemDragContent(state,0,POINT{LogicalX(state,LONG(x)),LONG(y)});
+            return PointStartsItemDrag(state,0,POINT{LogicalX(state,LONG(x)),LONG(y)});
         };
         for(bool selected:{false,true}) {
             state.selectedFlags.assign(1,selected); state.selected=selected?0:-1;
@@ -48,17 +48,17 @@ static void TestItemDragHitZones(const std::wstring& fixture) {
                 for(float y:{row.top+1.f,row.top+row.height*.5f,row.top+row.height-1.f}) {
                     Check(hit(item.text.left+measured.width*.5f,y),"list filename does not own full tall row height");
                     Check(hit((item.icon.left+item.icon.right)*.5f,y),"list icon does not own full tall row height");
-                    Check(!hit(item.text.left+measured.width+60.f,y),"blank Name column space starts file drag");
+                    Check(hit(item.text.left+measured.width+60.f,y)==selected,"Name padding must drag only an already-selected item");
                 }
             } else {
-                Check(!hit((item.icon.left+item.icon.right)*.5f,item.icon.top-1.f),
-                    "grid icon padding starts file drag");
+                Check(hit((item.icon.left+item.icon.right)*.5f,item.icon.top-1.f)==selected,
+                    "grid icon padding must drag only an already-selected item");
                 const float outside=item.cell.left+1.f;
-                Check(!hit(outside,(item.icon.top+item.icon.bottom)*.5f),"grid cell padding starts file drag");
+                Check(hit(outside,(item.icon.top+item.icon.bottom)*.5f)==selected,"grid cell padding must drag only an already-selected item");
                 const auto text=CurrentSelectionRect(state,0,false,nullptr,true);
                 Check(text.right>text.left && text.bottom>text.top,"grid filename has no rendered box");
                 Check(hit((text.left+text.right)*.5f,(text.top+text.bottom)*.5f),"grid filename box is not draggable");
-                Check(!hit(text.right+2.f,(text.top+text.bottom)*.5f),"grid filename target expands to cell width");
+                Check(hit(text.right+2.f,(text.top+text.bottom)*.5f)==selected,"grid filename padding must drag only an already-selected item");
             }
         }
         UnregisterAnimationWindow(state.hwnd); Stop(state.background); DropTarget(state); DestroyWindow(state.hwnd);

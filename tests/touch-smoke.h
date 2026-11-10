@@ -1448,6 +1448,8 @@ static void TestTouchInput(const std::wstring& fixture) {
     POINT blank{LogicalX(state,LONG(ListEndX(state)-Scale96(20,ViewDpi(state)))),point.y};
     const int blankRow=RowFromPoint(state,blank.y,blank.x);
     Check(blankRow>=0 && !PointOnItemDragContent(state,blankRow,blank),"held padding fixture is not blank row space");
+    ClearSelectionForFolderMenu(state);
+    WaitForPreparedSelection(state);
     const auto promotionsBeforePadding=TouchFixture::promotions;
     input.Next(); input.Send(state,{input.Packet(state,input.primary,blank,down)});
     Held(state);
@@ -1457,6 +1459,24 @@ static void TestTouchInput(const std::wstring& fixture) {
     Check(!state.touch.dragPending && !state.touch.dragPromoted &&
         TouchFixture::promotions==promotionsBeforePadding && TouchFixture::drags==0,
         "held blank row padding armed or promoted a file drag");
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,blankMoved,up|POINTER_FLAG_CANCELED)});
+    StopTouch(state);
+
+    // The same blank origin on a selected item must carry the selection.
+    Reset(state,input,true);
+    const int selectedBlankRow=RowFromPoint(state,blank.y,blank.x);
+    Check(selectedBlankRow>=0 && selectedBlankRow+1<state.total,"selected padding fixture rows");
+    Select(state,selectedBlankRow); SelectWithModifiers(state,selectedBlankRow+1,true,false);
+    WaitForPreparedSelection(state);
+    const auto selectedBeforePadding=state.selectedFlags;
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,blank,down)});
+    Held(state);
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,blankMoved,move)});
+    Check(state.touch.dragPending && state.selectedFlags==selectedBeforePadding,
+        "selected row padding failed to arm a drag or changed the selection");
+    Pump(state);
+    Check(state.touch.dragPromoted && TouchFixture::promotions==promotionsBeforePadding+1 && TouchFixture::drags==0,
+        "selected row padding did not promote the held drag");
     input.Next(); input.Send(state,{input.Packet(state,input.primary,blankMoved,up|POINTER_FLAG_CANCELED)});
     StopTouch(state);
 

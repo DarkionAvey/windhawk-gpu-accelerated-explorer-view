@@ -11,7 +11,7 @@
 - **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
-- **IMPROVED** Drag files directly from their icon or filename without selecting first. List targets use the full row height; blank row and grid padding remain available for rectangle selection.
+- **IMPROVED** Drag files directly from their icon or filename without selecting first. Unselected list targets use the full row height; their blank row and grid padding remain available for rectangle selection. Selected items drag from the whole row or cell.
 - **IMPROVED** Zebra stripes animate between snapshots of the visible bands, respecting group boundaries and empty-row stripes.
 - **IMPROVED** Thumbnail overlays now match Explorer's sizes: shortcut arrows and app badges no longer cover large thumbnails. Video frames get film strips in Explorer's proportions, drawn over the image edges with see-through holes.
 - **IMPROVED** Item tooltips now look like the modern tooltips in Explorer's Gallery: subtly rounded, no border and a soft centered shadow. Their text follows the view's text size, between the native tooltip size and twice it.

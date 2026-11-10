@@ -19247,6 +19247,15 @@ bool PointOnItemDragContent(ViewState& state, int index, POINT point) {
     return x>=leading && x<trailing && y>=visual.top && y<visual.top+visual.height;
 }
 
+// Selection already establishes drag intent. Only unselected items need the
+// narrow content test; selected row/cell padding carries the whole selection.
+bool PointStartsItemDrag(ViewState& state,int index,POINT point) {
+    if(index<0 || index>=state.total || size_t(index)>=state.entries.size()) return false;
+    if(size_t(index)<state.selectedFlags.size() && state.selectedFlags[size_t(index)])
+        return InsideListX(state,point.x) && RowFromPoint(state,point.y,point.x)==index;
+    return PointOnItemDragContent(state,index,point);
+}
+
 // Pointer hover and keyboard selection use the same SelectionRect geometry,
 // cubic easing, and frame worker, but hover has its own duration constant.
 struct HoverVisual {
@@ -32243,9 +32252,9 @@ bool TouchItemValid(ViewState& state) {
         state.entries[size_t(state.touch.row)].path == state.touch.item);
 }
 
-bool TouchDragOriginOnContent(ViewState& state) {
+bool TouchDragOriginEligible(ViewState& state) {
     POINT origin=state.touch.start;
-    return MapUiPoint(nullptr,state.hwnd,origin) && PointOnItemDragContent(state,state.touch.row,origin);
+    return MapUiPoint(nullptr,state.hwnd,origin) && PointStartsItemDrag(state,state.touch.row,origin);
 }
 
 void ReplayTouchMouse(ViewState& state, UINT message, POINT point) {
@@ -32271,7 +32280,7 @@ PCWSTR TouchDragBlock(ViewState& state) {
     if (!state.touch.dragPending) return L"not pending";
     if (!state.touch.active || !state.touch.down) return L"contact ended";
     if (state.touch.epoch != state.mouseFolderEpoch || !TouchItemValid(state)) return L"item changed";
-    if (!TouchDragOriginOnContent(state)) return L"press outside icon or filename";
+    if (!TouchDragOriginEligible(state)) return L"press outside icon or filename";
     if (state.pendingNativeSelection || state.nativeSelectionUnsafe || state.nativeSelectionImportPending ||
         state.nativeSelectionAwaitingRefresh) return L"native selection not ready";
     if (!state.visible || !TabOwnsActiveView(state)) return L"inactive view";
@@ -32440,7 +32449,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
                     TraceTouchHitTest(state,L"hold",state.touch.start,origin,RowFromPoint(state,origin.y,origin.x),mapped,error);
                 }
                 if (state.touch.row >= 0 && size_t(state.touch.row) < state.selectedFlags.size() && TouchItemValid(state) &&
-                    TouchDragOriginOnContent(state) && !state.selectedFlags[size_t(state.touch.row)]) Select(state, state.touch.row);
+                    TouchDragOriginEligible(state) && !state.selectedFlags[size_t(state.touch.row)]) Select(state, state.touch.row);
             }
             // Native HOLD cancellation followed by manipulation is the
             // transition from a held item to dragging. A second contact or
@@ -32538,7 +32547,7 @@ void DrainTouchOutput(ViewState& state, const std::shared_ptr<TouchRecognizer>& 
         state.touch.consumed = true;
         KillTimer(hwnd, kTouchHoldTimerId);
         if (state.touch.holding && session->contacts.size() <= 1 &&
-            event.contactCount == 1 && state.touch.row >= 0 && TouchItemValid(state) && TouchDragOriginOnContent(state)) {
+            event.contactCount == 1 && state.touch.row >= 0 && TouchItemValid(state) && TouchDragOriginEligible(state)) {
             if (!state.touch.down) { StopTouch(state); return; }
             state.touch.dragPending = true;
             TraceTouchDrag(state,L"native held manipulation",true);
@@ -34767,8 +34776,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->mousePressControl = control;
                 s->mousePressShift = shift;
                 if (index >= 0) {
-                    // Empty row/cell padding remains available for marquee,
-                    // independently of the full-width selection background.
+                    // A selected item drags from its whole row/cell. For an
+                    // unselected item, blank padding remains a marquee origin.
                     const bool alreadySelected =
                         static_cast<size_t>(index) < s->selectedFlags.size() &&
                         s->selectedFlags[static_cast<size_t>(index)] != 0;
@@ -34779,7 +34788,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         !s->clickPolicy.singleClick && s->mousePressSource != ClickSource::Touch &&
                         s->selected == index && s->selectedFlags.Count(0, s->selectedFlags.size()) == 1 &&
                         PointOnFilenameText(*s, index, POINT{x, y});
-                    if (PointOnItemDragContent(*s,index,POINT{x,y})) {
+                    if (PointStartsItemDrag(*s,index,POINT{x,y})) {
                         // Grabbing a selected member preserves the selection;
                         // an unselected item is selected at the drag threshold.
                         // Click modifiers remain deferred until release.
@@ -34790,8 +34799,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         s->shellDragToggleOnClick = control && !shift;
 
                     } else {
-                        // Blank padding is a possible marquee origin, even
-                        // in a selected row. Defer click modifiers until UP;
+                        // Blank padding on an unselected item is a marquee
+                        // origin. Defer click modifiers until UP;
                         // moving beyond the OS drag threshold instead starts
                         // marquee without any transient Shell selection work.
                         PrepareMarquee(*s, POINT{x, y}, control);
