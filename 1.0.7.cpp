@@ -4021,6 +4021,7 @@ struct ViewState {
     std::array<float, 2> touchScrollbarFrom{}, touchScrollbarTo{};
     std::array<LARGE_INTEGER, 2> touchScrollbarStarted{};
     bool zoomAnimating = false;
+    double zoomFromHeight96 = 0.; // Effective preference at the start, independent of layout geometry.
     float zoomFromRowPx = 0.f, zoomFromFontPx = 0.f, zoomFromIconPx = 0.f;
     float zoomToIconPx = 0.f, zoomToFontPx = 0.f, zoomToRowPx = 0.f, zoomFromScroll = 0.f;
     float zoomAnchorRow = 0.f; // Fractional document row at the viewport center.
@@ -4333,7 +4334,7 @@ struct SwipeFeedbackSnapshot {
     X(hovered) X(clickPolicy) X(checkboxRevealStarted) X(sortChevronFlipStarted) X(sortChevronFlipFrom) X(checkboxRevealFrom) X(checkboxRevealHeaderState)X(pointingDevice) X(typeSearch) X(searchHighlightTerms) X(lastTyped) X(keyboardCaretVisible) X(clipboardIsCut) X(clipboardSequence) X(clipboardInitialized) X(clipboardIconsStartedQpc) \
     X(shellDropHotRow) X(marqueePossible) X(marqueeActive) X(marqueeStart) X(marqueeCurrent) X(marqueeStartDocumentY) \
     X(rowHeight96) X(compactRows) X(preciseRowHeight96) X(touchScrollbarFrom) X(touchScrollbarTo) X(touchScrollbarStarted) \
-    X(zoomAnimating) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
+    X(zoomAnimating) X(zoomFromHeight96) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
     X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(zoomFromCompact) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
     X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
@@ -4887,6 +4888,14 @@ float ContentReveal(const ViewState& state) {
     if (!state.zoomAnimating) return to;
     return state.zoomFromContent +
         (to - state.zoomFromContent) * EaseOutCubic(UiTransitionProgress(state, state.zoomStartedQpc));
+}
+double PresentedZoomHeight96(const ViewState& state) {
+    const int saved = state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
+    const double precise = state.preciseRowHeight96[state.gridView];
+    const double target = precise > 0. && std::llround(precise) == saved ? precise : saved;
+    if (!state.zoomAnimating) return target;
+    return state.zoomFromHeight96 + (target-state.zoomFromHeight96) *
+        EaseOutCubic(UiTransitionProgress(state,state.zoomStartedQpc));
 }
 // How compact the presented list rows are: 1 in Compact view, 0 otherwise,
 // and in between while the zoom that toggles it runs.
@@ -13571,17 +13580,20 @@ float ListViewportWidth(ViewState& state);
 
 // Height of a tile's reserved text block: three lines (name, type, size), or
 // for drives two lines around the usage bar. Shared by metrics and layout.
+float ItemTextLinePitch(float font) {
+    // Keep layout continuous; text/image drawing handles pixel alignment.
+    // Rounding here multiplies each lost fraction by the number of lines.
+    return font * 1.5f;
+}
 float TileTextHeight(const ViewState& state, float font, int dpi) {
-    // Whole-pixel line pitch: each line snaps to the pixel grid on its own, so
-    // a fractional pitch would round some gaps up and others down.
-    const float line = std::round(font * 1.5f), gap = float(Scale96(2, dpi));
+    const float line = ItemTextLinePitch(font), gap = float(Scale96(2, dpi));
     return DriveTiles(state) ? line * 2.f + float(Scale96(kDriveBarHeight96, dpi)) + gap * 2.f :
         line * 3.f + gap * 2.f;
 }
 // A Content row's text block: two lines on each side (name over type; date
-// over size). Same whole-pixel pitch as tiles.
+// over size). Same continuous pitch as tiles.
 float ContentTextHeight(float font, int dpi) {
-    return std::round(font * 1.5f) * 2.f + float(Scale96(2, dpi));
+    return ItemTextLinePitch(font) * 2.f + float(Scale96(2, dpi));
 }
 
 void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
@@ -13614,8 +13626,8 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // Compact list rows drop padding, not text: the font keeps the full row.
     const float listRow = state.compactRows && !ContentLayout(state) ?
         (direct ? baseRow * kCompactRowFraction : std::round(baseRow * kCompactRowFraction)) : baseRow;
-    const float icon = TileLayout(state) ? (direct ? tileText : std::round(tileText)) :
-        ContentLayout(state) ? (direct ? contentText : std::round(contentText)) :
+    const float icon = TileLayout(state) ? tileText :
+        ContentLayout(state) ? contentText :
         state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
         static_cast<float>(Scale96(16, dpi)), std::max(static_cast<float>(Scale96(16, dpi)), listRow - Scale96(6, dpi)));
@@ -13780,7 +13792,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
             (g.cell.left + g.cell.right - side) * .5f;
         // Tile icons and their text share one top edge, with a wider gap
         // between them; the pair is centered in the cell as one block.
-        const float line = std::round(state.fontPx * 1.5f); // Whole pixels, as TileTextHeight.
+        const float line = ItemTextLinePitch(state.fontPx);
         const float gap = static_cast<float>(Scale96(2, dpi));
         const float bar = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
         const bool drive = DriveTiles(state);
@@ -13822,7 +13834,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
             // every line is reserved before its value arrives. Entering or
             // leaving Content moves the icon and name from their list places
             // on the zoom clock that also carries the row height.
-            const float line = std::round(state.fontPx * 1.5f);
+            const float line = ItemTextLinePitch(state.fontPx);
             const float gap = static_cast<float>(Scale96(2, dpi));
             const float block = ContentTextHeight(state.fontPx, dpi);
             const float top = visual.top + std::max(0.f, state.rowPx - std::max(side, block)) * .5f;
@@ -27884,10 +27896,13 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         // view; a distant selection must not pull the viewport from the hand.
         const int oldColumns = state.itemsPerRow;
         const bool zoomLayout = state.zoomLayoutTransition;
+        AdvanceRowHeight(state);
         auto cells = CapturePresentedGridCells(state);
         auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
             CaptureVisibleGroupHeaders(state);
-        AdvanceRowHeight(state, true);
+        // Take over the current pose rather than finishing a wheel/trackpad
+        // zoom at its endpoint before following the fingers.
+        state.zoomAnimating = false;
         // A grid reflow already in flight keeps moving under later samples;
         // only a column change (or a finished wheel zoom) retargets it.
         if (cells.empty() || zoomLayout) StopRowTransition(state);
@@ -27921,7 +27936,6 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         Redraw(state);
         return bounded96;
     }
-    state.preciseRowHeight96[state.gridView] = 0.;
     BeginAnimatedZoom(state, height96);
     ScheduleZoomAutoRefit(state, true);
     Redraw(state);
@@ -27936,6 +27950,7 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     AdvanceRowHeight(state);
+    const double height = PresentedZoomHeight96(state);
     const float content = ContentReveal(state), compact = CompactReveal(state);
     if (!state.zoomAnimating)
         state.zoomAnchorRow = (state.scrollNow + ViewHeight(state) * .5f) /
@@ -27953,6 +27968,7 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     state.zoomFromFontPx = state.fontPx;
     state.zoomFromIconPx = state.iconPx;
     state.zoomFromScroll = oldScroll;
+    state.zoomFromHeight96 = height;
     // Only now adopt the destination. All source geometry above belongs to
     // the applied layout, independently of an earlier Shell observation.
     if (requested) {
@@ -27963,6 +27979,7 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     state.zoomFromContent = content;
     state.zoomFromCompact = compact;
     if (height96 >= 0) {
+        state.preciseRowHeight96[state.gridView] = 0.;
         state.rowHeight96[state.gridView] = height96;
         if (IsWindow(state.activeTabHost))
             state.tabPresentations[state.activeTabHost].zoomHeight96[state.gridView] = height96;
@@ -28227,18 +28244,7 @@ void ApplyManipulationPan(ViewState& state, float physicalX, float dy) {
 
 void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* contact = nullptr) {
     if (!state.touchpadPinching) {
-        if (contact && state.zoomAnimating) {
-            AdvanceRowHeight(state);
-            const double height = state.gridView ? state.iconPx *
-                std::max(1, Scale96(g_row96.load(), ViewDpi(state))) * 96. /
-                (std::max(1, state.nativeIconSize) * double(ViewDpi(state))) : state.rowPx * 96. / ViewDpi(state);
-            state.preciseRowHeight96[state.gridView] = std::clamp(height,24.,
-                state.gridView ? double(std::numeric_limits<int>::max()) : 96.);
-            state.rowHeight96[state.gridView] = int(std::llround(state.preciseRowHeight96[state.gridView]));
-            state.zoomAnimating = false;
-            // ApplyRowHeight captures the current cells before replacing
-            // this zoom's row motion, including any icon/name morph.
-        }
+        if (contact) AdvanceRowHeight(state);
         // Decided once per gesture: a cell outgrowing the viewport must not
         // lose its protection partway through the same pinch.
         state.pinchRevealRow = contact ? FullyVisibleSelection(state) : -1;
@@ -28253,6 +28259,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
             RetargetSwipeFeedback(state,true,false);
         }
         state.touchpadPinchHeight96 =
+            contact ? PresentedZoomHeight96(state) :
             state.preciseRowHeight96[state.gridView] > 0. ? state.preciseRowHeight96[state.gridView] :
             state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
     }

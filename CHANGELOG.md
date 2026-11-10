@@ -30,6 +30,7 @@
 
 - **FIXED** Icons leaving Tiles for Content or Details could animate from the wrong position. View changes and interrupted layout animations now retain the outgoing icon and filename positions.
 - **FIXED** Collapsing a sticky group now scrolls to that group's own heading, keeping the collapsed group visible instead of skipping ahead.
+- **FIXED** Touchscreen pinch zoom in Content and Tiles could resize icons in visible steps. Taking over a wheel or trackpad zoom with touch now uses the current zoom scale instead of estimating it from the row or icon size.
 - **FIXED** Deleting a striped row in a grouped list could animate a stripe beneath an unrelated collapsed group.
 - **FIXED** A hidden native list could keep an old window size after resizing, leaving a strip where right-click menus did not open and restoring a cropped native view. Native child layout updates are also retained during parent resize and visibility changes.
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
