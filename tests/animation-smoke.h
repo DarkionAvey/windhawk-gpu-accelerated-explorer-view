@@ -544,6 +544,12 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
                 markQueued();
                 const int before=state.paintCalls;
                 SendMessageW(state.hwnd,kMsgFrame,0,0);
+                if(!(state.framePaintPending && state.paintCalls==before && stillQueued() &&
+                    GetUpdateRect(state.hwnd,nullptr,FALSE)))
+                    std::cout<<"INPUT FRAME bits="<<bits<<" pending="<<state.framePaintPending
+                        <<" paints="<<before<<"->"<<state.paintCalls<<" queued="<<stillQueued()
+                        <<" update="<<GetUpdateRect(state.hwnd,nullptr,FALSE)<<" deferred="<<state.frameInputDeferred
+                        <<" needs="<<NeedsAnimationPaint(state)<<" visible="<<IsWindowVisible(state.hwnd)<<std::endl;
                 Check(state.framePaintPending && state.paintCalls==before && stillQueued() &&
                     GetUpdateRect(state.hwnd,nullptr,FALSE),
                     "paced frame painted ahead of pending hardware input");

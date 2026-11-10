@@ -1557,7 +1557,8 @@ static void TestTouchInput(const std::wstring& fixture) {
     for(bool grid:{false,true}) for(bool grouped:{false,true}) for(bool rtl:{false,true}) for(UINT dpi:{96u,144u,192u}) {
         StyleFixture::Session metrics; StyleFixture::dpi=dpi;
         Reset(state,input); state.gridView=grid; state.columnsView=!grid;
-        state.cachedNativeMode=grid ? FVM_ICON : FVM_DETAILS; state.rtlLayout=rtl; state.nativeIconSize=48;
+        state.layoutNativeMode=state.cachedNativeMode=grid ? FVM_ICON : FVM_DETAILS;
+        state.rtlLayout=rtl; state.layoutIconSize=state.nativeIconSize=48;
         state.rowHeight96[grid]=40; state.preciseRowHeight96[grid]=0.; state.grouping.enabled=grouped;
         RebuildGroupSections(state); UpdateMetrics(state); UpdateColumns(state);
         state.columns[0].width=1400; UpdateColumns(state);
@@ -1628,7 +1629,8 @@ static void TestTouchInput(const std::wstring& fixture) {
         StopTouch(state);
     }
     state.grouping.enabled=false; RebuildGroupSections(state); state.gridView=false; state.columnsView=true;
-    state.cachedNativeMode=FVM_DETAILS; state.rtlLayout=false; UpdateMetrics(state); UpdateColumns(state);
+    state.layoutNativeMode=state.cachedNativeMode=FVM_DETAILS;
+    state.rtlLayout=false; UpdateMetrics(state); UpdateColumns(state);
 
     // Radial intent is relative to the initial centroid/radius, independent
     // of separation, orientation, DPI and the optional history setting.

@@ -38,8 +38,10 @@ static void TestTileLayout(const std::wstring& directory) {
         Check(std::fabs(item.icon.bottom - item.detail[1].bottom) <= 1.f,
             "tile icon does not span its reserved text lines");
         const float pitch = item.detail[0].top - item.text.top;
-        Check(pitch == std::round(pitch) && item.detail[1].top - item.detail[0].top == pitch,
-            "tile lines are not evenly spaced on whole pixels");
+        const float expectedPitch=state.fontPx*1.5f+float(MulDiv(2,dpi,96));
+        Check(std::fabs(pitch-expectedPitch)<.01f &&
+            std::fabs(item.detail[1].top-item.detail[0].top-expectedPitch)<.01f,
+            "tile lines lost their evenly spaced fractional layout pitch");
         // Tiles request exactly their lines; values must equal Windows' own.
         QueueVisibleDetails(state);
         SHFILEINFOW info{};

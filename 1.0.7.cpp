@@ -37084,16 +37084,19 @@ bool AttachShellSelectionEvents(ViewState& state, IDispatch* browser) {
         ComPtr<IShellView> sourceView;
         HWND sourceHwnd = nullptr;
         if (!browser) return settled(); // BindShellAutomation will supply a later browser source.
+        ComPtr<IWebBrowser2> webBrowser;
+        const HRESULT webResult=browser->QueryInterface(IID_PPV_ARGS(&webBrowser));
+        if (!current()) return false;
+        if (webResult==E_NOINTERFACE) return settled();
+        if (FAILED(webResult) || !webBrowser) return false;
+        webBrowser->get_Document(document.GetAddressOf());
+        if (!current()) return false;
+        if (!document) return false; // The browser exists; its document is still loading.
         if (FAILED(browser->QueryInterface(IID_PPV_ARGS(&services))) || !services ||
             FAILED(services->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&sourceBrowser))) || !sourceBrowser ||
             FAILED(sourceBrowser->QueryActiveShellView(&sourceView)) || !sourceView ||
             FAILED(sourceView->GetWindow(&sourceHwnd)) || sourceHwnd != native) return false;
         if (!current()) return false;
-        ComPtr<IWebBrowser2> webBrowser;
-        if (SUCCEEDED(browser->QueryInterface(IID_PPV_ARGS(&webBrowser))) && webBrowser)
-            webBrowser->get_Document(document.GetAddressOf());
-        if (!current()) return false;
-        if (!document) return settled();
     }
     if (state.selectionEventCookie &&
         state.selectionEventSource.Get() == document.Get() &&
@@ -40007,7 +40010,6 @@ void ReleaseOverlayClass() {
 
 BOOL Wh_ModInit() {
     LoadSettings();
-    Wh_Log(L"[GPU draft] 1.0.7 view-events-3 loaded; native-view event binding and generation checks active");
     g_unloading.store(false);
     g_backgroundShutdown = false;
     const auto failedInitialization=[]() -> BOOL {

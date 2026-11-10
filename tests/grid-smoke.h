@@ -388,8 +388,10 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             &targetProps, &state.backbuffer)), "grid fixed target");
         state.target->SetTarget(state.backbuffer.Get());
         for (int size : {16,48,96,256}) {
-            state.cachedNativeMode = size == 16 ? FVM_SMALLICON : FVM_ICON;
-            state.nativeIconSize = size;
+            // This fixture installs a settled view, so observation and applied
+            // layout agree; real transitions keep these independent.
+            state.layoutNativeMode = state.cachedNativeMode = size == 16 ? FVM_SMALLICON : FVM_ICON;
+            state.layoutIconSize = state.nativeIconSize = size;
             state.scrollNow = state.scrollTarget = 0.f;
             UpdateMetrics(state);
             Check(MakeTextFormats(state,true) && state.textFormat->GetFontSize()==state.fontPx,
@@ -521,7 +523,8 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             }
             if (size==16 || size==96) TestGridFilenameSelection(state);
         }
-        state.cachedNativeMode = FVM_ICON; state.nativeIconSize = 48;
+        state.layoutNativeMode = state.cachedNativeMode = FVM_ICON;
+        state.layoutIconSize = state.nativeIconSize = 48;
         state.hovered = state.selected = -1; state.typeSearch.clear();
         UpdateMetrics(state);
         const int columns = state.itemsPerRow;
@@ -801,7 +804,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         // but reserves a horizontal icon and two lines before enrichment.
         state.thisPcGpu=state.gridView=true; state.columnsView=false;
         state.total=4; state.entries.assign(4,Entry{});
-        state.rowHeight96[true]=0; state.nativeIconSize=48;
+        state.rowHeight96[true]=0; state.layoutIconSize=state.nativeIconSize=48;
         state.selected=0; state.selectedFlags={1,0,0,0}; state.hovered=1;
         state.typeSearch.clear(); state.scrollNow=state.scrollTarget=0;
         const wchar_t* roots[]={L"C:\\",L"D:\\",L"F:\\",L"Z:\\"};
@@ -815,12 +818,12 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         state.entries[2].driveUsedPercent=35; // Device with no byte count.
         // Tiles carry the usage bar; This PC's icon modes are ordinary grids.
         for(UINT mode : {FVM_ICON,FVM_SMALLICON,FVM_THUMBNAIL}) {
-            state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
+            state.layoutNativeMode=state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
             Check(!DriveTiles(state) && !LayoutDriveBar(state,0,LayoutItem(state,LayoutRowVisual(state,0,1.f))).visible,
                 "This PC icon grid drew drive usage bars");
         }
         for(UINT mode : {FVM_TILE}) {
-            state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
+            state.layoutNativeMode=state.cachedNativeMode=mode; UpdateMetrics(state); MakeTextFormats(state,true);
             const auto item=LayoutItem(state,LayoutRowVisual(state,0,1.f));
             const auto bar=LayoutDriveBar(state,0,item);
             const int columns=state.itemsPerRow;

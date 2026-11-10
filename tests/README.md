@@ -201,6 +201,31 @@ in parallel, find the shared state and isolate it; do not declare Serial.
 Add `Regression::Scope scope("view=List dpi=144")` around loops: the text is
 attached to assertion failures and printed with crashes.
 
+## View changes and direct manipulation
+
+`view-events-roundtrip` and `view-events-this-pc-roundtrip` use a real private
+ExplorerBrowser, navigate away and back, and change modes/icon sizes through
+IFolderView2 with the HWND command observer deliberately unbound. They also
+verify re-subscription when the same event source survives a folder-generation
+change, and assert that mode notifications do not move focus. The This PC test
+is an intentional read-only Shell integration probe using its known-folder PIDL;
+filesystem destinations and all browser windows are private.
+
+`view-morph-96` and `view-morph-144` compare intermediate icon/name rectangles
+against the direct path between independently observed settled endpoints, in
+both directions between Details, large icons, Tiles and Content, with RTL and
+multiple grid columns. They include mid-flight reversals and shape capture.
+`view-morph-directory-diff` deletes a real private file during a morph and checks
+the surviving item's identity, icon/name position and removed-row ghost.
+
+`touch-zoom-fractional-96` and `touch-zoom-fractional-144` check Content, Tiles and
+drive-Tiles geometry against DPI/font arithmetic for fractional touch samples,
+then wheel/trackpad takeover on a held animation clock.
+`sticky-group-collapse-anchor` checks that collapsing a sticky heading retains
+that group's own heading with expanded or collapsed neighbors, in Details,
+Content and Tiles with RTL. These are component/COM integration checks, not
+measurements of live Explorer smoothness or displayed frame rates.
+
 ## User option tests
 
 Option coverage is complete by construction:

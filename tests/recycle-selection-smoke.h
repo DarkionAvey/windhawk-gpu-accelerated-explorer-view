@@ -22,14 +22,16 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     const auto originalIdentities=state.namespaceIdentities;
     const auto originalMode=state.cachedNativeMode;
     const int originalIconSize=state.nativeIconSize;
+    const auto originalLayoutMode=state.layoutNativeMode;
+    const int originalLayoutSize=state.layoutIconSize;
     const auto originalHeights=state.rowHeight96;
     const bool smooth=g_smooth.exchange(false);
     PIDLIST_ABSOLUTE rawParent=nullptr;
     Check(SUCCEEDED(SHGetIDListFromObject(state.folder.Get(),&rawParent)) && rawParent,"namespace selection parent");
     state.directoryFolderIdentity=SharedPidl(rawParent,TaskMemDeleter{});
     state.folderPath=delegated ? originalFolder : kRecycleBinLocation;
-    state.gridView=true; state.cachedNativeMode=FVM_ICON;
-    state.nativeIconSize=256;
+    state.gridView=true; state.layoutNativeMode=state.cachedNativeMode=FVM_ICON;
+    state.layoutIconSize=state.nativeIconSize=256;
     auto identities=std::make_shared<NamespaceIdentities>();
     const auto alternate=[&](int row,DWORD size) {
         ComPtr<SelectionBindData> data; data.Attach(new SelectionBindData);
@@ -129,6 +131,7 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     state.entries=entries; state.entryPathIndex=index; state.folderPath=originalFolder;
     state.directoryFolderIdentity=originalParent; state.namespaceIdentities=originalIdentities;
     state.gridView=false; state.cachedNativeMode=originalMode; state.nativeIconSize=originalIconSize;
+    state.layoutNativeMode=originalLayoutMode; state.layoutIconSize=originalLayoutSize;
     state.rowHeight96=originalHeights; state.wheelRemainder=0;
     state.nativeSelectionDirty=state.nativeSelectionMessageQueued=state.nativeSelectionImportPending=false;
     state.nativeSelectionAwaitingRefresh=state.nativeSelectionUnsafe=false;

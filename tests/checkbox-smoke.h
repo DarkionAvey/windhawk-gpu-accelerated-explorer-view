@@ -183,7 +183,13 @@ void Selection(const std::wstring& fixture) {
         const bool settled=Eventually([&] {
             pump(); int nativeTotal=-1;
             state.folderView->ItemCount(SVGIO_ALLVIEW,&nativeTotal);
-            return state.total==total && !state.directoryPending &&
+            // A painted summary can still describe the preceding selection
+            // while the header's Shell command/import is queued. Do not start
+            // the next filesystem mutation until that real command settles.
+            return nativeTotal==total && count()==(check==1 ? total : 0) &&
+                !state.checkboxHeaderActionPending && !state.pendingNativeSelection &&
+                !state.nativeSelectionUnsafe && !state.nativeSelectionImportPending &&
+                !state.nativeSelectionMessageQueued && state.total==total && !state.directoryPending &&
                 !state.watchedChangePending && state.checkboxSummaryTotal==total &&
                 state.checkboxSelection.SharesStorage(state.selectedFlags) && HeaderSelectionCheckboxState(state)==check;
         },30000);
@@ -193,6 +199,7 @@ void Selection(const std::wstring& fixture) {
                 <<" native="<<nativeTotal<<" selected="<<count()<<" gpu-selected="<<std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)
                 <<" pending="<<state.checkboxHeaderActionPending<<" directory="<<state.directoryPending<<" watch="<<state.watchedChangePending
                 <<" policy="<<state.clickPolicy.checkSelect<<" visible="<<state.visible<<std::endl;
+            for(const auto& line:selectionLog) std::wcout<<L"CHECKBOX LOG "<<line<<L'\n';
         }
         Check(settled,"checkbox membership/selection summary did not follow the real directory watch");
     };
@@ -230,11 +237,27 @@ void Selection(const std::wstring& fixture) {
     Check(mirrored,"checkbox header did not mirror Explorer's selection after a deletion");
     if(count()) {Tap(input,state,header); awaitRows(5,0);}
     Tap(input,state,header); awaitRows(5,1);
+    // DefView can extend its native Select All state to newly arriving items.
+    // Commit a real partial selection before testing unchecked insertion, so
+    // that expectation is independent of Shell's select-all insertion policy.
+    Tap(input,state,rowPoint(0));
+    Check(Eventually([&] {
+        pump(); return count()==4 && std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==4 &&
+            !state.selectedFlags[0] && !state.pendingNativeSelection && !state.nativeSelectionUnsafe &&
+            !state.nativeSelectionImportPending && !state.nativeSelectionMessageQueued &&
+            state.checkboxSelection.SharesStorage(state.selectedFlags) && HeaderSelectionCheckboxState(state)==0;
+    }),"checkbox partial native selection did not settle before insertion");
     const auto inserted=folder/L"inserted.txt";
     HANDLE newFile=CreateFileW(inserted.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
     Check(newFile!=INVALID_HANDLE_VALUE,"checkbox inserted file"); CloseHandle(newFile);
     SHChangeNotify(SHCNE_CREATE,SHCNF_PATHW|SHCNF_FLUSH,inserted.c_str(),nullptr);
-    awaitRows(6,0);
+    Check(Eventually([&] {
+        pump(); int nativeTotal=-1; state.folderView->ItemCount(SVGIO_ALLVIEW,&nativeTotal);
+        return nativeTotal==6 && state.total==6 && count()==4 &&
+            std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==4 &&
+            !state.directoryPending && !state.watchedChangePending && state.checkboxSummaryTotal==6 &&
+            state.checkboxSelection.SharesStorage(state.selectedFlags) && HeaderSelectionCheckboxState(state)==0;
+    },30000),"checkbox insertion changed the real partial selection or retained its old summary");
     const int uncheckedInserted=GpuRowForNativePath(state,inserted.wstring());
     Check(uncheckedInserted>=0 && !state.selectedFlags[size_t(uncheckedInserted)],"new item inherited a checked box");
 

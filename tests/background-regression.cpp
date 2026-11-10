@@ -1278,6 +1278,9 @@ static void TestKeyboardPresentation(ViewState& state) {
 }
 
 static void TestZoomPresentation(ViewState& state, const ViewState& other) {
+    // Retargeting samples elapsed motion between paints. Compare geometry at
+    // one presentation instant, without depending on CPU/GPU scheduling.
+    AnimationClockFixture::Freeze clock;
     // This component fixture supplies a visible overlay and a valid active
     // tab identity; production now correctly ignores hidden/inactive paints.
     FocusFixture::Session privateVisibility(state.hwnd,state.hwnd);
@@ -1299,7 +1302,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
     const auto otherZoom = other.rowHeight96;
     const auto otherFormat = other.textFormat.Get();
     auto tick = [&](double ms) {
-        QueryPerformanceCounter(&state.zoomStartedQpc);
+        AnimationClockFixture::Counter(&state.zoomStartedQpc);
         state.zoomStartedQpc.QuadPart -= static_cast<LONGLONG>(ms * state.qpcFrequency / 1000.);
         OverlayProc(state.hwnd, kMsgFrame, 0, 0);
         OverlayProc(state.hwnd, WM_PAINT, 0, 0); // Normal delivery advances geometry after input.
@@ -2019,6 +2022,7 @@ static void TestPreviewInput() {
 
 #include "option-effects-smoke.h"
 #include "native-return-smoke.h"
+#include "view-transition-regression-smoke.h"
 #include "regression-manifest.h"
 #include <set>
 
