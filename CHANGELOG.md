@@ -34,6 +34,7 @@
 - **FIXED** Library folders that would not open on double-click, sizes shown as raw byte counts, and sorting that redrew the whole list.
 - **FIXED** Apps with small icons appeared boxed and tiny in grid views; their icons now fill the icon space.
 - **FIXED** The view switch button's tooltip could appear clipped the first time it showed after Explorer started.
+- **FIXED** The Status column of OneDrive and other cloud folders showed a long hex string; it now shows the sync and sharing icons like native Explorer.
 
 ## 1.0.4 — Public release
 - **FIXED** ARM64 compatibility.

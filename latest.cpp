@@ -775,9 +775,12 @@ SortSpec DefaultSort() {
     return spec;
 }
 
+struct IconPixels;
 struct ColumnCell {
     PROPERTYKEY key{};
     std::wstring text;
+    // Worker-decoded state glyphs drawn instead of text (e.g. OneDrive status).
+    std::shared_ptr<const std::vector<IconPixels>> icons;
     bool operator==(const ColumnCell& other) const { return SameProperty(key,other.key) && text==other.text; }
 };
 struct ExplorerColumn {
@@ -3820,6 +3823,8 @@ struct ViewState {
     struct RetiredIconBitmap { ComPtr<ID2D1Bitmap> bitmap; size_t bytes; };
     std::deque<RetiredIconBitmap> retiredIconBitmaps;
     size_t retiredIconBitmapBytes = 0;
+    // Status-column glyph textures keyed by the worker's shared pixel buffer.
+    std::vector<std::pair<IconPixels, ComPtr<ID2D1Bitmap>>> statusIconBitmaps;
     // One explicit rename transaction per tab. Its HWND is a FRAME sibling
     // of the DirectComposition overlay; a child of the GPU HWND would be
     // composited behind the GPU visual and could not show focus/selection.
@@ -8243,7 +8248,8 @@ const wchar_t* EntryExtension(const EntrySortKey& e) {
     return ext ? ext : L"";
 }
 std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
-                              const PROPVARIANT* value = nullptr,bool* resolved = nullptr);
+                              const PROPVARIANT* value = nullptr,bool* resolved = nullptr,
+                              std::vector<std::wstring>* icons = nullptr);
 HRESULT EntryPropertyStore(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
                            GETPROPERTYSTOREFLAGS flags, IPropertyStore** out) {
     *out = nullptr;
@@ -8692,10 +8698,108 @@ unsigned long long DirectoryMetadataHash(const std::vector<Entry>& entries) {
     return hash;
 }
 
+// Status columns such as System.StorageProviderUIStatus (OneDrive) carry a
+// serialized property store whose System.PropList.StatusIcons names the
+// properties Explorer draws as icons. Format those instead of the raw blob,
+// which PSFormatForDisplay would render as hex, and collect each state's icon
+// location ("module,-id") for the Details renderer. Returns false when the
+// blob is not such a store so the caller keeps its default formatting.
+// System.PropList.StatusIcons; absent from the MinGW propkey.h.
+constexpr PROPERTYKEY kPropListStatusIcons{
+    {0xC9944A21, 0xA406, 0x48FE, {0x82, 0x25, 0xAE, 0xC7, 0xE2, 0x4C, 0x21, 0x1B}}, 16};
+// System.ItemCustomState.Values/IconReferences: parallel per-state vectors.
+constexpr PROPERTYKEY kItemCustomStateValues{
+    {0xFCEFF153, 0xE839, 0x4CF3, {0xA9, 0xE7, 0xEA, 0x22, 0x83, 0x20, 0x94, 0xB8}}, 122};
+constexpr PROPERTYKEY kItemCustomStateIcons{
+    {0xFCEFF153, 0xE839, 0x4CF3, {0xA9, 0xE7, 0xEA, 0x22, 0x83, 0x20, 0x94, 0xB8}}, 123};
+ComPtr<IPropertyStore> DeserializePropertyStore(const BYTE* data, ULONG size) {
+    ComPtr<IPropertyStore> store;
+    ComPtr<IPersistSerializedPropStorage> persist;
+    if (!data || !size || FAILED(PSCreateMemoryPropertyStore(IID_PPV_ARGS(&store))) ||
+        FAILED(store.As(&persist)) ||
+        FAILED(persist->SetPropertyStorage(reinterpret_cast<PCUSERIALIZEDPROPSTORAGE>(data), size)))
+        return nullptr;
+    return store;
+}
+bool FormatStatusPropertyBlob(const PROPVARIANT& property, std::wstring& result,
+                              std::vector<std::wstring>* icons = nullptr) {
+    if (property.vt != VT_BLOB) return false;
+    const auto inner = DeserializePropertyStore(property.blob.pBlobData, property.blob.cbSize);
+    if (!inner) return false;
+    PROPVARIANT list{};
+    PropVariantInit(&list);
+    ComPtr<IPropertyDescriptionList> descriptions;
+    const bool hasList = SUCCEEDED(inner->GetValue(kPropListStatusIcons, &list)) &&
+        list.vt == VT_LPWSTR && list.pwszVal &&
+        SUCCEEDED(PSGetPropertyDescriptionListFromString(list.pwszVal, IID_PPV_ARGS(&descriptions)));
+    PropVariantClear(&list);
+    if (!hasList) return false;
+    const auto append = [&result](PCWSTR text) {
+        if (!text || !*text) return;
+        if (!result.empty()) result += L", ";
+        result += text;
+    };
+    const auto strings = [](IPropertyStore* store, REFPROPERTYKEY key) {
+        std::vector<std::wstring> values;
+        PROPVARIANT value{};
+        PropVariantInit(&value);
+        if (SUCCEEDED(store->GetValue(key, &value)) && value.vt == (VT_VECTOR | VT_LPWSTR))
+            for (ULONG i = 0; i < value.calpwstr.cElems; ++i)
+                values.emplace_back(value.calpwstr.pElems[i] ? value.calpwstr.pElems[i] : L"");
+        PropVariantClear(&value);
+        return values;
+    };
+    UINT count = 0;
+    descriptions->GetCount(&count);
+    result.clear();
+    if (icons) icons->clear();
+    for (UINT i = 0; i < count; ++i) {
+        ComPtr<IPropertyDescription> description;
+        PROPERTYKEY key{};
+        if (FAILED(descriptions->GetAt(i, IID_PPV_ARGS(&description))) ||
+            FAILED(description->GetPropertyKey(&key)))
+            continue;
+        PROPVARIANT value{};
+        PropVariantInit(&value);
+        if (FAILED(inner->GetValue(key, &value)) || value.vt == VT_EMPTY || value.vt == VT_NULL) {
+            PropVariantClear(&value);
+            continue;
+        }
+        if (value.vt == (VT_VECTOR | VT_UI1)) {
+            // Provider custom states (e.g. OneDrive "Shared") are one more
+            // serialized store listing each state's label and icon.
+            if (const auto states = DeserializePropertyStore(value.caub.pElems, value.caub.cElems)) {
+                for (const auto& text : strings(states.Get(), kItemCustomStateValues)) append(text.c_str());
+                if (icons) for (auto& icon : strings(states.Get(), kItemCustomStateIcons))
+                    if (!icon.empty()) icons->push_back(std::move(icon));
+            }
+        } else {
+            PWSTR formatted = nullptr;
+            if (SUCCEEDED(PSFormatForDisplayAlloc(key, value, PDFF_DEFAULT, &formatted))) append(formatted);
+            CoTaskMemFree(formatted);
+            // Enumerated states (System.StorageProviderState) name their
+            // icon in the property schema, as Explorer's column does.
+            ComPtr<IPropertyEnumTypeList> types;
+            ComPtr<IPropertyEnumType2> type;
+            UINT index = 0;
+            PWSTR image = nullptr;
+            if (icons && SUCCEEDED(description->GetEnumTypeList(IID_PPV_ARGS(&types))) &&
+                SUCCEEDED(types->FindMatchingIndex(value, &index)) &&
+                SUCCEEDED(types->GetAt(index, IID_PPV_ARGS(&type))) &&
+                SUCCEEDED(type->GetImageReference(&image)) && image && *image)
+                icons->push_back(image);
+            CoTaskMemFree(image);
+        }
+        PropVariantClear(&value);
+    }
+    return true; // A status store without displayable states is authoritative.
+}
+
 // Shared Shell property formatting for filesystem and This PC detail jobs.
 // Call only from a directory worker, never from an input or paint callback.
 std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
-                              const PROPVARIANT* value,bool* resolved) {
+                              const PROPVARIANT* value,bool* resolved,
+                              std::vector<std::wstring>* icons) {
     if(resolved) *resolved=false;
     if (!store && !value) return {};
     PROPVARIANT pv{};
@@ -8703,6 +8807,11 @@ std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
     std::wstring result;
     if (value || SUCCEEDED(store->GetValue(key, &pv))) {
         const auto& property=value ? *value : pv;
+        if (FormatStatusPropertyBlob(property, result, icons)) {
+            if(resolved) *resolved=true;
+            PropVariantClear(&pv);
+            return result;
+        }
         PWSTR formatted = nullptr;
         const bool empty=property.vt==VT_EMPTY || property.vt==VT_NULL;
         const HRESULT hr=empty ? S_OK : PSFormatForDisplayAlloc(key,property,PDFF_DEFAULT,&formatted);
@@ -8713,6 +8822,47 @@ std::wstring FormatShellDetail(IPropertyStore* store, const PROPERTYKEY& key,
     }
     PropVariantClear(&pv);
     return result;
+}
+
+// Status icons are a handful of shared resources (cloud, check, "Shared"),
+// so each location set is decoded once per small-icon size for every tab.
+// Call only from a detail worker; the UI thread just uploads the pixels.
+using StatusIcons = std::shared_ptr<const std::vector<IconPixels>>;
+StatusIcons DecodeStatusIcons(const std::vector<std::wstring>& locations, HWND hwnd) {
+    if (locations.empty()) return {};
+    const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
+    const UINT size = UINT(std::max(1, GetSystemMetricsForDpi(SM_CXSMICON,
+        dpi ? dpi : USER_DEFAULT_SCREEN_DPI)));
+    std::wstring cacheKey = std::to_wstring(size);
+    for (const auto& location : locations) { cacheKey += L'|'; cacheKey += location; }
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_map<std::wstring, StatusIcons> cache;
+    {
+        ExclusiveSrwLock guard(lock);
+        if (const auto found = cache.find(cacheKey); found != cache.end()) return found->second;
+    }
+    ComPtr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)))) return {};
+    auto icons = std::make_shared<std::vector<IconPixels>>();
+    for (auto location : locations) {
+        if (!location.empty() && location.front() == L'@') location.erase(0, 1);
+        wchar_t expanded[4096]{};
+        const DWORD count = ExpandEnvironmentStringsW(location.c_str(), expanded, ARRAYSIZE(expanded));
+        if (count && count <= ARRAYSIZE(expanded)) location = expanded;
+        const int index = PathParseIconLocationW(location.data());
+        location.resize(wcslen(location.c_str()));
+        HICON raw = nullptr;
+        SHDefExtractIconW(location.c_str(), index, 0, &raw, nullptr, size);
+        std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)> icon(raw, DestroyIcon);
+        auto pixels = icon ? DecodeShellIcon(factory.Get(), icon.get()) : IconPixels{};
+        if (pixels.Ready()) icons->push_back(std::move(pixels));
+    }
+    // A location set that yields nothing keeps the cell's text instead.
+    StatusIcons result = icons->empty() ? StatusIcons{} : StatusIcons(std::move(icons));
+    ExclusiveSrwLock guard(lock);
+    if (cache.size() >= 64) cache.clear(); // Bounded; holders keep their pixels.
+    return cache.try_emplace(cacheKey, result).first->second;
 }
 
 // Detail workers resolve one row per job, normally with a shared parent.
@@ -10782,7 +10932,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                                     static_cast<GETPROPERTYSTOREFLAGS>(
                                         GPS_DELAYCREATION | GPS_BESTEFFORT),
                                     store.GetAddressOf());
-                            cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                            std::vector<std::wstring> icons;
+                            cell.text = FormatShellDetail(store.Get(),key,nullptr,&resolved,&icons);
+                            cell.icons = DecodeStatusIcons(icons, detail.hwnd);
                         }
                         if(!resolved) {v.failed=true; continue;}
                         if (SameKey(key, PKEY_DateModified)) v.date = cell.text;
@@ -10835,7 +10987,9 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                             else if (SameKey(key, PKEY_Size)) cell.text = v.size;
                             else {
                                 bool resolved=false;
-                                cell.text=FormatShellDetail(store.Get(),key,nullptr,&resolved);
+                                std::vector<std::wstring> icons;
+                                cell.text=FormatShellDetail(store.Get(),key,nullptr,&resolved,&icons);
+                                cell.icons=DecodeStatusIcons(icons,detail.hwnd);
                                 if(!resolved) {v.failed=true; continue;}
                             }
                             v.cells.push_back(std::move(cell));
@@ -15248,6 +15402,23 @@ const std::wstring* ColumnCellText(const Entry& entry,
     return nullptr;
 }
 
+const std::vector<IconPixels>* ColumnCellIcons(const Entry& entry, const PROPERTYKEY& key) {
+    for (const auto& cell : entry.cells)
+        if (SameKey(cell.key, key)) return cell.icons && !cell.icons->empty() ? cell.icons.get() : nullptr;
+    return nullptr;
+}
+
+// Status glyphs keep their worker-decoded small-icon size, shrinking only to
+// fit the row, separated by a quarter of that size.
+float StatusIconsWidth(const std::vector<IconPixels>& icons, float height) {
+    float width = 0.f;
+    for (const auto& icon : icons) {
+        const float side = std::min(float(icon.height), height);
+        width += (width > 0.f ? side*.25f : 0.f) + float(icon.width)*side/float(icon.height);
+    }
+    return width;
+}
+
 // Headers and body cells share their text origin during column edits and
 // horizontal scrolling. Mode transitions retain the header's Details bounds.
 // Layout against the full column; the surrounding paint clip owns viewport
@@ -15376,7 +15547,9 @@ void FitColumnsToVisibleRows(ViewState& state) {
         for (size_t j = 0; j < sample.count; ++j) {
             const Entry& e = state.entries[static_cast<size_t>(sample.At(j))];
             const auto* cell = ColumnCellText(e, column.key, state.columnEpoch, state.propertyEpoch);
-            if (cell && !cell->empty())
+            if (const auto* icons = ColumnCellIcons(e, column.key))
+                textWidth = std::max(textWidth, StatusIconsWidth(*icons, std::max(1.f, state.rowPx)));
+            else if (cell && !cell->empty())
                 textWidth = std::max(textWidth, ColumnTextWidth(state, *cell, false));
         }
         const float captionInset = name ? NameTextOrigin(state)-NameColumnStart(state) :
@@ -15529,7 +15702,9 @@ bool AutoRefitWouldImproveClipping(ViewState& state) {
                 if (labelRoom>0.f) room=std::min(room,labelRoom);
             }
             if (room <= 0.f) return true;
-            const float measured = ColumnTextWidth(state, *cell, false);
+            const auto* icons = ColumnCellIcons(entry, column.key);
+            const float measured = icons ? StatusIconsWidth(*icons, std::max(1.f, state.rowPx)) :
+                ColumnTextWidth(state, *cell, false);
             if (measured <= 0.f || measured > room) return true;
         }
     }
@@ -16640,6 +16815,7 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.retiredTextLayouts.clear();
     state.retiredRasterBytes=0;
     state.retiredIconBitmaps.clear(); state.retiredIconBitmapBytes=0;
+    state.statusIconBitmaps.clear();
     state.glyphAtlas.reset(); // Every slot above is gone; pages belong to this device.
     if (state.textRasterTarget) state.textRasterTarget->SetTarget(nullptr);
     state.textRasterBrush.Reset(); state.textRasterTarget.Reset();
@@ -17524,6 +17700,46 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
 // Cheap GPU upload from an already decoded CPU buffer. Only called from
 // kMsgFrame (and never WM_PAINT/ReceiveIcons). Failure is remembered until
 // the D2D target is recreated, avoiding a retry storm.
+// Status cells draw their state glyphs like Explorer, from the text origin.
+// Textures are created on first use from the worker's shared pixels and are
+// released with the device; a failed upload is remembered, not retried.
+ID2D1Bitmap* StatusIconBitmap(ViewState& state, const IconPixels& pixels) {
+    if (!state.target || !pixels.Ready()) return nullptr;
+    for (const auto& [owner, bitmap] : state.statusIconBitmaps)
+        if (owner.data.Identity() == pixels.data.Identity()) return bitmap.Get();
+    if (state.statusIconBitmaps.size() >= 64) state.statusIconBitmaps.clear();
+    const auto maximum = state.target->GetMaximumBitmapSize();
+    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
+    ComPtr<ID2D1Bitmap> bitmap;
+    if (pixels.width <= maximum && pixels.height <= maximum)
+        state.target->CreateBitmap(D2D1::SizeU(pixels.width, pixels.height),
+            pixels.data.data(), pixels.stride, &props, &bitmap);
+    state.statusIconBitmaps.push_back({pixels, bitmap});
+    return bitmap.Get();
+}
+
+void DrawStatusIcons(ViewState& state, const std::vector<IconPixels>& icons,
+                     float left, float top, float right, float bottom, float opacity) {
+    const float height = bottom - top;
+    if (height <= 0.f || right <= left) return;
+    float x = state.rtlLayout ? right : left;
+    for (const auto& pixels : icons) {
+        const float side = std::min(float(pixels.height), height);
+        const float width = float(pixels.width)*side/float(pixels.height);
+        const float gap = &pixels == &icons.front() ? 0.f : side*.25f;
+        const float start = state.rtlLayout ? x - gap - width : x + gap;
+        if (start < left - .5f || start + width > right + .5f) break; // Never overflow the column.
+        x = state.rtlLayout ? start : start + width;
+        ID2D1Bitmap* bitmap = StatusIconBitmap(state, pixels);
+        if (!bitmap) continue;
+        const float y = top + (height - side)*.5f;
+        const auto rect = SnapDrawRect(state.target.Get(), D2D1::RectF(start, y, start + width, y + side));
+        state.target->DrawBitmap(bitmap, &rect, opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+            nullptr, nullptr);
+    }
+}
+
 size_t RetainedIconBytes(const IconRecord& rec) {
     if(!rec.bitmapPixels.Ready() || rec.bitmapPixels.data.Identity()==rec.pixels.data.Identity()) return 0;
     return rec.bitmapPixels.data.capacity()+
@@ -21923,7 +22139,11 @@ void Paint(ViewState& state) {
                 if (text && !text->empty()) {
                     if (compositionFrame.Widths()) compositionFrame.Column(columnIndex);
                     const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
-                    Text(state, *text, left, v.top + cell.top, right, v.top + cell.bottom,
+                    if (const auto* icons = ColumnCellIcons(e, col.key))
+                        // Glyphs keep Explorer's full color; secondary opacity dims text only.
+                        DrawStatusIcons(state, *icons, left, v.top + cell.top, right, v.top + cell.bottom,
+                                        fade * contentOpacity);
+                    else Text(state, *text, left, v.top + cell.top, right, v.top + cell.bottom,
                          nameColor, false, detailsAlpha * fade * contentOpacity, false, false, 0, true);
                 }
             }
