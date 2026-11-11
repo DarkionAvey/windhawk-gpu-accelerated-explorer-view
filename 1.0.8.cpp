@@ -196,6 +196,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <shobjidl.h>
 #include <propkey.h>
 #include <propsys.h>
+#include <propvarutil.h>
 #include <shldisp.h>
 #include <shdispid.h>
 #include <exdisp.h>
@@ -8473,47 +8474,149 @@ HRESULT EntryPropertyStore(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     const HRESULT hr = SHCreateItemFromIDList(identity, IID_PPV_ARGS(&item));
     return SUCCEEDED(hr) ? item->GetPropertyStore(flags, IID_PPV_ARGS(out)) : hr;
 }
-void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key) {
-    ComPtr<IPropertyStore> store;
-    if (FAILED(EntryPropertyStore(e.path, e.shellIdentity.get(),
-        GPS_DEFAULT, store.GetAddressOf())) || !store) return;
-    PROPVARIANT pv{};
-    PropVariantInit(&pv);
-    if (SUCCEEDED(store->GetValue(key, &pv))) {
-        if (SameKey(key, PKEY_Size) && pv.vt == VT_UI8) { e.byteSize = pv.uhVal.QuadPart; e.byteSizeKnown = true; }
-        if (pv.vt == VT_FILETIME) {
-            if (SameKey(key, PKEY_DateModified)) e.lastWrite = pv.filetime;
-            else if (SameKey(key, PKEY_DateCreated)) e.created = pv.filetime;
-            else if (SameKey(key, PKEY_DateAccessed)) e.accessed = pv.filetime;
-        }
-        if (SameKey(key, PKEY_ItemTypeText)) e.type = FormatShellDetail(store.Get(), key);
-        switch (pv.vt) {
-        case VT_LPWSTR:
-            if (pv.pwszVal) { e.sortText = pv.pwszVal; e.sortValueKind = 1; }
-            break;
-        case VT_BSTR:
-            if (pv.bstrVal) { e.sortText = pv.bstrVal; e.sortValueKind = 1; }
-            break;
-        case VT_UI8: e.sortNumber = static_cast<double>(pv.uhVal.QuadPart);
-            e.sortValueKind = 2; break;
-        case VT_I8: e.sortNumber = static_cast<double>(pv.hVal.QuadPart);
-            e.sortValueKind = 2; break;
-        case VT_UI4: e.sortNumber = pv.ulVal; e.sortValueKind = 2; break;
-        case VT_I4: e.sortNumber = pv.lVal; e.sortValueKind = 2; break;
-        case VT_UI2: e.sortNumber = pv.uiVal; e.sortValueKind = 2; break;
-        case VT_I2: e.sortNumber = pv.iVal; e.sortValueKind = 2; break;
-        case VT_R8: e.sortNumber = pv.dblVal; e.sortValueKind = std::isnan(e.sortNumber) ? 0 : 2; break;
-        case VT_R4: e.sortNumber = pv.fltVal; e.sortValueKind = std::isnan(e.sortNumber) ? 0 : 2; break;
-        case VT_DATE: e.sortNumber = pv.date; e.sortValueKind = std::isnan(e.sortNumber) ? 0 : 2; break;
-        case VT_BOOL: e.sortNumber = pv.boolVal != VARIANT_FALSE;
-            e.sortValueKind = 2; break;
-        case VT_FILETIME:
-            e.sortNumber = static_cast<double>(FileTimeNumber(pv.filetime));
-            e.sortValueKind = 2; break;
-        default: break; // Unsupported variant: stable name fallback.
+struct ShellFindFacts;
+struct ShellSizeBinding {
+    unsigned long long token = 0;
+    OwnedPidl parent;
+    ComPtr<IShellFolder2> folder;
+    UINT column = 0;
+    bool hasColumn = false;
+    void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
+};
+PCUITEMID_CHILD BindShellSizeItem(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
+                                  ShellSizeBinding& binding, unsigned long long token,
+                                  const ShellFindFacts* facts, OwnedPidl& owned);
+bool ReadShellSizeValue(ShellSizeBinding& binding, PCUITEMID_CHILD child, ULONGLONG& value);
+struct ShellColumnBinding {
+    unsigned long long token=0;
+    OwnedPidl parent;
+    ComPtr<IShellFolder2> folder;
+    void Reset() { parent.reset(); folder.Reset(); }
+};
+PCUITEMID_CHILD BindShellColumnItem(PCIDLIST_ABSOLUTE identity, ShellColumnBinding& binding,
+                                    unsigned long long token);
+bool ReadShellColumnValue(ShellColumnBinding& binding, PCUITEMID_CHILD child,
+                          const PROPERTYKEY& key, VARIANT& value);
+
+// Both Shell columns (legacy VARIANT) and property stores use this conversion.
+// In particular, Automation DATE days must never be compared to FILETIME ticks.
+bool AssignExtraShellSortValue(Entry& e, const PROPERTYKEY& key, const PROPVARIANT& value) {
+    PROPVARIANT converted{};
+    const PROPVARIANT* source=&value;
+    if (value.vt==VT_DATE) {
+        SYSTEMTIME time{};
+        if (!std::isfinite(value.date) || !VariantTimeToSystemTime(value.date,&time) ||
+            !SystemTimeToFileTime(&time,&converted.filetime)) return false;
+        converted.vt=VT_FILETIME;
+        source=&converted;
+    }
+    const auto& pv=*source;
+    if (SameKey(key,PKEY_Size) && pv.vt==VT_UI8) {
+        e.byteSize=pv.uhVal.QuadPart; e.byteSizeKnown=true;
+    }
+    if (pv.vt==VT_FILETIME) {
+        if (SameKey(key,PKEY_DateModified)) e.lastWrite=pv.filetime;
+        else if (SameKey(key,PKEY_DateCreated)) e.created=pv.filetime;
+        else if (SameKey(key,PKEY_DateAccessed)) e.accessed=pv.filetime;
+    }
+    switch (pv.vt) {
+    case VT_LPWSTR:
+        if (pv.pwszVal) { e.sortText=pv.pwszVal; e.sortValueKind=1; }
+        break;
+    case VT_BSTR:
+        if (pv.bstrVal) { e.sortText=pv.bstrVal; e.sortValueKind=1; }
+        break;
+    case VT_UI8: e.sortNumber=static_cast<double>(pv.uhVal.QuadPart); e.sortValueKind=2; break;
+    case VT_I8: e.sortNumber=static_cast<double>(pv.hVal.QuadPart); e.sortValueKind=2; break;
+    case VT_UI4: e.sortNumber=pv.ulVal; e.sortValueKind=2; break;
+    case VT_I4: e.sortNumber=pv.lVal; e.sortValueKind=2; break;
+    case VT_UI2: e.sortNumber=pv.uiVal; e.sortValueKind=2; break;
+    case VT_I2: e.sortNumber=pv.iVal; e.sortValueKind=2; break;
+    case VT_R8: e.sortNumber=pv.dblVal; e.sortValueKind=std::isnan(e.sortNumber) ? 0 : 2; break;
+    case VT_R4: e.sortNumber=pv.fltVal; e.sortValueKind=std::isnan(e.sortNumber) ? 0 : 2; break;
+    case VT_BOOL: e.sortNumber=pv.boolVal!=VARIANT_FALSE; e.sortValueKind=2; break;
+    case VT_FILETIME:
+        e.sortNumber=static_cast<double>(FileTimeNumber(pv.filetime)); e.sortValueKind=2; break;
+    default: break; // Unsupported value: try the property store, then stable names.
+    }
+    if (SameKey(key,PKEY_ItemTypeText) && e.sortValueKind==1) e.type=e.sortText;
+    PropVariantClear(&converted);
+    return e.sortValueKind!=0;
+}
+bool ReadShellColumnSortValue(Entry& e, const PROPERTYKEY& key,
+                              ShellColumnBinding& binding, unsigned long long token) {
+    const PCUITEMID_CHILD child=BindShellColumnItem(e.shellIdentity.get(),binding,token);
+    if (!child) return false;
+    VARIANT value{};
+    PROPVARIANT property{};
+    bool usable=ReadShellColumnValue(binding,child,key,value) &&
+        SUCCEEDED(VariantToPropVariant(&value,&property)) && AssignExtraShellSortValue(e,key,property);
+    PropVariantClear(&property);
+    VariantClear(&value);
+    if (!usable && (SameKey(key,PKEY_DateModified) || SameKey(key,PKEY_DateCreated) ||
+        SameKey(key,PKEY_DateAccessed))) {
+        // Shell columns/stores can omit filesystem dates before 1900, and
+        // SHGDFIL_FINDDATA can report zero for them. Resolve a real filesystem
+        // path from the identity; never interpret our opaque key as a path.
+        PWSTR raw=nullptr;
+        const HRESULT pathHr=SHGetNameFromIDList(e.shellIdentity.get(),SIGDN_FILESYSPATH,&raw);
+        std::unique_ptr<wchar_t,TaskMemDeleter> path(raw);
+        WIN32_FILE_ATTRIBUTE_DATA facts{};
+        if (SUCCEEDED(pathHr) && path &&
+            GetFileAttributesExW(path.get(),GetFileExInfoStandard,&facts)) {
+            PROPVARIANT stamp{};
+            stamp.vt=VT_FILETIME;
+            stamp.filetime=SameKey(key,PKEY_DateModified) ? facts.ftLastWriteTime :
+                SameKey(key,PKEY_DateCreated) ? facts.ftCreationTime : facts.ftLastAccessTime;
+            usable=AssignExtraShellSortValue(e,key,stamp);
         }
     }
-    PropVariantClear(&pv);
+    return usable;
+}
+void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key,
+                             ShellSizeBinding* sizeBinding=nullptr,
+                             ShellColumnBinding* columnBinding=nullptr,
+                             unsigned long long token=0) {
+    e.sortText.clear(); e.sortNumber=0; e.sortValueKind=0;
+    if (SameKey(key,PKEY_Size) && sizeBinding && e.shellIdentity) {
+        OwnedPidl owned;
+        const PCUITEMID_CHILD child=BindShellSizeItem(e.path,e.shellIdentity.get(),
+            *sizeBinding,token,nullptr,owned);
+        if (child) {
+            ULONGLONG size=0;
+            const bool known=ReadShellSizeValue(*sizeBinding,child,size);
+            if (known) {
+                e.byteSize=size; e.byteSizeKnown=true;
+                e.sortNumber=static_cast<double>(size); e.sortValueKind=2;
+                return;
+            }
+        }
+        // A namespace provider may not expose Size through its parent folder.
+        // Preserve the existing property-store behavior as the correctness fallback.
+    }
+    if (!SameKey(key,PKEY_Size) && columnBinding && e.shellIdentity) {
+        if (ReadShellColumnSortValue(e,key,*columnBinding,token)) return;
+        // Unsupported or missing parent-column values use the established per-item route.
+    }
+    ComPtr<IPropertyStore> store;
+    const HRESULT storeHr = EntryPropertyStore(e.path, e.shellIdentity.get(),
+        GPS_DEFAULT, store.GetAddressOf());
+    if (SUCCEEDED(storeHr) && store) {
+        PROPVARIANT pv{};
+        if (SUCCEEDED(store->GetValue(key,&pv))) {
+            AssignExtraShellSortValue(e,key,pv);
+            if (SameKey(key,PKEY_ItemTypeText)) e.type=FormatShellDetail(store.Get(),key,&pv);
+        }
+        PropVariantClear(&pv);
+    }
+    if (!e.sortValueKind && e.shellIdentity && !sizeBinding && !columnBinding) {
+        // A content handler can reject the property store (e.g. a damaged
+        // image) while the parent still supplies native dates, size and type.
+        // Unbound callers need that same fallback; never repeat a failed
+        // column read when the batch already tried it above.
+        ShellColumnBinding fallback;
+        ReadShellColumnSortValue(e,key,fallback,token);
+    }
 }
 // Natural merge sort reuses ascending runs and reverses strictly descending
 // runs. Balanced merge rounds bound arbitrary inputs by O(n log n), preserve
@@ -8809,11 +8912,17 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
     } else if (spec.kind == SortKind::ShellProperty) {
         // Uncommon properties may require expensive providers. Keep the COM
         // work out of the Explorer UI thread and respect navigation cancellation.
+        ShellSizeBinding sizeBinding;
+        ShellColumnBinding columnBinding;
         for (size_t i = 0; i < entries.size(); ++i) {
             if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
-            ReadExtraShellSortValue(entries[i], spec.key);
+            ReadExtraShellSortValue(entries[i], spec.key,
+                SameKey(spec.key,PKEY_Size) ? &sizeBinding : nullptr,
+                !SameKey(spec.key,PKEY_Size) ? &columnBinding : nullptr,token);
         }
     }
+    ShellSizeBinding secondarySizeBinding;
+    ShellColumnBinding secondaryColumnBinding;
     for (const auto& column : spec.secondary) {
         auto kind=ClassifySort(column.propkey);
         if (!entries.empty() && kind!=SortKind::Name && kind!=SortKind::Extension &&
@@ -8829,7 +8938,9 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
                 // Reuse the property conversion without overwriting the primary
                 // key. Only provider-backed secondary keys need extra storage.
                 Entry probe; probe.path=entry.path; probe.shellIdentity=entry.shellIdentity;
-                ReadExtraShellSortValue(probe,column.propkey);
+                ReadExtraShellSortValue(probe,column.propkey,
+                    SameKey(column.propkey,PKEY_Size) ? &secondarySizeBinding : nullptr,
+                    !SameKey(column.propkey,PKEY_Size) ? &secondaryColumnBinding : nullptr,token);
                 value.text=std::move(probe.sortText); value.number=probe.sortNumber; value.kind=probe.sortValueKind;
             }
             entry.secondarySortValues.push_back(std::move(value));
@@ -9138,15 +9249,6 @@ StatusIcons DecodeStatusIcons(const std::vector<std::wstring>& locations, HWND h
 // Keep that parent's folder and Size column for one directory generation
 // instead of rebinding from the desktop and rescanning every column per row.
 // Owned by a single worker and released inside its apartment.
-struct ShellSizeBinding {
-    unsigned long long token = 0;
-    OwnedPidl parent;
-    ComPtr<IShellFolder2> folder;
-    UINT column = 0;
-    bool hasColumn = false;
-    void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
-};
-
 // Supplies the enumerated Win32 record to a filesystem parse. Without it the
 // Shell may build a child ID without size data (always on removable drives),
 // and the folder's Size column then reports 0 bytes for every file.
@@ -9269,6 +9371,37 @@ bool ReadShellSizeValue(ShellSizeBinding& binding, PCUITEMID_CHILD child, ULONGL
     if (known) value = raw.ullVal;
     VariantClear(&raw);
     return known;
+}
+
+// Resolve arbitrary namespace sort keys through the parent's native column
+// provider. GetDetailsEx takes the key directly; no column-index scan is needed.
+PCUITEMID_CHILD BindShellColumnItem(PCIDLIST_ABSOLUTE identity, ShellColumnBinding& binding,
+                                    unsigned long long token) {
+    if (binding.token!=token) { binding.Reset(); binding.token=token; }
+    if (!identity || ILIsEmpty(identity)) return nullptr;
+    PCUITEMID_CHILD child=ILFindLastID(identity);
+    const size_t parentBytes=static_cast<size_t>(
+        reinterpret_cast<const BYTE*>(child)-reinterpret_cast<const BYTE*>(identity));
+    const bool sameParent=binding.parent &&
+        ILGetSize(binding.parent.get())==parentBytes+sizeof(USHORT) &&
+        memcmp(binding.parent.get(),identity,parentBytes)==0;
+    if (!sameParent) {
+        binding.Reset(); binding.token=token;
+        OwnedPidl parent(ILCloneFull(identity));
+        if (!parent || !ILRemoveLastID(parent.get())) return nullptr;
+        binding.parent=std::move(parent);
+        ComPtr<IShellFolder> folder;
+        PCUITEMID_CHILD ignored=nullptr;
+        if (FAILED(SHBindToParent(identity,IID_PPV_ARGS(&folder),&ignored)) || !folder ||
+            FAILED(folder.As(&binding.folder)) || !binding.folder) return nullptr;
+    }
+    return binding.folder ? child : nullptr;
+}
+bool ReadShellColumnValue(ShellColumnBinding& binding, PCUITEMID_CHILD child,
+                          const PROPERTYKEY& key, VARIANT& value) {
+    VariantInit(&value);
+    SHCOLUMNID column=key;
+    return SUCCEEDED(binding.folder->GetDetailsEx(child,&column,&value));
 }
 
 // Use the folder's formatted column rather than formatting its raw property
@@ -10532,6 +10665,23 @@ bool StatusTogglePlacement(const StatusButtonSnapshot& snapshot,RECT& placed,HWN
     return true;
 }
 
+// A retained PIDL can embed enumeration-time dates/sizes. Updating the Shell
+// item also preserves virtual/delegated identity; never parse our opaque key as
+// a path. Failure asks the normal enumeration path to establish a new snapshot.
+bool RefreshSortCheckIdentity(Entry& entry) {
+    if (!entry.shellIdentity) return !entry.path.starts_with(L"windhawk:pidl:");
+    ComPtr<IShellItem2> item;
+    OwnedPidl fresh;
+    PIDLIST_ABSOLUTE raw=nullptr;
+    HRESULT hr=SHCreateItemFromIDList(entry.shellIdentity.get(),IID_PPV_ARGS(&item));
+    if (SUCCEEDED(hr)) hr=item->Update(nullptr);
+    if (SUCCEEDED(hr)) hr=SHGetIDListFromObject(item.Get(),&raw);
+    fresh.reset(raw);
+    if (FAILED(hr) || !fresh) return false;
+    entry.shellIdentity=SharedPidl(fresh.release(),TaskMemDeleter{});
+    return true;
+}
+
 DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     auto& lane = *static_cast<TabBackground::Worker*>(context);
     auto& work = *lane.owner;
@@ -10812,37 +10962,30 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     std::any_of(directory.sort.secondary.begin(),directory.sort.secondary.end(),[](const SORTCOLUMN& c) {
                         return ClassifySort(c.propkey)==SortKind::Type;
                     })) typeNames.clear();
-                // Ask the Size provider about every checked folder before the
-                // first difference ends the loop, so the names lane's next sort
-                // reads a complete record instead of converging over refreshes.
                 const bool sizes = SortUsesSize(directory.sort);
-                if (sizes) {
-                    std::vector<Entry> folders;
-                    for (const auto& previous : directory.sortChecks) if (previous.folder) {
-                        Entry folder; static_cast<EntrySortKey&>(folder)=previous;
-                        folder.contentSizeKnown=false;
-                        folders.push_back(std::move(folder));
-                    }
-                    ResolveFolderContentSizes(folders,work,directory.token,FolderSizeSource::Fresh);
-                }
+                std::vector<Entry> currentChecks;
+                currentChecks.reserve(directory.sortChecks.size());
                 for (const auto& previous : directory.sortChecks) {
                     if (!DirectoryJobCurrent(work,directory.token)) break;
                     Entry current; static_cast<EntrySortKey&>(current)=previous;
                     current.sortText.clear(); current.sortNumber=0; current.sortValueKind=0;
                     current.contentSizeKnown=false; // Nested changes alter a folder's size.
+                    if (!RefreshSortCheckIdentity(current)) {
+                        result.sortChanged=true; result.sortChangedPath=previous.path; break;
+                    }
                     if (current.path.starts_with(L"windhawk:pidl:")) {
                         if (directory.sort.kind == SortKind::Name || directory.sort.kind == SortKind::Extension) {
                             ComPtr<IShellItem> item; PWSTR name=nullptr;
                             const HRESULT hr=SHCreateItemFromIDList(current.shellIdentity.get(),IID_PPV_ARGS(&item));
                             if (SUCCEEDED(hr) && SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY,&name)) && name)
                                 current.name=name;
-                            else result.sortChanged=true;
+                            else {result.sortChanged=true; result.sortChangedPath=previous.path;}
                             CoTaskMemFree(name);
                         }
                     } else {
                         WIN32_FILE_ATTRIBUTE_DATA data{};
                         if (!GetFileAttributesExW(current.path.c_str(),GetFileExInfoStandard,&data)) {
-                            result.sortChanged=true; break;
+                            result.sortChanged=true; result.sortChangedPath=previous.path; break;
                         }
                         current.lastWrite=data.ftLastWriteTime; current.created=data.ftCreationTime;
                         current.accessed=data.ftLastAccessTime; current.attributes=data.dwFileAttributes;
@@ -10850,7 +10993,15 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         current.byteSize=(static_cast<ULONGLONG>(data.nFileSizeHigh)<<32)|data.nFileSizeLow;
                         current.byteSizeKnown=true;
                     }
-                    std::vector<Entry> probe; probe.push_back(std::move(current));
+                    currentChecks.push_back(std::move(current));
+                }
+                // Refresh every folder before comparing: the names lane must
+                // see a complete size record, including after the first change.
+                if (sizes) ResolveFolderContentSizes(currentChecks,work,directory.token,FolderSizeSource::Fresh);
+                for (size_t i=0; !result.sortChanged && i<currentChecks.size(); ++i) {
+                    if (!DirectoryJobCurrent(work,directory.token)) break;
+                    const auto& previous=directory.sortChecks[i];
+                    std::vector<Entry> probe; probe.push_back(std::move(currentChecks[i]));
                     SortDirectoryEntries(probe,directory.sort,typeNames,work,directory.token,false,
                         sizes ? FolderSizeSource::Recorded : FolderSizeSource::Fresh);
                     SortSpec comparison=directory.sort;
@@ -15312,6 +15463,10 @@ int HeaderColumnAt(ViewState& state, int x, int y) {
         if (logical >= start && logical < end) return static_cast<int>(i);
     }
     return -1;
+}
+
+bool ShouldReplayHeaderDoubleClick(ViewState& state, int x, int y) {
+    return state.columnsView && HeaderColumnAt(state,x,y)>=0;
 }
 
 int DraggedColumnIndex(const ViewState& state) {
@@ -35883,9 +36038,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!sameFolderRow) {
                 // Windows may label the FIRST press in the new folder DBLCLK
                 // because the HWND has not changed. Treat it as an ordinary
-                // first row press, preserving selection and capture. Keep the
-                // old no-op behavior for header double-clicks.
+                // first row press, preserving selection and capture. It also
+                // replaces the second DOWN on a stationary column header, so
+                // route it through the regular header press path; otherwise
+                // the second sort click is silently lost.
                 if (row >= 0)
+                    return OverlayProc(hwnd, WM_LBUTTONDOWN, wParam, lParam);
+                if (ShouldReplayHeaderDoubleClick(*s,x,y))
                     return OverlayProc(hwnd, WM_LBUTTONDOWN, wParam, lParam);
                 return 0;
             }

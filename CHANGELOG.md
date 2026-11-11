@@ -37,6 +37,8 @@
 - **FIXED** File hover tooltip shadows now fall below the tooltip with a tighter blur instead of forming a glow around it.
 - **FIXED** File hover tooltips now use the list's actual font and weight, including custom fonts, while keeping the existing minimum and maximum text sizes.
 - **FIXED** Arrow keys now start from the hovered item in every view when there is no selection or saved keyboard position. Left and Right move between items across groups, and collapse or expand a group only when its heading has keyboard focus. Space toggles the focused heading.
+- **FIXED** Rapid repeated clicks on a column header now apply every sort toggle, including Windows' double-click sequence.
+- **FIXED** Date sorting stays consistent when Shell column reads fall back to item properties. Changes to cached item dates and sizes are checked using refreshed Shell identities.
 - **FIXED** Icons leaving Tiles for Content or Details could animate from the wrong position. View changes and interrupted layout animations now retain the outgoing icon and filename positions.
 - **FIXED** Cloud folder Status columns showed hexadecimal data instead of sync icons. Status icons now follow Windows' property definitions and provider custom states, with text kept when icons cannot be loaded.
 - **FIXED** Switching from Details to an icon grid could send icons sideways before settling. Icon and filename motion now uses destination cell bounds, and folder updates retain an interrupted view transition's geometry.

@@ -2000,6 +2000,7 @@ static void TestPreviewInput() {
 #include "namespace-search-smoke.h"
 #include "tile-layout-smoke.h"
 #include "provider-selection-smoke.h"
+#include "shell-column-sort-smoke.h"
 #include "native-viewport-resize-smoke.h"
 #include "initial-sort-smoke.h"
 #include "empty-sort-key-smoke.h"

@@ -54,6 +54,12 @@ static void TestInitialSorting(const std::wstring& fixture) {
             for(int i=0;i<state.total;++i) if(_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str())) return false;
             return true;
         },30000);
+        if(!converged) {
+            SortSpec native;
+            const bool readable=ReadShellSort(state,native);
+            std::cout<<"NATIVE SORT readable="<<readable<<" direction="<<int(native.direction)
+                <<" GPU direction="<<int(state.sort.direction)<<std::endl;
+        }
         if(!converged) for(int i=0;i<std::min<int>(state.total,int(paths.size()));++i)
             if(_wcsicmp(paths[i].c_str(),state.entries[i].path.c_str()))
                 std::wcout<<L"SORT MISMATCH key="<<(key ? key->pid : 0)<<L" direction="<<direction
@@ -82,15 +88,60 @@ static void TestInitialSorting(const std::wstring& fixture) {
     SetActive(state.hwnd,true); settle();
     Check(SameKey(state.sort.key,PKEY_Size) && state.sort.direction==SORT_ASCENDING &&
         SameSort(state.sort,state.displayedSort),"native-to-overlay switch retained the old sort");
-    // Read real native columns before invoking the same header path as input.
+    // Isolated component input replay: no cursor/focus changes on the input
+    // desktop. Exercise the complete press/capture/release path, not SortByHeader.
     state.deferColumnProviders=false; state.featureInitializationStep=std::max(3u,state.featureInitializationStep);
     FinishColumnTransition(state); RefreshExplorerColumns(state,true);
     Check(!state.columns.empty(),"native header columns");
-    SortByHeader(state,0); settle(false);
-    Check(!state.rowTransitionActive && !state.instantInteractionSort,"header sort animated or retained its interaction intent");
+    const auto bounds=ColumnBounds(state,0,true);
+    const int headerX=LogicalX(state,static_cast<int>(ListStartX(state)+(bounds.first+bounds.second)*.5f));
+    const int headerY=ColumnHeaderHeight(state)/2;
+    PointerFixture::Session pointer;
+    ModifierFixture::Session modifiers;
+    const auto headerInput=[&](UINT message,int x,int y) {
+        // Hardware input follows posted work in the normal Windows queue.
+        // Dispatch that work between component input events, without waiting
+        // for the GPU enumeration or inventing a double-click timing delay.
+        host.Pump();
+        PointerFixture::At(state.hwnd,POINT{x,y});
+        PointerFixture::held=message!=WM_LBUTTONUP;
+        return OverlayProc(state.hwnd,message,PointerFixture::held ? MK_LBUTTON : 0,MAKELPARAM(x,y));
+    };
+    const SortSpec beforeClick=state.sort;
+    headerInput(WM_LBUTTONDOWN,headerX,headerY);
+    Check(state.columnDragArmed && GetCapture()==state.hwnd && SameSort(beforeClick,state.sort),
+        "header press did not capture or sorted before release");
+    headerInput(WM_LBUTTONUP,headerX,headerY);
+    const SortSpec firstClickSort=state.sort;
+    Check(SameKey(firstClickSort.key,state.columns.front().key) && !SameSort(firstClickSort,beforeClick),
+        "header release did not apply its first sort");
+    headerInput(WM_LBUTTONDBLCLK,headerX,headerY);
+    Check(state.columnDragArmed && GetCapture()==state.hwnd && SameSort(firstClickSort,state.sort),
+        "double-click did not replay the header press/capture path");
+    headerInput(WM_LBUTTONUP,headerX,headerY);
+    Check(SameKey(state.sort.key,firstClickSort.key) &&
+        state.sort.direction==(firstClickSort.direction==SORT_ASCENDING ? SORT_DESCENDING : SORT_ASCENDING),
+        "rapid second header click did not reverse the first sort");
+    settle(false);
+    Check(!state.rowTransitionActive && !state.instantInteractionSort && !state.columnDragArmed &&
+        GetCapture()!=state.hwnd,"completed header double-click retained animation, intent or capture");
     SortSpec updated;
     Check(ReadShellSort(state,updated) && SameSort(updated,state.sort) &&
         SameKey(updated.key,state.columns.front().key),"overlay header did not update native sorting");
+    awaitNativeOrder("rapid double header sort differs from native order");
+    // A second press is also allowed to become a drag. Vertical movement
+    // crosses the system threshold without changing the insertion slot.
+    headerInput(WM_LBUTTONDOWN,headerX,headerY);
+    headerInput(WM_LBUTTONUP,headerX,headerY);
+    const SortSpec beforeDrag=state.sort;
+    headerInput(WM_LBUTTONDBLCLK,headerX,headerY);
+    const int dragY=headerY+GetSystemMetrics(SM_CYDRAG)+1;
+    headerInput(WM_MOUSEMOVE,headerX,dragY);
+    Check(state.columnDragActive && GetCapture()==state.hwnd,"double-click second press could not become a drag");
+    headerInput(WM_LBUTTONUP,headerX,dragY);
+    Check(SameSort(beforeDrag,state.sort) && !state.columnDragArmed && GetCapture()!=state.hwnd,
+        "header drag sorted on release or retained capture");
+    settle(false);
     // A reversal really moves the private rows. Replace its pending worker
     // generation, as a concurrent refresh would, without losing input policy.
     SortByHeader(state,0);
