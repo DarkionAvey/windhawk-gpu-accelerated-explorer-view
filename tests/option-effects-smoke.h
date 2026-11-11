@@ -53,7 +53,6 @@ inline const Coverage kCoverage[]={
     {L"Gestures.doubleClickUp",L"additional-gestures"},
     {L"Gestures.middleClickNewTab",L"additional-gestures"},
     {L"Gestures.twoFingerContextMenu",L"additional-gestures"},
-    {L"Columns.preSort",L"option-live-sweep-details"},
     {L"Columns.folderPlacement",L"option-live-sweep-details"},
     {L"Columns.autoRefitColumns",L"resize-auto-refit"},
     {L"enableLogging",L"option-live-sweep-details"},
@@ -1117,8 +1116,6 @@ inline void CheckLiveResult(LiveExplorer& live,const Settings& settings) {
                 "folders were not placed last");
         else Check(!(lastFolder<=firstFile),"mixed folder placement kept folders together");
     }
-    if(settings.values.at(L"Columns.preSort")==L"false") Check(!s.sort.explicitOrder || s.sort.explicitOrder==s.displayedSort.explicitOrder,
-        "disabling Explorer sorting left an inconsistent sort state");
 }
 
 // Real-world folder content: images that have thumbnails (tiny, typical,

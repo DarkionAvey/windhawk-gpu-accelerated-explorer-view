@@ -14,18 +14,17 @@ static void TestInitialSorting(const std::wstring& fixture) {
         Check(WriteFile(file,bytes,i,&written,nullptr) && SetFileTime(file,&stamp,&stamp,&stamp),"initial sort metadata");
         CloseHandle(file);
     }
-    const bool previous=g_preSort.exchange(true);
     const bool interactions=g_animateItemInteractions.exchange(false);
     const auto placement=g_folderPlacement.exchange(FolderPlacement::ExplorerDefault);
-    struct Restore { bool preSort,interactions; FolderPlacement placement;
-        ~Restore() {g_preSort=preSort; g_animateItemInteractions=interactions; g_folderPlacement=placement;}
-    } restore{previous,interactions,placement};
+    struct Restore { bool interactions; FolderPlacement placement;
+        ~Restore() {g_animateItemInteractions=interactions; g_folderPlacement=placement;}
+    } restore{interactions,placement};
     {
     ProviderSelectionFixture::Browser host;
     auto& state=host.state;
     FocusFixture::Session focus(host.frame,state.hwnd);
     host.Navigate(root.wstring(),7);
-    Check(state.preSortEnabled && state.sortInitialized && state.trackNativeSort &&
+    Check(state.sortInitialized && state.trackNativeSort &&
         state.sort.explicitOrder && SameSort(state.sort,state.displayedSort),"first folder ignored native sorting");
     const auto settle=[&](bool finishMotion=true) {
         Check(Eventually([&] {host.Pump(); ReceiveDirectoryResults(state);
@@ -61,15 +60,10 @@ static void TestInitialSorting(const std::wstring& fixture) {
                     <<L" row="<<i<<L" native="<<paths[i]<<L" GPU="<<state.entries[i].path<<std::endl;
         Check(converged,message);
     };
-    // Turning off pre-sorting also rejects an automatically sorted cache,
-    // rather than silently preserving the former default on the next visit.
-    g_preSort=false;
+    // A cached return retains the folder's saved native sort.
     auto folder=state.folder;
     ResetForNewDirectory(state,root.wstring(),folder,false,state.activeTabHost); settle();
-    Check(!state.sort.explicitOrder && !state.displayedSort.explicitOrder,"opt-out reused an automatic pre-sorted cache");
-    g_preSort=true;
-    ResetForNewDirectory(state,root.wstring(),folder,false,state.activeTabHost); settle();
-    Check(state.sort.explicitOrder && SameSort(state.sort,state.displayedSort),"enabling pre-sorting reused an unsorted cache");
+    Check(state.sort.explicitOrder && SameSort(state.sort,state.displayedSort),"cached return lost the native sort");
     for (const auto& key : {PKEY_ItemNameDisplay,PKEY_Size,PKEY_DateModified})
         for (const auto direction : {SORT_ASCENDING,SORT_DESCENDING}) {
             SORTCOLUMN column{key,direction};
@@ -130,27 +124,14 @@ static void TestInitialSorting(const std::wstring& fixture) {
     RefreshSortFromExplorer(state,true,true); settle();
     Check(state.sort.secondary.size()==1 && SameSort(state.sort,state.displayedSort),"secondary native key was dropped");
     awaitNativeOrder("secondary sort differs from native order");
-    g_preSort=false;
     state.folderCache.folders.clear();
     InitializeFolderSort(state,root.wstring());
-    Check(!state.sort.explicitOrder && !state.nativeSortPending,"pre-sort opt-out was ignored");
+    Check(state.sort.explicitOrder && !state.nativeSortPending,"initialization did not retain the native sort");
     QueueDirectoryRefresh(state,true); settle();
-    Check(!state.displayedSort.explicitOrder,"opt-out enumeration was sorted");
-    // Submit real work, then enable pre-sorting before receiving its result.
-    // The shared settings path must cancel that old generation even when
-    // the folder-placement preference did not change.
-    QueueDirectoryRefresh(state,true);
-    const auto oldToken=state.directoryToken;
-    g_preSort=true;
-    const bool replace=ReconcileSortSettings(state);
-    QueueDirectoryRefresh(state,replace,true);
-    Check(replace && state.directoryToken!=oldToken,"pre-sort settings kept an in-flight unsorted generation");
-    settle();
-    Check(ReadShellSort(state,updated) && SameSort(state.displayedSort,updated),
-        "pre-sort settings published the old generation under a sorted header");
+    Check(ReadShellSort(state,updated) && SameSort(state.displayedSort,updated),"directory refresh did not use the native sort");
     }
     Check(std::filesystem::weakly_canonical(root).parent_path()==std::filesystem::weakly_canonical(fixture),
         "initial sort cleanup escaped its private fixture");
     Check(ReleasePrivateFixture(root),"initial sort fixture cleanup did not settle");
-    std::cout<<"PASS: saved/native sorting, cached returns, view switches, instant/grouped header writes, pending replacements, internal animation switch, animated native commands and opt-out\n";
+    std::cout<<"PASS: saved/native sorting, cached returns, view switches, instant/grouped header writes, pending replacements, internal animation switch and animated native commands\n";
 }

@@ -16,6 +16,23 @@ inline D2D1_RECT_F Between(D2D1_RECT_F a,D2D1_RECT_F b,float p) {
     return {a.left*(1-p)+b.left*p,a.top*(1-p)+b.top*p,
         a.right*(1-p)+b.right*p,a.bottom*(1-p)+b.bottom*p};
 }
+inline void TextAnchorPath(const ItemGeometry& item,const ItemGeometry& before,const ItemGeometry& after,float p) {
+    const float x0=before.wrapped ? .5f : 0.f, x1=after.wrapped ? .5f : 0.f;
+    const float y0=before.wrapped ? 0.f : .5f, y1=after.wrapped ? 0.f : .5f;
+    const auto anchor=[](D2D1_RECT_F r,float x,float y) {
+        return D2D1::Point2F(r.left+(r.right-r.left)*x,r.top+(r.bottom-r.top)*y);
+    };
+    const auto a=anchor(before.text,x0,y0), b=anchor(after.text,x1,y1);
+    const auto actual=anchor(item.text,item.textCenter,item.textVertical);
+    Near(item.textCenter,x0*(1-p)+x1*p,"text centering jumped to destination alignment");
+    Near(item.textVertical,y0*(1-p)+y1*p,"text paragraph alignment jumped to destination");
+    Near(actual.x,a.x*(1-p)+b.x*p,"text anchor wandered horizontally away from its endpoint path");
+    Near(actual.y,a.y*(1-p)+b.y*p,"text anchor wandered vertically away from its endpoint path");
+    Near(item.text.right-item.text.left,(before.text.right-before.text.left)*(1-p)+
+        (after.text.right-after.text.left)*p,"text box width did not interpolate");
+    Near(item.text.bottom-item.text.top,(before.text.bottom-before.text.top)*(1-p)+
+        (after.text.bottom-after.text.top)*p,"text box height did not interpolate");
+}
 inline void Fonts() {
     Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))),"transition fonts");
@@ -57,8 +74,7 @@ static void TestViewMorphGeometry(UINT dpi) {
             const auto item=LayoutItem(state,LayoutRowVisual(state,row,p));
             Rect(item.icon,Between(before[size_t(row)].icon,destination[size_t(row)].icon,p),
                 "icon departed from the direct path between settled endpoints");
-            Rect(item.text,Between(before[size_t(row)].text,destination[size_t(row)].text,p),
-                "filename departed from the direct path between settled endpoints");
+            TextAnchorPath(item,before[size_t(row)],destination[size_t(row)],p);
         }
         // Reverse while mid-flight: the next snapshot starts at the current
         // pose, including component geometry, not either settled endpoint.
@@ -78,6 +94,73 @@ static void TestViewMorphGeometry(UINT dpi) {
     }
     g_writeFactory.Reset();
     std::cout<<"PASS: bidirectional icon/name paths, wide list to grid, multi-column identities and reversal snapshots\n";
+}
+
+// No device, pixel readback, queued input or real-time deadline is involved.
+// DirectWrite supplies frozen local ink metrics; independent endpoint arithmetic
+// specifies where those glyphs belong while their containing box changes.
+static void TestViewMorphTextAnchors() {
+    using namespace ViewTransitionRegression;
+    WorkerComApartment apartment;
+    StyleFixture::Session style; Fonts();
+    AnimationClockFixture::Freeze clock;
+    for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true})
+    for(const auto pair:{std::pair{FVM_LIST,FVM_ICON},std::pair{FVM_ICON,FVM_LIST},
+                        std::pair{FVM_DETAILS,FVM_ICON},std::pair{FVM_ICON,FVM_CONTENT}}) {
+        Regression::Scope scope("text anchors dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl)+
+            " from="+std::to_string(pair.first)+" to="+std::to_string(pair.second));
+        StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"text anchor geometry",48,rtl,false,false,1800,1100);
+        auto& state=tab.state; FocusFixture::Session focus(tab.frame,state.hwnd);
+        ApplyViewLayout(state,{UINT(pair.first),96},false);
+        const auto before=LayoutItem(state,LayoutRowVisual(state,0,1));
+        ApplyViewLayout(state,{UINT(pair.second),96},true,true); FinishColumnTransition(state);
+        const auto after=LayoutItem(state,LayoutRowVisual(state,0,1));
+        // Shape only once, independently of animation progress, just like a
+        // retained mask. Include both leading/list and centered/grid masks.
+        for(bool wrapped:{false,true}) {
+            ComPtr<IDWriteTextFormat> format;
+            Check(SUCCEEDED(g_writeFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,18.f*dpi/96.f,L"",&format)),"frozen anchor font");
+            format->SetReadingDirection(rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT:DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+            format->SetTextAlignment(wrapped ? DWRITE_TEXT_ALIGNMENT_CENTER:DWRITE_TEXT_ALIGNMENT_LEADING);
+            format->SetParagraphAlignment(wrapped ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR:DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            TextLayoutCache::Layout frozen;
+            constexpr float maskWidth=1400.f,maskHeight=160.f;
+            Check(SUCCEEDED(g_writeFactory->CreateTextLayout(L"Applications",12,format.Get(),maskWidth,maskHeight,&frozen.text)),
+                "independent frozen text layout");
+            DWRITE_TEXT_METRICS ink{}; Check(SUCCEEDED(frozen.text->GetMetrics(&ink)),"independent frozen ink metrics");
+            for(float p:{0.f,.125f,.25f,.5f,.75f,.875f,1.f}) {
+                const auto item=LayoutItem(state,LayoutRowVisual(state,0,p));
+                TextAnchorPath(item,before,after,p);
+                const float width=item.text.right-item.text.left,height=item.text.bottom-item.text.top;
+                for(float scale:{.75f,1.f,1.5f}) {
+                    const auto offset=TextAlignmentOffset(frozen,width,height,item.textCenter,item.textVertical,scale);
+                    const float nativeX=wrapped ? .5f : rtl ? 1.f : 0.f, nativeY=wrapped ? 0.f : .5f;
+                    const float desiredX=rtl ? 1.f-item.textCenter:item.textCenter;
+                    const float physicalLeft=rtl ? 1800.f-item.text.right:item.text.left;
+                    const float actualX=physicalLeft+(width-maskWidth*scale)*nativeX+ink.left*scale+offset.x;
+                    const float actualY=item.text.top+(height-maskHeight*scale)*nativeY+ink.top*scale+offset.y;
+                    Near(actualX,physicalLeft+width*desiredX-ink.width*scale*desiredX,
+                        "frozen text mask moved independently of its horizontal anchor");
+                    Near(actualY,item.text.top+height*item.textVertical-ink.height*scale*item.textVertical,
+                        "frozen text mask moved independently of its vertical anchor");
+                }
+            }
+            Check(frozen.text->GetMaxWidth()==maskWidth && frozen.text->GetMaxHeight()==maskHeight,
+                "moving frozen text reshaped its layout bounds");
+        }
+        state.rowTransitionStartedQpc=AnimationClockFixture::instant;
+        AdvanceClock(state.rowTransitionStartedQpc,.5);
+        const auto interrupted=LayoutItem(state,LayoutRowVisual(state,0,.875f));
+        ApplyViewLayout(state,{UINT(pair.first),96},true,true);
+        const auto resumed=LayoutItem(state,LayoutRowVisual(state,0,0));
+        Rect(resumed.text,interrupted.text,"retarget discarded the displayed text box");
+        Near(resumed.textCenter,interrupted.textCenter,"retarget discarded partial horizontal alignment");
+        Near(resumed.textVertical,interrupted.textVertical,"retarget discarded partial paragraph alignment");
+    }
+    g_writeFactory.Reset();
+    std::cout<<"PASS: deterministic text anchors, frozen local ink metrics, RTL, DPI and interrupted view morphs\n";
 }
 
 static void TestFractionalTouchZoom(UINT dpi) {

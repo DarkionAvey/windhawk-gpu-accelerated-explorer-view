@@ -162,6 +162,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("view-events-roundtrip", PARALLEL, TestViewEventRoundTrip(fixture,false)),
     REGRESSION("view-events-this-pc-roundtrip", PARALLEL, TestViewEventRoundTrip(fixture,true)),
     REGRESSION("view-morph-96", PARALLEL, TestViewMorphGeometry(96)),
+    REGRESSION("view-morph-text-anchors", PARALLEL, TestViewMorphTextAnchors()),
     REGRESSION("view-morph-144", PARALLEL, TestViewMorphGeometry(144)),
     REGRESSION("view-morph-directory-diff", PARALLEL, TestViewMorphDirectoryDiff(fixture)),
     REGRESSION("touch-zoom-fractional-96", PARALLEL, TestFractionalTouchZoom(96)),

@@ -1,6 +1,7 @@
-# Changelog
+ # Changelog
 
-## Unreleased
+## Since 1.0.5 — Unreleased
+- **ADDED** Internal animation duration scale for debugging, set to 1.0 by default.
 - **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.
 - **ADDED** Support for Explorer's file extension visibility settings, including live updates.
 - **ADDED** Batch renaming of multiple selected files and folders, with native numbering and undo support.
@@ -29,6 +30,8 @@
 - **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
+- **FIXED** Selection highlights morph from their displayed shape when switching views, including filename-only grid selections and full-row list selections.
+- **FIXED** Filenames move from their displayed text anchors during view changes instead of sliding in from the center of the list. Interrupted transitions retain the current alignment.
 - **FIXED** Recycle Bin items show their filenames instead of repeating the original full path, while retaining their Shell identities.
 - **FIXED** Gallery keeps its native image view instead of receiving the GPU overlay.
 - **FIXED** File hover tooltip shadows now fall below the tooltip with a tighter blur instead of forming a glow around it.
@@ -39,9 +42,11 @@
 - **FIXED** Switching from Details to an icon grid could send icons sideways before settling. Icon and filename motion now uses destination cell bounds, and folder updates retain an interrupted view transition's geometry.
 - **FIXED** View changes, selection and folder events could stop being observed after navigation. Event subscriptions now follow the current native view and folder generation, including when returning to This PC.
 - **FIXED** Collapsing a sticky group now scrolls to that group's own heading, keeping the collapsed group visible instead of skipping ahead.
+
 - **FIXED** Touchscreen pinch zoom in Content and Tiles could resize icons in visible steps. Taking over a wheel or trackpad zoom with touch now uses the current zoom scale instead of estimating it from the row or icon size.
 - **FIXED** Deleting a striped row in a grouped list could animate a stripe beneath an unrelated collapsed group.
 - **FIXED** A hidden native list could keep an old window size after resizing, leaving a strip where right-click menus did not open and restoring a cropped native view. Native child layout updates are also retained during parent resize and visibility changes.
+
 - **FIXED** Rename field flickering, incorrect caret positioning, and visual artifacts.
 - **FIXED** Selection and interaction issues when finishing a rename.
 - **FIXED** View switch tooltip flickering and moving while shown.
@@ -55,6 +60,8 @@
 - **FIXED** Library folders that would not open on double-click, sizes shown as raw byte counts, and sorting that redrew the whole list.
 - **FIXED** Apps with small icons appeared boxed and tiny in grid views; their icons now fill the icon space.
 - **FIXED** The view switch button's tooltip could appear clipped the first time it showed after Explorer started.
+
+- **REMOVED** The option to disable Explorer's saved folder sorting; the mod now always follows it.
 
 ## 1.0.4 — Public release
 - **FIXED** ARM64 compatibility.

@@ -987,9 +987,6 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     userMode(FVM_ICON,192); FinishColumnTransition(*state); Paint(*state);
     Check(state->gridView && state->layoutIconSize==192,"user could not override a pinned folder mode");
     userMode(FVM_DETAILS); FinishColumnTransition(*state); Paint(*state);
-    // With pre-sorting disabled, a first visit can publish names before
-    // Explorer supplies its folder preference and keep that displayed layout.
-    const bool savedPreSort=g_preSort.exchange(false);
     const auto cold=JoinPath(directory,L"mode-cold-child");
     const auto coldReady=JoinPath(directory,L"mode-cold-ready");
     std::filesystem::create_directory(cold); std::filesystem::create_directory(coldReady);
@@ -1018,7 +1015,6 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     userMode(FVM_ICON,256); FinishColumnTransition(*state); Paint(*state);
     Check(state->gridView && state->layoutIconSize==256,
         "cold pinned preview rejected an explicit request matching native mode");
-    g_preSort=savedPreSort;
     // Without an early preview, a valid incoming native mode is available
     // before the worker publishes names and must be chosen immediately.
     response->mode=FVM_LIST;

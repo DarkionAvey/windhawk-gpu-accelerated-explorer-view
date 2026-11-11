@@ -145,7 +145,6 @@ inline const Boolean booleans[]={
     {L"Navigation.showScrollbar",true,&g_scrollbar},
     {L"Navigation.instantScrollbarScrub",false,&g_instantScrub},
     {L"Columns.autoRefitColumns",true,&g_autoRefitColumns},
-    {L"Columns.preSort",true,&g_preSort},
     {L"enableLogging",false,&g_perf},
 };
 // Free-form and choice options with their defaults.

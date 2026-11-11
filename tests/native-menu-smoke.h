@@ -225,11 +225,8 @@ void ExerciseCommands(ProviderSelectionFixture::Browser& host) {
     const auto invoke=[&](const wchar_t* parent,const wchar_t* verb,bool finishMotion=true) {
         Commands command(state); command.Invoke(state,command.FindVerb(parent,verb)); settle(finishMotion);
     };
-    // Exercise native commands with pre-sorting disabled as well. No GPU
-    // header/frame command has primed this opt-out policy.
-    state.preSortEnabled=false; state.sort=DefaultSort();
-    state.sortInitialized=state.trackNativeSort=false;
-    Check(!state.trackNativeSort && !state.sort.explicitOrder,"native menu regression needs an untouched GPU sort");
+    // Native menu commands stay synchronized with the saved Explorer sort.
+    Check(state.trackNativeSort && state.sort.explicitOrder,"native menu regression requires the initial Explorer sort");
     for (auto mode : {FVM_DETAILS,FVM_LIST,FVM_ICON}) {
         Check(SUCCEEDED(state.folderView->SetViewModeAndIconSize(mode,48)),"native command initial mode");
         host.Pump(); FolderViewMode observed;

@@ -11,8 +11,6 @@ static void TestEmptyShellSortKey(const std::wstring& fixture) {
         Check(file!=INVALID_HANDLE_VALUE,"empty sort key private file");
         CloseHandle(file);
     }
-    const bool previous=g_preSort.exchange(true);
-    struct Restore { bool preSort; ~Restore() {g_preSort=preSort;} } restore{previous};
     {
     ProviderSelectionFixture::Browser host;
     auto& state=host.state;
