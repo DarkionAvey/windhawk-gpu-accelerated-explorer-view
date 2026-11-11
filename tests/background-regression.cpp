@@ -1421,6 +1421,7 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 #include "group-heading-smoke.h"
 #include "text-render-smoke.h"
 #include "grid-smoke.h"
+#include "edge-autoscroll-smoke.h"
 #include "recycle-smoke.h"
 #include "icon-smoke.h"
 #include "provider-smoke.h"

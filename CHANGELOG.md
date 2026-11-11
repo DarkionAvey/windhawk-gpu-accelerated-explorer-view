@@ -1,6 +1,7 @@
  # Changelog
 
 ## Since 1.0.5 — Unreleased
+- **ADDED** Dragging files near any edge of the view scrolls toward offscreen destinations, with speed controlled by the pointer's distance into the edge.
 - **ADDED** Internal animation duration scale for debugging, set to 1.0 by default.
 - **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.
 - **ADDED** Support for Explorer's file extension visibility settings, including live updates.

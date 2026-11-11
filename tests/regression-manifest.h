@@ -99,6 +99,8 @@ static const Regression::Test kRegressions[] = {
     // Touch, gestures and drag.
     REGRESSION("touch-input", PARALLEL, TestTouchInput(fixture)),
     REGRESSION("drag-preview", PARALLEL, TestDragPreview(fixture)),
+    REGRESSION("edge-autoscroll-zones", PARALLEL, TestEdgeAutoscrollZones(fixture)),
+    REGRESSION("edge-autoscroll-rate", PARALLEL, TestEdgeAutoscrollRate(fixture)),
     REGRESSION("drag-pile-thumbnail-corners", PARALLEL, TestDragPileThumbnailCorners()),
     REGRESSION("drag-pile-count-badge", PARALLEL, TestDragPileCountBadge()),
     REGRESSION("drag-pile-symbol-smoothing", PARALLEL, TestDragPileSymbolSmoothing()),

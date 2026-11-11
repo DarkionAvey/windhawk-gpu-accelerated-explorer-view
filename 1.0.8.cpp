@@ -150,8 +150,8 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
     - showScrollbar: true
       $name: Show scrollbars
     - instantScrollbarScrub: false
-      $name: Jump by item when dragging the vertical scrollbar
-      $description: On = jump by whole items; off = smooth scrolling while dragging the vertical thumb.
+      $name: Jump by item during vertical drag scrolling
+      $description: On = jump by whole items when dragging the vertical thumb or a file near an edge; off = scroll continuously.
   $name: Scrolling and navigation
 - Gestures:
     - doubleClickUp: true
@@ -4011,6 +4011,12 @@ struct ViewState {
     bool shellDropRegistered = false;
     bool shellOleInitialized = false;
     int shellDropHotRow = -1;
+    bool shellDropScrollActive = false;
+    POINT shellDropScrollPoint{}; // Client coordinates, updated by OLE DragOver.
+    LARGE_INTEGER shellDropScrollLastQpc{};
+    float shellDropScrollRequestedY = 0.f;
+    unsigned long long shellDropScrollToken = 0;
+    ULONGLONG shellDropScrollEpoch = 0;
     bool marqueePossible = false;
     bool marqueeActive = false;
     // During a drag, GPU-only provisional selection must not repeatedly
@@ -5060,6 +5066,7 @@ int KeyboardFocusedSection(const ViewState& state) {
     return -1;
 }
 void FinishRename(ViewState& state, bool commit);
+void StopShellDropAutoscroll(ViewState& state);
 ViewState* State(HWND hwnd);
 void MoveScroll(ViewState& state, float target);
 void ToggleGroupSection(ViewState& state, int index) {
@@ -5143,7 +5150,7 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
             state.inScope && state.detailsViewActive && PresentationVisible(state) && !PresentationMinimized(state)) ||
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
-        state.hoverAnimationActive || state.marqueeFading ||
+        state.hoverAnimationActive || state.marqueeFading || state.shellDropScrollActive ||
         (includeForeground && (!state.presenter || state.presentationOnly) &&
             (state.swipeIndicator.moving || state.swipeOutgoingIndicator.moving)) ||
         state.presentPending || (includeEnrichment && state.iconUploadsPending) ||
@@ -5162,7 +5169,8 @@ bool NeedsAnimationFrames(const ViewState& state) {
     if (state.graphicsStandby) return state.graphicsStandbyPending || state.tabSwitchProbeUntil;
     return state.framePaintPending || NeedsAnimationPaint(state) ||
         (state.visible && state.inScope && state.detailsViewActive && PointerDragActive(state)) ||
-        state.marqueeFrameActive || state.manipulationFrameActive || state.touch.inertia ||
+        state.marqueeFrameActive || state.shellDropScrollActive ||
+        state.manipulationFrameActive || state.touch.inertia ||
         (state.lastFolderNativePresentAfter && !state.lastFolderNativePending.empty() &&
             state.visible && state.inScope && state.detailsViewActive && TabOwnsActiveView(state)) ||
         state.tabSwitchProbeUntil != 0 ||
@@ -5355,7 +5363,7 @@ void EndFrameProfile(ViewState& state) {
     for (size_t i=0; i<p.stages; ++i) { p.totals[i] += p.current[i]; p.maxima[i] = std::max(p.maxima[i],p.current[i]); }
     const bool input = state.lastInteractionTick && GetTickCount64()-state.lastInteractionTick < 120;
     p.continuing = NeedsAnimationPaint(state, false) || (input && (state.draggingScrollbar || state.draggingHorizontal)) ||
-        state.manipulationFrameActive || state.marqueeFrameActive;
+        state.manipulationFrameActive || state.marqueeFrameActive || state.shellDropScrollActive;
     const double elapsed = 1000.*(now.QuadPart-p.window)/p.frequency;
     if (elapsed < 1000. && p.samples < p.intervals.size() && (p.continuing || p.frames < 8)) return;
     // Windhawk's OutputDebugString transport can wait for its consumer. Keep
@@ -5535,6 +5543,7 @@ void StopTouch(ViewState& state) {
     if (feedback) Redraw(state); // Retire the preview on the independent render owner too.
 }
 void ResetMouseGestureForNavigation(ViewState& state) {
+    StopShellDropAutoscroll(state);
     StopTouch(state);
     CancelNativeSelectionPreparation(state);
     AdvanceRowHeight(state, true);
@@ -19537,6 +19546,26 @@ void ScrubHorizontal(ViewState& state, int x) {
     SetHorizontalScroll(state, fraction * bar.scrollRange);
 }
 
+float ItemStepScrollTarget(ViewState& state, float requested) {
+    float px = requested;
+    const int group = GroupAtDocument(state, px);
+    if (group >= 0) {
+        const auto& section = state.sections[static_cast<size_t>(group)];
+        px = section.documentTop;
+        if (DisplayedRow(state, section.first)) {
+            const float stride = DisplayRowHeight(state, section.first);
+            const float origin = DocumentRowTop(state, section.first) - GroupHeadingHeight(state);
+            const float line = std::clamp(std::round((requested-origin)/stride), 0.f,
+                static_cast<float>(ItemLineCount(state, section.end-section.first)));
+            px = origin + line * stride;
+        }
+        if (fabsf(requested-section.documentEnd) < fabsf(requested-px)) px = section.documentEnd;
+    } else if (state.sections.empty()) {
+        px = std::round(px / std::max(1.f, state.rowPx)) * state.rowPx;
+    }
+    return std::clamp(px, 0.f, MaxScrollPx(state));
+}
+
 void ScrubScrollbar(ViewState& state, float mouseY) {
     if (!std::isfinite(mouseY)) return;
     const ScrollbarGeometry bar = Scrollbar(state);
@@ -19550,24 +19579,7 @@ void ScrubScrollbar(ViewState& state, float mouseY) {
         // Fast vertical scrolling follows item lines (one row in a grid).
         // Group offsets and collapsed headings use the shared layout geometry;
         // never enumerate the rows or resolve Shell metadata while scrubbing.
-        const float requested = px;
-        const int group = GroupAtDocument(state, px);
-        if (group >= 0) {
-            const auto& section = state.sections[static_cast<size_t>(group)];
-            px = section.documentTop;
-            if (DisplayedRow(state, section.first)) {
-                const float stride = DisplayRowHeight(state, section.first);
-                // The sticky heading reserves its own height above the first
-                // visible item, just as RevealScrollTarget does for navigation.
-                const float origin = DocumentRowTop(state, section.first) - GroupHeadingHeight(state);
-                const float line = std::clamp(std::round((requested-origin)/stride), 0.f,
-                    static_cast<float>(ItemLineCount(state, section.end-section.first)));
-                px = origin + line * stride;
-            }
-            if (fabsf(requested-section.documentEnd) < fabsf(requested-px)) px = section.documentEnd;
-        } else if (state.sections.empty()) {
-            px = std::round(px / std::max(1.f, state.rowPx)) * state.rowPx;
-        }
+        px = ItemStepScrollTarget(state, px);
         // The last position remains reachable even for a partial final row.
         if (fraction > .999f) px = MaxScrollPx(state);
         SetScrollImmediate(state, px);
@@ -25805,16 +25817,141 @@ struct MarqueeScrollEdge {
     int band = 0;
 };
 
+MarqueeScrollEdge EdgeScrollZone(ViewState& state, int position, int first, int last) {
+    if (last <= first) return {};
+    const int band = std::min(Scale96(44, ViewDpi(state)),
+                              std::max(1, (last - first) / 3));
+    const int edge = position < first + band ? position - (first + band) :
+                     position > last - band ? position - (last - band) : 0;
+    return {edge, band};
+}
+
+float EdgeScrollDepth(MarqueeScrollEdge zone) {
+    return zone.band > 0 ? std::clamp(static_cast<float>(zone.edge) / zone.band,
+        -1.f, 1.f) : 0.f;
+}
+
 MarqueeScrollEdge GetMarqueeScrollEdge(ViewState& state, POINT point) {
     const RECT viewport = ContentViewport(state, true);
-    const int top = viewport.top;
-    const int bottom = viewport.bottom;
-    if (bottom <= top) return {};
-    const int band = std::min(Scale96(44, ViewDpi(state)),
-                              std::max(1, (bottom - top) / 3));
-    const int edge = point.y < top + band ? point.y - (top + band) :
-                     point.y > bottom - band ? point.y - (bottom - band) : 0;
-    return {edge, band};
+    return EdgeScrollZone(state, point.y, viewport.top, viewport.bottom);
+}
+
+// The Shell does not publish Explorer's drag-scroll margin or rate. Use the
+// marquee's viewport edge geometry, rate and frame clock.
+constexpr float kEdgeScrollRowsPerSecond = 20.f;
+
+float EdgeScrollPitch(ViewState& state) {
+    if (!state.gridView) return std::max(1.f, state.rowPx);
+    // A grid row includes a thumbnail and caption. Use the tab's list-row
+    // height so the same edge speed covers the same physical distance.
+    const int listHeight96 = state.rowHeight96[0] ? state.rowHeight96[0] : g_row96.load();
+    const double precise = state.preciseRowHeight96[0];
+    const bool direct = precise > 0. && std::llround(precise) == listHeight96;
+    const float listRow = direct ? static_cast<float>(precise * ViewDpi(state) / 96.) :
+        static_cast<float>(Scale96(listHeight96, ViewDpi(state)));
+    return std::max(1.f, state.compactRows ?
+        (direct ? listRow * kCompactRowFraction : std::round(listRow * kCompactRowFraction)) : listRow);
+}
+
+// Both marquee and file drag use this frame clock, acceleration and physical
+// distance. Their edge zones and scroll destinations remain input-specific.
+D2D1_POINT_2F AdvanceEdgeScroll(ViewState& state, LARGE_INTEGER& previous,
+                                D2D1_POINT_2F depth) {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double elapsed = previous.QuadPart && state.qpcFrequency > 0. &&
+        now.QuadPart >= previous.QuadPart ?
+        static_cast<double>(now.QuadPart - previous.QuadPart) / state.qpcFrequency : 0.;
+    previous = now;
+    // A delayed Shell STA frame must not skip several screens on recovery.
+    const float seconds = static_cast<float>(std::clamp(elapsed, 0., .024));
+    const float distance = kEdgeScrollRowsPerSecond * EdgeScrollPitch(state) * seconds;
+    const auto amount = [distance](float value) {
+        const float magnitude = std::clamp(fabsf(value), 0.f, 1.f);
+        return std::copysign(distance * magnitude * magnitude, value);
+    };
+    return {amount(depth.x), amount(depth.y)};
+}
+
+struct ShellDragScrollDepth { float x = 0.f, y = 0.f; };
+
+ShellDragScrollDepth ShellDragEdgeDepth(ViewState& state, POINT point) {
+    RECT client{};
+    ViewClientRect(state, &client);
+    if (point.x < client.left || point.x >= client.right ||
+        point.y < client.top || point.y >= client.bottom) return {};
+    const auto horizontal = EdgeScrollZone(state, point.x, client.left, client.right);
+    const auto vertical = GetMarqueeScrollEdge(state, point);
+    ShellDragScrollDepth depth{
+        EdgeScrollDepth(horizontal), EdgeScrollDepth(vertical)};
+    if (state.rtlLayout) depth.x = -depth.x;
+    const float maxX = std::max(0.f, state.columnContentWidth - ListViewportWidth(state));
+    if ((depth.x < 0.f && state.horizontalScroll <= .01f) ||
+        (depth.x > 0.f && state.horizontalScroll >= maxX - .01f)) depth.x = 0.f;
+    if ((depth.y < 0.f && state.scrollNow <= .01f) ||
+        (depth.y > 0.f && state.scrollNow >= MaxScrollPx(state) - .01f)) depth.y = 0.f;
+    return depth;
+}
+
+void StopShellDropAutoscroll(ViewState& state) {
+    if (!state.shellDropScrollActive) return;
+    state.shellDropScrollActive = false;
+    state.shellDropScrollLastQpc = {};
+    UnregisterAnimationWhenIdle(state);
+}
+
+bool UpdateShellDropAutoscroll(ViewState& state, POINTL screen) {
+    POINT point{screen.x, screen.y};
+    if (!MapUiPoint(nullptr, state.hwnd, point)) {
+        StopShellDropAutoscroll(state);
+        return false;
+    }
+    state.shellDropScrollPoint = point;
+    const auto depth = ShellDragEdgeDepth(state, point);
+    if (depth.x == 0.f && depth.y == 0.f) {
+        StopShellDropAutoscroll(state);
+        return false;
+    }
+    if (!state.shellDropScrollActive) {
+        state.shellDropScrollActive = true;
+        state.shellDropScrollRequestedY = state.scrollNow;
+        state.shellDropScrollToken = state.token;
+        state.shellDropScrollEpoch = state.mouseFolderEpoch;
+        QueryPerformanceCounter(&state.shellDropScrollLastQpc);
+        RegisterViewAnimation(state);
+    }
+    return true;
+}
+
+void AdvanceShellDropAutoscroll(ViewState& state) {
+    if (!state.shellDropScrollActive) return;
+    if (state.shellDropScrollToken != state.token ||
+        state.shellDropScrollEpoch != state.mouseFolderEpoch ||
+        !state.visible || !state.inScope || !state.detailsViewActive ||
+        !TabOwnsActiveView(state) || !state.shellDropRegistered) {
+        StopShellDropAutoscroll(state);
+        return;
+    }
+    const auto depth = ShellDragEdgeDepth(state, state.shellDropScrollPoint);
+    if (depth.x == 0.f && depth.y == 0.f) {
+        StopShellDropAutoscroll(state);
+        return;
+    }
+    const auto delta = AdvanceEdgeScroll(state, state.shellDropScrollLastQpc, {depth.x, depth.y});
+    if (depth.y != 0.f) {
+        state.shellDropScrollRequestedY = std::clamp(
+            state.shellDropScrollRequestedY + delta.y, 0.f, MaxScrollPx(state));
+        const bool itemStep = g_instantScrub.load(std::memory_order_relaxed) ||
+            !g_smooth.load(std::memory_order_relaxed);
+        float target = itemStep ?
+            ItemStepScrollTarget(state, state.shellDropScrollRequestedY) : state.shellDropScrollRequestedY;
+        // Quantization must never move opposite to the pointer's edge.
+        if (itemStep) target = depth.y > 0.f ?
+            std::max(target, state.scrollNow) : std::min(target, state.scrollNow);
+        SetScrollImmediate(state, target);
+    }
+    if (depth.x != 0.f) SetHorizontalScroll(state,
+        state.horizontalScroll + delta.x);
 }
 
 bool MarqueeNeedsFrames(ViewState& state, POINT point) {
@@ -25832,38 +25969,20 @@ bool MarqueeNeedsFrames(ViewState& state, POINT point) {
 void UpdateMarqueeAutoscroll(ViewState& state, POINT point, bool frameTick = false) {
     const float before = state.scrollNow;
     if (frameTick) {
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
-        double elapsed = 0.;
-        if (state.marqueeLastScrollQpc.QuadPart && state.qpcFrequency > 0. &&
-            now.QuadPart >= state.marqueeLastScrollQpc.QuadPart) {
-            elapsed = static_cast<double>(
-                now.QuadPart - state.marqueeLastScrollQpc.QuadPart) /
-                state.qpcFrequency;
-        }
-        state.marqueeLastScrollQpc = now;
-        // Limit recovery after a blocked Shell STA: never leap several frames.
-        const float seconds = static_cast<float>(std::clamp(elapsed, 0., .024));
         const auto scrollEdge = GetMarqueeScrollEdge(state, point);
-        const int edge = scrollEdge.edge;
-        const int band = scrollEdge.band;
-        if (edge != 0 && seconds > 0.f && state.total > 0) {
-            const float depth = std::clamp(
-                static_cast<float>(std::abs(edge)) / static_cast<float>(band),
-                0.f, 1.f);
-            const float rowsPerSecond = 20.f * depth * depth;
-            const float pixels = rowsPerSecond * state.rowPx * seconds;
-            if (pixels > .001f) {
-                const int previousFirst = static_cast<int>(
-                    before / std::max(1.f, state.rowPx));
-                state.scrollNow = state.scrollTarget = std::clamp(
-                    before + (edge > 0 ? pixels : -pixels), 0.f, MaxScrollPx(state));
-                const int currentFirst = static_cast<int>(
-                    state.scrollNow / std::max(1.f, state.rowPx));
-                // Only schedule background data when a new row becomes visible.
-                if (currentFirst != previousFirst) {
-                    QueueVisibleDataFrame(state);
-                }
+        const float depth = EdgeScrollDepth(scrollEdge);
+        const float pixels = AdvanceEdgeScroll(state, state.marqueeLastScrollQpc,
+            {0.f, depth}).y;
+        if (state.total > 0 && fabsf(pixels) > .001f) {
+            const int previousFirst = static_cast<int>(
+                before / std::max(1.f, state.rowPx));
+            state.scrollNow = state.scrollTarget = std::clamp(
+                before + pixels, 0.f, MaxScrollPx(state));
+            const int currentFirst = static_cast<int>(
+                state.scrollNow / std::max(1.f, state.rowPx));
+            // Only schedule background data when a new row becomes visible.
+            if (currentFirst != previousFirst) {
+                QueueVisibleDataFrame(state);
             }
         }
     }
@@ -29078,6 +29197,7 @@ class ShellDropBridge final : public IDropTarget {
         hasDragOrigin_ = false;
         dragOrigin_ = {};
         if (ViewState* s = IsWindow(hwnd_) ? State(hwnd_) : nullptr) {
+            StopShellDropAutoscroll(*s);
             if (s->shellDropHotRow != -1) {
                 s->shellDropHotRow = -1;
                 Redraw(*s);
@@ -29182,6 +29302,8 @@ public:
         allowedEffects_ = *effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
         const int row = HitItem(*s, point);
         const HRESULT hr = ChangeTarget(*s, row, keys, point, effect);
+        if (SUCCEEDED(hr) && CurrentSession() && UpdateShellDropAutoscroll(*s, point))
+            *effect |= DROPEFFECT_SCROLL;
         if (SUCCEEDED(hr) && CurrentSession() && dragImageHelper_) {
             POINT cursor{point.x, point.y};
             dragImageEntered_ = SUCCEEDED(dragImageHelper_->DragEnter(
@@ -29218,6 +29340,7 @@ public:
             return FAILED(hr) ? hr : S_OK;
         }
         *effect &= allowedEffects_ | DROPEFFECT_SCROLL;
+        if (UpdateShellDropAutoscroll(*s, point)) *effect |= DROPEFFECT_SCROLL;
         if (dragImageEntered_ && dragImageHelper_) {
             POINT cursor{point.x, point.y};
             dragImageHelper_->DragOver(&cursor, *effect);
@@ -29293,6 +29416,7 @@ void RevokeShellDropTarget(ViewState& state) {
     }
 }
 void ShutdownShellDragDrop(ViewState& state) {
+    StopShellDropAutoscroll(state);
     RevokeShellDropTarget(state);
     state.shellDropBridge.Reset();
     if (state.shellOleInitialized) {
@@ -31793,6 +31917,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
     }
     AdvanceScroll(state);
     AdvanceHorizontalTrack(state);
+    AdvanceShellDropAutoscroll(state);
     AdvanceColumnTransition(state);
     if (AdvanceGroupAnimation(state)) {
         LayoutGroupSections(state);
