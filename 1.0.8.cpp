@@ -22502,8 +22502,7 @@ void Paint(ViewState& state) {
         visibleItems.erase(std::unique(visibleItems.begin(), visibleItems.end()), visibleItems.end());
     }
     const bool emptyRows = g_emptyRows.load(std::memory_order_relaxed);
-    const HoverVisual hover = state.inputFocusIndicators || state.shellDropHotRow >= 0 ?
-        CurrentHoverVisual(state) : HoverVisual{};
+    const HoverVisual hover = CurrentHoverVisual(state);
     // The presentation lane snapshots visible section bands after layout.
     // Provider work and item motion never determine stripe identity or parity.
     std::vector<ViewState::ZebraBand> zebraPresented;
