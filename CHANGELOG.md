@@ -33,6 +33,7 @@
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
 - **FIXED** Selection highlights morph from their displayed shape when switching views, including filename-only grid selections and full-row list selections.
+- **FIXED** The first item and group heading stay visible when a grouped folder opens in a new Explorer window.
 - **FIXED** Cold folder previews begin loading names when the destination is known.
 - **FIXED** Filenames move from their displayed text anchors during view changes instead of sliding in from the center of the list. Interrupted transitions retain the current alignment.
 - **FIXED** Recycle Bin items show their filenames instead of repeating the original full path, while retaining their Shell identities.

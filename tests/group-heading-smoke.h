@@ -1,3 +1,35 @@
+static void TestColdGroupedViewportOrigin(const std::wstring& fixture) {
+    ViewState state;
+    state.hwnd=CreateWindowExW(0,L"STATIC",L"grouped viewport origin",WS_POPUP,
+        -32000,-32000,640,360,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    Check(state.hwnd!=nullptr,"grouped viewport fixture window");
+    state.nativeHwnd=state.frameHwnd=state.hwnd;
+    state.grouping.enabled=true;
+    state.rowPx=43.f; state.headerPx=48.f;
+    state.total=2; state.entries.resize(2);
+    for(int i=0;i<2;++i) {
+        auto& entry=state.entries[size_t(i)];
+        entry.path=fixture+L"\\file"+std::to_wstring(i)+L".txt";
+        Check(GetFileAttributesW(entry.path.c_str())!=INVALID_FILE_ATTRIBUTES,
+            "grouped viewport file fixture missing");
+        entry.name=L"file"+std::to_wstring(i)+L".txt";
+        entry.groupKey=L"F"; entry.groupTitle=L"F";
+    }
+    RebuildGroupSections(state);
+    const float heading=GroupHeadingHeight(state);
+    Check(heading>0.f && DocumentRowTop(state,0)==heading,
+        "grouped first row did not follow its heading");
+    const float cold=RestoredViewportAnchorTarget(state,0,0.f,0.f);
+    Check(cold==0.f && LayoutGroupHeader(state,0,1.f).top==state.headerPx &&
+        state.headerPx+DocumentRowTop(state,0)-cold==state.headerPx+heading,
+        "cold grouped restore hid the first heading or row");
+    Check(RestoredViewportAnchorTarget(state,0,-heading,0.f)==0.f &&
+        RestoredViewportAnchorTarget(state,1,-7.f,heading+state.rowPx-7.f)==
+            DocumentRowTop(state,1)-7.f,
+        "grouped refresh lost a previously visible heading or scrolled anchor");
+    DestroyWindow(state.hwnd);
+}
+
 static void TestStickyGroupHeaders(HWND frame) {
     for(bool rtl : {false,true}) for(UINT mode : {FVM_DETAILS,FVM_LIST,FVM_ICON}) {
         ViewState state;
