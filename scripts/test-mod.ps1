@@ -1,9 +1,11 @@
 param(
     [string]$SourceFile,
     [string]$WindhawkDirectory,
+    [string]$LlvmToolsDirectory,
     [string[]]$Tests = @()
 )
 $ErrorActionPreference = 'Stop'
+$runClock = [Diagnostics.Stopwatch]::StartNew()
 $repository = Split-Path -Parent $PSScriptRoot
 if (!$SourceFile) { $SourceFile = (Read-Host 'Path to the mod .cpp to test (you can drag the file here)').Trim().Trim('"') }
 $output = Join-Path ([IO.Path]::GetTempPath()) ('gpu-mod-diagnostic-' + [guid]::NewGuid().ToString('N'))
@@ -19,8 +21,9 @@ try {
     Write-Host 'Checking Windhawk and preparing test binaries. This can take a few minutes.'
     # Console output bypasses the redirected PowerShell streams below.
     $progress = { param($message) [Console]::WriteLine($message) }
-    $arguments = @{ SourceFile=$SourceFile; OutputDirectory=$artifacts; Diagnostic=$true; ProgressAction=$progress }
+    $arguments = @{ SourceFile=$SourceFile; OutputDirectory=$artifacts; Diagnostic=$true; Coverage=$true; ProgressAction=$progress }
     if ($WindhawkDirectory) { $arguments.WindhawkDirectory=$WindhawkDirectory }
+    if ($LlvmToolsDirectory) { $arguments.LlvmToolsDirectory=$LlvmToolsDirectory }
     if ($Tests.Count) { $arguments.Tests=$Tests }
     & (Join-Path $repository 'tests/run-regressions.ps1') @arguments *> $console
     $exitCode = 0
@@ -42,5 +45,10 @@ if (Test-Path -LiteralPath $summary) {
         Write-Host 'Tests could not start. See preparation-and-run.log for the error.'
     }
 }
+Write-Host ('Running time: {0:N2}s' -f $runClock.Elapsed.TotalSeconds)
+$coverageSummary = Join-Path $artifacts 'coverage\summary.txt'
+$coverageHtml = Join-Path $artifacts 'coverage\html\index.html'
+if (Test-Path -LiteralPath $coverageSummary) { Write-Host "Code coverage summary: $coverageSummary" }
+if (Test-Path -LiteralPath $coverageHtml) { Write-Host "Code coverage report: $coverageHtml" }
 Write-Host "Detailed output: $output"
 exit $exitCode

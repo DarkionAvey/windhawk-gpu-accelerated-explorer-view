@@ -78,9 +78,11 @@ static void TestIconQueueIsolation() {
         {
             ExclusiveSrwLock lock(blocked.background->iconLock);
             Check(!blocked.background->iconJobs.empty(), "scrolled icon demand was not queued");
-            const auto& front = blocked.background->iconJobs.front();
+            const auto front = std::find_if(blocked.background->iconJobs.begin(),
+                blocked.background->iconJobs.end(), [](const IconJob& job) { return !job.useAttributes; });
+            Check(front != blocked.background->iconJobs.end(), "scrolled file icon demand was not queued");
             Check(std::any_of(visible.begin(), visible.end(), [&](int row) {
-                return front.key == blocked.entries[row].path;
+                return front->key == blocked.entries[row].path;
             }), "overscan or old viewport stayed ahead of visible icons");
         }
         blocked.scrollNow = blocked.scrollTarget = 0;

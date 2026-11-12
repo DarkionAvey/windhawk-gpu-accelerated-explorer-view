@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.0.7
+// @version         1.0.8
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -35,7 +35,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
-- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags.
+- **Detailed Tooltips** — Includes all available file properties such as dimensions, bitrate, comments and tags.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
@@ -56,29 +56,29 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 - Appearance:
     - rowHeight: 32
       $name: Row height
-      $description: Higher = taller file rows; lower = more files on screen. The default matches the Windows 11 right-click menu.
+      $description: Higher = taller file rows; lower = more files on screen.
     - fontSizePercent: 44
       $name: List text size (% of row height)
-      $description: Text size in List and Details views. Ctrl+wheel also changes size. The default matches the Windows 11 right-click menu text (about 14 px).
+      $description: Text size in List and Details views. Ctrl+wheel also changes size temporarily. 
     - gridFontSizePercent: 42
       $name: Grid text size (% of row height)
-      $description: Text size in icon grids and drive tiles. Ctrl+wheel also changes size.
+      $description: Text size in icon grids and drive tiles. Ctrl+wheel also changes size temporarily.
     - fontFamily: ""
       $name: Font family
       $description: Enter an installed font name. Leave blank to use Explorer's font.
     - textAntialiasing: system
       $name: Text antialiasing
-      $description: Preserves transparent backgrounds. Windows uses native monitor tuning. Font customization tools can override these choices.
+      $description: Font customization tools like MacTray can override this option.
       $options:
         - system: Windows default
         - smooth: Smooth grayscale
         - aliased: No antialiasing
     - secondaryTextOpacity: 45
-      $name: Date, type and size text opacity (%)
+      $name: Opacity (%) of secondary columns such as Date, Type and Size 
       $description: Higher = brighter text; lower = fainter text.
     - dimDotFiles: true
-      $name: Dim dotfiles and dotfolders
-      $description: Dim names beginning with a dot, like hidden or Cut items. This does not hide them.
+      $name: Treat dotfiles and dotfolders as hidden files
+      $description: Dim the names of files that begin with a dot.
     - middleEllipsis: gridOnly
       $name: Ellipsis in the middle of filenames
       $description: Preserve the end of a shortened filename, including its extension.
@@ -87,8 +87,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
         - alwaysOn: Always on
         - alwaysOff: Always off
     - listThumbnails: false
-      $name: Show thumbnails in list views
-      $description: Use available thumbnails at the item's icon size in List and Details, with rounded corners and shadows.
+      $name: Show thumbnails in list views when available
     - zebraStripes: true
       $name: Alternating row stripes
     - zebraOpacity: 4
@@ -97,8 +96,8 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
     - showEmptyRows: false
       $name: Show stripes below the last file
     - edgeMargin: 10
-      $name: Side margins (pixels)
-      $description: Higher = more space at the left and right edges; 0 = none.
+      $name: Side margins (pixels).
+      $description: Higher = more space at the left and right edges; 0 = none. Increase this value if you want more space to click the background. 
   $name: Appearance and layout
 - Selection:
     - filenameOnlySelection: gridOnly
@@ -127,7 +126,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 - Hover:
     - detailedTooltips: true
       $name: Detailed tooltips
-      $description: Add populated file properties such as dimensions, bitrate, comments and tags to item tooltips. Extra details are limited to the available screen space.
+      $description: Add available file properties such as dimensions, bitrate, comments and tags to item tooltips. 
     - animateHover: true
       $name: Animate hover highlight
     - hoverOpacity: 50
@@ -147,12 +146,12 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $name: Touchpad scrolling and pinch gestures
     - touchpadSwipeNavigation: false
       $name: Swipe to go Back or Forward
-      $description: Swipe sideways and lift to navigate. Use two fingers on a touchpad or touchscreen.
+      $description: Use two fingers on a touchpad or touchscreen to go back or forward.
     - showScrollbar: true
       $name: Show scrollbars
     - instantScrollbarScrub: false
-      $name: Jump by item when dragging the vertical scrollbar
-      $description: On = jump by whole items; off = smooth scrolling while dragging the vertical thumb.
+      $name: Jump by item during vertical drag scrolling
+      $description: On = jump by whole items when dragging the vertical thumb or a file near an edge; off = scroll continuously.
   $name: Scrolling and navigation
 - Gestures:
     - doubleClickUp: true
@@ -165,12 +164,8 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $description: On a touchscreen, tap an item or empty space with two fingers to show the same context menu as right-click.
   $name: Additional mouse and touch gestures
 - Columns:
-    - preSort: true
-      $name: Use Explorer sorting when opening folders
-      $description: Show items in Explorer's saved sort order. Disable to show unsorted items sooner until you choose a sort. Sort changes stay synchronized with Explorer.
     - folderPlacement: explorerDefault
       $name: Folder order when sorting
-      $description: Applies to saved and manually chosen sorts. Unsorted folders keep their original order.
       $options:
         - explorerDefault: Explorer default behavior
         - foldersTop: Folders first
@@ -178,11 +173,11 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
         - mixed: Mix folders with files
     - autoRefitColumns: true
       $name: Automatically fit columns
-      $description: Fit when folder data and layout are ready, when switching to Details, after window resizing, and after zooming. Folder and view changes preserve columns when text already fits.
+      $description: Auto fit columns when folder data and layout are ready, when switching to Details, after window resizing, and after zooming. Auto fit will not trigger when existing text already fits.
   $name: Columns and sorting
 - enableLogging: false
   $name: Enable logging
-  $description: Enable all diagnostics for a bug report, including selection, input, rendering, timing and GPU memory. Logs include file names and paths. Disable after reproducing the problem.
+  $description: Enable all diagnostics for a bug report, including selection, input, rendering, timing and GPU memory. Logs include file names and paths so beware. Disable after reproducing the problem.
 */
 // ==/WindhawkModSettings==
 
@@ -201,6 +196,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
 #include <shobjidl.h>
 #include <propkey.h>
 #include <propsys.h>
+#include <propvarutil.h>
 #include <shldisp.h>
 #include <shdispid.h>
 #include <exdisp.h>
@@ -527,13 +523,22 @@ constexpr int kScrollbarHitTolerance96 = 3;
 constexpr int kScrollbarContentGap96 = 5;
 constexpr int kHorizontalScrollbarHeight96 = 13;
 constexpr int kHeader96 = 38;
+// Internal animation debugging control. Edit and recompile: 2.0 doubles
+// durations (half speed), 0.5 halves durations (double speed).
+constexpr double kAnimationDurationScale = 1.0;
+static_assert(kAnimationDurationScale > 0. &&
+    kAnimationDurationScale < std::numeric_limits<double>::infinity(),
+    "Animation duration scale must be finite and positive");
+constexpr ULONGLONG AnimationMilliseconds(double milliseconds) {
+    return static_cast<ULONGLONG>(std::max(1., milliseconds * kAnimationDurationScale));
+}
 // One transition duration for keyboard selection, vertical/horizontal scroll
 // easing, and transient feedback. All animations share the DWM-paced frames.
-constexpr ULONGLONG kUiTransitionDurationMs = 180;
+constexpr ULONGLONG kUiTransitionDurationMs = AnimationMilliseconds(180.);
 constexpr UINT kPresentationBuffers = 2; // Flip-sequential buffers retain older frames.
 // Independent hover animation duration (milliseconds). Change this constant
 // and recompile to experiment without altering selection/scroll animations.
-constexpr ULONGLONG kHoverAnimationDurationMs = 80;
+constexpr ULONGLONG kHoverAnimationDurationMs = AnimationMilliseconds(80.);
 // Directory animations sample only the current viewport and a small overhang.
 // All path matching happens on the directory worker, never during painting.
 constexpr int kRowTransitionOverscan = 4;
@@ -578,7 +583,6 @@ std::atomic<int> g_row96{32};
 std::atomic<int> g_fontPercent{44}; // List/Details; keep the existing settings key.
 std::atomic<int> g_gridFontPercent{42};
 std::atomic<bool> g_autoRefitColumns{true};
-std::atomic<bool> g_preSort{true};
 // The settings callback may run on a different thread from Explorer's view.
 // Text formats take a snapshot only when they are created, never per frame.
 SRWLOCK g_fontFamilyLock = SRWLOCK_INIT;
@@ -719,9 +723,8 @@ void ReleaseTextRuntime() {
 }
 std::atomic<int> g_instances{0};
 
-// The native view supplies each folder's sort. Opting out of pre-sorting keeps
-// enumeration order until a deliberate sort choice; both policies use the same
-// immutable worker/cache descriptor and native command synchronization.
+// The native view supplies each folder's sort, which is applied before the
+// directory snapshot is published.
 enum class SortKind { Name, Modified, Type, Size, Created, Accessed, Extension, ShellProperty };
 // Directory grouping is an overlay presentation preference, separate from
 // Explorer's native sort property/direction. Include it in immutable worker jobs
@@ -990,6 +993,14 @@ struct CapturedGroupHeader {
     float oldTop = 0.f; // Window coordinates at capture time.
     bool collapsed = false;
 };
+struct SelectionShape {
+    D2D1_RECT_F bounds{};
+    // Grid labels display only a few lines. Keep translated paint/input
+    // snapshots allocation-free, including keyboard/hover animation frames.
+    std::array<D2D1_RECT_F,8> lines{};
+    unsigned count = 0;
+};
+
 struct CapturedRow {
     int oldIndex = -1;
     int newIndex = -1;
@@ -1002,6 +1013,9 @@ struct CapturedRow {
     float selectedNameWidth = -1.f; // existing painted-width cache, no measurement
     bool shaped = false; // Icon/name rectangles below were captured for a layout morph.
     D2D1_RECT_F oldIcon{}, oldText{};
+    float oldTextCenter = 0.f, oldTextVertical = .5f;
+    SelectionShape oldSelection;
+    bool selectionCaptured = false;
 };
 
 // All row movement is visual; hit testing, selection, indices and scrollbars
@@ -1016,6 +1030,9 @@ struct RowMotion {
     float oldOpacity = 1.f;
     bool shaped = false; // A list/grid morph moves the icon and name themselves.
     D2D1_RECT_F oldIcon{}, oldText{};
+    float oldTextCenter = 0.f, oldTextVertical = .5f;
+    SelectionShape oldSelection;
+    bool selectionCaptured = false;
 };
 
 struct RowVisual {
@@ -1025,18 +1042,15 @@ struct RowVisual {
     float morph = 1.f; // Below 1, icon and name still travel from the rectangles below.
     D2D1_RECT_F fromIcon{}, fromText{};
     D2D1_RECT_F destinationCell{}; // Logical destination bounds, before cell interpolation.
+    float fromTextCenter = 0.f, fromTextVertical = .5f;
+    SelectionShape fromSelection;
+    bool selectionCaptured = false;
 };
 
 // DirectWrite layouts are device-independent. Keep shaping and trimming state
 // across translated/faded frames, folder snapshots and D2D target recovery.
 // Each tab owns its caches; the bound is an LRU, never a whole-cache flush.
-struct SelectionShape {
-    D2D1_RECT_F bounds{};
-    // Grid labels display only a few lines. Keep translated paint/input
-    // snapshots allocation-free, including keyboard/hover animation frames.
-    std::array<D2D1_RECT_F,8> lines{};
-    unsigned count = 0;
-};
+
 // Text coverage masks share A8 pages instead of one GPU texture per value.
 // Shelves pack cells of one rounded height; every cell keeps a transparent
 // gutter, so filtered sampling never reads a neighbor. Empty shelves split
@@ -1182,6 +1196,7 @@ struct TextLayoutCache {
         SelectionShape filenameSelection;
         bool filenameSelectionReady = false;
         bool middleTrim = false;
+        std::optional<DWRITE_TEXT_METRICS> placementMetrics;
     };
     ComPtr<IDWriteTextFormat> format;
     DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING;
@@ -3506,8 +3521,7 @@ struct ViewState {
     int hotSection = -1;
     bool sortInitialized = false; // Native sort captured for this folder.
     bool trackNativeSort = false; // Follow Shell changes after opting into sorting.
-    bool preSortEnabled = g_preSort.load(std::memory_order_relaxed);
-    bool nativeSortPending = false; // Retry a failed initial settings read on native readiness.
+    bool nativeSortPending = false; // Retry a failed initial Shell sort read on native readiness.
     // Diagnostics: one log line per distinct sort-read failure and per blocked
     // directory generation, never one per timer tick.
     unsigned long long sortReadLogKey = 0, sortBlockLoggedToken = 0, sortOkLoggedToken = 0;
@@ -3997,6 +4011,12 @@ struct ViewState {
     bool shellDropRegistered = false;
     bool shellOleInitialized = false;
     int shellDropHotRow = -1;
+    bool shellDropScrollActive = false;
+    POINT shellDropScrollPoint{}; // Client coordinates, updated by OLE DragOver.
+    LARGE_INTEGER shellDropScrollLastQpc{};
+    float shellDropScrollRequestedY = 0.f;
+    unsigned long long shellDropScrollToken = 0;
+    ULONGLONG shellDropScrollEpoch = 0;
     bool marqueePossible = false;
     bool marqueeActive = false;
     // During a drag, GPU-only provisional selection must not repeatedly
@@ -5046,6 +5066,7 @@ int KeyboardFocusedSection(const ViewState& state) {
     return -1;
 }
 void FinishRename(ViewState& state, bool commit);
+void StopShellDropAutoscroll(ViewState& state);
 ViewState* State(HWND hwnd);
 void MoveScroll(ViewState& state, float target);
 void ToggleGroupSection(ViewState& state, int index) {
@@ -5129,7 +5150,7 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
             state.inScope && state.detailsViewActive && PresentationVisible(state) && !PresentationMinimized(state)) ||
         state.scrollbarMotion[0].started.QuadPart || state.scrollbarMotion[1].started.QuadPart ||
         state.touchScrollbarStarted[0].QuadPart || state.touchScrollbarStarted[1].QuadPart ||
-        state.hoverAnimationActive || state.marqueeFading ||
+        state.hoverAnimationActive || state.marqueeFading || state.shellDropScrollActive ||
         (includeForeground && (!state.presenter || state.presentationOnly) &&
             (state.swipeIndicator.moving || state.swipeOutgoingIndicator.moving)) ||
         state.presentPending || (includeEnrichment && state.iconUploadsPending) ||
@@ -5148,7 +5169,8 @@ bool NeedsAnimationFrames(const ViewState& state) {
     if (state.graphicsStandby) return state.graphicsStandbyPending || state.tabSwitchProbeUntil;
     return state.framePaintPending || NeedsAnimationPaint(state) ||
         (state.visible && state.inScope && state.detailsViewActive && PointerDragActive(state)) ||
-        state.marqueeFrameActive || state.manipulationFrameActive || state.touch.inertia ||
+        state.marqueeFrameActive || state.shellDropScrollActive ||
+        state.manipulationFrameActive || state.touch.inertia ||
         (state.lastFolderNativePresentAfter && !state.lastFolderNativePending.empty() &&
             state.visible && state.inScope && state.detailsViewActive && TabOwnsActiveView(state)) ||
         state.tabSwitchProbeUntil != 0 ||
@@ -5341,7 +5363,7 @@ void EndFrameProfile(ViewState& state) {
     for (size_t i=0; i<p.stages; ++i) { p.totals[i] += p.current[i]; p.maxima[i] = std::max(p.maxima[i],p.current[i]); }
     const bool input = state.lastInteractionTick && GetTickCount64()-state.lastInteractionTick < 120;
     p.continuing = NeedsAnimationPaint(state, false) || (input && (state.draggingScrollbar || state.draggingHorizontal)) ||
-        state.manipulationFrameActive || state.marqueeFrameActive;
+        state.manipulationFrameActive || state.marqueeFrameActive || state.shellDropScrollActive;
     const double elapsed = 1000.*(now.QuadPart-p.window)/p.frequency;
     if (elapsed < 1000. && p.samples < p.intervals.size() && (p.continuing || p.frames < 8)) return;
     // Windhawk's OutputDebugString transport can wait for its consumer. Keep
@@ -5521,6 +5543,7 @@ void StopTouch(ViewState& state) {
     if (feedback) Redraw(state); // Retire the preview on the independent render owner too.
 }
 void ResetMouseGestureForNavigation(ViewState& state) {
+    StopShellDropAutoscroll(state);
     StopTouch(state);
     CancelNativeSelectionPreparation(state);
     AdvanceRowHeight(state, true);
@@ -7101,7 +7124,6 @@ void LoadSettings() {
         Wh_GetIntSetting(L"Navigation.touchpadDirectManipulation") != 0);
     g_touchpadSwipeNavigation.store(
         Wh_GetIntSetting(L"Navigation.touchpadSwipeNavigation") != 0);
-    g_preSort.store(Wh_GetIntSetting(L"Columns.preSort") != 0);
     RefreshWheelSettings();
     const auto placementSetting = WindhawkUtils::StringSetting::make(L"Columns.folderPlacement");
     const wchar_t* placement = placementSetting.get();
@@ -8461,47 +8483,149 @@ HRESULT EntryPropertyStore(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
     const HRESULT hr = SHCreateItemFromIDList(identity, IID_PPV_ARGS(&item));
     return SUCCEEDED(hr) ? item->GetPropertyStore(flags, IID_PPV_ARGS(out)) : hr;
 }
-void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key) {
-    ComPtr<IPropertyStore> store;
-    if (FAILED(EntryPropertyStore(e.path, e.shellIdentity.get(),
-        GPS_DEFAULT, store.GetAddressOf())) || !store) return;
-    PROPVARIANT pv{};
-    PropVariantInit(&pv);
-    if (SUCCEEDED(store->GetValue(key, &pv))) {
-        if (SameKey(key, PKEY_Size) && pv.vt == VT_UI8) { e.byteSize = pv.uhVal.QuadPart; e.byteSizeKnown = true; }
-        if (pv.vt == VT_FILETIME) {
-            if (SameKey(key, PKEY_DateModified)) e.lastWrite = pv.filetime;
-            else if (SameKey(key, PKEY_DateCreated)) e.created = pv.filetime;
-            else if (SameKey(key, PKEY_DateAccessed)) e.accessed = pv.filetime;
-        }
-        if (SameKey(key, PKEY_ItemTypeText)) e.type = FormatShellDetail(store.Get(), key);
-        switch (pv.vt) {
-        case VT_LPWSTR:
-            if (pv.pwszVal) { e.sortText = pv.pwszVal; e.sortValueKind = 1; }
-            break;
-        case VT_BSTR:
-            if (pv.bstrVal) { e.sortText = pv.bstrVal; e.sortValueKind = 1; }
-            break;
-        case VT_UI8: e.sortNumber = static_cast<double>(pv.uhVal.QuadPart);
-            e.sortValueKind = 2; break;
-        case VT_I8: e.sortNumber = static_cast<double>(pv.hVal.QuadPart);
-            e.sortValueKind = 2; break;
-        case VT_UI4: e.sortNumber = pv.ulVal; e.sortValueKind = 2; break;
-        case VT_I4: e.sortNumber = pv.lVal; e.sortValueKind = 2; break;
-        case VT_UI2: e.sortNumber = pv.uiVal; e.sortValueKind = 2; break;
-        case VT_I2: e.sortNumber = pv.iVal; e.sortValueKind = 2; break;
-        case VT_R8: e.sortNumber = pv.dblVal; e.sortValueKind = std::isnan(e.sortNumber) ? 0 : 2; break;
-        case VT_R4: e.sortNumber = pv.fltVal; e.sortValueKind = std::isnan(e.sortNumber) ? 0 : 2; break;
-        case VT_DATE: e.sortNumber = pv.date; e.sortValueKind = std::isnan(e.sortNumber) ? 0 : 2; break;
-        case VT_BOOL: e.sortNumber = pv.boolVal != VARIANT_FALSE;
-            e.sortValueKind = 2; break;
-        case VT_FILETIME:
-            e.sortNumber = static_cast<double>(FileTimeNumber(pv.filetime));
-            e.sortValueKind = 2; break;
-        default: break; // Unsupported variant: stable name fallback.
+struct ShellFindFacts;
+struct ShellSizeBinding {
+    unsigned long long token = 0;
+    OwnedPidl parent;
+    ComPtr<IShellFolder2> folder;
+    UINT column = 0;
+    bool hasColumn = false;
+    void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
+};
+PCUITEMID_CHILD BindShellSizeItem(const std::wstring& path, PCIDLIST_ABSOLUTE identity,
+                                  ShellSizeBinding& binding, unsigned long long token,
+                                  const ShellFindFacts* facts, OwnedPidl& owned);
+bool ReadShellSizeValue(ShellSizeBinding& binding, PCUITEMID_CHILD child, ULONGLONG& value);
+struct ShellColumnBinding {
+    unsigned long long token=0;
+    OwnedPidl parent;
+    ComPtr<IShellFolder2> folder;
+    void Reset() { parent.reset(); folder.Reset(); }
+};
+PCUITEMID_CHILD BindShellColumnItem(PCIDLIST_ABSOLUTE identity, ShellColumnBinding& binding,
+                                    unsigned long long token);
+bool ReadShellColumnValue(ShellColumnBinding& binding, PCUITEMID_CHILD child,
+                          const PROPERTYKEY& key, VARIANT& value);
+
+// Both Shell columns (legacy VARIANT) and property stores use this conversion.
+// In particular, Automation DATE days must never be compared to FILETIME ticks.
+bool AssignExtraShellSortValue(Entry& e, const PROPERTYKEY& key, const PROPVARIANT& value) {
+    PROPVARIANT converted{};
+    const PROPVARIANT* source=&value;
+    if (value.vt==VT_DATE) {
+        SYSTEMTIME time{};
+        if (!std::isfinite(value.date) || !VariantTimeToSystemTime(value.date,&time) ||
+            !SystemTimeToFileTime(&time,&converted.filetime)) return false;
+        converted.vt=VT_FILETIME;
+        source=&converted;
+    }
+    const auto& pv=*source;
+    if (SameKey(key,PKEY_Size) && pv.vt==VT_UI8) {
+        e.byteSize=pv.uhVal.QuadPart; e.byteSizeKnown=true;
+    }
+    if (pv.vt==VT_FILETIME) {
+        if (SameKey(key,PKEY_DateModified)) e.lastWrite=pv.filetime;
+        else if (SameKey(key,PKEY_DateCreated)) e.created=pv.filetime;
+        else if (SameKey(key,PKEY_DateAccessed)) e.accessed=pv.filetime;
+    }
+    switch (pv.vt) {
+    case VT_LPWSTR:
+        if (pv.pwszVal) { e.sortText=pv.pwszVal; e.sortValueKind=1; }
+        break;
+    case VT_BSTR:
+        if (pv.bstrVal) { e.sortText=pv.bstrVal; e.sortValueKind=1; }
+        break;
+    case VT_UI8: e.sortNumber=static_cast<double>(pv.uhVal.QuadPart); e.sortValueKind=2; break;
+    case VT_I8: e.sortNumber=static_cast<double>(pv.hVal.QuadPart); e.sortValueKind=2; break;
+    case VT_UI4: e.sortNumber=pv.ulVal; e.sortValueKind=2; break;
+    case VT_I4: e.sortNumber=pv.lVal; e.sortValueKind=2; break;
+    case VT_UI2: e.sortNumber=pv.uiVal; e.sortValueKind=2; break;
+    case VT_I2: e.sortNumber=pv.iVal; e.sortValueKind=2; break;
+    case VT_R8: e.sortNumber=pv.dblVal; e.sortValueKind=std::isnan(e.sortNumber) ? 0 : 2; break;
+    case VT_R4: e.sortNumber=pv.fltVal; e.sortValueKind=std::isnan(e.sortNumber) ? 0 : 2; break;
+    case VT_BOOL: e.sortNumber=pv.boolVal!=VARIANT_FALSE; e.sortValueKind=2; break;
+    case VT_FILETIME:
+        e.sortNumber=static_cast<double>(FileTimeNumber(pv.filetime)); e.sortValueKind=2; break;
+    default: break; // Unsupported value: try the property store, then stable names.
+    }
+    if (SameKey(key,PKEY_ItemTypeText) && e.sortValueKind==1) e.type=e.sortText;
+    PropVariantClear(&converted);
+    return e.sortValueKind!=0;
+}
+bool ReadShellColumnSortValue(Entry& e, const PROPERTYKEY& key,
+                              ShellColumnBinding& binding, unsigned long long token) {
+    const PCUITEMID_CHILD child=BindShellColumnItem(e.shellIdentity.get(),binding,token);
+    if (!child) return false;
+    VARIANT value{};
+    PROPVARIANT property{};
+    bool usable=ReadShellColumnValue(binding,child,key,value) &&
+        SUCCEEDED(VariantToPropVariant(&value,&property)) && AssignExtraShellSortValue(e,key,property);
+    PropVariantClear(&property);
+    VariantClear(&value);
+    if (!usable && (SameKey(key,PKEY_DateModified) || SameKey(key,PKEY_DateCreated) ||
+        SameKey(key,PKEY_DateAccessed))) {
+        // Shell columns/stores can omit filesystem dates before 1900, and
+        // SHGDFIL_FINDDATA can report zero for them. Resolve a real filesystem
+        // path from the identity; never interpret our opaque key as a path.
+        PWSTR raw=nullptr;
+        const HRESULT pathHr=SHGetNameFromIDList(e.shellIdentity.get(),SIGDN_FILESYSPATH,&raw);
+        std::unique_ptr<wchar_t,TaskMemDeleter> path(raw);
+        WIN32_FILE_ATTRIBUTE_DATA facts{};
+        if (SUCCEEDED(pathHr) && path &&
+            GetFileAttributesExW(path.get(),GetFileExInfoStandard,&facts)) {
+            PROPVARIANT stamp{};
+            stamp.vt=VT_FILETIME;
+            stamp.filetime=SameKey(key,PKEY_DateModified) ? facts.ftLastWriteTime :
+                SameKey(key,PKEY_DateCreated) ? facts.ftCreationTime : facts.ftLastAccessTime;
+            usable=AssignExtraShellSortValue(e,key,stamp);
         }
     }
-    PropVariantClear(&pv);
+    return usable;
+}
+void ReadExtraShellSortValue(Entry& e, const PROPERTYKEY& key,
+                             ShellSizeBinding* sizeBinding=nullptr,
+                             ShellColumnBinding* columnBinding=nullptr,
+                             unsigned long long token=0) {
+    e.sortText.clear(); e.sortNumber=0; e.sortValueKind=0;
+    if (SameKey(key,PKEY_Size) && sizeBinding && e.shellIdentity) {
+        OwnedPidl owned;
+        const PCUITEMID_CHILD child=BindShellSizeItem(e.path,e.shellIdentity.get(),
+            *sizeBinding,token,nullptr,owned);
+        if (child) {
+            ULONGLONG size=0;
+            const bool known=ReadShellSizeValue(*sizeBinding,child,size);
+            if (known) {
+                e.byteSize=size; e.byteSizeKnown=true;
+                e.sortNumber=static_cast<double>(size); e.sortValueKind=2;
+                return;
+            }
+        }
+        // A namespace provider may not expose Size through its parent folder.
+        // Preserve the existing property-store behavior as the correctness fallback.
+    }
+    if (!SameKey(key,PKEY_Size) && columnBinding && e.shellIdentity) {
+        if (ReadShellColumnSortValue(e,key,*columnBinding,token)) return;
+        // Unsupported or missing parent-column values use the established per-item route.
+    }
+    ComPtr<IPropertyStore> store;
+    const HRESULT storeHr = EntryPropertyStore(e.path, e.shellIdentity.get(),
+        GPS_DEFAULT, store.GetAddressOf());
+    if (SUCCEEDED(storeHr) && store) {
+        PROPVARIANT pv{};
+        if (SUCCEEDED(store->GetValue(key,&pv))) {
+            AssignExtraShellSortValue(e,key,pv);
+            if (SameKey(key,PKEY_ItemTypeText)) e.type=FormatShellDetail(store.Get(),key,&pv);
+        }
+        PropVariantClear(&pv);
+    }
+    if (!e.sortValueKind && e.shellIdentity && !sizeBinding && !columnBinding) {
+        // A content handler can reject the property store (e.g. a damaged
+        // image) while the parent still supplies native dates, size and type.
+        // Unbound callers need that same fallback; never repeat a failed
+        // column read when the batch already tried it above.
+        ShellColumnBinding fallback;
+        ReadShellColumnSortValue(e,key,fallback,token);
+    }
 }
 // Natural merge sort reuses ascending runs and reverses strictly descending
 // runs. Balanced merge rounds bound arbitrary inputs by O(n log n), preserve
@@ -8797,11 +8921,17 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
     } else if (spec.kind == SortKind::ShellProperty) {
         // Uncommon properties may require expensive providers. Keep the COM
         // work out of the Explorer UI thread and respect navigation cancellation.
+        ShellSizeBinding sizeBinding;
+        ShellColumnBinding columnBinding;
         for (size_t i = 0; i < entries.size(); ++i) {
             if (!DirectoryJobCurrent(work, token, nativeNamespace)) return;
-            ReadExtraShellSortValue(entries[i], spec.key);
+            ReadExtraShellSortValue(entries[i], spec.key,
+                SameKey(spec.key,PKEY_Size) ? &sizeBinding : nullptr,
+                !SameKey(spec.key,PKEY_Size) ? &columnBinding : nullptr,token);
         }
     }
+    ShellSizeBinding secondarySizeBinding;
+    ShellColumnBinding secondaryColumnBinding;
     for (const auto& column : spec.secondary) {
         auto kind=ClassifySort(column.propkey);
         if (!entries.empty() && kind!=SortKind::Name && kind!=SortKind::Extension &&
@@ -8817,7 +8947,9 @@ void SortDirectoryEntries(std::vector<Entry>& entries, const SortSpec& requested
                 // Reuse the property conversion without overwriting the primary
                 // key. Only provider-backed secondary keys need extra storage.
                 Entry probe; probe.path=entry.path; probe.shellIdentity=entry.shellIdentity;
-                ReadExtraShellSortValue(probe,column.propkey);
+                ReadExtraShellSortValue(probe,column.propkey,
+                    SameKey(column.propkey,PKEY_Size) ? &secondarySizeBinding : nullptr,
+                    !SameKey(column.propkey,PKEY_Size) ? &secondaryColumnBinding : nullptr,token);
                 value.text=std::move(probe.sortText); value.number=probe.sortNumber; value.kind=probe.sortValueKind;
             }
             entry.secondarySortValues.push_back(std::move(value));
@@ -9126,15 +9258,6 @@ StatusIcons DecodeStatusIcons(const std::vector<std::wstring>& locations, HWND h
 // Keep that parent's folder and Size column for one directory generation
 // instead of rebinding from the desktop and rescanning every column per row.
 // Owned by a single worker and released inside its apartment.
-struct ShellSizeBinding {
-    unsigned long long token = 0;
-    OwnedPidl parent;
-    ComPtr<IShellFolder2> folder;
-    UINT column = 0;
-    bool hasColumn = false;
-    void Reset() { parent.reset(); folder.Reset(); column = 0; hasColumn = false; }
-};
-
 // Supplies the enumerated Win32 record to a filesystem parse. Without it the
 // Shell may build a child ID without size data (always on removable drives),
 // and the folder's Size column then reports 0 bytes for every file.
@@ -9257,6 +9380,37 @@ bool ReadShellSizeValue(ShellSizeBinding& binding, PCUITEMID_CHILD child, ULONGL
     if (known) value = raw.ullVal;
     VariantClear(&raw);
     return known;
+}
+
+// Resolve arbitrary namespace sort keys through the parent's native column
+// provider. GetDetailsEx takes the key directly; no column-index scan is needed.
+PCUITEMID_CHILD BindShellColumnItem(PCIDLIST_ABSOLUTE identity, ShellColumnBinding& binding,
+                                    unsigned long long token) {
+    if (binding.token!=token) { binding.Reset(); binding.token=token; }
+    if (!identity || ILIsEmpty(identity)) return nullptr;
+    PCUITEMID_CHILD child=ILFindLastID(identity);
+    const size_t parentBytes=static_cast<size_t>(
+        reinterpret_cast<const BYTE*>(child)-reinterpret_cast<const BYTE*>(identity));
+    const bool sameParent=binding.parent &&
+        ILGetSize(binding.parent.get())==parentBytes+sizeof(USHORT) &&
+        memcmp(binding.parent.get(),identity,parentBytes)==0;
+    if (!sameParent) {
+        binding.Reset(); binding.token=token;
+        OwnedPidl parent(ILCloneFull(identity));
+        if (!parent || !ILRemoveLastID(parent.get())) return nullptr;
+        binding.parent=std::move(parent);
+        ComPtr<IShellFolder> folder;
+        PCUITEMID_CHILD ignored=nullptr;
+        if (FAILED(SHBindToParent(identity,IID_PPV_ARGS(&folder),&ignored)) || !folder ||
+            FAILED(folder.As(&binding.folder)) || !binding.folder) return nullptr;
+    }
+    return binding.folder ? child : nullptr;
+}
+bool ReadShellColumnValue(ShellColumnBinding& binding, PCUITEMID_CHILD child,
+                          const PROPERTYKEY& key, VARIANT& value) {
+    VariantInit(&value);
+    SHCOLUMNID column=key;
+    return SUCCEEDED(binding.folder->GetDetailsEx(child,&column,&value));
 }
 
 // Use the folder's formatted column rather than formatting its raw property
@@ -10520,6 +10674,23 @@ bool StatusTogglePlacement(const StatusButtonSnapshot& snapshot,RECT& placed,HWN
     return true;
 }
 
+// A retained PIDL can embed enumeration-time dates/sizes. Updating the Shell
+// item also preserves virtual/delegated identity; never parse our opaque key as
+// a path. Failure asks the normal enumeration path to establish a new snapshot.
+bool RefreshSortCheckIdentity(Entry& entry) {
+    if (!entry.shellIdentity) return !entry.path.starts_with(L"windhawk:pidl:");
+    ComPtr<IShellItem2> item;
+    OwnedPidl fresh;
+    PIDLIST_ABSOLUTE raw=nullptr;
+    HRESULT hr=SHCreateItemFromIDList(entry.shellIdentity.get(),IID_PPV_ARGS(&item));
+    if (SUCCEEDED(hr)) hr=item->Update(nullptr);
+    if (SUCCEEDED(hr)) hr=SHGetIDListFromObject(item.Get(),&raw);
+    fresh.reset(raw);
+    if (FAILED(hr) || !fresh) return false;
+    entry.shellIdentity=SharedPidl(fresh.release(),TaskMemDeleter{});
+    return true;
+}
+
 DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     auto& lane = *static_cast<TabBackground::Worker*>(context);
     auto& work = *lane.owner;
@@ -10800,37 +10971,30 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                     std::any_of(directory.sort.secondary.begin(),directory.sort.secondary.end(),[](const SORTCOLUMN& c) {
                         return ClassifySort(c.propkey)==SortKind::Type;
                     })) typeNames.clear();
-                // Ask the Size provider about every checked folder before the
-                // first difference ends the loop, so the names lane's next sort
-                // reads a complete record instead of converging over refreshes.
                 const bool sizes = SortUsesSize(directory.sort);
-                if (sizes) {
-                    std::vector<Entry> folders;
-                    for (const auto& previous : directory.sortChecks) if (previous.folder) {
-                        Entry folder; static_cast<EntrySortKey&>(folder)=previous;
-                        folder.contentSizeKnown=false;
-                        folders.push_back(std::move(folder));
-                    }
-                    ResolveFolderContentSizes(folders,work,directory.token,FolderSizeSource::Fresh);
-                }
+                std::vector<Entry> currentChecks;
+                currentChecks.reserve(directory.sortChecks.size());
                 for (const auto& previous : directory.sortChecks) {
                     if (!DirectoryJobCurrent(work,directory.token)) break;
                     Entry current; static_cast<EntrySortKey&>(current)=previous;
                     current.sortText.clear(); current.sortNumber=0; current.sortValueKind=0;
                     current.contentSizeKnown=false; // Nested changes alter a folder's size.
+                    if (!RefreshSortCheckIdentity(current)) {
+                        result.sortChanged=true; result.sortChangedPath=previous.path; break;
+                    }
                     if (current.path.starts_with(L"windhawk:pidl:")) {
                         if (directory.sort.kind == SortKind::Name || directory.sort.kind == SortKind::Extension) {
                             ComPtr<IShellItem> item; PWSTR name=nullptr;
                             const HRESULT hr=SHCreateItemFromIDList(current.shellIdentity.get(),IID_PPV_ARGS(&item));
                             if (SUCCEEDED(hr) && SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY,&name)) && name)
                                 current.name=name;
-                            else result.sortChanged=true;
+                            else {result.sortChanged=true; result.sortChangedPath=previous.path;}
                             CoTaskMemFree(name);
                         }
                     } else {
                         WIN32_FILE_ATTRIBUTE_DATA data{};
                         if (!GetFileAttributesExW(current.path.c_str(),GetFileExInfoStandard,&data)) {
-                            result.sortChanged=true; break;
+                            result.sortChanged=true; result.sortChangedPath=previous.path; break;
                         }
                         current.lastWrite=data.ftLastWriteTime; current.created=data.ftCreationTime;
                         current.accessed=data.ftLastAccessTime; current.attributes=data.dwFileAttributes;
@@ -10838,7 +11002,15 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                         current.byteSize=(static_cast<ULONGLONG>(data.nFileSizeHigh)<<32)|data.nFileSizeLow;
                         current.byteSizeKnown=true;
                     }
-                    std::vector<Entry> probe; probe.push_back(std::move(current));
+                    currentChecks.push_back(std::move(current));
+                }
+                // Refresh every folder before comparing: the names lane must
+                // see a complete size record, including after the first change.
+                if (sizes) ResolveFolderContentSizes(currentChecks,work,directory.token,FolderSizeSource::Fresh);
+                for (size_t i=0; !result.sortChanged && i<currentChecks.size(); ++i) {
+                    if (!DirectoryJobCurrent(work,directory.token)) break;
+                    const auto& previous=directory.sortChecks[i];
+                    std::vector<Entry> probe; probe.push_back(std::move(currentChecks[i]));
                     SortDirectoryEntries(probe,directory.sort,typeNames,work,directory.token,false,
                         sizes ? FolderSizeSource::Recorded : FolderSizeSource::Fresh);
                     SortSpec comparison=directory.sort;
@@ -11731,8 +11903,7 @@ bool CachedFolderSort(const ViewState& state,
                       ShellGroupSpec* grouping = nullptr) {
     const auto it = state.folderCache.folders.find(path);
     if (it == state.folderCache.folders.end() || it->second.visibility != state.visibility ||
-        (g_preSort.load(std::memory_order_relaxed) && !it->second.sort.explicitOrder) ||
-        (!g_preSort.load(std::memory_order_relaxed) && it->second.sort.explicitOrder && !it->second.sort.userChosen) ||
+        !it->second.sort.explicitOrder ||
         (it->second.sort.explicitOrder &&
          it->second.sort.placement != g_folderPlacement.load(std::memory_order_relaxed)))
         return false;
@@ -12048,7 +12219,8 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
 // view proved unable to report one, rows proceed in enumeration order and
 // RefreshSortFromExplorer re-sorts them if a later read succeeds.
 bool SortReadDefersNames(const ViewState& state) {
-    return state.nativeSortPending && state.sortReadUnavailableToken!=state.token;
+    return state.nativeSortPending && !(state.optimisticStartedAt && state.directoryFolderIdentity) &&
+        state.sortReadUnavailableToken!=state.token;
 }
 
 void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
@@ -12065,11 +12237,11 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
         // Record each deferral state once per navigation generation.
         state.sortBlockLoggedToken=state.token*2+sortDeferred;
         Wh_Log(L"[GPU sort] %s folder=%s token=%llu directory=%llu loaded=%d pending=%d replace=%d "
-            L"preSort=%d track=%d initialized=%d",
+            L"track=%d initialized=%d",
             sortDeferred ? L"REQUEST_DEFERRED" : L"REQUEST_UNSORTED",
             state.folderPath.c_str(),static_cast<unsigned long long>(state.token),
             static_cast<unsigned long long>(state.directoryToken),state.loaded,state.directoryPending,replacePending,
-            state.preSortEnabled,state.trackNativeSort,state.sortInitialized);
+            state.trackNativeSort,state.sortInitialized);
     }
     if ((state.directoryPending && !replacePending) || !state.hwnd ||
         sortDeferred ||
@@ -12675,10 +12847,10 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
             wchar_t fmtid[40]=L"-";
             if (bad) StringFromGUID2(bad->propkey.fmtid,fmtid,ARRAYSIZE(fmtid));
             Wh_Log(L"[GPU sort] READ_FAILED folder=%s token=%llu reason=%u countHr=0x%08lX count=%d columnsHr=0x%08lX "
-                L"key=%s,%lu pending=%d preSort=%d track=%d viewChanged=%d tokenChanged=%d nativeChanged=%d",
+                L"key=%s,%lu pending=%d track=%d viewChanged=%d tokenChanged=%d nativeChanged=%d",
                 state.folderPath.c_str(),static_cast<unsigned long long>(token),reason,static_cast<ULONG>(countHr),count,
                 static_cast<ULONG>(columnsResult),fmtid,bad ? bad->propkey.pid : 0ul,state.nativeSortPending,
-                state.preSortEnabled,state.trackNativeSort,state.folderView.Get()!=view.Get(),state.token!=token,
+                state.trackNativeSort,state.folderView.Get()!=view.Get(),state.token!=token,
                 state.nativeHwnd!=native);
             if (reason!=1 && reason!=4 && state.folderView.Get()==view.Get())
                 ProbeShellSortState(state,view.Get(),L"unavailable",columns);
@@ -12749,7 +12921,6 @@ bool ReadShellSort(ViewState& state, SortSpec& out) {
 
 void InitializeFolderSort(ViewState& state, const std::wstring& path, bool provisional = false) {
     state.instantInteractionSort.reset();
-    state.preSortEnabled = g_preSort.load(std::memory_order_relaxed);
     state.sort = DefaultSort();
     state.sortInitialized = state.trackNativeSort = state.nativeSortPending = false;
     SortSpec cached;
@@ -12759,10 +12930,9 @@ void InitializeFolderSort(ViewState& state, const std::wstring& path, bool provi
         state.trackNativeSort = cached.explicitOrder;
     }
     if (provisional) {
-        state.nativeSortPending = state.preSortEnabled && !state.sortInitialized;
+        state.nativeSortPending = !state.sortInitialized;
         return;
     }
-    if (!state.preSortEnabled && !state.trackNativeSort) return;
     SortSpec native;
     if (ReadShellSort(state, native)) {
         native.userChosen = state.sort.userChosen;
@@ -12830,7 +13000,7 @@ void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force =
     bool sortChanged=false;
     SortSpec updated;
     if ((!IsRecycleBinLocation(state.folderPath) || force || state.nativeSortPending) &&
-        (state.preSortEnabled || acceptUntrackedSort || state.trackNativeSort) && ReadShellSort(state, updated)) {
+        ReadShellSort(state, updated)) {
         state.trackNativeSort = true;
         const bool pending = std::exchange(state.nativeSortPending, false);
         if (pending) Wh_Log(L"[GPU sort] READ_RECOVERED folder=%s token=%llu columns=%zu",
@@ -12852,24 +13022,14 @@ void RefreshSortFromExplorer(ViewState& state, bool queueIfChanged, bool force =
     Redraw(state);
 }
 
-// Settings can arrive while an old unsorted enumeration is still pending.
-// Return whether its generation must be replaced, even when placement stayed
-// equal. Merely updating the header policy would mislabel that old result.
+// Folder-placement changes can arrive while an enumeration is pending.
+// Replace that generation so its rows use the current placement policy.
 bool ReconcileSortSettings(ViewState& state) {
     const auto placement=g_folderPlacement.load(std::memory_order_relaxed);
-    const bool preSort=g_preSort.load(std::memory_order_relaxed);
-    const bool changed=state.preSortEnabled!=preSort;
     const bool placementChanged=state.sort.placement!=placement;
-    if (changed || placementChanged) state.instantInteractionSort.reset();
-    if (changed) {
-        state.preSortEnabled=preSort;
-        if (preSort) {
-            state.nativeSortPending=true;
-            RefreshSortFromExplorer(state,false,true);
-        } else state.nativeSortPending=false;
-    }
+    if (placementChanged) state.instantInteractionSort.reset();
     state.sort.placement=placement;
-    return changed || placementChanged;
+    return placementChanged;
 }
 // Resolve header property keys from the folder's actual column mapping when
 // available; filesystem-folder fallback matches the four displayed columns.
@@ -14048,6 +14208,7 @@ struct ItemGeometry {
     D2D1_RECT_F detail[2]{}; // Tile type and size lines; Content's type line is detail[0].
     D2D1_RECT_F aside[2]{};  // Content's second text column: date modified, then size.
     bool wrapped = false;
+    float textCenter = 0.f, textVertical = .5f;
 };
 ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     const int dpi = ViewDpi(state);
@@ -14063,6 +14224,8 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const bool tiles = TileLayout(state);
         const bool compact = tiles || state.layoutNativeMode == FVM_SMALLICON;
         g.wrapped = !compact;
+        g.textCenter = g.wrapped ? .5f : 0.f;
+        g.textVertical = g.wrapped ? 0.f : .5f;
         const float iconX = compact ? g.cell.left + pad + SelectionCheckboxSpace(state) :
             (g.cell.left + g.cell.right - side) * .5f;
         // Tile icons and their text share one top edge, with a wider gap
@@ -14139,6 +14302,19 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         };
         g.icon = blend(visual.fromIcon, destination.icon);
         g.text = blend(visual.fromText, destination.text);
+        g.textCenter = visual.fromTextCenter + (destination.textCenter-visual.fromTextCenter)*visual.morph;
+        g.textVertical = visual.fromTextVertical + (destination.textVertical-visual.fromTextVertical)*visual.morph;
+        // Interpolate alignment anchors, not the center of a shrinking list box.
+        // This also preserves a partially aligned label when motion is retargeted.
+        const float fromX=visual.fromText.left+(visual.fromText.right-visual.fromText.left)*visual.fromTextCenter;
+        const float toX=destination.text.left+(destination.text.right-destination.text.left)*destination.textCenter;
+        const float dx=fromX+(toX-fromX)*visual.morph-
+            (g.text.left+(g.text.right-g.text.left)*g.textCenter);
+        const float fromY=visual.fromText.top+(visual.fromText.bottom-visual.fromText.top)*visual.fromTextVertical;
+        const float toY=destination.text.top+(destination.text.bottom-destination.text.top)*destination.textVertical;
+        const float dy=fromY+(toY-fromY)*visual.morph-
+            (g.text.top+(g.text.bottom-g.text.top)*g.textVertical);
+        g.text.left+=dx; g.text.right+=dx; g.text.top+=dy; g.text.bottom+=dy;
     }
     if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
         // Boxes slide with the band they lead, like the section badges.
@@ -14159,11 +14335,14 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     return g;
 }
 
+void CaptureItemSelection(ViewState& state, const RowVisual& visual, CapturedRow& capture);
 void CaptureItemMorph(ViewState& state, const RowVisual& visual, CapturedRow& capture) {
     capture.shaped = visual.morph < 1.f;
     if (!capture.shaped) return;
     const auto item = LayoutItem(state,visual);
     capture.oldIcon = item.icon; capture.oldText = item.text;
+    capture.oldTextCenter = item.textCenter; capture.oldTextVertical = item.textVertical;
+    CaptureItemSelection(state,visual,capture);
 }
 
 D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& item,const RowVisual& visual) {
@@ -14514,6 +14693,8 @@ void StartGroupingTransition(ViewState& state,
             motion.oldOpacity = old->oldOpacity;
             motion.shaped = old->shaped;
             motion.oldIcon = old->oldIcon; motion.oldText = old->oldText;
+            motion.oldTextCenter = old->oldTextCenter; motion.oldTextVertical = old->oldTextVertical;
+            motion.oldSelection = old->oldSelection; motion.selectionCaptured = old->selectionCaptured;
         } else {
             // Newly exposed rows are not necessarily new files: they may
             // simply have moved in from beyond the old viewport. A modest
@@ -14619,6 +14800,11 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
         const auto moved = [shift](D2D1_RECT_F r) { r.top += shift; r.bottom += shift; return r; };
         visual.morph = progress;
         visual.fromIcon = moved(motion.oldIcon); visual.fromText = moved(motion.oldText);
+        visual.fromTextCenter = motion.oldTextCenter; visual.fromTextVertical = motion.oldTextVertical;
+        visual.selectionCaptured = motion.selectionCaptured; visual.fromSelection = motion.oldSelection;
+        visual.fromSelection.bounds = moved(visual.fromSelection.bounds);
+        for(unsigned i=0;i<visual.fromSelection.count;++i)
+            visual.fromSelection.lines[i] = moved(visual.fromSelection.lines[i]);
         const float left = DocumentRowLeft(state,index);
         visual.destinationCell = D2D1::RectF(left,targetTop,left+state.itemWidth,targetTop+height);
     }
@@ -14657,6 +14843,8 @@ std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes
         if (shapes) {
             const auto item = LayoutItem(state, visual);
             capture.shaped = true; capture.oldIcon = item.icon; capture.oldText = item.text;
+            capture.oldTextCenter = item.textCenter; capture.oldTextVertical = item.textVertical;
+            CaptureItemSelection(state,visual,capture);
         }
         captures.push_back(std::move(capture));
     }
@@ -15287,6 +15475,10 @@ int HeaderColumnAt(ViewState& state, int x, int y) {
     return -1;
 }
 
+bool ShouldReplayHeaderDoubleClick(ViewState& state, int x, int y) {
+    return state.columnsView && HeaderColumnAt(state,x,y)>=0;
+}
+
 int DraggedColumnIndex(const ViewState& state) {
     if (!state.columnDragActive) return -1;
     for (size_t i = 0; i < state.columns.size(); ++i)
@@ -15795,6 +15987,7 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         }
         layout.text->SetTrimming(&trimming,sign.Get());
     }
+    if (geometryChanged) layout.placementMetrics.reset();
     if (naturalWidth) {
         DWRITE_TEXT_METRICS metrics{};
         if (FAILED(layout.text->GetMetrics(&metrics))) return nullptr;
@@ -17940,13 +18133,31 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     return true;
 }
 
-// Zoom changes the body size on every frame. Reshaping and directly drawing
-// each visible value then cost a full-viewport text pass per frame on large
-// displays. Draw a value's existing mask scaled about its aligned box instead,
-// without touching its shaped layout. The settled frame reshapes as before.
+// Placement is independent of shaping. Cached metrics are reused while a
+// frozen glyph mask travels between leading/centered and centered/top anchors.
+D2D1_POINT_2F TextAlignmentOffset(TextLayoutCache::Layout& shaped, float width, float height,
+                                 float center, float vertical, float scale = 1.f) {
+    if (center < 0.f) return {};
+    if (!shaped.placementMetrics) {
+        DWRITE_TEXT_METRICS metrics{};
+        if (FAILED(shaped.text->GetMetrics(&metrics))) return {};
+        shaped.placementMetrics = metrics;
+    }
+    const auto& metrics = *shaped.placementMetrics;
+    const auto alignment = shaped.text->GetTextAlignment();
+    const bool rtl = shaped.text->GetReadingDirection() == DWRITE_READING_DIRECTION_RIGHT_TO_LEFT;
+    const float horizontal = alignment == DWRITE_TEXT_ALIGNMENT_CENTER ? .5f :
+        (alignment == DWRITE_TEXT_ALIGNMENT_TRAILING) != rtl ? 1.f : 0.f;
+    const auto paragraph = shaped.text->GetParagraphAlignment();
+    const float actualVertical = paragraph == DWRITE_PARAGRAPH_ALIGNMENT_CENTER ? .5f :
+        paragraph == DWRITE_PARAGRAPH_ALIGNMENT_FAR ? 1.f : 0.f;
+    return D2D1::Point2F(((rtl ? 1.f-center : center)-horizontal)*(width-metrics.width*scale),
+        (vertical-actualVertical)*(height-metrics.height*scale));
+}
+// Reuse the frozen glyph mask during zoom; placement can still interpolate.
 bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, float t,
                           float r, float b, unsigned color, float opacity, bool wrapped,
-                          bool filename, bool underline) {
+                          bool filename, bool underline, float textCenter = -1.f, float textVertical = .5f) {
     IDWriteTextFormat* format = state.textFormat.Get();
     if (!format || state.textRasterUnavailable) return false;
     auto& cache = state.textLayouts[wrapped ? 3 : 0];
@@ -17980,8 +18191,9 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
     const auto paragraph = shaped.text->GetParagraphAlignment();
     const float vertical = paragraph == DWRITE_PARAGRAPH_ALIGNMENT_CENTER ? .5f :
         paragraph == DWRITE_PARAGRAPH_ALIGNMENT_FAR ? 1.f : 0.f;
+    const auto offset = TextAlignmentOffset(shaped,r-l,b-t,textCenter,textVertical,scale);
     const auto origin = SnapDrawPoint(state.target.Get(),
-        D2D1::Point2F(l+(r-l-width)*horizontal, t+(b-t-height)*vertical));
+        D2D1::Point2F(l+(r-l-width)*horizontal+offset.x, t+(b-t-height)*vertical+offset.y));
     // Clip to the value's box like the layout's own clip; map source equally.
     const auto destination = D2D1::RectF(std::max(origin.x,l), std::max(origin.y,t),
         std::min(origin.x+width,r), std::min(origin.y+height,b));
@@ -18025,7 +18237,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
           float r, float b, unsigned hex, bool header=false, float opacity=1.f,
           bool sortedHeader=false, bool wrapped=false,
           const std::vector<DWRITE_TEXT_RANGE>* highlight=nullptr, bool deferCold=false,
-          bool filename=false, bool underline=false) {
+          bool filename=false, bool underline=false, float textCenter=-1.f, float textVertical=.5f) {
     if (highlight && highlight->empty()) highlight = nullptr;
     if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
@@ -18049,7 +18261,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
     if (!fmt) return;
     if (!header && !highlight && state.zoomAnimating &&
-        DrawScaledTextRaster(state,text,l,t,r,b,hex,opacity,wrapped,filename,underline)) return;
+        DrawScaledTextRaster(state,text,l,t,r,b,hex,opacity,wrapped,filename,underline,textCenter,textVertical)) return;
     // Changes to font/trimming geometry retain immediate drawing during their
     // animation. With stable geometry, don't even shape a new deferred value
     // after its frame's enrichment budget has already been consumed.
@@ -18066,7 +18278,10 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         }
     }
     if (auto layout = ResolveTextLayout(state, text, r-l, b-t, header, sortedHeader, nullptr, wrapped,filename)) {
-        cache.layouts.at(text).painted = state.graphicsPaintSerial; // On screen: never trimmed this frame.
+        auto& shaped = cache.layouts.at(text);
+        const auto offset = TextAlignmentOffset(shaped,r-l,b-t,textCenter,textVertical);
+        l+=offset.x; r+=offset.x; t+=offset.y; b+=offset.y;
+        shaped.painted = state.graphicsPaintSerial; // On screen: never trimmed this frame.
         BOOL currentUnderline = FALSE;
         if (SUCCEEDED(layout->GetUnderline(0,&currentUnderline)) && bool(currentUnderline) != underline)
             layout->SetUnderline(underline,{0,static_cast<UINT32>(text.size())});
@@ -18779,7 +18994,7 @@ float ClipboardIconWiggleAngle(float size96, double elapsedMs, size_t seed = 0) 
     constexpr double periodMs = 2. * kUiTransitionDurationMs;
     // Identity supplies a stable pseudorandom 0..120 ms start delay. Preserve
     // that phase through reordering, scrolling and icon resolution changes.
-    const double delayMs = static_cast<double>(seed % 121);
+    const double delayMs = static_cast<double>(seed % 121) * kAnimationDurationScale;
     if (elapsedMs <= delayMs) return 0.f;
     const float amplitude = ClipboardIconWiggleAmplitude(size96);
     return amplitude * static_cast<float>(sin(fmod(elapsedMs-delayMs,periodMs) *
@@ -19332,6 +19547,26 @@ void ScrubHorizontal(ViewState& state, int x) {
     SetHorizontalScroll(state, fraction * bar.scrollRange);
 }
 
+float ItemStepScrollTarget(ViewState& state, float requested) {
+    float px = requested;
+    const int group = GroupAtDocument(state, px);
+    if (group >= 0) {
+        const auto& section = state.sections[static_cast<size_t>(group)];
+        px = section.documentTop;
+        if (DisplayedRow(state, section.first)) {
+            const float stride = DisplayRowHeight(state, section.first);
+            const float origin = DocumentRowTop(state, section.first) - GroupHeadingHeight(state);
+            const float line = std::clamp(std::round((requested-origin)/stride), 0.f,
+                static_cast<float>(ItemLineCount(state, section.end-section.first)));
+            px = origin + line * stride;
+        }
+        if (fabsf(requested-section.documentEnd) < fabsf(requested-px)) px = section.documentEnd;
+    } else if (state.sections.empty()) {
+        px = std::round(px / std::max(1.f, state.rowPx)) * state.rowPx;
+    }
+    return std::clamp(px, 0.f, MaxScrollPx(state));
+}
+
 void ScrubScrollbar(ViewState& state, float mouseY) {
     if (!std::isfinite(mouseY)) return;
     const ScrollbarGeometry bar = Scrollbar(state);
@@ -19345,24 +19580,7 @@ void ScrubScrollbar(ViewState& state, float mouseY) {
         // Fast vertical scrolling follows item lines (one row in a grid).
         // Group offsets and collapsed headings use the shared layout geometry;
         // never enumerate the rows or resolve Shell metadata while scrubbing.
-        const float requested = px;
-        const int group = GroupAtDocument(state, px);
-        if (group >= 0) {
-            const auto& section = state.sections[static_cast<size_t>(group)];
-            px = section.documentTop;
-            if (DisplayedRow(state, section.first)) {
-                const float stride = DisplayRowHeight(state, section.first);
-                // The sticky heading reserves its own height above the first
-                // visible item, just as RevealScrollTarget does for navigation.
-                const float origin = DocumentRowTop(state, section.first) - GroupHeadingHeight(state);
-                const float line = std::clamp(std::round((requested-origin)/stride), 0.f,
-                    static_cast<float>(ItemLineCount(state, section.end-section.first)));
-                px = origin + line * stride;
-            }
-            if (fabsf(requested-section.documentEnd) < fabsf(requested-px)) px = section.documentEnd;
-        } else if (state.sections.empty()) {
-            px = std::round(px / std::max(1.f, state.rowPx)) * state.rowPx;
-        }
+        px = ItemStepScrollTarget(state, px);
         // The last position remains reachable even for a partial final row.
         if (fraction > .999f) px = MaxScrollPx(state);
         SetScrollImmediate(state, px);
@@ -19636,6 +19854,48 @@ void InterpolateSelectionBounds(const ViewState& state, D2D1_RECT_F& rc,
 
 // Derive the same logical X bounds as Paint. Used only on keyboard input to
 // capture the currently visible shape before a rapid-arrow retarget.
+// Morph the displayed selection, not a rectangle rebuilt under the new view's
+// policy. Both endpoints use the shared selection geometry and cached labels.
+D2D1_RECT_F MorphSelectionRect(ViewState& state,int index,const RowVisual& visual,SelectionShape* shape) {
+    const bool morph=visual.morph<1.f && visual.selectionCaptured;
+    const auto& cell=visual.destinationCell;
+    const float listRight=ListEndX(state);
+    const float nameRight=std::min(ColumnsPresented(state) ? NameColumnEnd(state):listRight,listRight)-NameTrailingGap(state);
+    SelectionShape target;
+    auto bounds=SelectionRect(state,index,morph ? cell.top:visual.top,morph ? cell.bottom-cell.top:visual.height,
+        NameTextOrigin(state),nameRight,listRight,morph ? cell.left:visual.left,
+        morph ? cell.right-cell.left:visual.width,&target);
+    if(!morph) {if(shape) *shape=target; return bounds;}
+    const auto& from=visual.fromSelection;
+    const auto blend=[p=visual.morph](D2D1_RECT_F a,D2D1_RECT_F b) {
+        return D2D1::RectF(a.left+(b.left-a.left)*p,a.top+(b.top-a.top)*p,
+            a.right+(b.right-a.right)*p,a.bottom+(b.bottom-a.bottom)*p);
+    };
+    if(visual.morph<=0.f) {if(shape) *shape=from; return from.bounds;}
+    const auto result=blend(from.bounds,bounds);
+    if(shape) {
+        *shape={}; shape->bounds=result;
+        shape->count=std::max(std::max(1u,from.count),std::max(1u,target.count));
+        const auto part=[](const SelectionShape& s,D2D1_RECT_F rect,unsigned i,unsigned count) {
+            if(s.count==count) return s.lines[i];
+            // Partition a full-row rectangle into non-overlapping bands when
+            // its destination has several wrapped filename lines.
+            const float height=(rect.bottom-rect.top)/count;
+            return D2D1::RectF(rect.left,rect.top+i*height,rect.right,rect.top+(i+1)*height);
+        };
+        for(unsigned i=0;i<shape->count;++i)
+            shape->lines[i]=blend(part(from,from.bounds,i,shape->count),part(target,bounds,i,shape->count));
+    }
+    return result;
+}
+void CaptureItemSelection(ViewState& state,const RowVisual& visual,CapturedRow& capture) {
+    const int index=capture.oldIndex;
+    if(index<0 || index>=state.total || !ModelSelected(state,index)) return;
+    capture.oldSelection={};
+    const auto bounds=MorphSelectionRect(state,index,visual,&capture.oldSelection);
+    capture.oldSelection.bounds=bounds;
+    capture.selectionCaptured=bounds.right>bounds.left && bounds.bottom>bounds.top;
+}
 D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = true,
                                  SelectionShape* shape = nullptr, bool filenameText = false) {
     const float listRight = ListEndX(state);
@@ -19645,6 +19905,10 @@ D2D1_RECT_F CurrentSelectionRect(ViewState& state, int index, bool animated = tr
     D2D1_RECT_F rc = SelectionRect(state, index,
         state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
         DisplayRowHeight(state, index), left, right, listRight, -1.f, 0.f, shape, nullptr, filenameText);
+    if(animated && !filenameText && state.rowTransitionActive) {
+        const auto visual=LayoutRowVisual(state,index,CurrentRowProgress(state));
+        if(visual.morph<1.f && visual.selectionCaptured) rc=MorphSelectionRect(state,index,visual,shape);
+    }
     if (animated && state.keyboardSelectionAnimating) {
         InterpolateSelectionBounds(state, rc, KeyboardSelectionProgress(state));
     }
@@ -21514,8 +21778,8 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     // never restart scale animation or make pointer movement appear delayed.
     if(entering && preview->animate) {
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-        layer.curve=UiCompositionCurve(state,.65f,1.f,now,.080f);
-        layer.opacityCurve=UiCompositionCurve(state,0.f,1.f,now,.080f);
+        layer.curve=UiCompositionCurve(state,.65f,1.f,now,float(.080 * kAnimationDurationScale));
+        layer.opacityCurve=UiCompositionCurve(state,0.f,1.f,now,float(.080 * kAnimationDurationScale));
         if(layer.opacityCurve) {
             if(FAILED(state.composition->CreateEffectGroup(&layer.opacity)) ||
                 FAILED(layer.opacity->SetOpacity(layer.opacityCurve.Get())) ||
@@ -21598,6 +21862,8 @@ bool PresentationFrameReady(ViewState& state);
 // springs, entry/active stretch curves and threshold/release impulses. Source
 // revision and parameter mapping are documented in docs/swipe-panel-0.9.277.md.
 SwipeSpring SampleSwipeSpring(SwipeSpring spring,double seconds) {
+    // Keep spring trajectories and retarget velocity in their original time domain.
+    seconds /= kAnimationDurationScale;
     const double omega=std::sqrt(spring.stiffness), gamma=omega*spring.damping;
     const double offset=spring.value-spring.target, decay=std::exp(-gamma*seconds);
     if(spring.damping<1.f) {
@@ -21625,7 +21891,7 @@ float SwipeCurve(float progress,float x1,float y1,float x2,float y2) {
     return bezier((low+high)*.5f,y1,y2);
 }
 
-constexpr double kSwipeCommitFadeSeconds=.080;
+constexpr double kSwipeCommitFadeSeconds=.080 * kAnimationDurationScale;
 
 double SwipeSeconds(const ViewState& state,const SwipeIndicator& motion,LARGE_INTEGER now) {
     return state.qpcFrequency>0. ? std::max(0.,(now.QuadPart-motion.origin.QuadPart)/state.qpcFrequency):0.;
@@ -22249,8 +22515,7 @@ void Paint(ViewState& state) {
         visibleItems.erase(std::unique(visibleItems.begin(), visibleItems.end()), visibleItems.end());
     }
     const bool emptyRows = g_emptyRows.load(std::memory_order_relaxed);
-    const HoverVisual hover = state.inputFocusIndicators || state.shellDropHotRow >= 0 ?
-        CurrentHoverVisual(state) : HoverVisual{};
+    const HoverVisual hover = CurrentHoverVisual(state);
     // The presentation lane snapshots visible section bands after layout.
     // Provider work and item motion never determine stripe identity or parity.
     std::vector<ViewState::ZebraBand> zebraPresented;
@@ -22388,8 +22653,8 @@ void Paint(ViewState& state) {
         const float strength = SelectionStrength(state, i);
         if (strength <= 0.f) continue;
         SelectionShape shape;
-        const auto selection = SelectionRect(state, i, v.top, v.height,
-            xName, nameRight, listEnd, v.left, v.width,&shape);
+        const auto selection = v.morph<1.f && v.selectionCaptured ? MorphSelectionRect(state,i,v,&shape) :
+            SelectionRect(state, i, v.top, v.height, xName, nameRight, listEnd, v.left, v.width,&shape);
         const float alpha = strength * SelectionBaseOpacity(state, hover,
             DocumentRowTop(state, i) / std::max(1.f, state.rowPx), selection.left, selection.right);
         // The opaque native editor covers the filename; retain the item's
@@ -22699,7 +22964,8 @@ void Paint(ViewState& state) {
                 nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
                 false, geometry.wrapped, &highlightRanges,false,true,
                 state.clickPolicy.singleClick && (state.clickPolicy.underlineCold ||
-                    (state.clickPolicy.underlineHot && state.hovered==i)));
+                    (state.clickPolicy.underlineHot && state.hovered==i)),
+                v.morph < 1.f ? geometry.textCenter : -1.f, geometry.textVertical);
         if (usage.visible && DriveTiles(state)) {
                 const auto* caption = ColumnCellText(e, PKEY_Computer_DecoratedFreeSpace,
                     state.columnEpoch, state.propertyEpoch);
@@ -25552,16 +25818,141 @@ struct MarqueeScrollEdge {
     int band = 0;
 };
 
+MarqueeScrollEdge EdgeScrollZone(ViewState& state, int position, int first, int last) {
+    if (last <= first) return {};
+    const int band = std::min(Scale96(44, ViewDpi(state)),
+                              std::max(1, (last - first) / 3));
+    const int edge = position < first + band ? position - (first + band) :
+                     position > last - band ? position - (last - band) : 0;
+    return {edge, band};
+}
+
+float EdgeScrollDepth(MarqueeScrollEdge zone) {
+    return zone.band > 0 ? std::clamp(static_cast<float>(zone.edge) / zone.band,
+        -1.f, 1.f) : 0.f;
+}
+
 MarqueeScrollEdge GetMarqueeScrollEdge(ViewState& state, POINT point) {
     const RECT viewport = ContentViewport(state, true);
-    const int top = viewport.top;
-    const int bottom = viewport.bottom;
-    if (bottom <= top) return {};
-    const int band = std::min(Scale96(44, ViewDpi(state)),
-                              std::max(1, (bottom - top) / 3));
-    const int edge = point.y < top + band ? point.y - (top + band) :
-                     point.y > bottom - band ? point.y - (bottom - band) : 0;
-    return {edge, band};
+    return EdgeScrollZone(state, point.y, viewport.top, viewport.bottom);
+}
+
+// The Shell does not publish Explorer's drag-scroll margin or rate. Use the
+// marquee's viewport edge geometry, rate and frame clock.
+constexpr float kEdgeScrollRowsPerSecond = 20.f;
+
+float EdgeScrollPitch(ViewState& state) {
+    if (!state.gridView) return std::max(1.f, state.rowPx);
+    // A grid row includes a thumbnail and caption. Use the tab's list-row
+    // height so the same edge speed covers the same physical distance.
+    const int listHeight96 = state.rowHeight96[0] ? state.rowHeight96[0] : g_row96.load();
+    const double precise = state.preciseRowHeight96[0];
+    const bool direct = precise > 0. && std::llround(precise) == listHeight96;
+    const float listRow = direct ? static_cast<float>(precise * ViewDpi(state) / 96.) :
+        static_cast<float>(Scale96(listHeight96, ViewDpi(state)));
+    return std::max(1.f, state.compactRows ?
+        (direct ? listRow * kCompactRowFraction : std::round(listRow * kCompactRowFraction)) : listRow);
+}
+
+// Both marquee and file drag use this frame clock, acceleration and physical
+// distance. Their edge zones and scroll destinations remain input-specific.
+D2D1_POINT_2F AdvanceEdgeScroll(ViewState& state, LARGE_INTEGER& previous,
+                                D2D1_POINT_2F depth) {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double elapsed = previous.QuadPart && state.qpcFrequency > 0. &&
+        now.QuadPart >= previous.QuadPart ?
+        static_cast<double>(now.QuadPart - previous.QuadPart) / state.qpcFrequency : 0.;
+    previous = now;
+    // A delayed Shell STA frame must not skip several screens on recovery.
+    const float seconds = static_cast<float>(std::clamp(elapsed, 0., .024));
+    const float distance = kEdgeScrollRowsPerSecond * EdgeScrollPitch(state) * seconds;
+    const auto amount = [distance](float value) {
+        const float magnitude = std::clamp(fabsf(value), 0.f, 1.f);
+        return std::copysign(distance * magnitude * magnitude, value);
+    };
+    return {amount(depth.x), amount(depth.y)};
+}
+
+struct ShellDragScrollDepth { float x = 0.f, y = 0.f; };
+
+ShellDragScrollDepth ShellDragEdgeDepth(ViewState& state, POINT point) {
+    RECT client{};
+    ViewClientRect(state, &client);
+    if (point.x < client.left || point.x >= client.right ||
+        point.y < client.top || point.y >= client.bottom) return {};
+    const auto horizontal = EdgeScrollZone(state, point.x, client.left, client.right);
+    const auto vertical = GetMarqueeScrollEdge(state, point);
+    ShellDragScrollDepth depth{
+        EdgeScrollDepth(horizontal), EdgeScrollDepth(vertical)};
+    if (state.rtlLayout) depth.x = -depth.x;
+    const float maxX = std::max(0.f, state.columnContentWidth - ListViewportWidth(state));
+    if ((depth.x < 0.f && state.horizontalScroll <= .01f) ||
+        (depth.x > 0.f && state.horizontalScroll >= maxX - .01f)) depth.x = 0.f;
+    if ((depth.y < 0.f && state.scrollNow <= .01f) ||
+        (depth.y > 0.f && state.scrollNow >= MaxScrollPx(state) - .01f)) depth.y = 0.f;
+    return depth;
+}
+
+void StopShellDropAutoscroll(ViewState& state) {
+    if (!state.shellDropScrollActive) return;
+    state.shellDropScrollActive = false;
+    state.shellDropScrollLastQpc = {};
+    UnregisterAnimationWhenIdle(state);
+}
+
+bool UpdateShellDropAutoscroll(ViewState& state, POINTL screen) {
+    POINT point{screen.x, screen.y};
+    if (!MapUiPoint(nullptr, state.hwnd, point)) {
+        StopShellDropAutoscroll(state);
+        return false;
+    }
+    state.shellDropScrollPoint = point;
+    const auto depth = ShellDragEdgeDepth(state, point);
+    if (depth.x == 0.f && depth.y == 0.f) {
+        StopShellDropAutoscroll(state);
+        return false;
+    }
+    if (!state.shellDropScrollActive) {
+        state.shellDropScrollActive = true;
+        state.shellDropScrollRequestedY = state.scrollNow;
+        state.shellDropScrollToken = state.token;
+        state.shellDropScrollEpoch = state.mouseFolderEpoch;
+        QueryPerformanceCounter(&state.shellDropScrollLastQpc);
+        RegisterViewAnimation(state);
+    }
+    return true;
+}
+
+void AdvanceShellDropAutoscroll(ViewState& state) {
+    if (!state.shellDropScrollActive) return;
+    if (state.shellDropScrollToken != state.token ||
+        state.shellDropScrollEpoch != state.mouseFolderEpoch ||
+        !state.visible || !state.inScope || !state.detailsViewActive ||
+        !TabOwnsActiveView(state) || !state.shellDropRegistered) {
+        StopShellDropAutoscroll(state);
+        return;
+    }
+    const auto depth = ShellDragEdgeDepth(state, state.shellDropScrollPoint);
+    if (depth.x == 0.f && depth.y == 0.f) {
+        StopShellDropAutoscroll(state);
+        return;
+    }
+    const auto delta = AdvanceEdgeScroll(state, state.shellDropScrollLastQpc, {depth.x, depth.y});
+    if (depth.y != 0.f) {
+        state.shellDropScrollRequestedY = std::clamp(
+            state.shellDropScrollRequestedY + delta.y, 0.f, MaxScrollPx(state));
+        const bool itemStep = g_instantScrub.load(std::memory_order_relaxed) ||
+            !g_smooth.load(std::memory_order_relaxed);
+        float target = itemStep ?
+            ItemStepScrollTarget(state, state.shellDropScrollRequestedY) : state.shellDropScrollRequestedY;
+        // Quantization must never move opposite to the pointer's edge.
+        if (itemStep) target = depth.y > 0.f ?
+            std::max(target, state.scrollNow) : std::min(target, state.scrollNow);
+        SetScrollImmediate(state, target);
+    }
+    if (depth.x != 0.f) SetHorizontalScroll(state,
+        state.horizontalScroll + delta.x);
 }
 
 bool MarqueeNeedsFrames(ViewState& state, POINT point) {
@@ -25579,38 +25970,20 @@ bool MarqueeNeedsFrames(ViewState& state, POINT point) {
 void UpdateMarqueeAutoscroll(ViewState& state, POINT point, bool frameTick = false) {
     const float before = state.scrollNow;
     if (frameTick) {
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
-        double elapsed = 0.;
-        if (state.marqueeLastScrollQpc.QuadPart && state.qpcFrequency > 0. &&
-            now.QuadPart >= state.marqueeLastScrollQpc.QuadPart) {
-            elapsed = static_cast<double>(
-                now.QuadPart - state.marqueeLastScrollQpc.QuadPart) /
-                state.qpcFrequency;
-        }
-        state.marqueeLastScrollQpc = now;
-        // Limit recovery after a blocked Shell STA: never leap several frames.
-        const float seconds = static_cast<float>(std::clamp(elapsed, 0., .024));
         const auto scrollEdge = GetMarqueeScrollEdge(state, point);
-        const int edge = scrollEdge.edge;
-        const int band = scrollEdge.band;
-        if (edge != 0 && seconds > 0.f && state.total > 0) {
-            const float depth = std::clamp(
-                static_cast<float>(std::abs(edge)) / static_cast<float>(band),
-                0.f, 1.f);
-            const float rowsPerSecond = 20.f * depth * depth;
-            const float pixels = rowsPerSecond * state.rowPx * seconds;
-            if (pixels > .001f) {
-                const int previousFirst = static_cast<int>(
-                    before / std::max(1.f, state.rowPx));
-                state.scrollNow = state.scrollTarget = std::clamp(
-                    before + (edge > 0 ? pixels : -pixels), 0.f, MaxScrollPx(state));
-                const int currentFirst = static_cast<int>(
-                    state.scrollNow / std::max(1.f, state.rowPx));
-                // Only schedule background data when a new row becomes visible.
-                if (currentFirst != previousFirst) {
-                    QueueVisibleDataFrame(state);
-                }
+        const float depth = EdgeScrollDepth(scrollEdge);
+        const float pixels = AdvanceEdgeScroll(state, state.marqueeLastScrollQpc,
+            {0.f, depth}).y;
+        if (state.total > 0 && fabsf(pixels) > .001f) {
+            const int previousFirst = static_cast<int>(
+                before / std::max(1.f, state.rowPx));
+            state.scrollNow = state.scrollTarget = std::clamp(
+                before + pixels, 0.f, MaxScrollPx(state));
+            const int currentFirst = static_cast<int>(
+                state.scrollNow / std::max(1.f, state.rowPx));
+            // Only schedule background data when a new row becomes visible.
+            if (currentFirst != previousFirst) {
+                QueueVisibleDataFrame(state);
             }
         }
     }
@@ -28825,6 +29198,7 @@ class ShellDropBridge final : public IDropTarget {
         hasDragOrigin_ = false;
         dragOrigin_ = {};
         if (ViewState* s = IsWindow(hwnd_) ? State(hwnd_) : nullptr) {
+            StopShellDropAutoscroll(*s);
             if (s->shellDropHotRow != -1) {
                 s->shellDropHotRow = -1;
                 Redraw(*s);
@@ -28929,6 +29303,8 @@ public:
         allowedEffects_ = *effect & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
         const int row = HitItem(*s, point);
         const HRESULT hr = ChangeTarget(*s, row, keys, point, effect);
+        if (SUCCEEDED(hr) && CurrentSession() && UpdateShellDropAutoscroll(*s, point))
+            *effect |= DROPEFFECT_SCROLL;
         if (SUCCEEDED(hr) && CurrentSession() && dragImageHelper_) {
             POINT cursor{point.x, point.y};
             dragImageEntered_ = SUCCEEDED(dragImageHelper_->DragEnter(
@@ -28965,6 +29341,7 @@ public:
             return FAILED(hr) ? hr : S_OK;
         }
         *effect &= allowedEffects_ | DROPEFFECT_SCROLL;
+        if (UpdateShellDropAutoscroll(*s, point)) *effect |= DROPEFFECT_SCROLL;
         if (dragImageEntered_ && dragImageHelper_) {
             POINT cursor{point.x, point.y};
             dragImageHelper_->DragOver(&cursor, *effect);
@@ -29040,6 +29417,7 @@ void RevokeShellDropTarget(ViewState& state) {
     }
 }
 void ShutdownShellDragDrop(ViewState& state) {
+    StopShellDropAutoscroll(state);
     RevokeShellDropTarget(state);
     state.shellDropBridge.Reset();
     if (state.shellOleInitialized) {
@@ -31540,6 +31918,7 @@ void AdvanceAnimationFrame(ViewState& state, bool paced) {
     }
     AdvanceScroll(state);
     AdvanceHorizontalTrack(state);
+    AdvanceShellDropAutoscroll(state);
     AdvanceColumnTransition(state);
     if (AdvanceGroupAnimation(state)) {
         LayoutGroupSections(state);
@@ -32790,7 +33169,7 @@ void BeginPromotedTouchDrag(ViewState& state) {
 
 double TouchElapsedMs(const ViewState& state, LARGE_INTEGER from, LARGE_INTEGER to) {
     return from.QuadPart && state.qpcFrequency>0. ?
-        std::max(0.,1000.*(to.QuadPart-from.QuadPart)/state.qpcFrequency) : 0.;
+        std::max(0.,1000.*(to.QuadPart-from.QuadPart)/(state.qpcFrequency*kAnimationDurationScale)) : 0.;
 }
 
 D2D1_POINT_2F TouchVelocityAfter(D2D1_POINT_2F velocity,float deceleration,double milliseconds) {
@@ -35784,9 +36163,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!sameFolderRow) {
                 // Windows may label the FIRST press in the new folder DBLCLK
                 // because the HWND has not changed. Treat it as an ordinary
-                // first row press, preserving selection and capture. Keep the
-                // old no-op behavior for header double-clicks.
+                // first row press, preserving selection and capture. It also
+                // replaces the second DOWN on a stationary column header, so
+                // route it through the regular header press path; otherwise
+                // the second sort click is silently lost.
                 if (row >= 0)
+                    return OverlayProc(hwnd, WM_LBUTTONDOWN, wParam, lParam);
+                if (ShouldReplayHeaderDoubleClick(*s,x,y))
                     return OverlayProc(hwnd, WM_LBUTTONDOWN, wParam, lParam);
                 return 0;
             }

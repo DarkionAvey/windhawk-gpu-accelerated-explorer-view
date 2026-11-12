@@ -10,11 +10,21 @@ function Resolve-CoverageTools([string]$Compiler, [string]$Directory) {
     $candidates = @()
     if ($Directory) { $candidates = @($Directory) }
     else {
+        $candidates += Join-Path $PSScriptRoot ".build\llvm-coverage-tools-$major"
         $candidates += Split-Path -Parent $Compiler
         if ($env:LLVM_HOME) { $candidates += (Join-Path $env:LLVM_HOME 'bin'), $env:LLVM_HOME }
         $onPath = Get-Command llvm-cov.exe -ErrorAction SilentlyContinue
         if ($onPath) { $candidates += Split-Path -Parent $onPath.Source }
-        if ($env:ProgramFiles) { $candidates += Join-Path $env:ProgramFiles 'LLVM\bin' }
+        foreach ($programDirectory in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if ($programDirectory) { $candidates += Join-Path $programDirectory 'LLVM\bin' }
+        }
+        foreach ($key in @('HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+            $candidates += @(Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -match '^LLVM(\s|$)' -and $_.InstallLocation } |
+                ForEach-Object { Join-Path $_.InstallLocation 'bin' })
+        }
     }
     foreach ($candidate in $candidates) {
         $cov = Join-Path $candidate 'llvm-cov.exe'

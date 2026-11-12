@@ -1,5 +1,5 @@
 // Synthetic providers/windows only; no commands are launched or desktop input sent.
-static void TestLlmReport() {
+static void TestShellPropertySortReport() {
     Check(PrepareTextRuntime(),"report fixture text runtime preparation");
     {
         PROPVARIANT value{};
@@ -14,7 +14,8 @@ static void TestLlmReport() {
             PropertyFixture::sortVariant=&value;
             Entry entry; entry.path=L"wh-property-test:nan";
             ReadExtraShellSortValue(entry,PKEY_Rating);
-            Check(entry.sortValueKind==(std::isnan(number) ? 0 : 2),"Shell numeric NaN remained a sortable number");
+            const bool valid=type==VT_DATE ? std::isfinite(number) : !std::isnan(number);
+            Check(entry.sortValueKind==(valid ? 2 : 0),"Shell numeric value was not retained for sorting");
         }
         std::vector<Entry> entries(6);
         for(size_t i=0;i<entries.size();++i) {

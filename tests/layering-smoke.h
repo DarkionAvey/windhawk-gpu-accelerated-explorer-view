@@ -207,6 +207,7 @@ static void TestHighlightLayering(HWND frame) {
             for(int n=0;n<30;++n) { paint(); if(!state.textRasterPending) break; }
             const auto reference=pixels(state.backbuffer.Get());
             for(int feedback=0;feedback<7;++feedback) {
+                std::vector<BYTE> unfocusedFeedback;
                 state.selected=0; state.selectedFlags[0]=feedback==0 || feedback==2;
                 state.hovered=feedback==1 || feedback==2 ? 0 : -1;
                 state.shellDropHotRow=feedback==3 ? 0 : -1;
@@ -222,15 +223,23 @@ static void TestHighlightLayering(HWND frame) {
                     const auto flags=state.selectedFlags;
                     const int selected=state.selected,hovered=state.hovered;
                     for(HWND focused : {edit,chromeControl,HWND{}}) {
-                        FocusFixture::focus=focused; paint();
-                        Check(pixels(state.backbuffer.Get())==reference,
-                            "unfocused selection/hover/caret/marquee left visible pixels");
+                        FocusFixture::focus=focused; RefreshInputFocusIndicators(state); paint();
+                        if((feedback==1 || feedback==2) && unfocusedFeedback.empty()) {
+                            unfocusedFeedback=pixels(state.backbuffer.Get());
+                            if(feedback==1)
+                                Check(unfocusedFeedback!=reference,"unselected hover disappeared when the list lost focus");
+                        }
+                        const auto& expected=feedback==1 || feedback==2 ? unfocusedFeedback : reference;
+                        Check(pixels(state.backbuffer.Get())==expected && !state.selectionFeedbackVisible,
+                            "unfocused selection/caret/marquee changed pixels or hover");
                     }
-                    FocusFixture::focus=state.nativeHwnd; FocusFixture::foreground=nullptr; paint();
-                    Check(pixels(state.backbuffer.Get())==reference && state.selectedFlags==flags &&
+                    FocusFixture::focus=state.nativeHwnd; FocusFixture::foreground=nullptr;
+                    RefreshInputFocusIndicators(state); paint();
+                    const auto& expected=feedback==1 || feedback==2 ? unfocusedFeedback : reference;
+                    Check(pixels(state.backbuffer.Get())==expected && state.selectedFlags==flags &&
                         state.selected==selected && state.hovered==hovered,
                         "background Explorer retained highlights or lost logical selection/hover");
-                    FocusFixture::foreground=frame; paint();
+                    FocusFixture::foreground=frame; RefreshInputFocusIndicators(state); paint();
                     Check(state.inputFocusIndicators,"returning native-list focus did not restore feedback");
                     if(feedback<=2) Check(pixels(state.backbuffer.Get())!=reference,
                         "focus return retained selection logically but failed to restore its pixels");
@@ -342,12 +351,13 @@ static void TestHighlightLayering(HWND frame) {
         SetColumnViewMode(state,false); Paint(state);
         Check(state.modeComposition.published,"layering mode scene was not prepared");
         const auto origin=state.modeComposition.started.QuadPart;
+        state.hovered=-1; // Test the selection plane without native-style persistent hover.
         FocusFixture::foreground=nullptr; Paint(state);
         const auto inactive=pixels(state.modeComposition.background.bitmap.Get());
         Check(std::none_of(inactive.begin()+size_t(state.modeComposition.header)*640*4,inactive.end(),
             [](BYTE b) { return b!=0; }) && state.modeComposition.started.QuadPart==origin,
             "committed mode scene retained inactive selection pixels or restarted its animation");
-        FocusFixture::foreground=frame; Paint(state);
+        state.hovered=0; FocusFixture::foreground=frame; Paint(state);
         struct Visual {
             ID2D1Bitmap1* bitmap=nullptr;
             std::vector<Visual*> children;

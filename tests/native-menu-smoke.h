@@ -7,6 +7,22 @@ struct Item {
     bool submenu = false;
     bool operator==(const Item&) const = default;
 };
+// Some installed Shell extensions append a disabled copy of a command that
+// already appears enabled in the same root. It cannot be invoked and carries
+// no additional submenu; preserve exact comparison for every usable command.
+std::vector<Item> ActionableRootItems(const std::vector<Item>& items) {
+    std::vector<Item> result;
+    for (const auto& item : items) {
+        const bool redundant = !item.text.empty() && !item.submenu &&
+            (item.state & MFS_DISABLED) == MFS_DISABLED &&
+            std::any_of(items.begin(), items.end(), [&](const Item& other) {
+                return other.text == item.text && other.type == item.type && !other.submenu &&
+                    (other.state & MFS_DISABLED) == 0;
+            });
+        if (!redundant) result.push_back(item);
+    }
+    return result;
+}
 std::vector<Item> Read(HMENU menu, bool& valid) {
     std::vector<Item> result;
     const int count = GetMenuItemCount(menu);
@@ -493,7 +509,7 @@ void Child(const std::wstring& fixture, const std::wstring& provider) {
                     for (const auto& item : popup.items) std::wcout << L"HIDDEN " << item.text << L" state=" << item.state << L'\n';
                 }
             }
-            bool matchesNative = observed == reference;
+            bool matchesNative = ActionableRootItems(observed) == ActionableRootItems(reference);
             if (!matchesNative) {
                 // Shell commands such as Undo can change while other tests
                 // mutate files. Compare with a freshly displayed native menu
@@ -505,7 +521,8 @@ void Child(const std::wstring& fixture, const std::wstring& provider) {
                     std::cout<<"NATIVE CONTROL displayed="<<control.Displayed()<<std::endl;
                     for(const auto& item:control.items)
                         std::wcout<<L"NATIVE CONTROL "<<item.text<<L" state="<<item.state<<L'\n';
-                    matchesNative = control.Displayed() && observed == control.items;
+                    matchesNative = control.Displayed() &&
+                        ActionableRootItems(observed) == ActionableRootItems(control.items);
                 }
                 Check(SuppressNativeContent(state), "restore suppression after native control menu");
                 SetPresentationVisibility(state.hwnd, true);

@@ -35,7 +35,7 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Smooth Scrolling** — Fluid scrolling for a more responsive browsing experience.
 - **Touch support** — Multi touch support with modern interactions.
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
-- **Detailed Tooltips** — Under **Mouse hover**, includes available file properties such as dimensions, bitrate, comments and tags.
+- **Detailed Tooltips** — Includes all available file properties such as dimensions, bitrate, comments and tags.
 
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
@@ -12219,7 +12219,8 @@ void CaptureItemSnapshot(ViewState& state, DirectoryJob& snapshot) {
 // view proved unable to report one, rows proceed in enumeration order and
 // RefreshSortFromExplorer re-sorts them if a later read succeeds.
 bool SortReadDefersNames(const ViewState& state) {
-    return state.nativeSortPending && state.sortReadUnavailableToken!=state.token;
+    return state.nativeSortPending && !(state.optimisticStartedAt && state.directoryFolderIdentity) &&
+        state.sortReadUnavailableToken!=state.token;
 }
 
 void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,

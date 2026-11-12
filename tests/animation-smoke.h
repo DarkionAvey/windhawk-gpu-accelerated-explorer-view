@@ -479,9 +479,12 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         Check(Eventually([&] { frame(); return state.rowTransitionStartedQpc.QuadPart != 0; }),
               "paced wake did not produce its paint");
         Check(state.rowTransitionPresentedProgress == 0.f, "first submitted deletion frame skipped the start");
-        state.rowTransitionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.045);
-        Check(Eventually([&] { frame(); return state.rowTransitionPresentedProgress > 0.f; }),
-              "deletion has no intermediate submitted frame");
+        {
+            AnimationClockFixture::Freeze intermediateClock;
+            state.rowTransitionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.045);
+            Check(Eventually([&] { frame(); return state.rowTransitionPresentedProgress > 0.f; }),
+                  "deletion has no intermediate submitted frame");
+        }
         // The checks below advance each animation explicitly. Hold that clock
         // across provider waits and GPU submissions as well as the retarget
         // call: otherwise real time can settle the scene between assertions.
