@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.0.8
+// @version         1.0.9
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -13318,6 +13318,14 @@ int ArrowSelectionTarget(int selected, int vacant, int restored,
 void DeactivateOutsideScope(ViewState& state);
 void EnsureVisible(ViewState& state, int index);
 
+float RestoredViewportAnchorTarget(const ViewState& state, int index,
+                                   float offset, float capturedScroll) {
+    // A cold view can capture its first item before Shell grouping is known.
+    // Keep the document origin when a heading is inserted above that item.
+    if (capturedScroll == 0.f && index == 0 && offset == 0.f) return 0.f;
+    return DocumentRowTop(state, index) + offset;
+}
+
 bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
                          EntryPathIndex&& incomingIndex, bool complete, DWORD error, int lastFolderIndex,
                          int viewportAnchorIndex, float viewportScrollFraction,
@@ -13593,8 +13601,8 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
             // an obsolete anchor when a slow worker eventually finishes.
             SetScrollImmediate(state, state.scrollNow);
         } else if (viewportAnchorIndex >= 0 && viewportAnchorIndex < state.total) {
-            SetScrollImmediate(state, DocumentRowTop(state, viewportAnchorIndex) +
-                viewportAnchorOffsetPx);
+            SetScrollImmediate(state, RestoredViewportAnchorTarget(state,
+                viewportAnchorIndex, viewportAnchorOffsetPx, viewportCapturedScrollPx));
         } else {
             // Removed anchor: preserve the previous normalized position.
             SetScrollImmediate(state, std::clamp(viewportScrollFraction, 0.f, 1.f) *
