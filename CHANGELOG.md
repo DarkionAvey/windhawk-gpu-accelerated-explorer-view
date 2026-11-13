@@ -21,6 +21,7 @@
 - **IMPROVED** Drag files directly from their icon or filename without selecting first. Unselected list targets use the full row height; their blank row and grid padding remain available for rectangle selection. Selected items drag from the whole row or cell.
 - **IMPROVED** Themed selection and hover gradients use cached dithering for smoother color transitions without an extra drawing pass.
 - **IMPROVED** File tooltip text uses system ClearType on opaque backgrounds and grayscale smoothing on translucent backgrounds, respecting the selected text antialiasing mode.
+- **IMPROVED** Details column dividers use a subtler transparent theme color to match the native pane divider more closely.
 - **IMPROVED** Theme loading keeps readable properties when part of the XML is malformed and merges repeated definitions using the last complete value.
 - **IMPROVED** Focus and animation checks use the actual input state and a held animation clock.
 - **IMPROVED** Zebra stripes animate between snapshots of the visible bands, respecting group boundaries and empty-row stripes.
@@ -74,4 +75,5 @@
 - **FIXED** The view switch button's tooltip could appear clipped the first time it showed after Explorer started.
 
 - **REMOVED** The option to disable Explorer's saved folder sorting; the mod now always follows it.
+- **REMOVED** The accent-colored background behind a dragged Details column header.
 

@@ -23165,6 +23165,9 @@ void Paint(ViewState& state) {
         ? state.nativeTextColor : GetSysColor(COLOR_WINDOWTEXT));
     const unsigned headerColor = ThemeRgb(state.nativeHeaderTextColor != CLR_INVALID
         ? state.nativeHeaderTextColor : GetSysColor(COLOR_WINDOWTEXT));
+    // Keep divider contrast near the native navigation-pane separator while
+    // compositing the active theme foreground over Explorer's real surface.
+    constexpr float headerDividerOpacity = 1.f / 15.f;
     // Secondary columns are simply the same native text color with the
     // configured opacity: never invent a second dark/light RGB value.
     state.target->BeginDraw();
@@ -23250,11 +23253,10 @@ void Paint(ViewState& state) {
                         state.sort.direction == SORT_DESCENDING, headerColor, fade);
                 if (compositionFrame.Widths() || to <= listEnd)
                     Fill(state, to - .5f, headerOffset, to + .5f, headerBottom, headerColor,
-                         .14f * fade);
+                         headerDividerOpacity * fade);
             }
             if (compositionFrame.Widths()) compositionFrame.Background();
             // The grabbed header is painted LAST, above the moving neighbors.
-            // A subtle Shell-accent tint distinguishes it without inventing icons.
             const int floatingIndex = DraggedColumnIndex(state);
             if (floatingIndex >= 0) {
                 const auto& col = state.columns[static_cast<size_t>(floatingIndex)];
@@ -23263,9 +23265,6 @@ void Paint(ViewState& state) {
                 const float clipLeft = std::max(0.f, left);
                 const float clipRight = std::min(listEnd, right);
                 if (clipRight > clipLeft) {
-                    Fill(state, clipLeft, 0.f, clipRight, columnHeader,
-                         ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)), .22f,
-                         static_cast<float>(Scale96(5, ViewDpi(state))));
                     const bool sorted = state.sort.explicitOrder &&
                         SameKey(col.key, state.sort.key);
                     const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, dpi);
@@ -23292,7 +23291,7 @@ void Paint(ViewState& state) {
             // an unnaturally bright double line, so only paint the outer rule
             // when the scrollbar is actually present.
             if (bar.usable && w >= 1.f)
-                Fill(state, w - 1.f, headerOffset, w, headerBottom, headerColor, .14f * modeOpacity);
+                Fill(state, w - 1.f, headerOffset, w, headerBottom, headerColor, headerDividerOpacity * modeOpacity);
             state.target->PopAxisAlignedClip();
         }
         state.textRasterBuildTicks+=bodyRasterTicks;
