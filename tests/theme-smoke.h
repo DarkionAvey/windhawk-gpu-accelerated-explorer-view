@@ -318,6 +318,137 @@ static void TestThemedHighlight(Theme::Highlight kind,bool common=false) {
     std::cout<<"PASS: per-element pixels, DPI borders, solid/gradient alpha, LTR/RTL, mode overrides, clear and device lifetime\n";
 }
 
+static void TestThemedScrollbar(bool thumb) {
+    using namespace ThemeRegression;
+    StyleFixture::Session style;
+    OptionEffects::Settings settings; Fonts(); Surface surface;
+    settings.Set(L"Selection.selectionOpacity",L"0"); settings.Set(L"Hover.hoverOpacity",L"0");
+    settings.Set(L"Hover.hoverSelectedOpacity",L"0"); LoadSettings();
+    const std::wstring name=thumb ? L"DrawScrollbar:thumb":L"DrawScrollbar:track";
+    const std::wstring other=thumb ? L"DrawScrollbar:track":L"DrawScrollbar:thumb";
+    const auto compiled=Parse(L"<theme><element name=\""+name+
+        L"\" background=\"#111111\" border-width=\"1px\" border-radius=\"3px\" />"+
+        L"<element name=\""+name+L"\" border-color=\"#123456\" />"+
+        L"<element name=\""+name+L":hover\" background=\"#222222\" border-radius=\"invalid\"><dark border-width=\"2px\" /></element>"+
+        L"<element name=\""+name+L":pressed\" background=\"accent\" /></theme>");
+    for(size_t mode=0;mode<2;++mode) {
+        const auto& states=compiled->scrollbars[mode][thumb ? 0:1];
+        Check(states[0].borderRadius==3 && states[0].borderColor.rgb==0x123456 && states[0].borderWidth==1,
+            "merged scrollbar properties changed");
+        Check(states[1].background.color.rgb==0x222222 && states[2].background.color.accent &&
+            states[2].borderRadius==3 && states[2].borderColor.rgb==0x123456 &&
+            states[2].borderWidth==(mode ? 2.f:1.f),"pressed scrollbar did not inherit hover/base appearance");
+        Check(compiled->scrollbars[mode][thumb ? 1:0][2].background.kind==Theme::Paint::Kind::Default,
+            "scrollbar definition leaked to the other part");
+    }
+    const auto theme=[&](const std::wstring& properties) {
+        return L"<theme><element name=\""+other+L"\" background=\"transparent\" border-radius=\"0\" />"+
+            L"<element name=\""+name+L"\" "+properties+L"</theme>";
+    };
+    bool horizontal=false; size_t interaction=0;
+    const auto render=[&] {
+        return surface.Render([&](ViewState& state) {
+            const float s=state.presentationDpi/96.f;
+            const auto axis=horizontal ? ScrollAxis::Horizontal:ScrollAxis::Vertical;
+            const auto bar=MakeScrollbarGeometry(axis,20*s,(horizontal ? 110:44)*s,
+                20*s,(horizontal ? 44:110)*s,180*s,80*s,60*s,1.f);
+            Check(bar.usable,"private scrollbar geometry");
+            // Settle at an exact pose, independent of scheduler/animation time.
+            auto& motion=state.scrollbarMotion[horizontal ? 1:0]; motion={};
+            motion.activeFrom=motion.activeTo=interaction ? 1.f:0.f;
+            motion.pressedFrom=motion.pressedTo=interaction==2 ? 1.f:0.f;
+            DrawScrollbar(state,bar,0xffffff,interaction!=0,interaction==2);
+        });
+    };
+    const auto pixel=[&](const std::vector<DWORD>& pixels,int cross,int along) {
+        int x=horizontal ? along:cross, y=horizontal ? cross:along;
+        if(surface.state.rtlLayout) x=int(Surface::width)-1-x;
+        return At(pixels,x,y);
+    };
+    const auto noRamps=[&] {
+        for(const auto& ramps:surface.state.scrollbarResources.ramps)
+            for(const auto& ramp:ramps.slots) Check(!ramp.brush,"solid/cleared scrollbar retained dither textures");
+    };
+    for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true}) for(bool axis:{false,true}) {
+        horizontal=axis; surface.state.presentationDpi=dpi; surface.state.rtlLayout=rtl;
+        const float s=dpi/96.f;
+        Regression::Scope scope("scrollbar "+Regression::Narrow(name)+" dpi="+std::to_string(dpi)+
+            " rtl="+std::to_string(rtl)+" horizontal="+std::to_string(axis));
+        Load(settings,theme(LR"(background="#112233" border-radius="0"><dark background="#445566" /></element>)"+
+            std::wstring(L"<element name=\"")+name+L":hover\" background=\"#7799bb\"><dark background=\"#335577\" /></element>"+
+            L"<element name=\""+name+L":pressed\" background=\"accent\" />"));
+        for(auto mode:{Theme::Mode::Light,Theme::Mode::Dark}) for(size_t state=0;state<3;++state) {
+            surface.state.themeMode=mode; interaction=state;
+            const auto pixels=render();
+            const COLORREF accent=COLORREF(g_swipePalette.load()&0xffffff);
+            const DWORD expected=state==2 ? 0xff000000u|(DWORD(GetRValue(accent))<<16)|(DWORD(GetGValue(accent))<<8)|GetBValue(accent):
+                state==1 ? (mode==Theme::Mode::Dark ? 0xff335577u:0xff7799bbu):mode==Theme::Mode::Dark ? 0xff445566u:0xff112233u;
+            Check(pixel(pixels,MulDiv(32,dpi,96),MulDiv(thumb ? 70:30,dpi,96))==expected,
+                "shared axis appearance/state color or independent opacity is wrong");
+            noRamps();
+        }
+        surface.state.themeMode=Theme::Mode::Light; interaction=0;
+        Load(settings,theme(LR"(background="transparent" border-color="#ff0000" border-width="1px" border-radius="0" />)"));
+        const auto border=render();
+        const int edge=int(std::floor((20+(thumb ? 24*.32:0))*s+.5));
+        const int along=MulDiv(thumb ? 70:30,dpi,96), width=int(std::floor(s+.5));
+        for(int c=edge-2;c<edge+width+3;++c)
+            Check(pixel(border,c,along)==(c>=edge && c<edge+width ? 0xffff0000u:0u),
+                "scrollbar border moved its bounds or failed whole-pixel DPI scaling");
+        Check(pixel(border,MulDiv(32,dpi,96),along)==0,"border-only scrollbar gained a background");
+        Load(settings,theme(LR"(background="#ff000080" border-radius="0" />)"));
+        const auto translucent=render();
+        Check(pixel(translucent,MulDiv(32,dpi,96),along)==0x80800000u,"scrollbar paint alpha inherited highlight/native opacity");
+        interaction=1;
+        Load(settings,theme(L"background=\"linear-gradient("+std::wstring(horizontal ? L"to right":L"to bottom")+
+            L", #ff0000, #0000ff)\" border-radius=\"0\"><dark background=\"#00ff00\" /></element>"));
+        const auto reads=SettingsFixture::reads;
+        const auto gradient=render(); Check(gradient==render(),"warm scrollbar dither cache changed pixels");
+        Check(SettingsFixture::reads==reads,"scrollbar drawing reread settings");
+        const int start=int(std::floor((thumb ? 50+24*.12:20)*s+.5));
+        const int end=int(std::floor((thumb ? 90-24*.12:110)*s+.5));
+        for(int a:{start+(end-start)/4,start+3*(end-start)/4}) {
+            double red=0,blue=0;
+            const int cross=MulDiv(32,dpi,96)-4;
+            for(int c=cross;c<cross+8;++c) {red+=Channel(pixel(gradient,c,a),16);blue+=Channel(pixel(gradient,c,a),0);}
+            double t=(a+.5-start)/double(end-start);
+            // CSS directions are physical. RTL mirrors the bar's placement,
+            // while "to right" still points toward the screen's right edge.
+            if(horizontal && rtl) t=1-t;
+            // A nearest-sampled ramp has half a texel of position error,
+            // plus at most one 8-bit color step from quantization/dithering.
+            unsigned resolution=64; while(resolution<unsigned(end-start)) resolution*=2;
+            const double error=255./(2*resolution)+1;
+            Check(std::abs(red/8-255*(1-t))<=error && std::abs(blue/8-255*t)<=error,
+                "scrollbar gradient differs from independent interpolation");
+        }
+        size_t brushes=0,bytes=0;
+        for(const auto& ramps:surface.state.scrollbarResources.ramps) for(const auto& ramp:ramps.slots) if(ramp.brush) {
+            ComPtr<ID2D1Bitmap> bitmap; ramp.brush->GetBitmap(&bitmap); const auto size=bitmap->GetPixelSize();
+            ++brushes; bytes+=size_t(size.width)*size.height*4;
+        }
+        Check(brushes && bytes<=6*1024*1024,"scrollbar gradients missing or exceed bounded storage");
+        surface.state.themeMode=Theme::Mode::Dark;
+        Check(pixel(render(),MulDiv(32,dpi,96),along)==0xff00ff00u,"appearance change retained a stale gradient"); noRamps();
+        surface.state.themeMode=Theme::Mode::Light;
+        Load(settings,theme(LR"(background="#ff0000" border-radius="100000px" />)"));
+        const auto rounded=render();
+        const int crossEdge=int(std::floor((20+ (thumb ? 24*.12:0))*s+.5));
+        const int axialEdge=thumb ? start:MulDiv(20,dpi,96);
+        Check(pixel(rounded,crossEdge,axialEdge)==0 && pixel(rounded,MulDiv(32,dpi,96),along)==0xffff0000u,
+            "scrollbar radius did not clamp to the existing shape");
+        Load(settings,L""); const auto native=render(); noRamps();
+        Load(settings,theme(LR"(background="#ff0000" border-width="3px" border-radius="0" />)"));
+        surface.state.themeHighContrast=true;
+        Check(render()==native,"high contrast did not restore native scrollbar pixels");
+        surface.state.themeHighContrast=false;
+        Load(settings,L""); Check(render()==native,"clearing theme did not restore native scrollbar pixels");
+    }
+    DropTarget(surface.state); noRamps();
+    for(const auto& gradient:surface.state.scrollbarResources.gradients) Check(!gradient,"device teardown retained scrollbar gradients");
+    std::cout<<"PASS: scrollbar "<<(thumb ? "thumb":"track")<<" axes, states, light/dark, DPI/RTL pixels, borders, corners, alpha, gradients, cache and native fallback\n";
+}
+
 static void TestThemedTooltip() {
     using namespace ThemeRegression;
     OptionEffects::Settings settings; Fonts();

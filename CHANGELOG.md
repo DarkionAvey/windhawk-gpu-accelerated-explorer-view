@@ -4,6 +4,7 @@
 - **ADDED** Theme XML setting with shared properties and optional light and dark overrides for each element. Works on a single line; see THEMING.md for instructions.
 - **ADDED** Selection and hover backgrounds support solid colors, linear gradients with multiple color stops, and DPI-scaled borders aligned to whole pixels.
 - **ADDED** File hover tooltips support themed backgrounds, borders, rounded corners and cached CSS-style shadows. Muted metadata text follows the custom background.
+- **ADDED** Both scrollbars share themeable thumbs and tracks, with backgrounds, borders, rounded corners and hover and pressed styles.
 - **ADDED** Dragging files near any edge of the view scrolls toward offscreen destinations, with speed controlled by the pointer's distance into the edge.
 - **ADDED** Internal animation duration scale for debugging, set to 1.0 by default.
 - **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.

@@ -92,6 +92,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("theme-selected-hover", PARALLEL, TestThemedHighlight(Theme::Highlight::SelectedHover)),
     REGRESSION("theme-tooltip", PARALLEL, TestThemedTooltip()),
     REGRESSION("theme-tooltip-antialiasing", PARALLEL, TestThemedTooltipAntialiasing()),
+    REGRESSION("theme-scrollbar-thumb", PARALLEL, TestThemedScrollbar(true)),
+    REGRESSION("theme-scrollbar-track", PARALLEL, TestThemedScrollbar(false)),
     REGRESSION("option-effects-list", PARALLEL, OptionEffects::TestListLayouts(fixture)),
     REGRESSION("option-effects-grid", PARALLEL, OptionEffects::TestGridLayouts(fixture)),
     REGRESSION("option-effects-zoom", PARALLEL, OptionEffects::TestZoomInputs(fixture)),

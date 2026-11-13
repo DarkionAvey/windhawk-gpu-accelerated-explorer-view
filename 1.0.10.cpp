@@ -319,6 +319,8 @@ struct Document {
     std::array<std::array<SurfaceStyle, 3>, 2> highlights;
     std::array<bool, 2> highlightEnabled{};
     std::array<SurfaceStyle, 2> tooltips;
+    // Appearance, part (thumb/track), interaction (normal/hover/pressed).
+    std::array<std::array<std::array<SurfaceStyle, 3>, 2>, 2> scrollbars;
     const Value* Find(Mode mode, std::wstring_view element, std::wstring_view property) const {
         const auto e = elements.find(element);
         if (e == elements.end()) return nullptr;
@@ -778,6 +780,17 @@ void CompileStyles(Document& document) {
             return style.background.kind != Paint::Kind::Default || style.borderWidth > 0.f;
         });
         apply(document.tooltips[mode],L"RenderItemTip");
+        constexpr std::wstring_view parts[] = {L"DrawScrollbar:thumb", L"DrawScrollbar:track"};
+        for (size_t part = 0; part < std::size(parts); ++part) {
+            auto& bar = document.scrollbars[mode][part];
+            // An omitted radius keeps the native capsule at any breadth.
+            bar[0].borderRadius = std::numeric_limits<float>::max();
+            apply(bar[0], parts[part]);
+            bar[1] = bar[0];
+            apply(bar[1], std::wstring(parts[part]) + L":hover");
+            bar[2] = bar[1];
+            apply(bar[2], std::wstring(parts[part]) + L":pressed");
+        }
     }
 }
 void Load() {
@@ -4759,6 +4772,13 @@ struct ViewState {
         // all three states combined. No per-item entries or resize churn.
         std::array<ThemeGradientRamps, 3> ramps;
     } highlightResources;
+    struct ScrollbarResources {
+        std::shared_ptr<const Theme::Document> snapshot;
+        Theme::Mode mode = Theme::Mode::Light;
+        COLORREF accent = CLR_INVALID;
+        std::array<ComPtr<ID2D1LinearGradientBrush>, 6> gradients;
+        std::array<ThemeGradientRamps, 6> ramps;
+    } scrollbarResources;
     ComPtr<IDXGISwapChain1> swapChain;
     ComPtr<IDCompositionTarget> compTarget;
     ComPtr<IDCompositionVisual> visual;
@@ -18048,6 +18068,7 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.textRasterBrush.Reset(); state.textRasterTarget.Reset();
     state.thumbnailBrush.Reset();
     state.highlightResources = {};
+    state.scrollbarResources = {};
     state.brush.Reset();
     state.defaultFolderIcon.bitmap.Reset();
     state.defaultFolderIcon.bitmapPixels={};
@@ -20037,6 +20058,8 @@ void UpdateTouchScrollbars(ViewState& state) {
     if (changed) Redraw(state);
 }
 
+bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
+                          float alpha, float radius, size_t part, size_t interaction);
 void DrawScrollbar(ViewState& state, const ScrollbarGeometry& bar,
                    unsigned color, bool active, bool dragging) {
     const bool horizontal = bar.axis == ScrollAxis::Horizontal;
@@ -20055,21 +20078,25 @@ void DrawScrollbar(ViewState& state, const ScrollbarGeometry& bar,
     } else if (progress >= 1.f) motion.started = {};
     const float breadth = horizontal ? bar.bottom - bar.top : bar.right - bar.left;
     const float inset = breadth * (.32f - .20f * std::max(hot, TouchScrollbarAmount(state, horizontal)));
-    if (hot > 0.f || pressed > 0.f)
-        Fill(state, bar.left, bar.top, bar.right, bar.bottom, color,
-             .09f*hot + .08f*pressed, breadth * .5f);
+    const size_t interaction = dragging ? 2 : active ? 1 : 0;
+    const auto surface = [&](D2D1_RECT_F bounds, float alpha, float radius, size_t part) {
+        if (!DrawScrollbarSurface(state, bounds, color, alpha, radius, part, interaction))
+            Fill(state, bounds.left, bounds.top, bounds.right, bounds.bottom, color, alpha, radius);
+    };
+    surface(D2D1::RectF(bar.left, bar.top, bar.right, bar.bottom),
+        .09f*hot + .08f*pressed, breadth * .5f, 1);
     const float alpha = .44f + .34f*hot + .16f*pressed;
     // Inset both ends with the sides so each thumb shares the track's cap
     // centers at its limits. Scale the cap padding for very short tracks.
     const float capInset = inset * std::min(1.f, bar.thumbLength / breadth);
     if (horizontal) {
-        Fill(state, bar.thumbStart + capInset, bar.top + inset,
-             bar.thumbStart + bar.thumbLength - capInset, bar.bottom - inset,
-             color, alpha, (breadth - 2.f * inset) * .5f);
+        surface(D2D1::RectF(bar.thumbStart + capInset, bar.top + inset,
+             bar.thumbStart + bar.thumbLength - capInset, bar.bottom - inset),
+             alpha, (breadth - 2.f * inset) * .5f, 0);
     } else {
-        Fill(state, bar.left + inset, bar.thumbStart + capInset,
-             bar.right - inset, bar.thumbStart + bar.thumbLength - capInset,
-             color, alpha, (breadth - 2.f * inset) * .5f);
+        surface(D2D1::RectF(bar.left + inset, bar.thumbStart + capInset,
+             bar.right - inset, bar.thumbStart + bar.thumbLength - capInset),
+             alpha, (breadth - 2.f * inset) * .5f, 0);
     }
 }
 
@@ -20520,11 +20547,11 @@ ID2D1BitmapBrush* DitheredGradientBrush(ID2D1RenderTarget* target, ThemeGradient
     ramp.brush->SetOpacity(std::clamp(alpha/opacity,0.f,1.f));
     return ramp.brush.Get();
 }
-void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
-                          float radius, float alpha, Theme::Highlight kind) {
-    if (!VisibleOpacity(alpha)) return;
-    const size_t index = static_cast<size_t>(kind);
-    const auto& style = state.themeSnapshot->highlights[static_cast<size_t>(state.themeMode)][index];
+void DrawThemeSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
+                      float radius, float alpha, const Theme::SurfaceStyle& style,
+                      ComPtr<ID2D1LinearGradientBrush>& gradientBrush, ThemeGradientRamps& ramps,
+                      float rampOpacity, unsigned fallbackColor, float borderAlpha = -1.f) {
+    if (!VisibleOpacity(alpha) && !(style.borderWidth > 0.f && VisibleOpacity(borderAlpha))) return;
     const auto physical = [&](D2D1_RECT_F rect) {
         if (state.rtlLayout) { const float l = rect.left; rect.left = state.paintWidth-rect.right; rect.right = state.paintWidth-l; }
         return SnapDrawRect(state.target.Get(), rect);
@@ -20533,16 +20560,16 @@ void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds
     if (part.right <= part.left || part.bottom <= part.top) return;
     const auto& paint = style.background;
     ID2D1Brush* brush = state.brush.Get();
-    auto* gradient = state.highlightResources.gradients[index].Get();
+    auto* gradient = gradientBrush.Get();
     if (paint.kind == Theme::Paint::Kind::Linear && gradient) {
         const auto line = GradientLine(paint,bounds);
         gradient->SetStartPoint(line.start);
         gradient->SetEndPoint(line.end);
         gradient->SetOpacity(std::clamp(alpha, 0.f, 1.f)); brush = gradient;
-        if (auto* ramp = DitheredGradientBrush(state.target.Get(),state.highlightResources.ramps[index],paint,
-            state.highlightResources.opacity[index]/100.f,line.direction,line.start,line.length,alpha)) brush = ramp;
+        if (auto* ramp = DitheredGradientBrush(state.target.Get(),ramps,paint,
+            rampOpacity,line.direction,line.start,line.length,alpha)) brush = ramp;
     } else {
-        auto color = paint.kind == Theme::Paint::Kind::Default ? Packed(ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed))) :
+        auto color = paint.kind == Theme::Paint::Kind::Default ? Packed(fallbackColor) :
             HighlightColor(paint.kind == Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color);
         color.a *= std::clamp(alpha, 0.f, 1.f); state.brush->SetColor(color);
     }
@@ -20556,11 +20583,50 @@ void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds
         // logical width once, then use the same whole-pixel stroke for its inset
         // and corner geometry. Clamp before multiplying to avoid float overflow.
         const float width = std::clamp(roundf(std::min(style.borderWidth, maximum/scale)*scale), 1.f, maximum);
-        auto color = HighlightColor(style.borderColor); color.a *= std::clamp(alpha, 0.f, 1.f);
+        auto color = HighlightColor(style.borderColor); color.a *= std::clamp(borderAlpha < 0.f ? alpha : borderAlpha, 0.f, 1.f);
         state.brush->SetColor(color);
         StrokeRoundedRect(state, D2D1::RoundedRect(part, std::max(0.f, radius-width*.5f),
             std::max(0.f, radius-width*.5f)), state.brush.Get(), width);
     }
+}
+void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
+                          float radius, float alpha, Theme::Highlight kind) {
+    const size_t index = static_cast<size_t>(kind);
+    DrawThemeSurface(state, part, bounds, radius, alpha,
+        state.themeSnapshot->highlights[static_cast<size_t>(state.themeMode)][index],
+        state.highlightResources.gradients[index], state.highlightResources.ramps[index],
+        state.highlightResources.opacity[index]/100.f, ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)));
+}
+bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
+                          float alpha, float radius, size_t part, size_t interaction) {
+    const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
+    auto& resources = state.scrollbarResources;
+    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
+    if (resources.snapshot != snapshot || resources.mode != state.themeMode || resources.accent != accent) {
+        resources = {}; resources.snapshot = snapshot; resources.mode = state.themeMode; resources.accent = accent;
+        if (snapshot) {
+            const auto& parts = snapshot->scrollbars[static_cast<size_t>(state.themeMode)];
+            for (size_t p = 0; p < parts.size(); ++p)
+                for (size_t s = 0; s < parts[p].size(); ++s)
+                    if (parts[p][s].background.kind == Theme::Paint::Kind::Linear)
+                        resources.gradients[p*3+s] = NativeThemeGradient(state.target.Get(), parts[p][s].background);
+        }
+    }
+    if (!snapshot) return false;
+    const auto& style = snapshot->scrollbars[static_cast<size_t>(state.themeMode)][part][interaction];
+    if (style.background.kind == Theme::Paint::Kind::Default && style.borderWidth <= 0.f &&
+        style.borderRadius == std::numeric_limits<float>::max()) return false;
+    const float maximum = std::max(0.f, std::min(bounds.right-bounds.left, bounds.bottom-bounds.top)*.5f);
+    const float scale = ViewDpi(state)/96.f;
+    if (style.borderRadius != std::numeric_limits<float>::max())
+        radius = std::min(maximum, roundf(std::min(style.borderRadius, maximum/scale)*scale));
+    // Custom fills/borders use their own alpha. An omitted background keeps
+    // the native animated fill independently of a themed border or radius.
+    const size_t slot = part*3+interaction;
+    DrawThemeSurface(state, bounds, bounds, radius,
+        style.background.kind == Theme::Paint::Kind::Default ? alpha : 1.f, style,
+        resources.gradients[slot], resources.ramps[slot], 1.f, color, 1.f);
+    return true;
 }
 void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                        const SelectionShape* shape = nullptr, bool outline = false,

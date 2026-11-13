@@ -107,6 +107,59 @@ The same theme on one line, ready to paste into the setting:
 <theme><element name="FillSelectionRect:selected" background="transparent" border-color="#3b82f6" border-width="1px" /><element name="FillSelectionRect:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /><element name="FillSelectionRect:selected:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /></theme>
 ```
 
+## Scrollbars
+
+The vertical and horizontal scrollbars share these elements:
+
+| Element name | Applies to |
+|---|---|
+| `DrawScrollbar:thumb` | The moving thumb |
+| `DrawScrollbar:thumb:hover` | The thumb while its scrollbar is hovered |
+| `DrawScrollbar:thumb:pressed` | The thumb while its scrollbar is held down |
+| `DrawScrollbar:track` | The track behind the thumb |
+| `DrawScrollbar:track:hover` | The track while its scrollbar is hovered |
+| `DrawScrollbar:track:pressed` | The track while its scrollbar is held down |
+
+Hover overrides inherit from the base element. Pressed overrides inherit from
+hover. Each element also supports shared, light and dark properties.
+
+| Property | Value |
+|---|---|
+| `background` | A color or `linear-gradient(...)` |
+| `background-color` | A solid color |
+| `border-color` | A color; defaults to the Windows accent color |
+| `border-width` | A nonnegative length such as `1px`; defaults to `0` |
+| `border-radius` | One nonnegative length for all corners; keeps the usual capsule shape when omitted |
+
+An omitted background keeps the usual animated fill. Custom backgrounds and
+borders use their own color transparency; the selection and hover opacity
+settings do not affect them. Use `background="transparent"` for a border alone.
+Borders stay inside the shape and scale to whole screen pixels. Corner sizes
+scale with DPI and stop at half the shape's thickness.
+
+The usual scrollbar sizing, hover expansion and touch targets stay the same.
+Hover and pressed styles apply to both parts of the scrollbar being used;
+the other scrollbar keeps its own state. Windows high-contrast mode keeps the
+usual appearance.
+
+```xml
+<theme>
+  <element name="DrawScrollbar:thumb" background="#64748b"
+           border-color="#cbd5e1" border-width="1px" border-radius="3px" />
+  <element name="DrawScrollbar:thumb:hover" background="#3b82f6" />
+  <element name="DrawScrollbar:thumb:pressed" background="#1d4ed8" />
+  <element name="DrawScrollbar:track" background="#64748b20" border-radius="4px" />
+  <element name="DrawScrollbar:track:hover" background="#3b82f630" />
+  <element name="DrawScrollbar:track:pressed" background="#3b82f650" />
+</theme>
+```
+
+Ready to paste:
+
+```xml
+<theme><element name="DrawScrollbar:thumb" background="#64748b" border-color="#cbd5e1" border-width="1px" border-radius="3px" /><element name="DrawScrollbar:thumb:hover" background="#3b82f6" /><element name="DrawScrollbar:thumb:pressed" background="#1d4ed8" /><element name="DrawScrollbar:track" background="#64748b20" border-radius="4px" /><element name="DrawScrollbar:track:hover" background="#3b82f630" /><element name="DrawScrollbar:track:pressed" background="#3b82f650" /></theme>
+```
+
 ## File hover tooltip
 
 Use `RenderItemTip` to style the tooltip that appears when you hover over a file.
