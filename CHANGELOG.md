@@ -1,6 +1,9 @@
  # Changelog
 
 ## Since 1.0.5 — Unreleased
+- **ADDED** Theme XML setting with shared properties and optional light and dark overrides for each element. Works on a single line; see THEMING.md for instructions.
+- **ADDED** Selection and hover backgrounds support solid colors, linear gradients with multiple color stops, and DPI-scaled borders aligned to whole pixels.
+- **ADDED** File hover tooltips support themed backgrounds, borders, rounded corners and cached CSS-style shadows. Muted metadata text follows the custom background.
 - **ADDED** Dragging files near any edge of the view scrolls toward offscreen destinations, with speed controlled by the pointer's distance into the edge.
 - **ADDED** Internal animation duration scale for debugging, set to 1.0 by default.
 - **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.
@@ -15,6 +18,9 @@
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
 - **IMPROVED** Drag files directly from their icon or filename without selecting first. Unselected list targets use the full row height; their blank row and grid padding remain available for rectangle selection. Selected items drag from the whole row or cell.
+- **IMPROVED** Themed selection and hover gradients use cached dithering for smoother color transitions without an extra drawing pass.
+- **IMPROVED** File tooltip text uses system ClearType on opaque backgrounds and grayscale smoothing on translucent backgrounds, respecting the selected text antialiasing mode.
+- **IMPROVED** Theme loading keeps readable properties when part of the XML is malformed and merges repeated definitions using the last complete value.
 - **IMPROVED** Focus and animation checks use the actual input state and a held animation clock.
 - **IMPROVED** Zebra stripes animate between snapshots of the visible bands, respecting group boundaries and empty-row stripes.
 - **IMPROVED** Thumbnail overlays now match Explorer's sizes: shortcut arrows and app badges no longer cover large thumbnails. Video frames get film strips in Explorer's proportions, drawn over the image edges with see-through holes.
@@ -32,6 +38,7 @@
 - **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
+- **FIXED** Three-digit theme colors such as `#39f` now expand to the correct color.
 - **FIXED** Selection highlights morph from their displayed shape when switching views, including filename-only grid selections and full-row list selections.
 - **FIXED** The first item and group heading stay visible when a grouped folder opens in a new Explorer window.
 - **FIXED** Cold folder previews begin loading names when the destination is known.

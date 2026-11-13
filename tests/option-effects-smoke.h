@@ -21,6 +21,7 @@ using Values=std::map<std::wstring,std::wstring>;
 // Where each option's user-visible effect is asserted.
 struct Coverage { const wchar_t* key; const wchar_t* test; };
 inline const Coverage kCoverage[]={
+    {L"theme",L"theme-selection"},
     {L"Appearance.rowHeight",L"option-effects-list"},
     {L"Appearance.fontSizePercent",L"option-effects-list"},
     {L"Appearance.gridFontSizePercent",L"option-effects-grid"},
@@ -1029,6 +1030,11 @@ inline std::vector<std::wstring> ProbeValues(const OptionCatalog::Option& option
         values.push_back(option.initial==L"true" ? L"false" : L"true");
     } else if(option.key==L"Appearance.fontFamily") {
         values={L"Courier New",L"  Segoe UI  ",L"No Such Font Family 4d2f",std::wstring(300,L'W')};
+    } else if(option.key==L"theme") {
+        values={LR"(<theme><element name="FillSelectionRect" background="#dc2626" border-width="1px" /></theme>)",
+            LR"xml(<theme><element name="FillSelectionRect:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a1a)" /></theme>)xml",
+            LR"(<theme><element name="RenderItemTip" background="#202020" border-radius="0" box-shadow="6px 8px 0px #000000" /></theme>)",
+            L"<theme><element"};
     } else if(option.key==L"Selection.selectionColor") {
         values={L"#FF0000",L"12aBef",L"not a colour"};
     } else {
@@ -1085,16 +1091,33 @@ inline void EndBusy(LiveExplorer& live,Busy busy) {
     StopHoverAnimation(s); s.hovered=-1;
 }
 
-// Effect checks that hold in any state after a settings change.
-inline void CheckLiveResult(LiveExplorer& live,const Settings& settings) {
+struct ExpectedZoom {
+    std::array<int,2> height{};
+    std::array<double,2> precise{};
+};
+// Ordinary option edits reset zoom. Theme-only and no-op edits preserve the
+// intent observed before the settings callback, not the configured row default.
+inline void CheckLiveResult(LiveExplorer& live,const Settings& settings,const ExpectedZoom& zoom={}) {
     auto& s=*live.state;
     Check(s.visible && s.inScope,"option change fell back to the native view");
     Check(s.graphicsReady && SUCCEEDED(s.graphicsFailure),"option change failed GPU rendering");
     const int dpi=ViewDpi(s);
-    const int row96=g_row96.load();
-    const int font=s.gridView ? ListFont(std::min(row96,96),g_gridFontPercent.load(),dpi) : ListFont(row96,g_fontPercent.load(),dpi);
+    Check(s.rowHeight96==zoom.height,"settings callback unexpectedly reset or retained the tab's zoom intent");
+    const int configuredRow=std::stoi(settings.values.at(L"Appearance.rowHeight"));
+    const int row96=zoom.height[s.gridView] ? zoom.height[s.gridView]:configuredRow;
+    const double precise=zoom.precise[s.gridView];
+    const bool continuous=precise>0 && std::llround(precise)==row96;
+    const double fontRow=s.gridView ? std::min(continuous ? precise:double(row96),96.):(continuous ? precise:double(row96));
+    const int percent=std::stoi(settings.values.at(s.gridView ? L"Appearance.gridFontSizePercent":L"Appearance.fontSizePercent"));
+    const double physical=continuous ? fontRow*dpi/96.:MulDiv(int(fontRow),dpi,96);
+    const float font=continuous ? std::max(float(MulDiv(7,dpi,96)),float(physical*percent/100.)):
+        float(std::max(MulDiv(7,dpi,96),MulDiv(int(physical),percent,100)));
     Check(std::abs(s.fontPx-float(font))<.01f,"text size after an option change does not match the options");
-    if(!s.gridView) Check(std::abs(s.rowPx-float(Scale96(row96,dpi)))<.01f,"row height after an option change does not match the option");
+    if(!s.gridView) {
+        const double row=continuous ? precise*dpi/96.:MulDiv(row96,dpi,96);
+        const double expected=s.compactRows ? (continuous ? row*27./37.:std::round(row*27./37.)):row;
+        Check(std::abs(s.rowPx-expected)<.01,"row height after an option change does not match the option/zoom intent");
+    }
     {
         // The immutable model the renderer draws from carries the new metrics.
         const auto model=CapturePresentationModel(s);
@@ -1204,15 +1227,34 @@ static void TestLiveSweep(const std::wstring& fixture,std::initializer_list<std:
                     const auto state=Busy(busy++%int(Busy::Count));
                     Regression::Scope scope(Text(option.key,value)+" while "+BusyName(state));
                     BeginBusy(live,state);
+                    const bool preserve=option.key==L"theme" || settings.values.at(option.key)==value;
+                    const ExpectedZoom zoom=preserve ? ExpectedZoom{live.state->rowHeight96,live.state->preciseRowHeight96}:ExpectedZoom{};
+                    const HWND editor=live.state->rename.editor;
                     const auto submitted=live.state->presentationSequence;
                     settings.Set(option.key,value);
                     ChangeSettingsFromWindhawkThread();
                     live.Settle("option change did not settle",submitted);
+                    if(preserve) {
+                        Check(live.state->preciseRowHeight96==zoom.precise,"theme/no-op update changed continuous zoom intent");
+                        Check(live.state->rename.editor==editor,"theme/no-op update canceled the rename editor");
+                    }
                     EndBusy(live,state);
                     live.Settle("interaction did not settle after an option change",live.state->presentationSequence);
-                    CheckLiveResult(live,settings);
+                    CheckLiveResult(live,settings,zoom);
                     VisitAllItems(live);
                     ++applied;
+                }
+                // Zoom is an interaction state, not an option. Explicitly
+                // change/restore an ordinary option before checking the default
+                // layout; a final theme/no-op edit must not silently reset it.
+                if(live.state->rowHeight96!=std::array<int,2>{}) {
+                    const auto saved=settings.values.at(L"Appearance.rowHeight");
+                    for(const auto& height:{saved==L"24" ? std::wstring(L"96"):std::wstring(L"24"),saved}) {
+                        const auto submitted=live.state->presentationSequence;
+                        settings.Set(L"Appearance.rowHeight",height); ChangeSettingsFromWindhawkThread();
+                        live.Settle("explicit zoom reset did not settle",submitted);
+                        CheckLiveResult(live,settings);
+                    }
                 }
                 Check(std::abs(live.state->rowPx-baselineRow)<.01f && std::abs(live.state->fontPx-baselineFont)<.01f,
                     "restoring every option to its default did not restore the original layout");

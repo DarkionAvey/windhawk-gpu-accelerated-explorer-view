@@ -151,7 +151,7 @@ inline const Boolean booleans[]={
 inline const std::pair<const wchar_t*,const wchar_t*> strings[]={
     {L"Appearance.fontFamily",L""},{L"Appearance.textAntialiasing",L"system"},{L"Appearance.middleEllipsis",L"gridOnly"},
     {L"Selection.filenameOnlySelection",L"gridOnly"},{L"Selection.selectionColor",L"accent"},
-    {L"Columns.folderPlacement",L"explorerDefault"},
+    {L"Columns.folderPlacement",L"explorerDefault"},{L"theme",L""},
 };
 // Every option as written in the settings block: key, default and, for
 // $options lists, each choice in schema order.
@@ -172,7 +172,9 @@ inline std::vector<Option> Schema() {
         if(!settings) continue;
         std::wsmatch match;
         if(std::regex_match(line,match,rootOption)) {
-            options.push_back({match[1].str(),match[2].str(),{}}); group.clear(); listing=false;
+            std::wstring value=match[2];
+            if(value.size()>=2 && value.front()==L'"' && value.back()==L'"') value=value.substr(1,value.size()-2);
+            options.push_back({match[1].str(),value,{}}); group.clear(); listing=false;
         } else if(std::regex_match(line,match,category)) {group=match[1]; listing=false;}
         else if(std::regex_match(line,match,option)) {
             std::wstring value=match[2];

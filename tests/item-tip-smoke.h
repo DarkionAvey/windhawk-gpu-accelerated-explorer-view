@@ -469,11 +469,14 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(tip.background == GetSysColor(COLOR_INFOBK) && tip.foreground == GetSysColor(COLOR_INFOTEXT),
         "item tip ignores high contrast colors");
 
-    // The translucent popup uses the view's system or explicit
-    // smooth/aliased policy in its translucent-target form (ClearType needs an
-    // opaque target), including changes while it is open.
+    // Native tooltip bodies are opaque even though the layered window has
+    // transparent corners/shadow. System ClearType is eligible over the body;
+    // the explicit smooth/aliased choices must still be honored while open.
     Check(hover(note), "font policy tooltip");
     const auto oldAntialiasing = g_textAntialiasing.load();
+    BOOL smoothing=TRUE; UINT smoothingType=0;
+    Check(SystemParametersInfoW(SPI_GETFONTSMOOTHING,0,&smoothing,0) &&
+        SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE,0,&smoothingType,0),"read native tooltip smoothing policy");
     for (auto mode : {TextAntialiasing::System, TextAntialiasing::Smooth, TextAntialiasing::Aliased}) {
         g_textAntialiasing = mode; ++g_textRenderingRevision;
         InvalidateRect(tip.hwnd, nullptr, FALSE); UpdateWindow(tip.hwnd);
@@ -482,7 +485,10 @@ static void ItemTipScenario(const std::wstring& directory) {
         ComPtr<IDWriteRenderingParams> effective; tip.target->GetTextRenderingParams(&effective);
         // A native font customizer (MacType) rewrites the target's policy, as
         // the list and drag-preview suites already recognize.
-        if (tip.target->GetTextAntialiasMode() != tip.textStyle.textAntialiasMode ||
+        const auto expected=mode==TextAntialiasing::Aliased || (mode==TextAntialiasing::System && !smoothing) ?
+            D2D1_TEXT_ANTIALIAS_MODE_ALIASED : mode==TextAntialiasing::System && smoothingType==FE_FONTSMOOTHINGCLEARTYPE ?
+            D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE : D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+        if (tip.target->GetTextAntialiasMode() != expected ||
             effective.Get() != tip.textStyle.textRenderingParams.Get())
             Check(GetModuleHandleW(L"MacType64.dll") || GetModuleHandleW(L"MacType64.Core.dll"),
                 "unexplained tooltip text policy override");

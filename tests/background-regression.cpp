@@ -2028,6 +2028,7 @@ static void TestPreviewInput() {
 #include "cloud-item-tip-smoke.h"
 
 #include "option-effects-smoke.h"
+#include "theme-smoke.h"
 #include "native-return-smoke.h"
 #include "view-transition-regression-smoke.h"
 #include "regression-manifest.h"

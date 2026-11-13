@@ -988,28 +988,34 @@ static void TestRenameEditingShortcuts(const std::wstring& fixture) {
     const HWND editor = state.rename.editor;
     Check(editor != nullptr, "rename shortcut editor");
     ::SetFocus(editor); FocusFixture::focus = editor;
-    // Modifiers live in this thread's own key state, which every handler's
-    // GetKeyState reads; the user's keyboard and other processes are untouched.
+    // The mod's handlers use scoped modifiers across nested Shell pumps.
+    // Native EDIT/TranslateMessage also need the thread snapshot set after
+    // message retrieval: PeekMessage can refresh it from the input queue.
+    ModifierFixture::Session modifiers;
     BYTE saved[256]{};
     Check(GetKeyboardState(saved) != FALSE, "keyboard state snapshot");
     struct RestoreKeys { BYTE* keys; ~RestoreKeys() { SetKeyboardState(keys); } } restoreKeys{saved};
     const auto press = [&](UINT vk, bool control, bool shift) {
-        BYTE keys[256]{};
+        auto& keys = modifiers.keys;
+        std::fill(std::begin(keys), std::end(keys), BYTE{});
         if (control) keys[VK_CONTROL] = keys[VK_LCONTROL] = 0x80;
         if (shift) keys[VK_SHIFT] = keys[VK_LSHIFT] = 0x80;
         const bool extended = vk == VK_LEFT || vk == VK_RIGHT || vk == VK_HOME || vk == VK_END || vk == VK_DELETE;
         const LPARAM down = LPARAM(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16) | (extended ? 1 << 24 : 0) | 1;
         for (const bool pressed : {true, false}) {
             keys[vk] = pressed ? 0x80 : 0;
-            Check(SetKeyboardState(keys) && PostMessageW(editor, pressed ? WM_KEYDOWN : WM_KEYUP, vk,
+            Check(PostMessageW(editor, pressed ? WM_KEYDOWN : WM_KEYUP, vk,
                 pressed ? down : down | (LPARAM(3) << 30)), "post editing key");
             MSG msg{};
             while (PeekMessageW(&msg, editor, 0, 0, PM_REMOVE)) {
+                Check(SetKeyboardState(keys) != FALSE, "native editing translation modifiers");
                 ::TranslateMessage(&msg);
+                Check(SetKeyboardState(keys) != FALSE, "native editing dispatch modifiers");
                 DispatchMessageW(&msg);
             }
         }
         Check(SetKeyboardState(saved) != FALSE, "restore keyboard state");
+        std::fill(std::begin(keys), std::end(keys), BYTE{});
     };
     using Range = std::pair<DWORD, DWORD>;
     const auto selection = [&] {

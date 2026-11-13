@@ -22,6 +22,8 @@ A Windhawk mod for Windows 11 Explorer with GPU rendering for smooth animations 
 - **Seamless View Switching** — You can easily switch between the modded and native views directly from the Explorer window.
 - **Detailed Tooltips** — Includes all available file properties such as dimensions, bitrate, comments and tags.
 
+See the [theming guide](https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/blob/main/THEMING.md) for XML theme instructions.
+
 ## Touch gestures
 - Swipe horizontally with one finger to start marquee selection. 
 - Two finger horizontal swipes will start Back or Forward gestures (disabled by default). 
