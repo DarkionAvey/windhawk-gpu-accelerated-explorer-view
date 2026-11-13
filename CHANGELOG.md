@@ -5,6 +5,8 @@
 - **ADDED** Selection and hover backgrounds support solid colors, linear gradients with multiple color stops, and DPI-scaled borders aligned to whole pixels.
 - **ADDED** File hover tooltips support themed backgrounds, borders, rounded corners and cached CSS-style shadows. Muted metadata text follows the custom background.
 - **ADDED** Both scrollbars share themeable thumbs and tracks, with backgrounds, borders, rounded corners and hover and pressed styles.
+- **ADDED** Drag-selection rectangles support themed backgrounds, borders and rounded corners, with light and dark overrides.
+- **ADDED** Theme borders support solid, dashed and dotted patterns, or no border.
 - **ADDED** Dragging files near any edge of the view scrolls toward offscreen destinations, with speed controlled by the pointer's distance into the edge.
 - **ADDED** Internal animation duration scale for debugging, set to 1.0 by default.
 - **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.
@@ -53,7 +55,7 @@
 - **FIXED** Rapid repeated clicks on a column header now apply every sort toggle, including Windows' double-click sequence.
 - **FIXED** Date sorting stays consistent when Shell column reads fall back to item properties. Changes to cached item dates and sizes are checked using refreshed Shell identities.
 - **FIXED** Icons leaving Tiles for Content or Details could animate from the wrong position. View changes and interrupted layout animations now retain the outgoing icon and filename positions.
-- **FIXED** Cloud folder Status columns showed hexadecimal data instead of sync icons. Status icons now follow Windows' property definitions and provider custom states, with text kept when icons cannot be loaded.
+- **FIXED** OneDrive folder Status columns showed hexadecimal data instead of sync icons. Status icons now follow Windows' property definitions and provider custom states, with text kept when icons cannot be loaded (PR by @dariy-vel).
 - **FIXED** Switching from Details to an icon grid could send icons sideways before settling. Icon and filename motion now uses destination cell bounds, and folder updates retain an interrupted view transition's geometry.
 - **FIXED** View changes, selection and folder events could stop being observed after navigation. Event subscriptions now follow the current native view and folder generation, including when returning to This PC.
 - **FIXED** Collapsing a sticky group now scrolls to that group's own heading, keeping the collapsed group visible instead of skipping ahead.

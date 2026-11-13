@@ -64,6 +64,32 @@ struct Surface {
 };
 inline DWORD At(const std::vector<DWORD>& pixels,int x,int y) {return pixels.at(size_t(y)*Surface::width+x);}
 inline unsigned Channel(DWORD pixel,unsigned shift) {return (pixel>>shift)&255;}
+// Inspect a straight border edge, away from corners/text. Expectations describe
+// the visible pattern rather than calling the mod's stroke-style helpers.
+template<class Draw> void BorderPatterns(Draw draw) {
+    size_t dashedRun=0,dottedRun=0;
+    for(const auto* style:{L"solid",L"dashed",L"dotted",L"none"}) {
+        Regression::Scope scope("border-style="+Regression::Narrow(style));
+        const auto row=draw(style);
+        Check(row.size()>=16,"border pattern sample is too short");
+        size_t ink=0,gaps=0,run=0,longest=0;
+        for(DWORD p:row) {
+            Check((p&0xffff)==0 && Channel(p,16)==Channel(p,24),"border pattern changed its red color/premultiplication");
+            if(Channel(p,24)>64) {++ink; longest=std::max(longest,++run);} else {++gaps;run=0;}
+        }
+        if(std::wstring_view(style)==L"solid") Check(ink==row.size(),"solid border contains gaps");
+        else if(std::wstring_view(style)==L"none")
+            Check(std::all_of(row.begin(),row.end(),[](DWORD p){return p==0;}),"disabled border still draws pixels");
+        else {
+            Check(ink>0 && gaps>0,"pattern border has no ink or no gaps");
+            if(std::wstring_view(style)==L"dashed") dashedRun=longest; else dottedRun=longest;
+        }
+    }
+    Check(dashedRun>dottedRun,"dashes and round dots did not produce distinct visible lengths");
+}
+inline void BorderCacheReleased(const ThemeBorderStrokes& cache) {
+    for(const auto& stroke:cache.styles) Check(!stroke,"device teardown retained a border stroke style");
+}
 
 struct Tooltip {
     StyleFixture::Session style;
@@ -276,6 +302,15 @@ static void TestThemedHighlight(Theme::Highlight kind,bool common=false) {
         for(int x=left-2;x<left+width+3;++x)
             Check(At(border,x,y)==(x>=left && x<left+width ? 0xffff0000u:0u),"border width/inset is not independent whole-pixel DPI arithmetic");
         Check(At(border,(left+right)/2,y)==0,"transparent border-only theme gained a fill");
+        BorderPatterns([&](const wchar_t* pattern) {
+            Load(settings,Element(name,L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-style=\""+
+                std::wstring(pattern)+L"\""));
+            const auto pixels=render(); Check(pixels==render(),"warm highlight border changed pixels");
+            std::vector<DWORD> edge;
+            for(int x=left+MulDiv(10,dpi,96);x<right-MulDiv(10,dpi,96);++x) edge.push_back(At(pixels,x,MulDiv(20,dpi,96)));
+            Check(At(pixels,left-1,y)==0,"highlight pattern escaped its bounds");
+            return edge;
+        });
         Load(settings,Element(name,LR"xml(background="linear-gradient(to right, #ff0000, #0000ff)" border-width="0")xml"));
         const auto reads=SettingsFixture::reads;
         const auto gradient=render(); Check(gradient==render(),"warm dither cache changed pixels");
@@ -306,6 +341,7 @@ static void TestThemedHighlight(Theme::Highlight kind,bool common=false) {
     Load(settings,L""); const auto cleared=render();
     Check(At(cleared,280,100)==0xff112233u,"clearing theme did not restore legacy fill");
     DropTarget(surface.state);
+    BorderCacheReleased(surface.state.themeBorderStrokes);
     Check(std::all_of(surface.state.highlightResources.gradients.begin(),surface.state.highlightResources.gradients.end(),
         [](const auto& gradient) {return !gradient;}),"device teardown retained gradients");
     for(const auto& ramps:surface.state.highlightResources.ramps) for(const auto& ramp:ramps.slots)
@@ -396,6 +432,20 @@ static void TestThemedScrollbar(bool thumb) {
             Check(pixel(border,c,along)==(c>=edge && c<edge+width ? 0xffff0000u:0u),
                 "scrollbar border moved its bounds or failed whole-pixel DPI scaling");
         Check(pixel(border,MulDiv(32,dpi,96),along)==0,"border-only scrollbar gained a background");
+        for(size_t state=0;state<3;++state) {
+            interaction=state;
+            BorderPatterns([&](const wchar_t* pattern) {
+                Load(settings,theme(L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-radius=\"0\" border-style=\""+
+                    std::wstring(pattern)+L"\" />"));
+                const auto pixels=render(); Check(pixels==render(),"warm scrollbar border changed pixels");
+                const int cross=int(std::floor((20+(thumb ? 24*(state ? .12:.32):0))*s+.5));
+                std::vector<DWORD> samples;
+                for(int a=MulDiv(thumb ? 60:30,dpi,96);a<MulDiv(thumb ? 80:100,dpi,96);++a) samples.push_back(pixel(pixels,cross,a));
+                Check(pixel(pixels,cross-1,along)==0,"scrollbar pattern escaped its bounds");
+                return samples;
+            });
+        }
+        interaction=0;
         Load(settings,theme(LR"(background="#ff000080" border-radius="0" />)"));
         const auto translucent=render();
         Check(pixel(translucent,MulDiv(32,dpi,96),along)==0x80800000u,"scrollbar paint alpha inherited highlight/native opacity");
@@ -445,8 +495,86 @@ static void TestThemedScrollbar(bool thumb) {
         Load(settings,L""); Check(render()==native,"clearing theme did not restore native scrollbar pixels");
     }
     DropTarget(surface.state); noRamps();
+    BorderCacheReleased(surface.state.themeBorderStrokes);
     for(const auto& gradient:surface.state.scrollbarResources.gradients) Check(!gradient,"device teardown retained scrollbar gradients");
     std::cout<<"PASS: scrollbar "<<(thumb ? "thumb":"track")<<" axes, states, light/dark, DPI/RTL pixels, borders, corners, alpha, gradients, cache and native fallback\n";
+}
+
+static void TestThemedMarquee() {
+    using namespace ThemeRegression;
+    StyleFixture::Session style;
+    OptionEffects::Settings settings; Fonts(); Surface surface;
+    const auto parsed=Parse(LR"(<theme><element name="DrawMarquee" border-style="dashed" border-width="2px">
+        <light border-style="invalid" /><dark border-style="dotted" /></element></theme>)");
+    Check(parsed->marquees[0].borderStyle==Theme::BorderStyle::Dashed && parsed->marquees[1].borderStyle==Theme::BorderStyle::Dotted,
+        "border-style mode override/invalid inheritance changed");
+    settings.Set(L"Selection.marqueeOpacity",L"100");
+    bool handled=false;
+    const auto render=[&](float fade=1.f,bool line=false) {
+        return surface.Render([&](ViewState& state) {
+            const float s=state.presentationDpi/96.f;
+            handled=DrawMarquee(state,D2D1::RectF(20*s,20*s,(line ? 20:200)*s,80*s),
+                std::stoi(settings.values.at(L"Selection.marqueeOpacity"))/100.f*fade);
+        });
+    };
+    for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true}) {
+        Regression::Scope scope("marquee theme dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl));
+        surface.state.presentationDpi=dpi; surface.state.rtlLayout=rtl;
+        const int left=MulDiv(20,dpi,96),right=MulDiv(200,dpi,96),top=MulDiv(20,dpi,96),y=MulDiv(50,dpi,96);
+        Load(settings,Element(L"DrawMarquee",LR"(background="transparent" border-color="#ff0000" border-width="1px" border-radius="0")"));
+        const auto border=render(); Check(handled,"marquee theme was not drawn");
+        const int width=int(std::floor(dpi/96.f+.5f));
+        for(int x=left-2;x<left+width+3;++x)
+            Check(At(border,x,y)==(x>=left && x<left+width ? 0xffff0000u:0u),"marquee border width/inset/DPI/physical RTL placement differs");
+        Check(At(border,(left+right)/2,y)==0,"border-only marquee gained a fill");
+        for(bool line:{false,true}) BorderPatterns([&](const wchar_t* pattern) {
+            Load(settings,Element(L"DrawMarquee",L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-radius=\"0\" border-style=\""+
+                std::wstring(pattern)+L"\""));
+            const auto pixels=render(1.f,line); Check(pixels==render(1.f,line),"warm marquee border changed pixels");
+            std::vector<DWORD> row;
+            if(line) for(int a=MulDiv(30,dpi,96);a<MulDiv(70,dpi,96);++a) row.push_back(At(pixels,left,a));
+            else for(int x=left+MulDiv(10,dpi,96);x<right-MulDiv(10,dpi,96);++x) row.push_back(At(pixels,x,top));
+            return row;
+        });
+        Load(settings,Element(L"DrawMarquee",LR"(background="#ff000080" border-style="none" border-radius="0")"));
+        Check(At(render(),left,y)==0x80800000u,"none border suppressed the fill or retained an outline");
+        settings.Set(L"Selection.marqueeOpacity",L"50"); LoadSettings();
+        const auto faded=render(.5f);
+        Check(std::abs(int(At(faded,(left+right)/2,y)>>24)-32)<=1,"marquee color alpha, option opacity and release fade do not multiply");
+        Load(settings,Element(L"DrawMarquee",LR"xml(background="linear-gradient(to right, #ff0000, #0000ff)" border-width="0" border-radius="0")xml"));
+        const auto reads=SettingsFixture::reads;
+        const auto gradient=render(); Check(gradient==render() && SettingsFixture::reads==reads,"warm marquee gradient changed or reread settings");
+        for(int x:{left+(right-left)/4,left+3*(right-left)/4}) {
+            double red=0,blue=0,alpha=0;
+            for(int a=y;a<y+8;++a) {red+=Channel(At(gradient,x,a),16);blue+=Channel(At(gradient,x,a),0);alpha+=Channel(At(gradient,x,a),24);}
+            const double t=(x+.5-left)/double(right-left);
+            Check(std::abs(red/8-127.5*(1-t))<2 && std::abs(blue/8-127.5*t)<2 && std::abs(alpha/8-127.5)<1,
+                "marquee gradient differs from independent interpolation/opacity");
+        }
+        size_t bytes=0,brushes=0;
+        for(const auto& ramp:surface.state.marqueeResources.ramps.slots) if(ramp.brush) {
+            ComPtr<ID2D1Bitmap> bitmap; ramp.brush->GetBitmap(&bitmap); const auto size=bitmap->GetPixelSize();
+            bytes+=size_t(size.width)*size.height*4; ++brushes;
+        }
+        Check(brushes && bytes<=1024*1024,"marquee ramp storage missing or unbounded");
+        settings.Set(L"Selection.marqueeOpacity",L"100"); LoadSettings();
+        Check((At(render(),(left+right)/2,y)>>24)==255,"marquee opacity change retained a stale ramp");
+        Load(settings,LR"(<theme><element name="DrawMarquee" background="#ff0000" border-width="0" border-radius="12px">
+            <dark background="#00ff00" /></element></theme>)");
+        const auto rounded=render();
+        Check(At(rounded,left,top)==0 && At(rounded,(left+right)/2,y)==0xffff0000u,"marquee corner radius or fill is wrong");
+        for(const auto& ramp:surface.state.marqueeResources.ramps.slots) Check(!ramp.brush,"solid marquee retained a stale ramp");
+        surface.state.themeMode=Theme::Mode::Dark;
+        Check(At(render(),(left+right)/2,y)==0xff00ff00u,"marquee dark override did not render");
+        surface.state.themeHighContrast=true; const auto contrast=render();
+        Check(!handled && std::all_of(contrast.begin(),contrast.end(),[](DWORD p){return p==0;}),"high contrast did not defer to native marquee drawing");
+        surface.state.themeHighContrast=false; surface.state.themeMode=Theme::Mode::Light;
+        Load(settings,L""); render(); Check(!handled,"clearing theme did not restore native marquee routing");
+    }
+    DropTarget(surface.state); BorderCacheReleased(surface.state.themeBorderStrokes);
+    Check(!surface.state.marqueeResources.gradient,"device teardown retained marquee gradient");
+    for(const auto& ramp:surface.state.marqueeResources.ramps.slots) Check(!ramp.brush,"device teardown retained marquee texture");
+    std::cout<<"PASS: marquee physical RTL/DPI geometry, border patterns/degenerate line, corners, fill/gradient alpha, opacity/fade, modes, cache and native fallback\n";
 }
 
 static void TestThemedTooltip() {
@@ -465,6 +593,16 @@ static void TestThemedTooltip() {
             Check(((tip.label>>shift)&255)==expected,"muted metadata did not blend against custom background");
         }
         const SIZE size=tip.size;
+        BorderPatterns([&](const wchar_t* pattern) {
+            Load(settings,Element(L"RenderItemTip",L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-radius=\"0\" box-shadow=\"none\" border-style=\""+
+                std::wstring(pattern)+L"\""));
+            tooltip.Show(); const auto first=LayeredPixelsFixture::pixels; RenderItemTip(tip);
+            Check(first==LayeredPixelsFixture::pixels,"warm tooltip border changed pixels");
+            Check(tip.size.cx==size.cx && tip.size.cy==size.cy,"border pattern changed tooltip layout");
+            std::vector<DWORD> row;
+            for(int x=MulDiv(10,dpi,96);x<tip.size.cx-MulDiv(10,dpi,96);++x) row.push_back(tooltip.Pixel(x,0));
+            return row;
+        });
         Load(settings,Element(L"RenderItemTip",LR"(background="#bcbcbc" border-width="0" border-radius="0" box-shadow="8px 10px 0px 0px #000000")"));
         tooltip.Show();
         Check(tip.size.cx==size.cx && tip.size.cy==size.cy,"shadow customization changed text layout");
@@ -490,6 +628,7 @@ static void TestThemedTooltip() {
         tooltip.Show(Theme::Mode::Dark,true);
         Check(tip.style.background.kind==Theme::Paint::Kind::Default,"high contrast retained tooltip customization");
         tip.DropTarget(); Check(!tip.shadowBitmap && !tip.gradient,"tooltip device loss retained resources");
+        BorderCacheReleased(tip.borderStrokes);
     }
     std::cout<<"PASS: tooltip body/border/corners, cached hard/soft colored shadows, opacity, metadata palette, appearance and DPI\n";
 }

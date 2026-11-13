@@ -177,7 +177,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
   $name: Columns and sorting
 - theme: ""
   $name: Theme XML (experimental)
-  $description: "Enter your theme in XML. Leave blank to clear it. Guide: https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/blob/main/THEMING.md"
+  $description: "Enter your theme in XML. Guide and examples: https://github.com/DarkionAvey/windhawk-gpu-accelerated-explorer-view/blob/main/THEMING.md"
 - enableLogging: false
   $name: Enable logging
   $description: Enable all diagnostics for a bug report, including selection, input, rendering, timing and GPU memory. Logs include file names and paths so beware. Disable after reproducing the problem.
@@ -300,11 +300,13 @@ struct Shadow {
     Color color{0, 1.f, false};
     float x = 0.f, y = 0.f, blur = 0.f, spread = 0.f;
 };
+enum class BorderStyle { Solid, Dashed, Dotted, None };
 struct SurfaceStyle {
     Paint background;
     Color borderColor;
     float borderWidth = 0.f;
     float borderRadius = 4.f;
+    BorderStyle borderStyle = BorderStyle::Solid;
     std::optional<Shadow> shadow; // Absence keeps the native tooltip shadow.
 };
 using Value = std::wstring;
@@ -319,6 +321,7 @@ struct Document {
     std::array<std::array<SurfaceStyle, 3>, 2> highlights;
     std::array<bool, 2> highlightEnabled{};
     std::array<SurfaceStyle, 2> tooltips;
+    std::array<SurfaceStyle, 2> marquees;
     // Appearance, part (thumb/track), interaction (normal/hover/pressed).
     std::array<std::array<std::array<SurfaceStyle, 3>, 2>, 2> scrollbars;
     const Value* Find(Mode mode, std::wstring_view element, std::wstring_view property) const {
@@ -723,12 +726,12 @@ Shadow ReadShadow(std::wstring_view text) {
 }
 void CompileStyles(Document& document) {
     // Property metadata binds names to members; no per-element assignment chain.
-    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*>;
+    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*>;
     struct Binding { std::wstring_view name; Member member; };
     const Binding bindings[] = {{L"background-color", &SurfaceStyle::background},
         {L"background", &SurfaceStyle::background}, {L"border-color", &SurfaceStyle::borderColor},
         {L"border-width", &SurfaceStyle::borderWidth}, {L"border-radius", &SurfaceStyle::borderRadius},
-        {L"box-shadow", &SurfaceStyle::shadow}};
+        {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}};
     constexpr std::wstring_view names[] = {L"FillSelectionRect:selected", L"FillSelectionRect:hover", L"FillSelectionRect:selected:hover"};
     for (size_t mode = 0; mode < document.highlights.size(); ++mode) {
         auto& styles = document.highlights[mode];
@@ -751,6 +754,14 @@ void CompileStyles(Document& document) {
                             const float width = Number(text);
                             if (!std::isfinite(width) || width < 0.f) throw std::invalid_argument("nonnegative length");
                             style.*member = width;
+                        } else if constexpr (std::is_same_v<Field, BorderStyle>) {
+                            constexpr std::pair<std::wstring_view, BorderStyle> choices[] = {
+                                {L"solid",BorderStyle::Solid},{L"dashed",BorderStyle::Dashed},
+                                {L"dotted",BorderStyle::Dotted},{L"none",BorderStyle::None}};
+                            const auto choice = std::find_if(std::begin(choices),std::end(choices),
+                                [&](const auto& item) {return item.first == Parser::Trim(*value);});
+                            if (choice == std::end(choices)) throw std::invalid_argument("border style");
+                            style.*member = choice->second;
                         } else if constexpr (std::is_same_v<Field, std::optional<Shadow>>) {
                             style.*member = ReadShadow(*value);
                         } else {
@@ -780,6 +791,8 @@ void CompileStyles(Document& document) {
             return style.background.kind != Paint::Kind::Default || style.borderWidth > 0.f;
         });
         apply(document.tooltips[mode],L"RenderItemTip");
+        document.marquees[mode].borderWidth = 1.f;
+        apply(document.marquees[mode], L"DrawMarquee");
         constexpr std::wstring_view parts[] = {L"DrawScrollbar:thumb", L"DrawScrollbar:track"};
         for (size_t part = 0; part < std::size(parts); ++part) {
             auto& bar = document.scrollbars[mode][part];
@@ -821,6 +834,10 @@ struct ThemeGradientRamps {
     struct Ramp { ComPtr<ID2D1BitmapBrush> brush; bool attempted = false; };
     // Complete bounded table, shared by highlight and tooltip rendering.
     std::array<Ramp, 9> slots;
+};
+struct ThemeBorderStrokes {
+    std::array<ComPtr<ID2D1StrokeStyle>, 2> styles;
+    std::array<bool, 2> attempted{};
 };
 
 // Shell/COM callbacks can nest through the native message pump. Large path
@@ -3716,6 +3733,7 @@ struct ItemTip {
     bool opaqueBackground = true;
     D2D1_RECT_F textBounds{}; // Conservative clipped layout bounds, body-local.
     ThemeGradientRamps gradientRamps;
+    ThemeBorderStrokes borderStrokes;
     ComPtr<ID2D1LinearGradientBrush> gradient;
     bool gradientAttempted = false, shadowAttempted = false;
     ComPtr<ID2D1Bitmap> shadowBitmap;
@@ -3741,7 +3759,7 @@ struct ItemTip {
     size_t rowCapacity = 0;
     DragTextStyle textStyle; // Shared monitor-aware rendering policy, independent popup target.
     void ClearSurface() {
-        gradientRamps = {}; gradient.Reset(); gradientAttempted = false;
+        gradientRamps = {}; gradient.Reset(); gradientAttempted = false; borderStrokes = {};
         shadowBitmap.Reset(); shadowAttempted = false; shadowSize = {}; shadowDpi = 0;
     }
     void DropTarget() {
@@ -4779,6 +4797,15 @@ struct ViewState {
         std::array<ComPtr<ID2D1LinearGradientBrush>, 6> gradients;
         std::array<ThemeGradientRamps, 6> ramps;
     } scrollbarResources;
+    struct MarqueeResources {
+        std::shared_ptr<const Theme::Document> snapshot;
+        Theme::Mode mode = Theme::Mode::Light;
+        COLORREF accent = CLR_INVALID;
+        int opacity = -1;
+        ComPtr<ID2D1LinearGradientBrush> gradient;
+        ThemeGradientRamps ramps;
+    } marqueeResources;
+    ThemeBorderStrokes themeBorderStrokes;
     ComPtr<IDXGISwapChain1> swapChain;
     ComPtr<IDCompositionTarget> compTarget;
     ComPtr<IDCompositionVisual> visual;
@@ -18069,6 +18096,8 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.thumbnailBrush.Reset();
     state.highlightResources = {};
     state.scrollbarResources = {};
+    state.marqueeResources = {};
+    state.themeBorderStrokes = {};
     state.brush.Reset();
     state.defaultFolderIcon.bitmap.Reset();
     state.defaultFolderIcon.bitmapPixels={};
@@ -18342,12 +18371,27 @@ D2D1_RECT_F SnapDrawRect(ID2D1RenderTarget* target,D2D1_RECT_F rect) {
     const auto b=SnapDrawPoint(target,D2D1::Point2F(rect.right,rect.bottom));
     return D2D1::RectF(a.x,a.y,b.x,b.y);
 }
-void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColorBrush* brush,float width=1.f) {
+ID2D1StrokeStyle* ThemeBorderStroke(ID2D1RenderTarget* target, ThemeBorderStrokes& cache, Theme::BorderStyle style) {
+    if (style != Theme::BorderStyle::Dashed && style != Theme::BorderStyle::Dotted) return nullptr;
+    const size_t slot = style == Theme::BorderStyle::Dotted ? 1 : 0;
+    if (!cache.attempted[slot]) {
+        cache.attempted[slot] = true;
+        ComPtr<ID2D1Factory> factory; target->GetFactory(&factory);
+        auto properties = D2D1::StrokeStyleProperties();
+        properties.dashStyle = slot ? D2D1_DASH_STYLE_DOT : D2D1_DASH_STYLE_DASH;
+        properties.dashCap = slot ? D2D1_CAP_STYLE_ROUND : D2D1_CAP_STYLE_FLAT;
+        const HRESULT hr = factory->CreateStrokeStyle(properties,nullptr,0,&cache.styles[slot]);
+        if (FAILED(hr)) Wh_Log(L"[GPU theme] Border pattern unavailable hr=%08lx; using solid border",hr);
+    }
+    return cache.styles[slot].Get();
+}
+void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColorBrush* brush,float width=1.f,
+                ID2D1StrokeStyle* style=nullptr) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
     width=std::max(1.f,roundf(width));
     const float phase=(static_cast<int>(width)&1) ? .5f : 0.f;
     static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawLine(SnapDrawPoint(state.target.Get(),a,phase),
-        SnapDrawPoint(state.target.Get(),b,phase),brush,width);
+        SnapDrawPoint(state.target.Get(),b,phase),brush,width,style);
 }
 // A chevron's two pixel-snapped strokes meet at one tip point, closed by a
 // disc of the stroke's width: a round join, so the tip is one continuous
@@ -18363,14 +18407,15 @@ void StrokeChevron(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F tip,D2D1_POINT
     target->DrawLine(corner,SnapDrawPoint(target,b,phase),brush,width);
     target->FillEllipse(D2D1::Ellipse(corner,width*.5f,width*.5f),brush);
 }
-void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBrush* brush,float width=1.f) {
+void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBrush* brush,float width=1.f,
+                       ID2D1StrokeStyle* style=nullptr) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
     rect.rect=SnapDrawRect(state.target.Get(),rect.rect);
     width=std::max(1.f,roundf(width));
     const float inset=width*.5f;
     rect.rect.left+=inset; rect.rect.top+=inset; rect.rect.right-=inset; rect.rect.bottom-=inset;
     if(rect.rect.right<=rect.rect.left || rect.rect.bottom<=rect.rect.top) return;
-    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawRoundedRectangle(rect,brush,width);
+    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawRoundedRectangle(rect,brush,width,style);
 }
 template<class Style>
 void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=false) {
@@ -20575,7 +20620,7 @@ void DrawThemeSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
     }
     if (radius > 0.f) state.target->FillRoundedRectangle(D2D1::RoundedRect(part, radius, radius), brush);
     else state.target->FillRectangle(part, brush);
-    if (style.borderWidth > 0.f) {
+    if (style.borderWidth > 0.f && style.borderStyle != Theme::BorderStyle::None) {
         const float scale = ViewDpi(state)/96.f;
         const float maximum = floorf(std::min(part.right-part.left, part.bottom-part.top)*.5f);
         if (maximum < 1.f) return;
@@ -20586,7 +20631,8 @@ void DrawThemeSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
         auto color = HighlightColor(style.borderColor); color.a *= std::clamp(borderAlpha < 0.f ? alpha : borderAlpha, 0.f, 1.f);
         state.brush->SetColor(color);
         StrokeRoundedRect(state, D2D1::RoundedRect(part, std::max(0.f, radius-width*.5f),
-            std::max(0.f, radius-width*.5f)), state.brush.Get(), width);
+            std::max(0.f, radius-width*.5f)), state.brush.Get(), width,
+            ThemeBorderStroke(state.target.Get(),state.themeBorderStrokes,style.borderStyle));
     }
 }
 void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
@@ -20626,6 +20672,45 @@ bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
     DrawThemeSurface(state, bounds, bounds, radius,
         style.background.kind == Theme::Paint::Kind::Default ? alpha : 1.f, style,
         resources.gradients[slot], resources.ramps[slot], 1.f, color, 1.f);
+    return true;
+}
+bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
+    const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
+    auto& resources = state.marqueeResources;
+    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
+    const int configuredOpacity = g_marqueeAlpha.load(std::memory_order_relaxed);
+    if (resources.snapshot != snapshot || resources.mode != state.themeMode ||
+        resources.accent != accent || resources.opacity != configuredOpacity) {
+        resources = {}; resources.snapshot = snapshot; resources.mode = state.themeMode;
+        resources.accent = accent; resources.opacity = configuredOpacity;
+        if (snapshot && snapshot->elements.contains(L"DrawMarquee")) {
+            const auto& paint = snapshot->marquees[static_cast<size_t>(state.themeMode)].background;
+            if (paint.kind == Theme::Paint::Kind::Linear)
+                resources.gradient = NativeThemeGradient(state.target.Get(), paint);
+        }
+    }
+    if (!snapshot || !snapshot->elements.contains(L"DrawMarquee")) return false;
+    const auto& style = snapshot->marquees[static_cast<size_t>(state.themeMode)];
+    const float scale = ViewDpi(state)/96.f;
+    const float maximum = std::max(0.f,std::min(physical.right-physical.left,physical.bottom-physical.top)*.5f);
+    const float radius = std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
+    if (physical.right == physical.left || physical.bottom == physical.top) {
+        if (style.borderWidth > 0.f && style.borderStyle != Theme::BorderStyle::None) {
+            auto color = HighlightColor(style.borderColor); color.a *= std::min(1.f,opacity*2.3f);
+            state.brush->SetColor(color);
+            const float length = std::max(1.f,std::max(physical.right-physical.left,physical.bottom-physical.top));
+            StrokeLine(state,D2D1::Point2F(physical.left,physical.top),D2D1::Point2F(physical.right,physical.bottom),
+                state.brush.Get(),std::max(1.f,roundf(std::min(style.borderWidth,length/scale)*scale)),
+                ThemeBorderStroke(state.target.Get(),state.themeBorderStrokes,style.borderStyle));
+        }
+        return true;
+    }
+    if (state.rtlLayout) {
+        const float left = physical.left;
+        physical.left = state.paintWidth-physical.right; physical.right = state.paintWidth-left;
+    }
+    DrawThemeSurface(state,physical,physical,radius,opacity,style,resources.gradient,resources.ramps,
+        configuredOpacity/100.f,ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),std::min(1.f,opacity*2.3f));
     return true;
 }
 void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
@@ -23980,17 +24065,19 @@ void Paint(ViewState& state) {
             const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
             const unsigned rgb = ThemeRgb(c);
             const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
-            // Marquee is stored in physical pointer coordinates, unlike the
-            // logical column geometry mirrored by Fill().
-            Fill(state, state.rtlLayout ? w - right : left, top,
-                 state.rtlLayout ? w - left : right, bottom,
-                 rgb, opacity, float(Scale96(4, ViewDpi(state))));
-            state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
-            if (right == left || bottom == top)
-                StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
-            else {
-                const float radius = static_cast<float>(Scale96(4, ViewDpi(state)));
-                StrokeRoundedRect(state,D2D1::RoundedRect(rc, radius, radius),state.brush.Get(),1.f);
+            if (!DrawMarquee(state, rc, opacity)) {
+                // Marquee is stored in physical pointer coordinates, unlike the
+                // logical column geometry mirrored by Fill().
+                Fill(state, state.rtlLayout ? w - right : left, top,
+                     state.rtlLayout ? w - left : right, bottom,
+                     rgb, opacity, float(Scale96(4, ViewDpi(state))));
+                state.brush->SetColor(Packed(rgb, std::min(1.f, opacity * 2.3f)));
+                if (right == left || bottom == top)
+                    StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
+                else {
+                    const float radius = static_cast<float>(Scale96(4, ViewDpi(state)));
+                    StrokeRoundedRect(state,D2D1::RoundedRect(rc, radius, radius),state.brush.Get(),1.f);
+                }
             }
         }
         state.target->PopAxisAlignedClip();
@@ -31432,7 +31519,7 @@ void RenderItemTip(ItemTip& tip) {
             }
         }
         if (background) tip.target->FillRoundedRectangle(body,background);
-        if (fill && tip.style.borderWidth > 0.f) {
+        if (fill && tip.style.borderWidth > 0.f && tip.style.borderStyle != Theme::BorderStyle::None) {
             const float maximum = floorf(std::min(tip.size.cx,tip.size.cy)*.5f);
             if (maximum >= 1.f) {
                 const float width = std::clamp(roundf(std::min(tip.style.borderWidth,maximum/scale)*scale),1.f,maximum);
@@ -31442,7 +31529,8 @@ void RenderItemTip(ItemTip& tip) {
                 edge.radiusX = edge.radiusY = std::max(0.f,radius-inset);
                 fill->SetColor(HighlightColor(tip.style.borderColor));
                 if (edge.rect.right > edge.rect.left && edge.rect.bottom > edge.rect.top)
-                    tip.target->DrawRoundedRectangle(edge,fill.Get(),width);
+                    tip.target->DrawRoundedRectangle(edge,fill.Get(),width,
+                        ThemeBorderStroke(tip.target.Get(),tip.borderStrokes,tip.style.borderStyle));
             }
         }
         if (text && label) {

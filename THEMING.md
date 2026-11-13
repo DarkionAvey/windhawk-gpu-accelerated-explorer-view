@@ -107,6 +107,43 @@ The same theme on one line, ready to paste into the setting:
 <theme><element name="FillSelectionRect:selected" background="transparent" border-color="#3b82f6" border-width="1px" /><element name="FillSelectionRect:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /><element name="FillSelectionRect:selected:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /></theme>
 ```
 
+## Border patterns
+
+Every element that supports borders also accepts `border-style`: `solid`
+(the default), `dashed`, `dotted`, or `none`. Set `border-width` to a positive
+length to see a border. Dash and dot spacing follows its thickness and display
+scaling. These work on highlights, tooltips, scrollbar thumbs and tracks, and
+the drag-selection rectangle. `none` turns off the border without changing its
+other settings.
+
+## Drag-selection rectangle
+
+Use `DrawMarquee` to style the rectangle drawn when you drag to select files.
+It supports shared properties and light/dark overrides.
+
+| Property | Value |
+|---|---|
+| `background` | A color or `linear-gradient(...)`; keeps the configured selection color when omitted |
+| `background-color` | A solid color |
+| `border-color` | A color; defaults to the Windows accent color |
+| `border-width` | A nonnegative length such as `1px`; defaults to `1px`; use `0` to remove the border |
+| `border-radius` | One nonnegative length for all corners; defaults to `4px` |
+
+The existing marquee opacity setting still applies, including its stronger
+border and release fade. Color transparency multiplies that opacity. Borders
+stay inside the rectangle and scale to whole screen pixels. Corner sizes scale
+with DPI and are limited by the rectangle's size. These styles change drawing,
+not which files are selected. High-contrast mode keeps the usual appearance.
+
+```xml
+<theme>
+  <element name="DrawMarquee" border-color="#7552d2" border-width="2px" border-style="dashed" border-radius="2px">
+    <dark background="linear-gradient(to bottom, #9372e5, #492b87)" border-color="#b79bee" />
+    <light background="linear-gradient(to bottom, #e5dafa, #aa8bdf)" />
+  </element>
+</theme>
+```
+
 ## Scrollbars
 
 The vertical and horizontal scrollbars share these elements:

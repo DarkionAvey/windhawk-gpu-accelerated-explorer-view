@@ -94,6 +94,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("theme-tooltip-antialiasing", PARALLEL, TestThemedTooltipAntialiasing()),
     REGRESSION("theme-scrollbar-thumb", PARALLEL, TestThemedScrollbar(true)),
     REGRESSION("theme-scrollbar-track", PARALLEL, TestThemedScrollbar(false)),
+    REGRESSION("theme-marquee", PARALLEL, TestThemedMarquee()),
     REGRESSION("option-effects-list", PARALLEL, OptionEffects::TestListLayouts(fixture)),
     REGRESSION("option-effects-grid", PARALLEL, OptionEffects::TestGridLayouts(fixture)),
     REGRESSION("option-effects-zoom", PARALLEL, OptionEffects::TestZoomInputs(fixture)),
