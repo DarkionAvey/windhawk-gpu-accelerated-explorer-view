@@ -286,7 +286,9 @@ namespace {
 namespace Theme {
 enum class Mode { Light, Dark };
 enum class Highlight { Selected, Hover, SelectedHover };
-struct Color { unsigned rgb = 0; float alpha = 1.f; bool accent = true; bool operator==(const Color&) const = default; };
+struct Color { unsigned rgb = 0; float alpha = 1.f; bool accent = true;
+    float accentWeight = -1.f; // Interpolated scale color: accent plus a literal RGB.
+    bool operator==(const Color&) const = default; };
 struct Stop { Color color; float offset = -1.f; };
 struct Paint {
     enum class Kind { Default, Solid, Linear } kind = Kind::Default;
@@ -307,13 +309,27 @@ struct SurfaceStyle {
     float borderWidth = 0.f;
     float borderRadius = 4.f;
     BorderStyle borderStyle = BorderStyle::Solid;
+    std::optional<float> height;
     std::optional<Shadow> shadow; // Absence keeps the native tooltip shadow.
 };
 using Value = std::wstring;
 using Properties = std::map<std::wstring, Value, std::less<>>;
+struct ScaleStop {
+    std::wstring offset;
+    Properties universal;
+    std::array<Properties, 2> modes;
+};
 struct Element {
     Properties universal;
     std::array<Properties, 2> modes;
+    std::vector<ScaleStop> scale;
+    std::array<std::vector<ScaleStop>, 2> modeScales;
+    std::array<bool, 2> modeScaleDefined{};
+};
+struct DriveStyle {
+    SurfaceStyle surface;
+    std::array<Paint, 101> paints; // Existing drive usage is presented in whole percentages.
+    bool enabled = false, trackOrigin = false, scaled = false;
 };
 using Elements = std::map<std::wstring, Element, std::less<>>;
 struct Document {
@@ -322,6 +338,9 @@ struct Document {
     std::array<bool, 2> highlightEnabled{};
     std::array<SurfaceStyle, 2> tooltips;
     std::array<SurfaceStyle, 2> marquees;
+    std::array<std::array<SurfaceStyle,6>,2> checkboxes;
+    std::array<bool,2> checkboxEnabled{};
+    std::array<std::array<DriveStyle, 2>, 2> driveBars; // Appearance, fill/track.
     // Appearance, part (thumb/track), interaction (normal/hover/pressed).
     std::array<std::array<std::array<SurfaceStyle, 3>, 2>, 2> scrollbars;
     const Value* Find(Mode mode, std::wstring_view element, std::wstring_view property) const {
@@ -428,7 +447,8 @@ struct Parser {
         Check(reader->SetInput(stream.Get()), L"Cannot open XML input");
         // Track semantic scope independently of XML depth: optional theme
         // wrappers never change which element owns its appearance properties.
-        struct Scope { Element* element = nullptr; bool appearance = false; };
+        struct Scope { Element* element = nullptr; bool appearance = false, scale = false;
+            int mode = -1; ScaleStop* stop = nullptr; };
         Scope scope;
         std::vector<Scope> parents;
         parents.reserve(16);
@@ -446,12 +466,27 @@ struct Parser {
                 if (tag == L"theme") {
                     // Grouping only, including repeated/nested wrappers.
                     // Attributes on a wrapper never become element properties.
+                } else if (tag == L"scale") {
+                    if (!scope.element || scope.scale || scope.stop) Fail(L"Put scale inside a styled element or its appearance");
+                    scope.scale = true;
+                    if (scope.mode >= 0) scope.element->modeScaleDefined[scope.mode] = true;
+                } else if (tag == L"stop" && scope.scale) {
+                    if (scope.stop) Fail(L"Do not nest percentage stops");
+                    const auto offset = attributes.find(L"offset");
+                    if (offset == attributes.end()) Fail(L"A percentage stop needs an offset");
+                    auto& stops = scope.mode < 0 ? scope.element->scale : scope.element->modeScales[scope.mode];
+                    ScaleStop stop; stop.offset = std::move(offset->second); attributes.erase(offset);
+                    stop.universal = std::move(attributes); stops.push_back(std::move(stop));
+                    scope.stop = &stops.back(); scope.appearance = false;
                 } else if (tag == L"light" || tag == L"dark") {
-                    if (!scope.element || scope.appearance) Fail(L"Put light/dark blocks inside an element, without nesting appearances");
+                    if (!scope.element || scope.appearance) Fail(L"Put light/dark blocks inside an element, scale or stop, without nesting appearances");
                     constexpr std::wstring_view modes[] = {L"light", L"dark"};
                     const auto mode = std::find(std::begin(modes), std::end(modes), tag);
                     const size_t index = mode-std::begin(modes);
-                    merge(scope.element->modes[index], std::move(attributes));
+                    if (scope.stop) merge(scope.stop->modes[index], std::move(attributes));
+                    else if (scope.scale) scope.element->modeScaleDefined[index] = true;
+                    else merge(scope.element->modes[index], std::move(attributes));
+                    scope.mode = int(index);
                     scope.appearance = true;
                 } else {
                     if (scope.element) Fail(L"Keep styled elements beside one another, not inside one another");
@@ -496,8 +531,10 @@ struct Parser {
         // Recovery frames intact attributes only. XmlLite still validates each
         // attribute and decodes its entities; no guessed colors or XML values.
         std::wstring repaired=L"<theme>", current, appearance;
+        std::vector<std::wstring> scaleScopes;
         size_t count=0, useful=0, depth=0;
-        const auto closeMode=[&] {if(!appearance.empty()) {repaired+=L"</"+appearance+L">"; appearance.clear();}};
+        const auto closeScales=[&] {while(!scaleScopes.empty()) {repaired+=L"</"+scaleScopes.back()+L">"; scaleScopes.pop_back();}};
+        const auto closeMode=[&] {closeScales(); if(!appearance.empty()) {repaired+=L"</"+appearance+L">"; appearance.clear();}};
         const auto closeElement=[&] {closeMode(); if(!current.empty()) {repaired+=L"</element>"; current.clear();}};
         const auto countEntry=[&] {
             if(++count>kMaxEntries) Fail(L"Theme exceeds 2048 elements and attributes",E_INVALIDARG,false);
@@ -532,7 +569,11 @@ struct Parser {
             if(name.size()>256 || name.find(L':')!=name.npos) Fail(L"Unsupported XML name",E_INVALIDARG,false);
             if(closing) {
                 if(depth) --depth;
-                if(name==appearance) closeMode();
+                const auto nested=std::find(scaleScopes.rbegin(),scaleScopes.rend(),name);
+                if(nested!=scaleScopes.rend()) {
+                    const size_t keep=scaleScopes.size()-size_t(nested-scaleScopes.rbegin())-1;
+                    while(scaleScopes.size()>keep) {repaired+=L"</"+scaleScopes.back()+L">"; scaleScopes.pop_back();}
+                } else if(name==appearance) closeMode();
                 else if(name==current) closeElement();
                 continue;
             }
@@ -563,6 +604,25 @@ struct Parser {
                 } catch(const ParseError& error) {if(!error.recoverable) throw;}
             }
             if(name==L"theme") continue;
+            if(!current.empty() && (name==L"scale" || (!scaleScopes.empty() &&
+                (name==L"stop" || name==L"light" || name==L"dark")))) {
+                // Keep percentage scopes intact while recovering individual
+                // complete attributes through the same native XML reader.
+                if(name==L"scale" && !scaleScopes.empty()) closeScales();
+                if(name==L"stop" && properties.find(L"offset")==properties.end()) continue;
+                if(name==L"stop") {
+                    const auto previous=std::find(scaleScopes.rbegin(),scaleScopes.rend(),L"stop");
+                    if(previous!=scaleScopes.rend()) {
+                        const size_t keep=scaleScopes.size()-size_t(previous-scaleScopes.rbegin())-1;
+                        while(scaleScopes.size()>keep) {repaired+=L"</"+scaleScopes.back()+L">"; scaleScopes.pop_back();}
+                    }
+                }
+                repaired+=L"<"+name;
+                for(const auto& [property,value]:properties) {repaired+=L" "+property+L"=\""+Escape(value)+L"\""; ++useful;}
+                repaired+=empty ? L" />":L">";
+                if(!empty) scaleScopes.push_back(name);
+                continue;
+            }
             if(name==L"light" || name==L"dark") {
                 if(current.empty()) continue;
                 closeMode(); appearance=name; repaired+=L"<"+appearance;
@@ -724,14 +784,85 @@ Shadow ReadShadow(std::wstring_view text) {
     shadow.x = lengths[0]; shadow.y = lengths[1]; shadow.blur = lengths[2]; shadow.spread = lengths[3];
     return shadow;
 }
+Color MixScaleColor(const Color& a, const Color& b, float t) {
+    Color color; color.alpha = a.alpha+(b.alpha-a.alpha)*t;
+    color.accent = a.accent && b.accent;
+    if (a.accent != b.accent) {
+        color.rgb = a.accent ? b.rgb : a.rgb;
+        color.accentWeight = a.accent ? 1.f-t : t;
+    } else if (!color.accent) {
+        for (unsigned shift : {0u,8u,16u}) {
+            const float x=float((a.rgb>>shift)&255), y=float((b.rgb>>shift)&255);
+            color.rgb |= unsigned(std::lround(x+(y-x)*t))<<shift;
+        }
+    }
+    return color;
+}
+Paint MixScalePaint(const Paint& a, const Paint& b, float t) {
+    if (t<=0.f) return a;
+    if (t>=1.f) return b;
+    if (a.kind==Paint::Kind::Default || b.kind==Paint::Kind::Default) return a;
+    if (a.kind==Paint::Kind::Solid && b.kind==Paint::Kind::Solid) {
+        Paint result=a; result.color=MixScaleColor(a.color,b.color,t); return result;
+    }
+    if (a.kind==Paint::Kind::Linear && b.kind==Paint::Kind::Linear) {
+        if (a.direction.x!=b.direction.x || a.direction.y!=b.direction.y || a.cornerDirection!=b.cornerDirection ||
+            a.stops.size()!=b.stops.size()) return a;
+        for(size_t i=0;i<a.stops.size();++i) if(a.stops[i].offset!=b.stops[i].offset) return a;
+    }
+    Paint result=a.kind==Paint::Kind::Linear ? a:b;
+    for(size_t i=0;i<result.stops.size();++i)
+        result.stops[i].color=MixScaleColor(a.kind==Paint::Kind::Solid ? a.color:a.stops[i].color,
+            b.kind==Paint::Kind::Solid ? b.color:b.stops[i].color,t);
+    if(std::all_of(result.stops.begin(),result.stops.end(),[&](const auto& stop){return stop.color==result.stops.front().color;})) {
+        result.kind=Paint::Kind::Solid; result.color=result.stops.front().color; result.stops.clear();
+    }
+    return result;
+}
+void CompileDriveScale(DriveStyle& style, const Element& element, size_t mode) {
+    struct Point {float offset; Paint paint;};
+    std::vector<Point> points;
+    const auto& stops=element.modeScaleDefined[mode] ? element.modeScales[mode]:element.scale;
+    for(const auto& stop:stops) {
+        try {
+            auto text=Parser::Trim(stop.offset);
+            if(!text.ends_with(L"%")) throw std::invalid_argument("percentage offset");
+            text.remove_suffix(1); const float offset=Number(text);
+            if(!std::isfinite(offset) || offset<0 || offset>100) throw std::invalid_argument("percentage range");
+            Paint paint;
+            for(const auto* scope:{&stop.universal,&stop.modes[mode]})
+                for(const auto* name:{L"background-color",L"background"}) {
+                    const auto value=scope->find(name); if(value==scope->end()) continue;
+                    try {
+                        if(std::wstring_view(name)==L"background") paint=ReadPaint(value->second);
+                        else {Paint solid; solid.kind=Paint::Kind::Solid; solid.color=ReadColor(value->second); paint=std::move(solid);}
+                    } catch(const std::exception&) {Wh_Log(L"[GPU theme] Invalid scale background; keeping inherited paint");}
+                }
+            if(paint.kind!=Paint::Kind::Default) points.push_back({offset,std::move(paint)});
+        } catch(const std::exception&) {Wh_Log(L"[GPU theme] Invalid scale offset; skipping stop");}
+    }
+    std::stable_sort(points.begin(),points.end(),[](const auto& a,const auto& b){return a.offset<b.offset;});
+    style.scaled=!points.empty();
+    size_t left=0;
+    for(size_t percent=0;percent<style.paints.size();++percent) {
+        if(points.empty()) {style.paints[percent]=style.surface.background; continue;}
+        while(left+1<points.size() && points[left+1].offset<=float(percent)) ++left;
+        if(float(percent)<points.front().offset) style.paints[percent]=points.front().paint;
+        else if(left+1==points.size()) style.paints[percent]=points[left].paint;
+        else {
+            const auto& a=points[left]; const auto& b=points[left+1];
+            style.paints[percent]=MixScalePaint(a.paint,b.paint,(float(percent)-a.offset)/(b.offset-a.offset));
+        }
+    }
+}
 void CompileStyles(Document& document) {
     // Property metadata binds names to members; no per-element assignment chain.
-    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*>;
+    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*, std::optional<float> SurfaceStyle::*>;
     struct Binding { std::wstring_view name; Member member; };
     const Binding bindings[] = {{L"background-color", &SurfaceStyle::background},
         {L"background", &SurfaceStyle::background}, {L"border-color", &SurfaceStyle::borderColor},
         {L"border-width", &SurfaceStyle::borderWidth}, {L"border-radius", &SurfaceStyle::borderRadius},
-        {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}};
+        {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}, {L"height", &SurfaceStyle::height}};
     constexpr std::wstring_view names[] = {L"FillSelectionRect:selected", L"FillSelectionRect:hover", L"FillSelectionRect:selected:hover"};
     for (size_t mode = 0; mode < document.highlights.size(); ++mode) {
         auto& styles = document.highlights[mode];
@@ -748,8 +879,11 @@ void CompileStyles(Document& document) {
                 try {
                     std::visit([&](auto member) {
                         using Field = std::remove_cvref_t<decltype(style.*member)>;
-                        if constexpr (std::is_same_v<Field, float>) {
+                        if constexpr (std::is_same_v<Field, float> || std::is_same_v<Field, std::optional<float>>) {
                             auto text = Parser::Trim(*value);
+                            if constexpr (std::is_same_v<Field, std::optional<float>>) {
+                                if(text==L"auto") {(style.*member).reset(); return;}
+                            }
                             if (text.ends_with(L"px")) text.remove_suffix(2);
                             const float width = Number(text);
                             if (!std::isfinite(width) || width < 0.f) throw std::invalid_argument("nonnegative length");
@@ -793,6 +927,16 @@ void CompileStyles(Document& document) {
         apply(document.tooltips[mode],L"RenderItemTip");
         document.marquees[mode].borderWidth = 1.f;
         apply(document.marquees[mode], L"DrawMarquee");
+        constexpr std::wstring_view checkboxNames[]={L"DrawSelectionCheckbox",L"DrawSelectionCheckbox:hover",
+            L"DrawSelectionCheckbox:pressed",L"DrawSelectionCheckbox:checked",L"DrawSelectionCheckbox:checked:hover",
+            L"DrawSelectionCheckbox:checked:pressed"};
+        auto& boxes=document.checkboxes[mode];
+        for(size_t i=0;i<std::size(checkboxNames);++i) {
+            if(i==0) {boxes[i].borderWidth=1.f;boxes[i].borderRadius=3.f;}
+            else boxes[i]=boxes[i==2 ? 1:i>=4 ? 3:0];
+            apply(boxes[i],checkboxNames[i]);
+            document.checkboxEnabled[mode]|=document.elements.contains(checkboxNames[i]);
+        }
         constexpr std::wstring_view parts[] = {L"DrawScrollbar:thumb", L"DrawScrollbar:track"};
         for (size_t part = 0; part < std::size(parts); ++part) {
             auto& bar = document.scrollbars[mode][part];
@@ -803,6 +947,20 @@ void CompileStyles(Document& document) {
             apply(bar[1], std::wstring(parts[part]) + L":hover");
             bar[2] = bar[1];
             apply(bar[2], std::wstring(parts[part]) + L":pressed");
+        }
+        constexpr std::wstring_view driveNames[]={L"DrawDriveBar:fill",L"DrawDriveBar:track"};
+        for(size_t part=0;part<std::size(driveNames);++part) {
+            const auto found=document.elements.find(driveNames[part]);
+            if(found==document.elements.end()) continue;
+            auto& drive=document.driveBars[mode][part]; drive.enabled=true;
+            drive.surface.borderRadius=std::numeric_limits<float>::max();
+            apply(drive.surface,driveNames[part]);
+            if(const auto* origin=document.Find(static_cast<Mode>(mode),driveNames[part],L"background-origin")) {
+                const auto value=Parser::Trim(*origin);
+                drive.trackOrigin=value==L"track-box";
+                if(value!=L"track-box" && value!=L"border-box") Wh_Log(L"[GPU theme] Invalid background-origin; using border-box");
+            }
+            CompileDriveScale(drive,found->second,mode);
         }
     }
 }
@@ -818,6 +976,14 @@ void Load() {
         for (const auto& [name, element] : replacement->elements) {
             count += element.universal.size();
             for (const auto& properties : element.modes) count += properties.size();
+            const auto countStops=[&](const auto& stops) {
+                for(const auto& stop:stops) {
+                    count+=1+stop.universal.size();
+                    for(const auto& properties:stop.modes) count+=properties.size();
+                }
+            };
+            countStops(element.scale);
+            for(const auto& stops:element.modeScales) countStops(stops);
         }
         Publish(std::move(replacement));
         Wh_Log(L"[GPU theme] Loaded %zu properties", count);
@@ -4276,8 +4442,9 @@ struct ViewState {
     float checkboxRevealFrom = 0.f;
     int checkboxRevealHeaderState = -1;
     PointingDevice pointingDevice = PointingDevice::Mouse;
-    // Owner-only press identity: -2 is the Name header, -1 is no checkbox press.
+    // Visual identities: -2 is the Name header, -1 is no checkbox.
     int checkboxPress = -1;
+    int checkboxHot = -1;
     std::wstring checkboxPressItem;
     unsigned long long checkboxPressEpoch = 0, checkboxPressToken = 0;
     POINT passiveMousePosition{};
@@ -4806,6 +4973,28 @@ struct ViewState {
         ThemeGradientRamps ramps;
     } marqueeResources;
     ThemeBorderStrokes themeBorderStrokes;
+    struct CheckboxResources {
+        std::shared_ptr<const Theme::Document> snapshot;
+        Theme::Mode mode=Theme::Mode::Light;
+        COLORREF accent=CLR_INVALID, background=CLR_INVALID, foreground=CLR_INVALID;
+        std::array<ComPtr<ID2D1LinearGradientBrush>,6> gradients;
+        std::array<ThemeGradientRamps,6> ramps;
+        std::array<D2D1_COLOR_F,6> marks{};
+    } checkboxResources;
+    struct DriveBarResources {
+        std::shared_ptr<const Theme::Document> snapshot;
+        Theme::Mode mode=Theme::Mode::Light;
+        COLORREF accent=CLR_INVALID;
+        struct PaintResources {
+            ComPtr<ID2D1LinearGradientBrush> gradient;
+            ThemeGradientRamps ramps;
+            bool attempted=false;
+        };
+        // Fixed-resolution ramps keep all 101 usage paints below 1.6 MiB
+        // per part, regardless of bar width, drive count or resize history.
+        std::array<std::array<PaintResources,101>,2> paints;
+    };
+    std::unique_ptr<DriveBarResources> driveBarResources;
     ComPtr<IDXGISwapChain1> swapChain;
     ComPtr<IDCompositionTarget> compTarget;
     ComPtr<IDCompositionVisual> visual;
@@ -4952,6 +5141,7 @@ struct SwipeFeedbackSnapshot {
 };
 
 #define PRESENTATION_MODEL_FIELDS(X) \
+    X(checkboxHot) X(checkboxPress) \
     X(hwnd) X(nativeHwnd) X(frameHwnd) X(activeTabHost) X(rtlLayout) X(inScope) X(thisPcGpu) \
     X(detailsViewActive) X(columnsView) X(gridView) X(nativeIconSize) X(layoutNativeMode) X(layoutIconSize) \
     X(startupAnimationsSuppressed) \
@@ -5720,6 +5910,7 @@ void ToggleGroupSection(ViewState& state, int index) {
     // skips hidden rows through DisplayedRow/NextDisplayedRow.
     ItemTipHoverMoved(state, -1);
     state.hovered = -1;
+    state.checkboxHot=-1;
     state.hotSection = -1;
     RegisterViewAnimation(state);
     Redraw(state);
@@ -6064,6 +6255,7 @@ ClickSource CurrentClickSource(const ViewState& state) {
 }
 
 void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
+    const bool checkboxWasPressed=state.checkboxPress!=-1;
     state.mousePressBackground = false;
     state.mousePressRenameEligible = false;
     if (folderChanged) {++state.mouseFolderEpoch; state.checkboxHeaderActionPending=false; state.checkboxHeaderActionSelection.clear();}
@@ -6081,6 +6273,7 @@ void ResetMouseClickSequence(ViewState& state, bool folderChanged = false) {
     state.dividerClickEpoch = 0;
     state.dividerClickTick = 0;
     DiscardCompletedMouseClick(state);
+    if(checkboxWasPressed) Redraw(state);
 }
 
 // Also cancel an unfinished gesture on navigation, so the leftover UP from
@@ -14667,6 +14860,17 @@ float TileTextHeight(const ViewState& state, float font, int dpi) {
     return DriveTiles(state) ? line * 2.f + float(Scale96(kDriveBarHeight96, dpi)) + gap * 2.f :
         line * 3.f + gap * 2.f;
 }
+float StorageBarHeight(const ViewState& state,size_t part,float itemHeight,float available) {
+    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const auto requested=snapshot ? snapshot->driveBars[static_cast<size_t>(state.themeMode)][part].surface.height:std::nullopt;
+    const int dpi=ViewDpi(state);
+    if(!requested) return float(Scale96(kDriveBarHeight96,dpi));
+    if(*requested==0.f) return 0.f;
+    const float percent=float(state.gridView ? g_gridFontPercent.load():g_fontPercent.load());
+    const float maximum=std::max(0.f,std::min(available,itemHeight*percent/100.f));
+    const float scale=dpi/96.f;
+    return std::min(floorf(maximum),roundf(std::min(*requested,maximum/scale)*scale));
+}
 // A Content row's text block: two lines on each side (name over type; date
 // over size). Same continuous pitch as tiles.
 float ContentTextHeight(float font, int dpi) {
@@ -14848,6 +15052,7 @@ float NameTextOrigin(const ViewState& state, bool header = false) {
 struct ItemGeometry {
     D2D1_RECT_F cell{}, icon{}, text{}, usage{}, capacity{}, checkbox{};
     D2D1_RECT_F detail[2]{}; // Tile type and size lines; Content's type line is detail[0].
+    std::array<float,2> usageHeights{}; // Fill/track share one centered layout slot.
     D2D1_RECT_F aside[2]{};  // Content's second text column: date modified, then size.
     bool wrapped = false;
     float textCenter = 0.f, textVertical = .5f;
@@ -14874,9 +15079,15 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         // between them; the pair is centered in the cell as one block.
         const float line = ItemTextLinePitch(state.fontPx);
         const float gap = static_cast<float>(Scale96(2, dpi));
-        const float bar = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
+        const float nativeBar = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
         const bool drive = DriveTiles(state);
-        const float content = TileTextHeight(state, state.fontPx, dpi);
+        if(drive) for(size_t part=0;part<g.usageHeights.size();++part)
+            g.usageHeights[part]=StorageBarHeight(state,part,visual.height,
+                visual.height-2.f*inset-2.f*line-2.f*gap);
+        const float bar = drive ? std::max(g.usageHeights[0],g.usageHeights[1]):nativeBar;
+        // Hiding the bar keeps the capacity caption in its existing slot.
+        const float reservedBar=bar>0.f ? bar:nativeBar;
+        const float content = drive ? line*2.f+reservedBar+gap*2.f:TileTextHeight(state,state.fontPx,dpi);
         const float tileTop = visual.top + (state.rowPx - std::max(side, content)) * .5f;
         const float iconY = tiles ? tileTop : compact ? visual.top + (state.rowPx-side)*.5f : visual.top + pad;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
@@ -14893,8 +15104,9 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
             if (drive) {
                 g.usage = D2D1::RectF(g.text.left, g.text.bottom + gap,
                     g.text.right, g.text.bottom + gap + bar);
-                g.capacity = D2D1::RectF(g.text.left, g.usage.bottom + gap,
-                    g.text.right, g.usage.bottom + gap + line);
+                const float capacityTop=g.text.bottom+gap+reservedBar+gap;
+                g.capacity = D2D1::RectF(g.text.left, capacityTop,
+                    g.text.right, capacityTop+line);
             } else for (int i = 0; i < 2; ++i) {
                 const float lineTop = g.text.bottom + gap + i * (line + gap);
                 g.detail[i] = D2D1::RectF(g.text.left, lineTop, g.text.right, lineTop + line);
@@ -15021,7 +15233,7 @@ int HeaderSelectionCheckboxState(const ViewState& state) {
 
 struct DriveBarGeometry {
     float labelRight = 0.f;
-    D2D1_RECT_F track{}, caption{};
+    D2D1_RECT_F track{}, fill{}, caption{};
     bool visible = false;
 };
 DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item);
@@ -18098,6 +18310,8 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.scrollbarResources = {};
     state.marqueeResources = {};
     state.themeBorderStrokes = {};
+    state.driveBarResources.reset();
+    state.checkboxResources = {};
     state.brush.Reset();
     state.defaultFolderIcon.bitmap.Reset();
     state.defaultFolderIcon.bitmapPixels={};
@@ -20483,7 +20697,15 @@ bool ThemedHighlights(const ViewState& state) {
         state.themeSnapshot->highlightEnabled[static_cast<size_t>(state.themeMode)];
 }
 D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
-    return Packed(color.accent ? ThemeRgb(COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF)) : color.rgb, color.alpha);
+    if(!color.accent && color.accentWeight<0.f) return Packed(color.rgb,color.alpha);
+    const auto accent=Packed(ThemeRgb(COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF)));
+    auto result=color.accent ? accent:Packed(color.rgb);
+    if(color.accentWeight>=0.f) {
+        result.r+=(accent.r-result.r)*color.accentWeight;
+        result.g+=(accent.g-result.g)*color.accentWeight;
+        result.b+=(accent.b-result.b)*color.accentWeight;
+    }
+    result.a=color.alpha; return result;
 }
 struct ThemeGradientLine {
     D2D1_POINT_2F direction, start, end;
@@ -20532,13 +20754,14 @@ void PrepareHighlightBrushes(ViewState& state) {
     }
 }
 ID2D1BitmapBrush* DitheredGradientBrush(ID2D1RenderTarget* target, ThemeGradientRamps& cache,
-    const Theme::Paint& paint, float opacity, D2D1_POINT_2F direction, D2D1_POINT_2F start, float length, float alpha) {
+    const Theme::Paint& paint, float opacity, D2D1_POINT_2F direction, D2D1_POINT_2F start, float length, float alpha,
+    UINT fixedWidth=0) {
     // Normal state transitions attenuate their configured opacity. Preserve any
     // stronger contribution via the native brush rather than clipping its alpha.
     if (opacity <= 0.f || alpha > opacity+.000001f || !std::isfinite(length) || length <= 0.f) return nullptr;
-    UINT width = 64;
+    UINT width = fixedWidth ? fixedWidth:64;
     size_t slot = 0;
-    while (width < length && slot+1 < cache.slots.size()) { width *= 2; ++slot; }
+    while (!fixedWidth && width < length && slot+1 < cache.slots.size()) { width *= 2; ++slot; }
     if (width > target->GetMaximumBitmapSize()) return nullptr;
     auto& ramp = cache.slots[slot];
     if (!ramp.attempted) {
@@ -20595,7 +20818,8 @@ ID2D1BitmapBrush* DitheredGradientBrush(ID2D1RenderTarget* target, ThemeGradient
 void DrawThemeSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
                       float radius, float alpha, const Theme::SurfaceStyle& style,
                       ComPtr<ID2D1LinearGradientBrush>& gradientBrush, ThemeGradientRamps& ramps,
-                      float rampOpacity, unsigned fallbackColor, float borderAlpha = -1.f) {
+                      float rampOpacity, unsigned fallbackColor, float borderAlpha = -1.f,
+                      UINT rampWidth=0, const Theme::Paint* paintOverride=nullptr) {
     if (!VisibleOpacity(alpha) && !(style.borderWidth > 0.f && VisibleOpacity(borderAlpha))) return;
     const auto physical = [&](D2D1_RECT_F rect) {
         if (state.rtlLayout) { const float l = rect.left; rect.left = state.paintWidth-rect.right; rect.right = state.paintWidth-l; }
@@ -20603,23 +20827,25 @@ void DrawThemeSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
     };
     part = physical(part); bounds = physical(bounds);
     if (part.right <= part.left || part.bottom <= part.top) return;
-    const auto& paint = style.background;
-    ID2D1Brush* brush = state.brush.Get();
-    auto* gradient = gradientBrush.Get();
-    if (paint.kind == Theme::Paint::Kind::Linear && gradient) {
-        const auto line = GradientLine(paint,bounds);
-        gradient->SetStartPoint(line.start);
-        gradient->SetEndPoint(line.end);
-        gradient->SetOpacity(std::clamp(alpha, 0.f, 1.f)); brush = gradient;
-        if (auto* ramp = DitheredGradientBrush(state.target.Get(),ramps,paint,
-            rampOpacity,line.direction,line.start,line.length,alpha)) brush = ramp;
-    } else {
-        auto color = paint.kind == Theme::Paint::Kind::Default ? Packed(fallbackColor) :
-            HighlightColor(paint.kind == Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color);
-        color.a *= std::clamp(alpha, 0.f, 1.f); state.brush->SetColor(color);
+    if(VisibleOpacity(alpha)) {
+        const auto& paint = paintOverride ? *paintOverride:style.background;
+        ID2D1Brush* brush = state.brush.Get();
+        auto* gradient = gradientBrush.Get();
+        if (paint.kind == Theme::Paint::Kind::Linear && gradient) {
+            const auto line = GradientLine(paint,bounds);
+            gradient->SetStartPoint(line.start);
+            gradient->SetEndPoint(line.end);
+            gradient->SetOpacity(std::clamp(alpha, 0.f, 1.f)); brush = gradient;
+            if (auto* ramp = DitheredGradientBrush(state.target.Get(),ramps,paint,
+                rampOpacity,line.direction,line.start,line.length,alpha,rampWidth)) brush = ramp;
+        } else {
+            auto color = paint.kind == Theme::Paint::Kind::Default ? Packed(fallbackColor) :
+                HighlightColor(paint.kind == Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color);
+            color.a *= std::clamp(alpha, 0.f, 1.f); state.brush->SetColor(color);
+        }
+        if (radius > 0.f) state.target->FillRoundedRectangle(D2D1::RoundedRect(part, radius, radius), brush);
+        else state.target->FillRectangle(part, brush);
     }
-    if (radius > 0.f) state.target->FillRoundedRectangle(D2D1::RoundedRect(part, radius, radius), brush);
-    else state.target->FillRectangle(part, brush);
     if (style.borderWidth > 0.f && style.borderStyle != Theme::BorderStyle::None) {
         const float scale = ViewDpi(state)/96.f;
         const float maximum = floorf(std::min(part.right-part.left, part.bottom-part.top)*.5f);
@@ -20711,6 +20937,43 @@ bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
     }
     DrawThemeSurface(state,physical,physical,radius,opacity,style,resources.gradient,resources.ramps,
         configuredOpacity/100.f,ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),std::min(1.f,opacity*2.3f));
+    return true;
+}
+bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fraction,
+                  unsigned fallbackColor, float contentOpacity, const D2D1_RECT_F* originTrack=nullptr) {
+    if(track.bottom<=track.top) return true;
+    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const size_t mode=static_cast<size_t>(state.themeMode);
+    if(!snapshot || (!snapshot->driveBars[mode][0].enabled && !snapshot->driveBars[mode][1].enabled)) {
+        state.driveBarResources.reset(); return false;
+    }
+    const auto& drive=snapshot->driveBars[mode][part];
+    if(!drive.enabled) return false;
+    const COLORREF accent=COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xffffff);
+    if(!state.driveBarResources || state.driveBarResources->snapshot!=snapshot ||
+        state.driveBarResources->mode!=state.themeMode || state.driveBarResources->accent!=accent) {
+        state.driveBarResources=std::make_unique<ViewState::DriveBarResources>();
+        state.driveBarResources->snapshot=snapshot; state.driveBarResources->mode=state.themeMode;
+        state.driveBarResources->accent=accent;
+    }
+    const size_t percent=drive.scaled ? size_t(std::clamp(std::lround(fraction*100.f),0l,100l)):0;
+    const auto& paint=drive.paints[percent];
+    auto& resources=state.driveBarResources->paints[part][percent];
+    if(!resources.attempted) {
+        resources.attempted=true;
+        if(paint.kind==Theme::Paint::Kind::Linear) resources.gradient=NativeThemeGradient(state.target.Get(),paint);
+    }
+    auto bounds=track;
+    if(part==0) bounds.right=bounds.left+(bounds.right-bounds.left)*fraction;
+    const float maximum=std::max(0.f,std::min(bounds.right-bounds.left,bounds.bottom-bounds.top)*.5f);
+    const float scale=ViewDpi(state)/96.f;
+    const auto& style=drive.surface;
+    const float radius=style.borderRadius==std::numeric_limits<float>::max() ? maximum:
+        std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
+    const float alpha=paint.kind==Theme::Paint::Kind::Default ? contentOpacity*(part==0 ? .82f:.18f):contentOpacity;
+    const auto origin=originTrack && originTrack->bottom>originTrack->top ? *originTrack:track;
+    DrawThemeSurface(state,bounds,drive.trackOrigin ? origin:bounds,radius,alpha,style,
+        resources.gradient,resources.ramps,1.f,fallbackColor,contentOpacity,512,&paint);
     return true;
 }
 void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
@@ -21147,6 +21410,12 @@ void StartKeyboardSelectionAnimation(ViewState& state, int index,
 // One themed usage track serves inline Name cells and horizontal drive tiles.
 // Item geometry owns the tile's two text lines; all coordinates remain logical
 // so drawing, pointer geometry and RTL use the existing grid paths.
+void CenterStorageBars(DriveBarGeometry& geometry,const std::array<float,2>& heights) {
+    const float center=(geometry.track.top+geometry.track.bottom)*.5f;
+    geometry.fill=geometry.track;
+    geometry.fill.top=center-heights[0]*.5f; geometry.fill.bottom=center+heights[0]*.5f;
+    geometry.track.top=center-heights[1]*.5f; geometry.track.bottom=center+heights[1]*.5f;
+}
 DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& item) {
     DriveBarGeometry result;
     if (!state.thisPcGpu || row < 0 || row >= state.total ||
@@ -21158,6 +21427,7 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     if (DriveTiles(state)) {
         result.labelRight = item.text.right;
         result.track = item.usage; result.caption = item.capacity;
+        CenterStorageBars(result,item.usageHeights);
         result.visible = result.track.right > result.track.left;
         return result;
     }
@@ -21171,9 +21441,15 @@ DriveBarGeometry LayoutDriveBar(ViewState& state, int row, const ItemGeometry& i
     // All rows share the complete measured label band; only the remaining
     // space belongs to the track. Hidden tracks leave all space to filenames.
     result.labelRight = textLeft + labelLimit;
-    const float height = static_cast<float>(Scale96(kDriveBarHeight96, dpi));
+    std::array<float,2> heights;
+    for(size_t part=0;part<heights.size();++part)
+        heights[part]=StorageBarHeight(state,part,item.text.bottom-item.text.top,
+            std::min(item.text.bottom,item.cell.bottom)-std::max(item.text.top,item.cell.top));
+    const float height = std::max(heights[0],heights[1]);
+    if(height<=0.f) {result.labelRight=item.text.right; return result;}
     const float top = (item.text.top + item.text.bottom - height) * .5f;
     result.track = D2D1::RectF(result.labelRight + margin, top, columnRight - margin, top + height);
+    CenterStorageBars(result,heights);
     result.visible = result.track.right - result.track.left >= minimum;
     return result;
 }
@@ -21494,8 +21770,54 @@ float ItemContentOpacity(ViewState& state, const Entry& entry, bool animated = f
 
 // Fluent-style rounded boxes and a single filled check path. Native colors
 // were captured on the owner; paint performs no theme, Shell or registry calls.
-void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, float opacity) {
+bool CheckboxVisualPressed(const ViewState& state,int id) {
+    return state.checkboxPress==id || (!state.presentationOnly && state.touch.down && state.touch.checkbox==id);
+}
+void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, float opacity,
+                           bool hot=false,bool pressed=false) {
     if (!VisibleOpacity(opacity) || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const size_t mode=static_cast<size_t>(state.themeMode);
+    const bool themed=snapshot && snapshot->checkboxEnabled[mode];
+    D2D1_COLOR_F mark{};
+    if(themed) {
+        auto& cache=state.checkboxResources;
+        const COLORREF accent=COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xffffff);
+        const COLORREF bg=state.nativeEditBackground;
+        const COLORREF fg=state.nativeTextColor==CLR_INVALID ? RGB(128,128,128):state.nativeTextColor;
+        const auto& styles=snapshot->checkboxes[mode];
+        if(cache.snapshot!=snapshot || cache.mode!=state.themeMode || cache.accent!=accent ||
+           cache.background!=bg || cache.foreground!=fg) {
+            cache={}; cache.snapshot=snapshot; cache.mode=state.themeMode; cache.accent=accent;
+            cache.background=bg; cache.foreground=fg;
+            for(size_t i=0;i<styles.size();++i) {
+                const auto& paint=styles[i].background;
+                if(paint.kind==Theme::Paint::Kind::Linear)
+                    cache.gradients[i]=NativeThemeGradient(state.target.Get(),paint);
+                auto color=paint.kind==Theme::Paint::Kind::Default ?
+                    Packed(ThemeRgb(i>=3 ? accent:fg),i>=3 ? 1.f:.08f):
+                    HighlightColor(paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color:paint.color);
+                const COLORREF rgb=RGB(std::lround(color.r*255),std::lround(color.g*255),std::lround(color.b*255));
+                const COLORREF fill=BlendColor(bg,rgb,int(std::lround(color.a*100)));
+                const COLORREF ink=ColorContrast(RGB(0,0,0),fill)>ColorContrast(RGB(255,255,255),fill) ? RGB(0,0,0):RGB(255,255,255);
+                int low=0,high=100;
+                while(low<high) {
+                    const int mid=(low+high)/2;
+                    if(ColorContrast(BlendColor(fill,ink,mid),fill)>=3.) high=mid; else low=mid+1;
+                }
+                cache.marks[i]=Packed(ThemeRgb(ink),std::min(.95f,low/100.f));
+            }
+        }
+        const size_t index=(checked ? 3:0)+(pressed ? 2:hot ? 1:0);
+        const auto& style=styles[index];
+        const float scale=ViewDpi(state)/96.f;
+        const float maximum=std::max(0.f,std::min(rect.right-rect.left,rect.bottom-rect.top)*.5f);
+        const float radius=std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
+        const float fillAlpha=style.background.kind==Theme::Paint::Kind::Default && !checked ? .08f:1.f;
+        DrawThemeSurface(state,rect,rect,radius,opacity*fillAlpha,style,cache.gradients[index],cache.ramps[index],
+            fillAlpha,ThemeRgb(checked ? accent:fg),opacity,64);
+        mark=cache.marks[index]; mark.a*=opacity;
+    } else state.checkboxResources={};
     if (state.rtlLayout) {
         const float left = state.paintWidth-rect.right;
         rect.right = state.paintWidth-rect.left; rect.left = left;
@@ -21510,16 +21832,19 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
         rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
     const auto palette = g_swipePalette.load(std::memory_order_relaxed);
     const unsigned foreground = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
+    if (!themed) {
     state.brush->SetColor(Packed(checked ? ThemeRgb(COLORREF(palette&0xFFFFFF)) : foreground,
         opacity*(checked ? 1.f : .08f)));
     state.target->FillRoundedRectangle(shape,state.brush.Get());
     state.brush->SetColor(Packed(foreground,opacity*.8f));
     state.target->DrawRoundedRectangle(shape,state.brush.Get(),border);
+    }
     if (!checked) return;
     // Same accent foreground as the swipe chevron: contrast-chosen black/white
     // at the minimum alpha that keeps 4.5:1 on the accent fill.
     state.brush->SetColor(Packed(ThemeRgb(COLORREF((palette>>24)&0xFFFFFF)),
         opacity*float((palette>>48)&255)/255.f));
+    if(themed) state.brush->SetColor(mark);
     if (EnsureSelectionCheckGlyph(state)) {
         D2D1_MATRIX_3X2_F previous{}; state.target->GetTransform(&previous);
         state.target->SetTransform(D2D1::Matrix3x2F::Scale(unit,unit)*
@@ -23325,7 +23650,7 @@ void Paint(ViewState& state) {
                     if (r>l) {
                         state.target->PushAxisAlignedClip(state.rtlLayout ?
                             D2D1::RectF(w-r,0.f,w-l,header) : D2D1::RectF(l,0.f,r,header),D2D1_ANTIALIAS_MODE_ALIASED);
-                        DrawSelectionCheckbox(state,box,checked!=0,fade*reveal);
+                        DrawSelectionCheckbox(state,box,checked!=0,fade*reveal,state.checkboxHot==-2,CheckboxVisualPressed(state,-2));
                         state.target->PopAxisAlignedClip();
                     }
                 }
@@ -23778,11 +24103,11 @@ void Paint(ViewState& state) {
             if (r>l) {
                 state.target->PushAxisAlignedClip(state.rtlLayout ? D2D1::RectF(w-r,header,w-l,contentBottom) :
                     D2D1::RectF(l,header,r,contentBottom),D2D1_ANTIALIAS_MODE_ALIASED);
-                DrawSelectionCheckbox(state,geometry.checkbox,checked,v.opacity*checkboxReveal);
+                DrawSelectionCheckbox(state,geometry.checkbox,checked,v.opacity*checkboxReveal,state.checkboxHot==int(i),CheckboxVisualPressed(state,int(i)));
                 state.target->PopAxisAlignedClip();
             }
         }
-        if (usage.visible) {
+        if (usage.visible && (usage.track.bottom>usage.track.top || usage.fill.bottom>usage.fill.top)) {
             const auto& bar = usage.track;
             const float radius = (bar.bottom - bar.top) * .5f;
             const float fraction = e.driveUsedPercent >= 0 ?
@@ -23790,13 +24115,16 @@ void Paint(ViewState& state) {
                 std::clamp(static_cast<float>(static_cast<double>(e.driveUsed) /
                     static_cast<double>(e.driveTotal)), 0.f, 1.f);
             const float width = bar.right - bar.left;
-            Fill(state, bar.left, bar.top, bar.right, bar.bottom,
-                nameColor, .18f * contentOpacity, radius);
-            if (fraction > 0.f)
-                Fill(state, bar.left, bar.top,
-                    bar.left + width * fraction, bar.bottom,
+            if(bar.bottom>bar.top && !DrawDriveBar(state,1,bar,fraction,nameColor,contentOpacity))
+                Fill(state, bar.left, bar.top, bar.right, bar.bottom,
+                    nameColor, .18f * contentOpacity, radius);
+            const auto& fill=usage.fill;
+            if (fraction > 0.f && fill.bottom>fill.top && !DrawDriveBar(state,0,fill,fraction,
+                ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),contentOpacity,&bar))
+                Fill(state, fill.left, fill.top,
+                    fill.left + width * fraction, fill.bottom,
                     ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),
-                    .82f * contentOpacity, radius);
+                    .82f * contentOpacity, (fill.bottom-fill.top)*.5f);
         }
         if (compositionFrame.active && !compositionFrame.Rows()) compositionFrame.Background();
         state.uiTraceDrawItem=false;
@@ -30872,6 +31200,7 @@ void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
     state.pointerInside = inside;
     const bool vertical = inside && OnScrollbar(state, pos.x, pos.y);
     const bool horizontal = inside && !vertical && OnHorizontalBar(state, pos.x, pos.y);
+    const int checkboxHot=inside && !vertical && !horizontal ? SelectionCheckboxAt(state,pos):-1;
     const int sectionHot = inside && !vertical && !horizontal ?
         GroupHeaderAtPoint(state, pos.x, pos.y) : -1;
     const int row = inside && !vertical && !horizontal &&
@@ -30880,10 +31209,11 @@ void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
     // stays exact, but a second hover animation would visually lag behind it.
     if (!animate) StopHoverAnimation(state);
     if (row != state.hovered || sectionHot != state.hotSection || vertical != state.verticalScrollbarHot ||
-        horizontal != state.horizontalScrollbarHot) {
+        horizontal != state.horizontalScrollbarHot || checkboxHot != state.checkboxHot) {
         if (row != state.hovered || sectionHot != state.hotSection)
             BeginHoverTransition(state, row, animate, sectionHot);
         state.hovered = row;
+        state.checkboxHot=checkboxHot;
         state.hotSection = sectionHot;
         state.verticalScrollbarHot = vertical;
         state.horizontalScrollbarHot = horizontal;
@@ -30894,7 +31224,9 @@ void UpdatePointerHover(ViewState& state, POINT pos, bool animate = true) {
 
 void ClearPointerHover(ViewState& state, bool animate) {
     ItemTipHoverMoved(state, -1);
-    if (state.hovered < 0 && state.hotSection < 0 &&
+    const bool checkboxHovered=state.checkboxHot!=-1;
+    state.checkboxHot=-1;
+    if (!checkboxHovered && state.hovered < 0 && state.hotSection < 0 &&
         !state.verticalScrollbarHot && !state.horizontalScrollbarHot &&
         !state.hoverAnimationActive) return;
     if (state.hovered >= 0 || state.hotSection >= 0) BeginHoverTransition(state, -1, animate);
@@ -33060,6 +33392,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
 #undef CAPTURE_PRESENTATION
+    if(state.touch.down && state.touch.checkbox!=-1) model->checkboxPress=state.touch.checkbox;
     static_cast<SwipeFeedbackSnapshot&>(*model)=CaptureSwipeFeedback(state);
     model->sequence=++state.presentationSequence; model->lifetime=state.lifetimeToken;
     if(state.horizontalScrollbarAdmitted && !state.horizontalScrollbarAdmittedSequence)
@@ -34047,6 +34380,8 @@ bool HandleSelectionCheckboxInput(ViewState& state, UINT message, POINT point) {
     SetFocus(IsWindow(state.nativeHwnd) ? state.nativeHwnd : state.hwnd);
     if (State(owner)!=&state || state.mouseFolderEpoch!=epoch) return true;
     state.checkboxPress=hit;
+    state.checkboxHot=hit;
+    Redraw(state);
     state.checkboxPressEpoch=state.mouseFolderEpoch;
     state.checkboxPressToken=state.token;
     if (hit>=0) state.checkboxPressItem=state.entries[size_t(hit)].path;

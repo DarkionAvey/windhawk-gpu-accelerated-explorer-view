@@ -6,7 +6,10 @@
 - **ADDED** File hover tooltips support themed backgrounds, borders, rounded corners and cached CSS-style shadows. Muted metadata text follows the custom background.
 - **ADDED** Both scrollbars share themeable thumbs and tracks, with backgrounds, borders, rounded corners and hover and pressed styles.
 - **ADDED** Drag-selection rectangles support themed backgrounds, borders and rounded corners, with light and dark overrides.
+- **ADDED** Selection checkboxes support themed backgrounds, borders and rounded corners for unchecked, checked, hovered and pressed states. Checkmarks adapt to the background.
 - **ADDED** Theme borders support solid, dashed and dotted patterns, or no border.
+- **ADDED** Storage bars support themed fills and tracks, usage-based colors and gradients, and full-track gradients revealed by used space.
+- **ADDED** Storage fill and track heights can be themed independently within the item's text-size limit and available space. Both stay vertically centered, and zero hides just that part.
 - **ADDED** Dragging files near any edge of the view scrolls toward offscreen destinations, with speed controlled by the pointer's distance into the edge.
 - **ADDED** Internal animation duration scale for debugging, set to 1.0 by default.
 - **ADDED** Double-click `test-mod.bat` to test a chosen mod source quietly, run tests individually and collect failure logs without publishing a release.

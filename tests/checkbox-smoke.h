@@ -66,7 +66,12 @@ void Selection(const std::wstring& fixture) {
         ReceiveDirectoryResults(state);
         ConsumePresentation(state);
     };
-    Tap(input,state,rowPoint(0));
+    input.Next(); input.Send(state,{input.Packet(state,input.primary,rowPoint(0),TouchInputTest::down)});
+    Check(CheckboxVisualPressed(state,0),"native touch down did not expose checkbox pressed state");
+    const auto pressedModel=CapturePresentationModel(state);
+    Check(pressedModel->checkboxPress==0,"checkbox pressed identity was lost in presentation snapshot");
+    input.Next(40); input.Send(state,{input.Packet(state,input.primary,rowPoint(0),TouchInputTest::up)});
+    Check(!CheckboxVisualPressed(state,0),"native touch release retained checkbox pressed state");
     Check(count()==1 && state.selectedFlags[0],"native touch checkbox failed to select item");
     Tap(input,state,rowPoint(1));
     Check(count()==2 && state.selectedFlags[0] && state.selectedFlags[1],"checkbox replaced a disjoint selection");
@@ -80,6 +85,12 @@ void Selection(const std::wstring& fixture) {
     const POINT gutterTop{LogicalX(state,LONG(gutter.left+1.f)),LONG(ceilf(gutter.top))};
     const POINT gutterBottom{gutterTop.x,LONG(ceilf(gutter.bottom)-1.f)};
     SetTouchInputMode(state,false);
+    UpdatePointerHover(state,rowPoint(0),false);
+    Check(state.checkboxHot==0 && CapturePresentationModel(state)->checkboxHot==0,
+        "checkbox hover hit identity was not handed to presentation");
+    ClearPointerHover(state);
+    Check(state.checkboxHot==-1 && CapturePresentationModel(state)->checkboxHot==-1,
+        "clearing pointer hover retained a checkbox style");
     Check(SelectionCheckboxAt(state,gutterTop)==0 && SelectionCheckboxAt(state,gutterBottom)==0,
         "mouse checkbox gutter missed the full native item height");
     Tap(input,state,gutterTop);

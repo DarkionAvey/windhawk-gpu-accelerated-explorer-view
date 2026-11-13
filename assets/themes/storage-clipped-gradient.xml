@@ -1,0 +1,10 @@
+<theme>
+  <element name="DrawDriveBar:track" border-width="1px" border-radius="2px">
+    <light background="#d8d8d8" border-color="#b0b0b0" />
+    <dark background="#292929" border-color="#444444" />
+  </element>
+  <element name="DrawDriveBar:fill" background-origin="track-box" border-radius="2px">
+    <light background="linear-gradient(to right, #285db1 0%, #c47b18 70%, #bb2b2b 100%)" />
+    <dark background="linear-gradient(to right, #75a6f0 0%, #ffb75c 70%, #f16c6c 100%)" />
+  </element>
+</theme>

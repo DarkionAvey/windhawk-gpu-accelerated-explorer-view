@@ -1,0 +1,7 @@
+<theme>
+  <element name="DrawDriveBar:track" border-width="1px" border-radius="2px">
+    <light background="#d8d8d8" border-color="#b0b0b0" />
+    <dark background="#292929" border-color="#444444" />
+  </element>
+  <element name="DrawDriveBar:fill" background="accent" border-width="0" border-radius="2px" />
+</theme>

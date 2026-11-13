@@ -1,0 +1,16 @@
+<theme>
+  <element name="DrawSelectionCheckbox" border-width="1px" border-radius="2px">
+    <dark background="#303030" border-color="#777777" />
+    <light background="#eeeeee" border-color="#888888" />
+  </element>
+  <element name="DrawSelectionCheckbox:hover" border-color="accent">
+    <dark background="#484848" />
+    <light background="#ffffff" />
+  </element>
+  <element name="DrawSelectionCheckbox:pressed" background="#808080" />
+  <element name="DrawSelectionCheckbox:checked" background="accent" border-color="accent" />
+  <element name="DrawSelectionCheckbox:checked:hover"
+           background="linear-gradient(to bottom, #9274e0, #7552d2)" border-color="#a68ce8" />
+  <element name="DrawSelectionCheckbox:checked:pressed"
+           background="#53339b" border-color="#7552d2" />
+</theme>

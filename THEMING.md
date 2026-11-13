@@ -107,6 +107,120 @@ The same theme on one line, ready to paste into the setting:
 <theme><element name="FillSelectionRect:selected" background="transparent" border-color="#3b82f6" border-width="1px" /><element name="FillSelectionRect:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /><element name="FillSelectionRect:selected:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /></theme>
 ```
 
+## Storage bars
+
+Use `DrawDriveBar:fill` for the used portion and `DrawDriveBar:track` for the
+full track underneath. These apply wherever the mod displays storage bars.
+Each supports `background`, `background-color`, `border-color`, `border-width`,
+`border-style` and `border-radius`, with the same light/dark overrides as other
+elements. Omitted corners keep the usual capsule shape; borders default to off.
+An omitted background keeps the usual fill. Custom colors use their own
+transparency and follow the item's visibility fade. Borders stay inside the
+shape and scale to whole screen pixels. High contrast keeps the usual bars.
+
+Set `height` separately on `DrawDriveBar:track` and `DrawDriveBar:fill`, for
+example a `5px` track with a `30px` fill. Both share the same vertical center.
+`auto` (the default) keeps that part's usual height. Custom heights scale with DPI and
+are limited to the current item's height multiplied by its text-size percentage.
+A 60px item with 50% text size allows at most 30px. Tiles also keep room for both
+text lines and their gaps, so the available height can be smaller. Rows and cells
+never grow to fit a bar. Use `height="0px"` to skip drawing just that part;
+the other part and tile capacity text stay visible. The taller part determines
+the shared space between tile text lines. Heights are rounded to whole screen pixels.
+
+For a fixed appearance, set an ordinary background:
+
+```xml
+<theme>
+  <element name="DrawDriveBar:track" background="#80808030" border-radius="2px" />
+  <element name="DrawDriveBar:fill" background="accent" border-radius="2px" />
+</theme>
+```
+
+### Change the paint with used space
+
+Add a `<scale>` with percentage stops. Percentages always mean **used space**.
+The whole fill changes between stops; these percentages are not positions
+along the bar. Stops can contain solid colors or spatial gradients.
+
+```xml
+<theme>
+  <element name="DrawDriveBar:fill" border-radius="2px">
+    <scale>
+      <stop offset="0%" background="accent" />
+      <stop offset="70%" background="accent" />
+      <stop offset="70%">
+        <light background="#c47713" />
+        <dark background="#ffb454" />
+      </stop>
+      <stop offset="90%">
+        <light background="#b82828" />
+        <dark background="#f16c6c" />
+      </stop>
+    </scale>
+  </element>
+</theme>
+```
+
+This keeps the accent color below 70% used, switches to orange at 70%, and
+blends toward red through 90%. The last color continues from 90% through 100%.
+The first color also extends below the first stop. Repeated percentages make
+a hard switch: the last stop at that percentage wins. Stops are sorted by
+percentage, and invalid stops are skipped. With no usable stops, the element's
+ordinary background applies. Paint changes follow whole percentage points.
+
+A stop's light/dark children override that stop's shared paint. For completely
+different stop lists, put light/dark directly inside `<scale>`:
+
+```xml
+<scale>
+  <light>
+    <stop offset="0%" background="accent" />
+    <stop offset="80%" background="#b82828" />
+  </light>
+  <dark>
+    <stop offset="0%" background="accent" />
+    <stop offset="95%" background="#f16c6c" />
+  </dark>
+</scale>
+```
+
+An appearance-specific list replaces the shared list for that appearance.
+An omitted appearance uses the shared list. A scale can also go inside the
+element's light/dark block. Borders and corners stay fixed while its background
+changes. A track can have its own scale too.
+
+Solid colors can blend into gradients. To blend between two gradients, use
+the same direction, number of color stops and color-stop positions in both.
+Otherwise, the earlier gradient stays in use until the next percentage stop.
+The mod caches dithered ramps for smoother gradients.
+
+### Reveal a full-track gradient
+
+Set `background-origin="track-box"` to anchor the gradient to the full track
+and reveal only the used portion:
+
+```xml
+<theme>
+  <element name="DrawDriveBar:fill" border-radius="2px"
+           background-origin="track-box"
+           background="linear-gradient(to right, #285db1 0%, #e59424 70%, #cf3030 100%)" />
+</theme>
+```
+
+At 40% used, only the first 40% of the gradient is visible. Without this
+property, or with `background-origin="border-box"`, the full gradient stretches
+across the filled portion. Gradient directions remain physical in RTL layouts.
+`track-box` and the scale structure are extensions provided by this mod.
+
+Complete examples to copy into the theme setting:
+
+- [Fixed accent fill and light/dark tracks](assets/themes/storage-fixed.xml)
+- [Usage colors with light/dark inside stops](assets/themes/storage-scale-colors.xml)
+- [Usage gradients with light/dark inside stops](assets/themes/storage-scale-gradients.xml)
+- [Separate light/dark stop lists](assets/themes/storage-scale-appearances.xml)
+- [Full-track gradient revealed by used space](assets/themes/storage-clipped-gradient.xml)
+
 ## Border patterns
 
 Every element that supports borders also accepts `border-style`: `solid`
@@ -290,6 +404,49 @@ they are not drawn as gradients.
 
 Gradients use dithering to soften visible color bands. Color transparency still
 combines with the mod's selection and hover opacity settings.
+
+## Selection checkboxes
+
+Item checkboxes and the Name-header checkbox share these styles:
+
+| Element name | State |
+|---|---|
+| `DrawSelectionCheckbox` | Shared style and unchecked |
+| `DrawSelectionCheckbox:hover` | Unchecked, hovered |
+| `DrawSelectionCheckbox:pressed` | Unchecked, pressed |
+| `DrawSelectionCheckbox:checked` | Checked |
+| `DrawSelectionCheckbox:checked:hover` | Checked, hovered |
+| `DrawSelectionCheckbox:checked:pressed` | Checked, pressed |
+
+Use `background`, `background-color`, `border-color`, `border-width`,
+`border-style`, and `border-radius`. Light and dark blocks work in every state.
+The base style is inherited by all states. Unchecked pressed inherits unchecked
+hover; checked hover and checked pressed inherit checked. Pressed takes priority
+over hover.
+
+Borders draw inside the checkbox without moving it or changing its hit area.
+`border-radius="0px"` makes square corners. Larger radii are capped at half the
+checkbox size. The checkmark gets a soft, contrasting color from the background,
+or the first color of a gradient. Its shape and derived colors are cached.
+
+```xml
+<theme>
+  <element name="DrawSelectionCheckbox" border-width="1px" border-radius="2px">
+    <dark background="#303030" border-color="#777777" />
+    <light background="#eeeeee" border-color="#888888" />
+  </element>
+  <element name="DrawSelectionCheckbox:hover" border-color="accent">
+    <dark background="#484848" />
+    <light background="#ffffff" />
+  </element>
+  <element name="DrawSelectionCheckbox:pressed" background="#808080" />
+  <element name="DrawSelectionCheckbox:checked" background="accent" border-color="accent" />
+  <element name="DrawSelectionCheckbox:checked:hover"
+           background="linear-gradient(to bottom, #9274e0, #7552d2)" border-color="#a68ce8" />
+  <element name="DrawSelectionCheckbox:checked:pressed"
+           background="#53339b" border-color="#7552d2" />
+</theme>
+```
 
 ## Writing XML
 

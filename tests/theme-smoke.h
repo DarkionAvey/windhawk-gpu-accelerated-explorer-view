@@ -500,6 +500,180 @@ static void TestThemedScrollbar(bool thumb) {
     std::cout<<"PASS: scrollbar "<<(thumb ? "thumb":"track")<<" axes, states, light/dark, DPI/RTL pixels, borders, corners, alpha, gradients, cache and native fallback\n";
 }
 
+static void TestThemeStorageScale() {
+    using namespace ThemeRegression;
+    const auto doc=Parse(LR"(<theme><element name="DrawDriveBar:fill"><scale>
+      <stop offset="0%" background="accent" /><stop offset="70%" background="accent" />
+      <stop offset="70%"><light background="#ff0000" /><dark background="#00ff00" /></stop>
+      <stop offset="90%"><light background="#0000ff" /><dark background="#ff0000" /></stop>
+      <stop offset="bad" background="#ffffff" />
+    </scale></element></theme>)");
+    for(size_t mode=0;mode<2;++mode) {
+        const auto& drive=doc->driveBars[mode][0];
+        Check(drive.enabled && drive.scaled && drive.paints[69].color.accent,"scale changed accent before the hard stop");
+        Check(drive.paints[70].color.rgb==(mode ? 0x00ff00u:0xff0000u),"duplicate percentage did not switch to the last stop");
+        Check(drive.paints[80].color.rgb==(mode ? 0x808000u:0x800080u),"scale interpolation did not mix independent channels");
+        Check(drive.paints[100].color.rgb==(mode ? 0xff0000u:0x0000ffu),"missing final stop did not extend through 100%");
+        Check(!doc->driveBars[mode][1].enabled,"fill scale leaked into track");
+    }
+    const auto modes=Parse(LR"(<element name="DrawDriveBar:fill"><scale>
+      <stop offset="0%" background="#123456" />
+      <light><stop offset="0%" background="accent" /><stop offset="80%" background="#ff0000" /></light>
+      <dark><stop offset="0%" background="accent" /><stop offset="95%" background="#00ff00" /></dark>
+    </scale></element>)");
+    Check(modes->driveBars[0][0].paints[80].color.rgb==0xff0000 &&
+        modes->driveBars[1][0].paints[80].color.accentWeight>0 && modes->driveBars[1][0].paints[100].color.rgb==0x00ff00,
+        "appearance stop lists did not replace shared stops or preserve accent interpolation");
+    const auto gradients=Parse(LR"xml(<element name="DrawDriveBar:track"><dark><scale>
+      <stop offset="20%" background="linear-gradient(to bottom, #ff0000, #000000)" />
+      <stop offset="80%" background="linear-gradient(to bottom, #0000ff, #ffffff)" />
+    </scale></dark></element>)xml");
+    const auto& paints=gradients->driveBars[1][1].paints;
+    Check(paints[0].stops[0].color.rgb==0xff0000 && paints[100].stops[0].color.rgb==0x0000ff &&
+        paints[50].stops[0].color.rgb==0x800080 && paints[50].stops[1].color.rgb==0x808080,
+        "gradient stop interpolation or endpoint extension differs");
+    const auto recovered=Parse(LR"(<element name="DrawDriveBar:fill"><scale><stop offset="0%" background="#123456" broken= />
+      <stop offset="90%" background="#abcdef" /></scale></element>)");
+    Check(recovered->driveBars[0][0].paints[0].color.rgb==0x123456 && recovered->driveBars[0][0].paints[100].color.rgb==0xabcdef,
+        "XML recovery lost scale scopes or complete stop properties");
+    std::cout<<"PASS: storage scales, appearance scopes, hard stops, interpolation, missing endpoints, accent and malformed XML recovery\n";
+}
+
+static void TestThemedStoragePaint(bool fill) {
+    using namespace ThemeRegression;
+    StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;
+    const size_t part=fill ? 0:1; const auto name=fill ? L"DrawDriveBar:fill":L"DrawDriveBar:track";
+    float fraction=.4f;
+    const auto render=[&](float alpha=1.f) {
+        return surface.Render([&](ViewState& view) {
+            const float s=view.presentationDpi/96.f;
+            Check(DrawDriveBar(view,part,D2D1::RectF(20*s,20*s,200*s,40*s),fraction,0xffffff,alpha),"storage paint route");
+        });
+    };
+    for(UINT dpi:{96u,120u,144u,192u}) for(bool rtl:{false,true}) {
+        Regression::Scope scope(std::string("storage paint ")+(fill ? "fill":"track")+" dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl));
+        surface.state.presentationDpi=dpi; surface.state.rtlLayout=rtl;
+        const int start=MulDiv(20,dpi,96),end=MulDiv(fill ? 92:200,dpi,96);
+        const int left=rtl ? 480-end:start,right=rtl ? 480-start:end,y=MulDiv(30,dpi,96),top=MulDiv(20,dpi,96);
+        Load(settings,Element(name,LR"(background="transparent" border-color="#ff0000" border-width="1px" border-radius="0")"));
+        const auto border=render(); const int width=MulDiv(1,dpi,96);
+        for(int x=left-2;x<left+width+3;++x)
+            Check(At(border,x,y)==(x>=left && x<left+width ? 0xffff0000u:0u),"storage border moved outside bounds or lost DPI thickness");
+        BorderPatterns([&](const wchar_t* pattern) {
+            Load(settings,Element(name,L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-radius=\"0\" border-style=\""+std::wstring(pattern)+L"\""));
+            const auto pixels=render(); std::vector<DWORD> row;
+            for(int x=left+MulDiv(6,dpi,96);x<right-MulDiv(6,dpi,96);++x) row.push_back(At(pixels,x,top));
+            return row;
+        });
+        Load(settings,Element(name,LR"(background="#ff000080" border-style="none" border-radius="0")"));
+        Check(std::abs(int(At(render(.5f),(left+right)/2,y)>>24)-64)<=1,"storage color alpha did not multiply item fade");
+        for(bool clipped:{false,true}) {
+            Load(settings,Element(name,L"background=\"linear-gradient(to right, #ff0000, #0000ff)\" border-radius=\"0\" background-origin=\""+
+                std::wstring(clipped ? L"track-box":L"border-box")+L"\""));
+            const auto reads=SettingsFixture::reads;
+            const auto gradient=render(); Check(gradient==render() && SettingsFixture::reads==reads,"warm storage gradient changed or reread settings");
+            const int originLeft=clipped ? (rtl ? 480-MulDiv(200,dpi,96):start):left;
+            const int originRight=clipped ? (rtl ? 480-start:MulDiv(200,dpi,96)):right;
+            for(int x:{left+(right-left)/4,left+3*(right-left)/4}) {
+                double red=0,blue=0;
+                for(int row=y-4;row<y+4;++row) {red+=Channel(At(gradient,x,row),16);blue+=Channel(At(gradient,x,row),0);}
+                const double t=(x+.5-originLeft)/double(originRight-originLeft);
+                Check(std::abs(red/8-255*(1-t))<2 && std::abs(blue/8-255*t)<2,"storage gradient clipping/direction differs from independent interpolation");
+            }
+            Check(At(gradient,left-1,y)==0 && At(gradient,right,y)==0,"storage fill escaped its used-space bounds");
+            size_t bytes=0;
+            for(const auto& states:surface.state.driveBarResources->paints) for(const auto& paint:states) for(const auto& ramp:paint.ramps.slots) if(ramp.brush) {
+                ComPtr<ID2D1Bitmap> bitmap; ramp.brush->GetBitmap(&bitmap); const auto size=bitmap->GetPixelSize();
+                bytes+=size_t(size.width)*size.height*4;
+            }
+            Check(bytes>0 && bytes<=2*101*512*8*4,"storage dither cache missing or exceeds its finite budget");
+        }
+        Load(settings,L"<element name=\""+std::wstring(name)+L"\" background=\"#ff0000\" border-radius=\"8px\"><dark background=\"#00ff00\" /></element>");
+        Check(At(render(),left,top)==0,"storage rounded corner missing");
+        surface.state.themeMode=Theme::Mode::Dark;
+        Check(At(render(),(left+right)/2,y)==0xff00ff00u,"storage dark paint retained stale gradient");
+        surface.state.themeHighContrast=true; const auto contrast=surface.Render([&](ViewState& view) {
+            Check(!DrawDriveBar(view,part,D2D1::RectF(20,20,200,40),fraction,0xffffff,1.f),"high contrast did not return to native storage painting");
+        });
+        Check(!surface.state.driveBarResources && std::all_of(contrast.begin(),contrast.end(),[](DWORD p){return p==0;}),"high contrast retained custom storage resources/pixels");
+        surface.state.themeHighContrast=false;surface.state.themeMode=Theme::Mode::Light;
+    }
+    Load(settings,L""); surface.Render([&](ViewState& view){Check(!DrawDriveBar(view,part,D2D1::RectF(20,20,200,40),fraction,0xffffff,1.f),"clearing storage theme retained custom route");});
+    DropTarget(surface.state); Check(!surface.state.driveBarResources,"device teardown retained storage cache"); BorderCacheReleased(surface.state.themeBorderStrokes);
+    std::cout<<"PASS: storage "<<(fill ? "fill":"track")<<" border patterns, DPI/RTL, alpha, stretched/clipped gradients, corners, modes and cache lifetime\n";
+}
+
+static void TestThemedStorageHeights() {
+    using namespace ThemeRegression;
+    StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;
+    settings.Set(L"Appearance.fontSizePercent",L"50"); settings.Set(L"Appearance.gridFontSizePercent",L"50");
+    auto entries=std::make_shared<std::vector<Entry>>(1);
+    entries->front().name=L"Disk"; entries->front().driveTotal=1000;
+    surface.state.presentationEntries=entries; surface.state.total=1; surface.state.thisPcGpu=true;
+    surface.state.presentationClient={0,0,LONG(Surface::width),LONG(Surface::height)};
+    const auto xml=[](const wchar_t* fill,const wchar_t* track) {
+        return L"<theme><element name=\"DrawDriveBar:fill\" background=\"#ff0000\" border-radius=\"0\" height=\""+
+            std::wstring(fill)+L"\" /><element name=\"DrawDriveBar:track\" background=\"#ff0000\" border-radius=\"0\" height=\""+track+L"\" /></theme>";
+    };
+    for(UINT dpi:{96u,120u,144u,192u}) for(bool tiles:{false,true}) for(bool rtl:{false,true}) {
+        Regression::Scope scope("storage height dpi="+std::to_string(dpi)+" tiles="+std::to_string(tiles)+" rtl="+std::to_string(rtl));
+        auto& state=surface.state; const float s=dpi/96.f;
+        state.presentationDpi=dpi; state.gridView=tiles; state.layoutNativeMode=tiles ? FVM_TILE:FVM_DETAILS;
+        state.rtlLayout=rtl; state.rowPx=(tiles ? 100:60)*s; state.fontPx=10*s; state.iconPx=16*s; state.itemWidth=200*s;
+        Check(MakeTextFormats(state),"storage height fonts");
+        const RowVisual visual{20*s,state.rowPx,1.f,0,200*s};
+        DriveBarGeometry geometry; ItemGeometry item;
+        const auto render=[&](size_t part) {
+            return surface.Render([&](ViewState& view) {
+                item=LayoutItem(view,visual); geometry=LayoutDriveBar(view,0,item);
+                Check(geometry.visible,"storage height private geometry");
+                Check(DrawDriveBar(view,part,part==0 ? geometry.fill:geometry.track,1.f,0xffffff,1.f),"storage theme drawing route");
+            });
+        };
+        Load(settings,xml(L"8px",L"2px"));
+        std::array<double,2> centers{};
+        for(size_t part=0;part<2;++part) {
+            const auto pixels=render(part);
+            const auto bounds=part==0 ? geometry.fill:geometry.track;
+            const int expected=MulDiv(part==0 ? 8:2,dpi,96);
+            const int logicalX=int((bounds.left+bounds.right)*.5f);
+            const int x=rtl ? int(Surface::width)-1-logicalX:logicalX;
+            int first=-1,last=-1,count=0;
+            for(int y=0;y<int(Surface::height);++y) {
+                const DWORD p=At(pixels,x,y);
+                Check(p==0 || p==0xffff0000u,"height introduced a fractional/blurred edge");
+                if(p) {if(first<0) first=y;last=y;++count;}
+            }
+            Check(count==expected && last-first+1==expected,"storage paint height differs from independent DPI arithmetic");
+            centers[part]=(first+last+1)/2.;
+            Check(std::abs(centers[part]-(bounds.top+bounds.bottom)*.5)<.501,"pixel snapping moved the shared center by more than half a pixel");
+        }
+        const double permitted=MulDiv(8,dpi,96)%2==MulDiv(2,dpi,96)%2 ? 0.:.5;
+        Check(std::abs(centers[0]-centers[1])==permitted,"crisp odd/even heights did not preserve the nearest shared center");
+        const float row=state.rowPx;
+        Load(settings,xml(L"1000px",L"1000px")); render(0);
+        const float available=tiles ? visual.height-2*MulDiv(2,dpi,96)-3*state.fontPx-2*MulDiv(2,dpi,96):
+            std::min(item.text.bottom,item.cell.bottom)-std::max(item.text.top,item.cell.top);
+        const float expected=floorf(std::max(0.f,std::min(available,visual.height*.5f)));
+        Near(geometry.fill.bottom-geometry.fill.top,expected,.001f,"storage height exceeded available space or font percentage cap");
+        Near(geometry.track.bottom-geometry.track.top,expected,.001f,"track height cap differs from fill");
+        Check(state.rowPx==row && item.cell.bottom-item.cell.top==visual.height-2*MulDiv(2,dpi,96),"theme height changed row/cell height");
+        if(tiles) Check(geometry.fill.top>=item.text.bottom && geometry.fill.bottom<=item.capacity.top,"expanded storage overlaps tile text");
+        for(size_t hidden=0;hidden<2;++hidden) {
+            Load(settings,xml(hidden==0 ? L"0px":L"8px",hidden==1 ? L"0px":L"2px"));
+            state.driveBarResources.reset();
+            const auto absent=render(hidden);
+            Check(std::all_of(absent.begin(),absent.end(),[](DWORD p){return p==0;}),"zero-height part drew pixels");
+            Check(!state.driveBarResources,"zero-height draw allocated paint resources");
+            const auto visible=render(1-hidden);
+            Check(std::any_of(visible.begin(),visible.end(),[](DWORD p){return p!=0;}),"zero-height part hid the other part");
+            // Release before the next isolated zero-height allocation check.
+            state.driveBarResources.reset();
+        }
+    }
+    std::cout<<"PASS: independent storage heights, crisp DPI/RTL pixels including 125%, parity-aware centering, caps, tile text clearance and zero-height isolation\n";
+}
+
 static void TestThemedMarquee() {
     using namespace ThemeRegression;
     StyleFixture::Session style;
@@ -661,4 +835,175 @@ static void TestThemedTooltipAntialiasing() {
     tooltip.Show();
     if(smoothing) Check(tip.target->GetTextAntialiasMode()==D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,"ClearType crossed rounded transparent corners");
     std::cout<<"PASS: native system preferences, smooth/aliased choices, opaque/transparent gradient eligibility and actual fringe-free grayscale pixels\n";
+}
+
+static void TestThemeCheckboxStates() {
+    using namespace ThemeRegression;
+    const auto doc=Parse(LR"xml(<theme>
+      <element name="DrawSelectionCheckbox" background="#111111" border-radius="2px" border-width="1px" />
+      <element name="DrawSelectionCheckbox" border-color="#123456" />
+      <element name="DrawSelectionCheckbox:hover" background="#222222"><dark border-width="2px" /></element>
+      <element name="DrawSelectionCheckbox:pressed" background="#333333" />
+      <element name="DrawSelectionCheckbox:checked" background="accent"><light border-color="#abcdef" /></element>
+      <element name="DrawSelectionCheckbox:checked:hover" background="#444444" />
+      <element name="DrawSelectionCheckbox:checked:pressed" background="#555555" />
+      <element name="DrawSelectionCheckbox:checked:pressed" background="#666666" broken=unquoted border-style="dotted" />
+    </theme>)xml");
+    for(size_t mode=0;mode<2;++mode) {
+        Check(doc->checkboxEnabled[mode],"checkbox styles were not enabled");
+        const auto& states=doc->checkboxes[mode];
+        for(size_t i=0;i<6;++i) {
+            Check(states[i].borderRadius==2 && states[i].borderWidth==((i==1 || i==2) && mode ? 2.f:1.f),
+                "checkbox state lost inherited radius or appearance border width");
+            Check(states[i].borderColor.rgb==(i>=3 && !mode ? 0xabcdefu:0x123456u),
+                "checkbox checked appearance leaked into unchecked/other appearance");
+        }
+        Check(states[0].background.color.rgb==0x111111 && states[1].background.color.rgb==0x222222 &&
+            states[2].background.color.rgb==0x333333 && states[3].background.color.accent &&
+            states[4].background.color.rgb==0x444444 && states[5].background.color.rgb==0x666666 &&
+            states[5].borderStyle==Theme::BorderStyle::Dotted,
+            "checkbox states, duplicate merge/last value or malformed attribute recovery changed");
+        Check(doc->highlights[mode][0].background.kind==Theme::Paint::Kind::Default &&
+            doc->scrollbars[mode][0][0].background.kind==Theme::Paint::Kind::Default,
+            "checkbox properties leaked to unrelated elements");
+    }
+    const auto inherited=Parse(LR"(<element name="DrawSelectionCheckbox" background="#111111" />
+        <element name="DrawSelectionCheckbox:hover" background="#222222" />
+        <element name="DrawSelectionCheckbox:checked" background="accent" />)");
+    for(const auto& states:inherited->checkboxes) Check(states[2].background.color.rgb==0x222222 &&
+        states[4].background.color.accent && states[5].background.color.accent,
+        "missing checkbox interaction state did not inherit hover/checked");
+    std::cout<<"PASS: six checkbox states, appearance inheritance, duplicate merge/last value, recovery and element isolation\n";
+}
+
+static void TestThemedCheckboxPixels() {
+    using namespace ThemeRegression;
+    OptionEffects::Settings settings; Fonts(); StyleFixture::Session style; Surface surface;
+    auto& state=surface.state; state.nativeTextColor=RGB(230,230,230); state.nativeEditBackground=RGB(32,32,32);
+    size_t interaction=0; float fade=1.f; bool large=false;
+    const auto render=[&] {return surface.Render([&](ViewState& view) {
+        const float scale=view.presentationDpi/96.f;
+        DrawSelectionCheckbox(view,D2D1::RectF(20*scale,20*scale,(large ? 100:40)*scale,(large ? 100:40)*scale),
+            interaction>=3,fade,interaction%3==1,interaction%3==2);
+    });};
+    const auto pixel=[&](const std::vector<DWORD>& pixels,int x,int y) {
+        return At(pixels,state.rtlLayout ? int(Surface::width)-1-x:x,y);
+    };
+    for(UINT dpi:{96u,120u,144u,192u}) for(bool rtl:{false,true}) {
+        Regression::Scope scope("checkbox pixels dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl));
+        state.presentationDpi=dpi; state.rtlLayout=rtl; state.themeMode=Theme::Mode::Light;
+        const int left=MulDiv(20,dpi,96),right=MulDiv(40,dpi,96),y=MulDiv(30,dpi,96);
+        Load(settings,L""); interaction=0; const auto native=render();
+        Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="transparent" border-color="#ff0000" border-width="1px" border-radius="0")"));
+        const auto border=render(); const int width=MulDiv(1,dpi,96);
+        for(int x=left-2;x<left+width+3;++x)
+            Check(pixel(border,x,y)==(x>=left && x<left+width ? 0xffff0000u:0u),"checkbox border lost whole-pixel DPI thickness or escaped its bounds");
+        Check(pixel(border,(left+right)/2,y)==0,"border-only checkbox gained a background");
+        large=true;
+        BorderPatterns([&](const wchar_t* pattern) {
+            Load(settings,Element(L"DrawSelectionCheckbox",L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-radius=\"0\" border-style=\""+
+                std::wstring(pattern)+L"\""));
+            const auto pixels=render(); std::vector<DWORD> samples;
+            for(int along=MulDiv(30,dpi,96);along<MulDiv(90,dpi,96);++along) samples.push_back(pixel(pixels,left,along));
+            return samples;
+        });
+        large=false;
+        std::wstring xml=L"<theme>";
+        constexpr const wchar_t* names[]={L"",L":hover",L":pressed",L":checked",L":checked:hover",L":checked:pressed"};
+        for(size_t i=0;i<6;++i) xml+=L"<element name=\"DrawSelectionCheckbox"+std::wstring(names[i])+L"\" border-width=\"0\" border-radius=\"0\">"+
+            L"<light background=\"#"+std::wstring(6,wchar_t(L'1'+i))+L"\" /><dark background=\"#"+std::wstring(6,wchar_t(L'a'+i))+L"\" /></element>";
+        Load(settings,xml+L"</theme>");
+        for(size_t mode=0;mode<2;++mode) for(interaction=0;interaction<6;++interaction) {
+            state.themeMode=static_cast<Theme::Mode>(mode);
+            const auto pixels=render(); const unsigned value=unsigned((mode ? 10:1)+interaction)*17;
+            Check(pixel(pixels,left+2,left+2)==(0xff000000u|value*0x10101),"checkbox appearance or checked/hover/pressed state drew the wrong fill");
+        }
+        interaction=0; state.themeMode=Theme::Mode::Light;
+        Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="#ff000080" border-width="0" border-radius="0")"));
+        fade=.5f; Check(pixel(render(),left+2,left+2)==0x40400000u,"checkbox color alpha did not multiply reveal opacity"); fade=1.f;
+        Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="#ff0000" border-width="0" border-radius="999999px")"));
+        const auto round=render();
+        Check(pixel(round,left,left)==0 && pixel(round,(left+right)/2,y)==0xffff0000u,"checkbox extreme radius was not clamped within its size");
+        Load(settings,Element(L"DrawSelectionCheckbox",LR"xml(background="linear-gradient(to right, #ff0000, #0000ff)" border-width="0" border-radius="0")xml"));
+        const auto reads=SettingsFixture::reads; const auto gradient=render();
+        Check(gradient==render() && SettingsFixture::reads==reads,"warm checkbox gradient changed pixels or reread settings");
+        for(int x=left+2;x<right-2;++x) {
+            // CSS directions remain physical when the checkbox placement is mirrored.
+            const double position=(x-left+.5)/double(right-left);
+            const double t=rtl ? 1-position:position;
+            const auto p=pixel(gradient,x,y);
+            Check(std::abs(int(Channel(p,16))-255*(1-t))<3 && std::abs(int(Channel(p,0))-255*t)<3,
+                "checkbox gradient differs from independent interpolation");
+        }
+        state.themeHighContrast=true; Check(render()==native,"high contrast did not restore native checkbox pixels"); state.themeHighContrast=false;
+        Load(settings,L""); Check(render()==native,"clearing theme did not restore native checkbox pixels");
+    }
+    DropTarget(state); Check(!state.selectionCheckGlyph && !state.checkboxResources.snapshot,"checkbox device teardown retained geometry or theme");
+    BorderCacheReleased(state.themeBorderStrokes);
+    std::cout<<"PASS: checkbox states, light/dark, DPI/RTL border patterns, radius clamp, alpha, gradients and native fallback\n";
+}
+
+static void TestThemedCheckboxCheckmarkCache() {
+    using namespace ThemeRegression;
+    OptionEffects::Settings settings; Fonts(); StyleFixture::Session style; Surface surface;
+    auto& state=surface.state; state.nativeTextColor=RGB(240,240,240); state.nativeEditBackground=RGB(32,32,32);
+    bool checked=true;
+    const auto render=[&] {return surface.Render([&](ViewState& view) {
+        DrawSelectionCheckbox(view,D2D1::RectF(20,20,40,40),checked,1.f);
+    });};
+    ComPtr<ID2D1PathGeometry> glyph;
+    for(const auto* background:{L"#101010",L"#eeeeee",L"linear-gradient(to right, #101010, #eeeeee)",
+                                L"linear-gradient(to right, #eeeeee, #101010)",L"#ffffff80",L"accent"}) {
+        Regression::Scope scope("checkbox mark "+Regression::Narrow(background));
+        Load(settings,Element(L"DrawSelectionCheckbox",L"background=\""+std::wstring(background)+L"\" border-width=\"0\" border-radius=\"0\""));
+        checked=false; const auto plain=render(); checked=true; const auto tick=render();
+        if(!glyph) glyph=state.selectionCheckGlyph;
+        Check(glyph && glyph==state.selectionCheckGlyph,"theme change rebuilt the normalized checkmark geometry");
+        const auto reads=SettingsFixture::reads;
+        const auto queries=std::array{StyleFixture::activations,StyleFixture::themeQueries,StyleFixture::systemColorQueries};
+        auto brush=state.checkboxResources.gradients[3];
+        std::array<ID2D1BitmapBrush*,9> ramps{};
+        for(size_t i=0;i<ramps.size();++i) ramps[i]=state.checkboxResources.ramps[3].slots[i].brush.Get();
+        Check(tick==render() && glyph==state.selectionCheckGlyph && brush==state.checkboxResources.gradients[3] && SettingsFixture::reads==reads,
+            "warm checkbox paint rebuilt resources, changed pixels or read settings");
+        Check(queries==std::array{StyleFixture::activations,StyleFixture::themeQueries,StyleFixture::systemColorQueries},"checkbox paint queried native color providers");
+        size_t changed=0;
+        for(int y=20;y<40;++y) for(int x=20;x<40;++x) changed+=At(plain,x,y)!=At(tick,x,y);
+        Check(changed>20 && changed<200,"checkbox checkmark is missing or fills the checkbox");
+        const auto mark=state.checkboxResources.marks[3];
+        Check(mark.a>0 && mark.a<1,"checkbox checkmark is invisible or harshly opaque");
+        const bool lightFirst=std::wstring_view(background).starts_with(L"#eeeeee") || std::wstring_view(background).starts_with(L"linear-gradient(to right, #eeeeee");
+        const bool darkFirst=std::wstring_view(background)==L"#101010" || std::wstring_view(background).starts_with(L"linear-gradient(to right, #101010");
+        if(lightFirst || darkFirst) {
+            Check(lightFirst ? mark.r==0:mark.r==1,"checkmark contrast did not follow solid/first gradient color");
+            bool softened=false;
+            for(int y=20;y<40;++y) for(int x=20;x<40;++x) {
+                const int a=Channel(At(plain,x,y),16),b=Channel(At(tick,x,y),16);
+                if(lightFirst ? b<a && b>0:b>a && b<255) softened=true;
+            }
+            Check(softened,"checkmark pixels do not show translucent contrasting ink");
+        }
+        for(size_t i=0;i<ramps.size();++i) Check(ramps[i]==state.checkboxResources.ramps[3].slots[i].brush.Get(),"warm checkbox paint replaced dither texture");
+        UINT64 bytes=0;
+        for(const auto& ramp:state.checkboxResources.ramps[3].slots) if(ramp.brush) {
+            ComPtr<ID2D1Bitmap> bitmap; ramp.brush->GetBitmap(&bitmap); const auto size=bitmap->GetPixelSize(); bytes+=UINT64(size.width)*size.height*4;
+        }
+        Check(bytes<=64*8*4,"one checkbox state exceeds the fixed gradient cache budget");
+        if(brush) Check(bytes>0,"checkbox gradient did not use a cached dither texture");
+    }
+    Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="accent" border-width="0" border-radius="0")"));
+    auto palette=g_swipePalette.load();
+    struct RestorePalette {unsigned long long value; ~RestorePalette(){g_swipePalette.store(value);}} restore{palette};
+    g_swipePalette.store((palette&~0xffffffull)|RGB(16,16,16)); const auto dark=render();
+    Check(state.checkboxResources.marks[3].r==1,"dark accent did not produce light checkmark");
+    g_swipePalette.store((palette&~0xffffffull)|RGB(238,238,238)); const auto light=render();
+    Check(dark!=light && state.checkboxResources.marks[3].r==0,"accent change retained stale fill/checkmark");
+    Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="transparent" border-width="0")"));
+    state.nativeEditBackground=RGB(16,16,16); render(); Check(state.checkboxResources.marks[3].r==1,"transparent fill ignored dark native background");
+    state.nativeEditBackground=RGB(238,238,238); render(); Check(state.checkboxResources.marks[3].r==0,"native background change retained stale checkmark");
+    Check(glyph==state.selectionCheckGlyph,"palette changes rebuilt cached checkmark geometry");
+    DropTarget(state); Check(!state.selectionCheckGlyph && !state.checkboxResources.snapshot,"device teardown retained checkbox cache");
+    for(const auto& gradient:state.checkboxResources.gradients) Check(!gradient,"device teardown retained checkbox gradient");
+    for(const auto& ramps:state.checkboxResources.ramps) for(const auto& ramp:ramps.slots) Check(!ramp.brush,"device teardown retained checkbox texture");
+    std::cout<<"PASS: visible translucent checkmarks, first-stop contrast, accent/native background invalidation, warm geometry/brush reuse and bounded device caches\n";
 }

@@ -1,0 +1,20 @@
+<theme>
+  <element name="DrawDriveBar:track" border-radius="2px">
+    <light background="#d8d8d8" />
+    <dark background="#292929" />
+  </element>
+  <element name="DrawDriveBar:fill" border-radius="2px">
+    <scale>
+      <stop offset="0%" background="accent" />
+      <stop offset="70%" background="accent" />
+      <stop offset="70%">
+        <light background="linear-gradient(to bottom, #e9ac52, #a55c09)" />
+        <dark background="linear-gradient(to bottom, #ffca7d, #b66c19)" />
+      </stop>
+      <stop offset="100%">
+        <light background="linear-gradient(to bottom, #e56868, #982323)" />
+        <dark background="linear-gradient(to bottom, #ff9696, #c23b3b)" />
+      </stop>
+    </scale>
+  </element>
+</theme>
