@@ -282,6 +282,7 @@ static void TestPeriodicCapacityRefresh() {
 
 static void TestDriveSpaceRefresh() {
     CapacityFixture::Session volume;
+    CapacityFixture::freeBytes=49;
     Check(CapacityFixture::gate!=nullptr,"synthetic volume gate");
     ViewState state, other;
     state.hwnd=MessageWindow(); state.background->hwnd=state.hwnd;
@@ -328,7 +329,8 @@ static void TestDriveSpaceRefresh() {
     SetEvent(CapacityFixture::gate);
     Check(Eventually([&]{ ReceiveDirectoryResults(state); return !state.directoryPending; }),"volume result did not arrive");
     RefreshThisPcRows(state,false);
-    Check(state.entries[0].driveUsed==400,"capacity refresh trusted the stale Shell free-space value");
+    Check(state.entries[0].driveUsed==951 && DriveHasLowSpace(state.entries[0]),
+        "capacity refresh trusted stale Shell free space or missed low space");
     const auto* caption=ColumnCellText(state.entries[0],PKEY_Computer_DecoratedFreeSpace,
         state.columnEpoch,state.propertyEpoch);
     Check(caption && !caption->empty(),"capacity worker did not publish the localized tile caption");
@@ -341,7 +343,8 @@ static void TestDriveSpaceRefresh() {
     PublishDirectoryResult(*state.background,std::move(stale));
     Check(Eventually([&]{ ReceiveDirectoryResults(state); return !state.directoryPending; }),"follow-up volume result did not arrive");
     RefreshThisPcRows(state,false);
-    Check(state.entries[0].driveUsed==750 && CapacityFixture::calls==2 && CapacityFixture::uiCalls==0 &&
+    Check(state.entries[0].driveUsed==750 && !DriveHasLowSpace(state.entries[0]) &&
+        CapacityFixture::calls==2 && CapacityFixture::uiCalls==0 &&
         state.directoryToken==generation && state.background->detailJobs.size()==1,
         "fresh space did not replace stale space independently of property work");
     caption=ColumnCellText(state.entries[0],PKEY_Computer_DecoratedFreeSpace,

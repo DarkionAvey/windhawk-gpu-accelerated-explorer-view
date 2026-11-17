@@ -32,6 +32,7 @@
 - **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
 
+- **FIXED** Drive storage bars turn red when less than 10% of space is free, with system colors in high contrast mode.
 - **FIXED** Selection highlights morph from their displayed shape when switching views, including filename-only grid selections and full-row list selections.
 - **FIXED** The first item and group heading stay visible when a grouped folder opens in a new Explorer window.
 - **FIXED** Cold folder previews begin loading names when the destination is known.

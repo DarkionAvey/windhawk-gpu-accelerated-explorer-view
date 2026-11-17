@@ -1,5 +1,129 @@
 // Private offscreen windows and synthetic item identities. No Shell probes,
 // real drive access, focus changes, or live Explorer input.
+static void TestDriveLowSpaceClassification() {
+    struct Case { ULONGLONG total, used; int percent; bool low; };
+    const ULONGLONG maximum = ~ULONGLONG(0);
+    // Explicit expectations cover strict boundaries, sub-percent precision,
+    // unknown/invalid values and the full 64-bit range.
+    const Case cases[] = {
+        {1000,0,-1,false}, {1000,899,-1,false}, {1000,900,-1,false},
+        {1000,901,-1,true}, {1000,1000,-1,true}, {1000,1001,-1,false},
+        {9300,8812,-1,true}, {11,9,-1,false}, {11,10,-1,true},
+        {1,0,-1,false}, {1,1,-1,true}, {0,0,-1,false}, {0,1,-1,false},
+        {maximum,maximum,-1,true}, {maximum,maximum-1,-1,true},
+        {maximum,maximum/2,-1,false},
+        {18446744073709551615ULL,16602069666338596453ULL,-1,false},
+        {18446744073709551615ULL,16602069666338596454ULL,-1,true},
+        {0,0,0,false}, {0,0,90,false}, {0,0,91,true}, {0,0,100,true},
+        {0,0,101,false}, {0,0,-2,false},
+        // A provider can supply total capacity with only a usage percentage.
+        {1000,0,91,true}, {1000,0,90,false}
+    };
+    for (const auto& sample : cases) {
+        Regression::Scope scope("total="+std::to_string(sample.total)+
+            " used="+std::to_string(sample.used)+" percent="+std::to_string(sample.percent));
+        Entry entry; entry.driveTotal=sample.total; entry.driveUsed=sample.used;
+        entry.driveUsedPercent=sample.percent;
+        Check(DriveHasLowSpace(entry)==sample.low,"low-space classification");
+    }
+}
+
+static void TestDriveBarColors(HWND frame) {
+    StyleFixture::Session style;
+    const auto selection=g_selectionRgb.exchange(RGB(0,180,0));
+    const auto zebra=g_zebra.exchange(false);
+    struct Restore {
+        COLORREF selection; bool zebra;
+        ~Restore() {g_selectionRgb=selection; g_zebra=zebra;}
+    } restore{selection,zebra};
+    for (int dpi : {96,144}) for (bool rtl : {false,true}) for (bool tiles : {false,true}) {
+        Regression::Scope scope("drive colors dpi="+std::to_string(dpi)+
+            " rtl="+std::to_string(rtl)+" tiles="+std::to_string(tiles)+
+            " mode="+(tiles ? "Tiles" : "Details"));
+        StyleFixture::dpi=UINT(dpi);
+        ViewState state;
+        state.hwnd=CreateWindowExW(0,L"STATIC",L"drive colors",WS_CHILD,
+            0,0,900,400,frame,nullptr,GetModuleHandleW(nullptr),nullptr);
+        Check(state.hwnd!=nullptr,"drive color window");
+        state.frameHwnd=state.activeTabHost=frame; state.nativeHwnd=state.hwnd;
+        state.background->hwnd=state.hwnd;
+        state.visible=state.inScope=state.loaded=state.thisPcGpu=true;
+        state.gridView=tiles; state.columnsView=state.detailsViewActive=!tiles;
+        state.layoutNativeMode=tiles ? FVM_TILE : FVM_DETAILS;
+        state.rtlLayout=rtl; state.folderPath=kThisPcLocation;
+        state.firstContentSubmittedAt=1; state.featureInitializationStep=kOverlayFeatureSteps;
+        state.total=1; state.entries.resize(1); state.selectedFlags.assign(1,0);
+        auto& entry=state.entries[0];
+        entry.name=L"Storage"; entry.path=L"windhawk:bar-color-fixture";
+        entry.folder=entry.detailsReady=true; entry.columnEpoch=state.columnEpoch;
+        ExplorerColumn name; name.key=PKEY_FileName; name.title=L"Name"; name.width=800;
+        state.columns={name};
+        UpdateMetrics(state); UpdateColumns(state);
+        Check(EnsureTarget(state),"drive color target");
+        // Light -> high contrast -> dark, using the production palette refresh.
+        for (int theme : {0,1,2}) {
+            Regression::Scope themeScope(std::string("theme=")+
+                (theme==0 ? "light" : theme==1 ? "high-contrast" : "dark"));
+            StyleFixture::highContrast=theme==1;
+            StyleFixture::appBg=theme==0 ? ABI::Windows::UI::Color{255,255,255,255} :
+                ABI::Windows::UI::Color{255,24,24,24};
+            RefreshNativePalette(state,true);
+            Check(state.driveBarWarningColor==(theme==1 ? RGB(12,110,210) : RGB(232,17,35)),
+                "drive warning palette did not follow high contrast or restore red");
+            struct Sample { ULONGLONG total,used; int percent; bool low; };
+            // Each warning is followed by normal usage to verify recovery.
+            for (const auto& sample : {Sample{1000,901,-1,true}, {1000,900,-1,false},
+                                      {1000,0,91,true}, {1000,0,90,false}}) {
+                Regression::Scope sampleScope("capacity-bytes="+std::to_string(sample.total)+
+                    " used-bytes="+std::to_string(sample.used)+
+                    " used-percent="+std::to_string(sample.percent)+
+                    " expected-low="+std::to_string(sample.low)+" expected-fill-RGB="+
+                    (sample.low ? (theme==1 ? "(12,110,210)" : "(232,17,35)") : "(0,180,0)"));
+                entry.driveTotal=sample.total; entry.driveUsed=sample.used;
+                entry.driveUsedPercent=sample.percent;
+                // Match OptionEffects::Canvas::Render: retain both resources
+                // until readback ends so Paint cannot Present and rotate buffers.
+                struct Capture {
+                    ViewState& state;
+                    ComPtr<IDXGISwapChain1> swap;
+                    HANDLE latency;
+                    ~Capture() {state.swapChain=std::move(swap); state.frameLatencyWaitable=latency;}
+                } capture{state,std::move(state.swapChain),std::exchange(state.frameLatencyWaitable,nullptr)};
+                Paint(state);
+                const auto bar=LayoutDriveBar(state,0,LayoutItem(state,LayoutRowVisual(state,0,1.f)));
+                Check(bar.visible,"drive color track");
+                ComPtr<ID2D1Bitmap1> cpu;
+                const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ|
+                    D2D1_BITMAP_OPTIONS_CANNOT_DRAW,state.backbuffer->GetPixelFormat());
+                Check(SUCCEEDED(state.target->CreateBitmap(state.backbuffer->GetPixelSize(),nullptr,0,&props,&cpu)) &&
+                    SUCCEEDED(cpu->CopyFromBitmap(nullptr,state.backbuffer.Get(),nullptr)),"drive color readback");
+                D2D1_MAPPED_RECT map{};
+                Check(SUCCEEDED(cpu->Map(D2D1_MAP_OPTIONS_READ,&map)),"drive color map");
+                const float logical=bar.track.left+(bar.track.right-bar.track.left)*.25f;
+                const UINT x=UINT(rtl ? float(cpu->GetPixelSize().width)-logical : logical);
+                const UINT y=UINT((bar.track.top+bar.track.bottom)*.5f);
+                Regression::Scope coordinateScope("pixel=("+std::to_string(x)+","+std::to_string(y)+
+                    ") buffer=("+std::to_string(cpu->GetPixelSize().width)+","+
+                    std::to_string(cpu->GetPixelSize().height)+")");
+                Check(x<cpu->GetPixelSize().width && y<cpu->GetPixelSize().height,"drive color sample bounds");
+                const auto* pixel=map.bits+size_t(y)*map.pitch+x*4;
+                // Channel dominance is independent of the classifier and of the
+                // theme text underneath the translucent fill (BGRA readback).
+                const int channel=sample.low ? (theme==1 ? 0 : 2) : 1;
+                Regression::Scope pixelScope("observed-BGRA=("+std::to_string(pixel[0])+","+
+                    std::to_string(pixel[1])+","+std::to_string(pixel[2])+","+std::to_string(pixel[3])+
+                    ") expected-alpha=[216,218] expected-dominant-channel="+
+                    (channel==0 ? "B" : channel==1 ? "G" : "R")+" gap>40");
+                // Interior alpha is .82 + .18 * (1 - .82), with byte rounding.
+                Check(pixel[3]>=216 && pixel[3]<=218 && int(pixel[channel])>int(pixel[(channel+1)%3])+40 &&
+                    int(pixel[channel])>int(pixel[(channel+2)%3])+40,"drive fill color pixels");
+                cpu->Unmap();
+            }
+        }
+        UnregisterAnimationWindow(state.hwnd); Stop(state.background); DropTarget(state); DestroyWindow(state.hwnd);
+    }
+}
+
 static void TestInlineDriveBars(HWND frame) {
     for(int dpi:{96,137,144,192}) for(float label:{20.f,120.f,480.f}) {
         const float needed=InlineDriveContentWidth(label,dpi);

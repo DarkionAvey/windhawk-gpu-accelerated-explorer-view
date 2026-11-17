@@ -148,6 +148,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("pipeline-trace", PARALLEL, TestPipelineTrace()),
     REGRESSION("property-pool-isolation", PARALLEL, TestPropertyPoolIsolation(fixture)),
     REGRESSION("drive-space-refresh", PARALLEL, TestDriveSpaceRefresh()),
+    REGRESSION("drive-low-space", PARALLEL, TestDriveLowSpaceClassification()),
+    REGRESSION("drive-bar-colors", PARALLEL, RegressionManifest::WithFrame(L"private drive color frame",1000,600, [](HWND frame) { TestDriveBarColors(frame); })),
     REGRESSION("preview-and-layout", PARALLEL, TestPreviewAndLayout(fixture)),
     REGRESSION("preprocessing-benchmarks", SERIAL(Regression::QuietCpu), TestPreprocessingBenchmarks(fixture)),
     // Shell providers and navigation.
