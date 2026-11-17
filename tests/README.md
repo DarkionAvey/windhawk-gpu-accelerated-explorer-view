@@ -82,7 +82,7 @@ blocking the gate. Up to two compiler processes run concurrently.
 ```powershell
 tests/run-regressions.ps1 -SourceFile 0.9.341.cpp                     # release gate
 tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Jobs 16            # wider
-tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Tests option-effects-list,touch-input
+tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Tests option-effects-list-details-96,touch-input
 background-regression.exe --list-tests                                # name, concurrency, gate, resources
 background-regression.exe --test option-live-sweep-details            # one test, this process
 ```
@@ -252,7 +252,8 @@ Option coverage is complete by construction:
   option, the release test that asserts its visible effect.
   `option-coverage` fails when an option lacks either.
 
-`option-effects-list`, `-grid`, `-zoom` and `-appearance` use a real private
+`option-effects-list-{details,list}-{96,144}`, `option-effects-grid`,
+`option-effects-zoom` and `option-effects-appearance` use a real private
 folder in an offscreen ExplorerBrowser, deliver each value through the
 production settings handler and read back the GPU frame. Expected results are
 independent of the renderer: row pitch and text size from DPI arithmetic,
@@ -264,6 +265,8 @@ rounding, colours and opacities, stripes, marquee, secondary text, dotfiles,
 antialiasing (when no font customizer such as MacType is injected, only the
 requested renderer mode is asserted), font family and middle ellipsis,
 in Details/List/Small/Medium/Large icons at 96/144 DPI and LTR/RTL.
+Each list-effects entry fixes one DPI and view mode, then covers both directions,
+four row heights and three text sizes (24 combinations, 96 across four entries).
 
 `option-live-sweep-details`, `-list` and `-icons` attach the production
 overlay to a genuine DefView with images, a shortcut, an archive and

@@ -1239,20 +1239,42 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
         struct Timer {HANDLE value=CreateWaitableTimerW(nullptr,FALSE,nullptr); ~Timer() {if(value) CloseHandle(value);}} timer;
         Check(timer.value!=nullptr,"fling sample timer");
         const auto pump=[] {MSG msg{}; while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&msg); DispatchMessageW(&msg);}};
+        LONGLONG logicalStep=0; // Enabled only inside the same-direction momentum scope.
+        const auto nextFrame=[&] {
+            if(logicalStep) {
+                // Device::Next uses real QPC after the harness undefines its macro.
+                // Read the held owner clock explicitly for controlled packets.
+                Check(AnimationClockFixture::held && input.realTime && input.performance,
+                    "controlled fling packet clock is not enabled");
+                ++input.frame;
+                AnimationClockFixture::Counter(&input.frameQpc);
+                Check(input.frameQpc.QuadPart>=input.startQpc.QuadPart,"controlled packet predates its clock origin");
+                input.tick=input.startTick+DWORD(1000.*(input.frameQpc.QuadPart-input.startQpc.QuadPart)/input.frequency.QuadPart);
+            } else input.Next();
+        };
         const auto sample=[&](unsigned intervals=1) {
-            LARGE_INTEGER due{}; due.QuadPart=-LONGLONG(view.frameIntervalMs*intervals*10000.);
-            Check(SetWaitableTimer(timer.value,&due,0,nullptr,nullptr,FALSE) && WaitForSingleObject(timer.value,5000)==WAIT_OBJECT_0,"fling sample cadence");
-            input.Next();
+            if(logicalStep) AnimationClockFixture::instant.QuadPart+=logicalStep*intervals;
+            else {
+                LARGE_INTEGER due{}; due.QuadPart=-LONGLONG(view.frameIntervalMs*intervals*10000.);
+                Check(SetWaitableTimer(timer.value,&due,0,nullptr,nullptr,FALSE) && WaitForSingleObject(timer.value,5000)==WAIT_OBJECT_0,"fling sample cadence");
+            }
+            nextFrame();
         };
         struct Flight {double released=0.,nativeVelocity=0.,deceleration=0.,combined=0.; LARGE_INTEGER at{}; bool horizontal=false;};
         const auto launch=[&](bool horizontal,int direction,unsigned steps,unsigned intervals,bool fresh) {
             if(fresh) {
                 Reset(view,input,true); SetScrollImmediate(view,MaxScrollPx(view)*.5f);
                 SetHorizontalScroll(view,std::max(0.f,view.columnContentWidth-ListViewportWidth(view))*.5f);
+                if(logicalStep) {
+                    // Retain ResetTime's dwTime origin, paired with the held QPC.
+                    AnimationClockFixture::Counter(&input.startQpc);
+                    input.frameQpc=input.startQpc;
+                    Check(view.qpcFrequency==double(input.frequency.QuadPart),"owner and packet QPC frequencies differ");
+                }
             }
             else {input.primary+=10;}
             POINT point{300,350};
-            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
+            nextFrame(); input.Send(view,{input.Packet(view,input.primary,point,down)});
             const auto caught=horizontal ? view.horizontalScroll:view.scrollNow;
             sample(); pump();
             Check((horizontal ? view.horizontalScroll:view.scrollNow)==caught && !view.touch.inertia,"contact failed to catch the previous coast");
@@ -1282,17 +1304,39 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
             }
             flight.combined=horizontal ? view.touch.flingVelocity.x:view.touch.flingVelocity.y;
             Check(view.touch.inertia && view.touch.flingStarted.QuadPart && flight.nativeVelocity*direction>0.,"real release failed to start velocity-based coasting");
+            if(logicalStep) {
+                LARGE_INTEGER owner{}; AnimationClockFixture::Counter(&owner);
+                Check(flight.at.QuadPart==owner.QuadPart && view.touch.sampledAt.QuadPart==owner.QuadPart &&
+                    view.touch.flingStarted.QuadPart==owner.QuadPart,"owner and released packet timestamps differ");
+            }
             return flight;
         };
         const auto finish=[&](const Flight& flight) {
-            const DWORD timeout=DWORD(std::ceil(std::abs(flight.combined)/flight.deceleration))+GetDoubleClickTime()+1000;
-            Check(Eventually([&] {pump(); return !view.touch.inertia;},timeout),"fling never reached its physical stopping time");
-            const double coast=(flight.horizontal ? view.horizontalScroll:view.scrollNow)-flight.released;
             const double sign=flight.horizontal ? (rtl ? 1.:-1.) : -1.;
             const double expected=sign*flight.combined*std::abs(flight.combined)/(2.*flight.deceleration);
+            const double limit=flight.horizontal ? std::max(0.f,view.columnContentWidth-ListViewportWidth(view)) : MaxScrollPx(view);
+            const double available=expected>=0. ? limit-flight.released : flight.released;
+            if(logicalStep) {
+                std::cout<<"FLING range start="<<flight.released<<" limit="<<limit<<" available="<<available
+                    <<" expected="<<expected<<" projected-end="<<flight.released+expected<<std::endl;
+                Check(std::abs(expected)<=available,"controlled fling trajectory exceeds the fixture scroll range");
+                // Complete the controlled coast at the first QPC tick after its
+                // physical stopping time. Presentation workers still use real time.
+                const auto stopTicks=LONGLONG(std::floor(std::abs(flight.combined)/flight.deceleration*
+                    input.frequency.QuadPart/1000.))+1;
+                AnimationClockFixture::instant.QuadPart=flight.at.QuadPart+stopTicks;
+            }
+            const DWORD timeout=DWORD(std::ceil(std::abs(flight.combined)/flight.deceleration))+GetDoubleClickTime()+1000;
+            Check(Eventually([&] {pump(); return !view.touch.inertia;},timeout),"fling never reached its physical stopping time");
+            const double finalPosition=flight.horizontal ? view.horizontalScroll:view.scrollNow;
+            const double coast=finalPosition-flight.released;
+            if(logicalStep) std::cout<<"FLING range final="<<finalPosition<<" start="<<flight.released
+                <<" limit="<<limit<<" available="<<available<<" coast="<<coast<<std::endl;
             // Scroll positions are floats at a large document offset. Repeated
             // native pan application can round by fractions of a device pixel.
-            if(std::abs(coast-expected)>.5) std::cerr<<"FLING coast="<<coast<<" expected="<<expected<<" velocity="<<flight.combined<<" deceleration="<<flight.deceleration<<std::endl;
+            if(std::abs(coast-expected)>.5) std::cerr<<"FLING coast="<<coast<<" expected="<<expected<<" velocity="<<flight.combined
+                <<" deceleration="<<flight.deceleration<<" start="<<flight.released<<" final="<<finalPosition
+                <<" limit="<<limit<<" available="<<available<<std::endl;
             Check(std::abs(coast-expected)<.5,"compositor/owner path lost more than half a pixel of fling distance");
             Check(Eventually([&] {pump(); return view.presentationAcceptedSequence>=view.presentationSequence && !view.framePaintPending;}),
                 "completed fling was not accepted by the renderer");
@@ -1303,14 +1347,52 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
         const auto slow=launch(false,direction,9,4,true); const auto slowDistance=finish(slow);
         Check(std::abs(fast.nativeVelocity)>std::abs(slow.nativeVelocity) && fastDistance>slowDistance,
             "long slow drag overpowered a short fast flick");
-        const auto first=launch(false,direction,3,1,true);
-        sample(); pump();
-        const auto repeated=launch(false,direction,3,1,false);
-        const double remaining=std::max(0.,std::abs(first.combined)-first.deceleration*1000.*(repeated.at.QuadPart-first.at.QuadPart)/input.frequency.QuadPart);
-        Check(remaining>0. && std::abs(repeated.combined-repeated.nativeVelocity-direction*remaining)<.02,
-            "successive same-direction flick did not add the remaining momentum");
-        const auto accumulatedDistance=finish(repeated);
-        Check(accumulatedDistance>fastDistance,"added momentum did not extend the displayed coast");
+        Flight repeated;
+        double accumulatedDistance=0.;
+        {
+            Regression::Scope scope("same-direction momentum dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl));
+            AnimationClockFixture::Freeze clock;
+            struct RestoreClock {
+                Device& input;
+                LONGLONG& step;
+                DWORD tick,startTick;
+                LARGE_INTEGER startQpc,frameQpc;
+                bool realTime;
+                ~RestoreClock() {
+                    input.tick=tick; input.startTick=startTick;
+                    input.startQpc=startQpc; input.frameQpc=frameQpc;
+                    input.realTime=realTime; step=0;
+                }
+            } restore{input,logicalStep,input.tick,input.startTick,input.startQpc,input.frameQpc,input.realTime};
+            logicalStep=LONGLONG(std::llround(view.frameIntervalMs*input.frequency.QuadPart/1000.));
+            Check(logicalStep>0,"logical fling cadence is below QPC resolution");
+            constexpr unsigned steps=3;
+            const auto first=launch(false,direction,steps,1,true);
+            const double stopTicks=std::abs(first.combined)/first.deceleration*input.frequency.QuadPart/1000.;
+            // Gap + caught contact + moves + release take steps+3 intervals.
+            // Fit all of them inside half the measured stopping time without
+            // slowing the second flick below the original frame cadence.
+            logicalStep=std::min(logicalStep,LONGLONG(std::floor(stopTicks/(2.*(steps+3)))));
+            Check(logicalStep>0,"remaining fling lifetime is below packet clock resolution");
+            sample(); pump();
+            repeated=launch(false,direction,steps,1,false);
+            const double elapsed=1000.*(repeated.at.QuadPart-first.at.QuadPart)/input.frequency.QuadPart;
+            const double remaining=std::max(0.,std::abs(first.combined)-first.deceleration*elapsed);
+            std::cout<<"FLING momentum dpi="<<dpi<<" rtl="<<rtl<<" first-qpc="<<first.at.QuadPart
+                <<" repeated-qpc="<<repeated.at.QuadPart<<" owner-qpc="<<AnimationClockFixture::instant.QuadPart
+                <<" caught-qpc="<<view.touch.carriedAt.QuadPart<<" step-qpc="<<logicalStep
+                <<" packet-time="<<input.tick<<" frequency="<<input.frequency.QuadPart<<" elapsed-ms="<<elapsed
+                <<" first-speed="<<first.combined<<" native-speed="<<repeated.nativeVelocity
+                <<" combined-speed="<<repeated.combined<<" first-deceleration="<<first.deceleration
+                <<" repeated-deceleration="<<repeated.deceleration<<" residual="<<remaining
+                <<" expected-speed="<<repeated.nativeVelocity+direction*remaining<<std::endl;
+            Check(repeated.at.QuadPart-first.at.QuadPart==logicalStep*(steps+3),
+                "successive flick timestamps do not match the controlled packet schedule");
+            Check(remaining>0. && std::abs(repeated.combined-repeated.nativeVelocity-direction*remaining)<.02,
+                "successive same-direction flick did not add the remaining momentum");
+            accumulatedDistance=finish(repeated);
+            Check(accumulatedDistance>fastDistance,"added momentum did not extend the displayed coast");
+        }
         launch(false,direction,3,1,true);
         const auto reverse=launch(false,-direction,3,1,false);
         Check(std::abs(reverse.combined-reverse.nativeVelocity)<.001,"reversal inherited opposite momentum");

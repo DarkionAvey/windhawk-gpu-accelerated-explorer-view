@@ -20,9 +20,12 @@ using Values=std::map<std::wstring,std::wstring>;
 
 // Where each option's user-visible effect is asserted.
 struct Coverage { const wchar_t* key; const wchar_t* test; };
+// The catalog names one release test per option. Every list partition checks
+// this same coverage contract and asserts the effects of all three options.
+inline constexpr wchar_t kListLayoutCoverageTest[]=L"option-effects-list-details-96";
 inline const Coverage kCoverage[]={
-    {L"Appearance.rowHeight",L"option-effects-list"},
-    {L"Appearance.fontSizePercent",L"option-effects-list"},
+    {L"Appearance.rowHeight",kListLayoutCoverageTest},
+    {L"Appearance.fontSizePercent",kListLayoutCoverageTest},
     {L"Appearance.gridFontSizePercent",L"option-effects-grid"},
     {L"Appearance.fontFamily",L"option-effects-appearance"},
     {L"Appearance.textAntialiasing",L"option-effects-appearance"},
@@ -34,7 +37,7 @@ inline const Coverage kCoverage[]={
     {L"Appearance.zebraOpacity",L"option-effects-appearance"},
     {L"Appearance.showEmptyRows",L"option-effects-appearance"},
     {L"Appearance.edgeMargin",L"option-effects-appearance"},
-    {L"Selection.filenameOnlySelection",L"option-effects-list"},
+    {L"Selection.filenameOnlySelection",kListLayoutCoverageTest},
     {L"Selection.selectionColor",L"option-effects-appearance"},
     {L"Selection.selectionOpacity",L"option-effects-appearance"},
     {L"Selection.selectionRadius",L"option-effects-appearance"},
@@ -120,15 +123,17 @@ struct Image {
     // Failure evidence: a 32-bit BMP in the working directory, which the
     // runner retains with the logs. Alpha is kept so transparent pixels show.
     void Save(const std::string& name) const {
+        // Parallel processes share the artifact directory, but not filenames.
+        const auto filename=std::to_string(GetCurrentProcessId())+"-"+name;
         BITMAPFILEHEADER file{}; BITMAPV5HEADER info{};
         info.bV5Size=sizeof(info); info.bV5Width=width; info.bV5Height=-height; info.bV5Planes=1;
         info.bV5BitCount=32; info.bV5Compression=BI_BITFIELDS; info.bV5RedMask=0x00FF0000;
         info.bV5GreenMask=0x0000FF00; info.bV5BlueMask=0x000000FF; info.bV5AlphaMask=0xFF000000;
         file.bfType=0x4D42; file.bfOffBits=sizeof(file)+sizeof(info); file.bfSize=DWORD(file.bfOffBits+bgra.size());
-        std::ofstream out(name,std::ios::binary);
+        std::ofstream out(filename,std::ios::binary);
         out.write(reinterpret_cast<const char*>(&file),sizeof(file)); out.write(reinterpret_cast<const char*>(&info),sizeof(info));
         out.write(reinterpret_cast<const char*>(bgra.data()),std::streamsize(bgra.size()));
-        std::cout<<"SAVED "<<name<<std::endl;
+        std::cout<<"SAVED "<<filename<<std::endl;
     }
     template<class Predicate> Box Find(RECT area,Predicate predicate) const {
         Box box;
@@ -432,37 +437,35 @@ inline std::vector<std::wstring> ListNames() {
     return names;
 }
 
-static void TestListLayouts(const std::wstring& fixture) {
+static void TestListLayouts(const std::wstring& fixture,int dpi,UINT mode) {
+    Regression::Scope view(std::string("view=")+ModeName(mode,16)+" dpi="+std::to_string(dpi));
     const auto names=ListNames();
     const auto folder=std::filesystem::path(fixture)/L"option-list";
     MakeFiles(folder,names,{L"Folder"});
     Settings settings;
-    for(int dpi:{96,144}) for(bool rtl:{false,true}) {
+    for(bool rtl:{false,true}) {
         Regression::Scope scope("dpi="+std::to_string(dpi)+(rtl ? " RTL" : " LTR"));
         Canvas canvas(folder,int(names.size())+1,dpi,rtl);
         PrepareProbe(canvas,settings);
-        for(UINT mode:{UINT(FVM_DETAILS),UINT(FVM_LIST)}) {
-            Regression::Scope view(std::string("view=")+ModeName(mode,16));
-            canvas.Layout(mode,16);
-            for(int row96:{24,32,60,96}) for(int percent:{20,52,80}) {
-                canvas.Apply(settings,L"Appearance.rowHeight",std::to_wstring(row96));
-                canvas.Apply(settings,L"Appearance.fontSizePercent",std::to_wstring(percent));
-                Regression::Scope values("row="+std::to_string(row96)+" text="+std::to_string(percent)+"%");
-                CheckFont(canvas,ListFont(row96,percent,dpi),L"H","list text size did not reach the renderer format");
-                canvas.Apply(settings,L"Selection.filenameOnlySelection",L"alwaysOff");
-                CheckRowPitch(canvas,row96);
-                CheckFullRowHighlight(canvas,L"Wide WWWW name.txt");
-                canvas.Apply(settings,L"Selection.filenameOnlySelection",L"alwaysOn");
-                for(const auto* name:{L"Wide WWWW name.txt",L"iii narrow.txt",L"Café ünïcødé.txt"})
-                    CheckFilenameHighlight(canvas,name,"list");
-                canvas.Apply(settings,L"Selection.filenameOnlySelection",L"gridOnly");
-                CheckFullRowHighlight(canvas,L"iii narrow.txt");
-            }
+        canvas.Layout(mode,16);
+        for(int row96:{24,32,60,96}) for(int percent:{20,52,80}) {
+            Regression::Scope values("row="+std::to_string(row96)+" text="+std::to_string(percent)+"%");
+            canvas.Apply(settings,L"Appearance.rowHeight",std::to_wstring(row96));
+            canvas.Apply(settings,L"Appearance.fontSizePercent",std::to_wstring(percent));
+            CheckFont(canvas,ListFont(row96,percent,dpi),L"H","list text size did not reach the renderer format");
+            canvas.Apply(settings,L"Selection.filenameOnlySelection",L"alwaysOff");
+            CheckRowPitch(canvas,row96);
+            CheckFullRowHighlight(canvas,L"Wide WWWW name.txt");
+            canvas.Apply(settings,L"Selection.filenameOnlySelection",L"alwaysOn");
+            for(const auto* name:{L"Wide WWWW name.txt",L"iii narrow.txt",L"Café ünïcødé.txt"})
+                CheckFilenameHighlight(canvas,name,"list");
+            canvas.Apply(settings,L"Selection.filenameOnlySelection",L"gridOnly");
+            CheckFullRowHighlight(canvas,L"iii narrow.txt");
         }
     }
-    settings.RequireExercised(L"option-effects-list");
+    settings.RequireExercised(kListLayoutCoverageTest);
     std::cout<<"PASS: row height, list text size and filename-only/full-row highlights match independent DPI arithmetic, "
-        "DirectWrite advances and rendered glyph pixels in Details/List at 96/144 DPI, LTR/RTL\n";
+        "DirectWrite advances and rendered glyph pixels in "<<ModeName(mode,16)<<" at "<<dpi<<" DPI, LTR/RTL\n";
 }
 
 static void TestGridLayouts(const std::wstring& fixture) {
