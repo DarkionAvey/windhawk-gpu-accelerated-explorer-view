@@ -70,6 +70,13 @@ static void TestRowComposition(HWND frame) {
                 else StartRowTransition(s,std::move(rows),oldTotal,row,s.scrollNow);
                 Check(s.rowTransitionActive,"row fixture did not start real motion");
             };
+            // The checks below need this motion still in flight. Hold the owner's
+            // animation clock and advance it only where the test lets time pass:
+            // a loaded machine can otherwise finish a 180 ms motion in between.
+            std::optional<AnimationClockFixture::Freeze> clock(std::in_place);
+            const auto advance=[&](double seconds) {
+                AnimationClockFixture::instant.QuadPart+=static_cast<LONGLONG>(s.qpcFrequency*seconds);
+            };
             capture(false); Paint(s);
             Check(s.graphicsReady && s.modeRootAttached && s.modeComposition.rows && s.modeComposition.published,
                 "structural animation still depends on owner-thread presentation");
@@ -105,6 +112,7 @@ static void TestRowComposition(HWND frame) {
             DCOMPOSITION_FRAME_STATISTICS before{},after{};
             Check(SUCCEEDED(s.composition->GetFrameStatistics(&before)),"row compositor clock before blocked owner");
             Sleep(80); // No messages, Paint, frame callback, or provider work.
+            advance(.045); // The owner's clock moves within the motion, as during that block.
             Check(SUCCEEDED(s.composition->GetFrameStatistics(&after)) && after.currentTime.QuadPart>before.currentTime.QuadPart &&
                 s.graphicsPaintSerial==paint && s.rowTransitionPresentedProgress==progress &&
                 s.modeComposition.root.Get()==root && s.rowTransitionStartedQpc.QuadPart==origin &&
@@ -131,6 +139,7 @@ static void TestRowComposition(HWND frame) {
             const float previousScroll=s.scrollNow;
             capture(true);
             Sleep(60); // A new names snapshot waits before its scene can commit.
+            advance(.060);
             Paint(s);
             const float oldProgress=LayoutTransitionProgress(s,true,previousOrigin,s.modeComposition.started);
             size_t matched=0;
@@ -146,6 +155,7 @@ static void TestRowComposition(HWND frame) {
                 ++matched;
             }
             Check(matched>0 && s.rowTransitionPresentedProgress==0.f,"replacement did not publish its new shared origin");
+            clock.reset();
             StopRowTransition(s); Paint(s);
             Check(!s.modeRootAttached && !s.modeComposition.rows,"settled rows retained temporary compositor resources");
             SetScrollImmediate(s,0); capture(true); Paint(s);

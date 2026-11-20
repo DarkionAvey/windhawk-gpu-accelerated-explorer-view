@@ -30,6 +30,13 @@
   parallel implementations. Preserve continuous input and concurrent scrolling.
 - Respect owner STA/COM boundaries, cancellation generations and callback
   draining before DLL unload. Do not forcibly terminate provider threads.
+- Never show hardcoded English (or any fixed-language) text to the user:
+  message boxes, tooltips, captions, labels, notices. Load the text from
+  Windows' own localized resources (LoadStringW on the owning system module,
+  FormatMessageW for error text, property-system display names) and keep the
+  resource identifier beside a comment naming its owner. When no localized
+  resource exists, log the condition (behind the logging option) instead of
+  inventing a fallback string. Log lines themselves stay English.
 - Preserve RTL/LTR, DPI, focus, clipboard, selection and cached-data behavior.
   Tests use private temporary fixtures and substituted clipboard/focus APIs;
   they must not depend on user folders or change the user's clipboard/focus.
@@ -53,8 +60,9 @@
   test. If a test fails only in parallel, find and isolate the shared state
   (private fixture, substituted API, per-process observation); never declare
   Serial to hide it, and never relax or retry an assertion.
-- Before reporting, run the new test alone (`--test name`) and with the suite
-  at `-Jobs 16`.
+- Before reporting, run the new test alone (`--test name`) and with the full
+  suite at the default parallelism. The scripts derive it per machine
+  (physical cores less four, at least two); do not hardcode a job count.
 - **Every test must finish within the fixed 120-second limit. There are no
   per-test timeouts and the limit is never raised, "just to be safe" or
   otherwise.** If a test approaches the limit, split it into smaller manifest

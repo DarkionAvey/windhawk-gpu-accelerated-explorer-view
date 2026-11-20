@@ -1245,7 +1245,7 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
             input.Next();
         };
         struct Flight {double released=0.,nativeVelocity=0.,deceleration=0.,combined=0.; LARGE_INTEGER at{}; bool horizontal=false;};
-        const auto launch=[&](bool horizontal,int direction,unsigned steps,unsigned intervals,bool fresh) {
+        const auto launch=[&](bool horizontal,int direction,unsigned steps,unsigned intervals,bool fresh,int stride=16) {
             if(fresh) {
                 Reset(view,input,true); SetScrollImmediate(view,MaxScrollPx(view)*.5f);
                 SetHorizontalScroll(view,std::max(0.f,view.columnContentWidth-ListViewportWidth(view))*.5f);
@@ -1263,7 +1263,7 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
             const auto begin=TouchFixture::recognized.size();
             for(unsigned step=0;step<steps;++step) {
                 sample(intervals);
-                if(horizontal) point.x+=direction*16; else point.y+=direction*16;
+                if(horizontal) point.x+=direction*stride; else point.y+=direction*stride;
                 if(horizontal) {POINT second{point.x+60,point.y}; input.Send(view,{input.Packet(view,input.primary,point,move),input.Packet(view,input.primary+1,second,move)});}
                 else input.Send(view,{input.Packet(view,input.primary,point,move)});
                 pump();
@@ -1303,14 +1303,31 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
         const auto slow=launch(false,direction,9,4,true); const auto slowDistance=finish(slow);
         Check(std::abs(fast.nativeVelocity)>std::abs(slow.nativeVelocity) && fastDistance>slowDistance,
             "long slow drag overpowered a short fast flick");
-        const auto first=launch(false,direction,3,1,true);
+        // Real input pacing sets both this flick's speed and the delay before
+        // the next contact. A long stroke keeps its coast alive well past that
+        // delay even when a loaded machine stretches every sample interval.
+        const auto first=launch(false,direction,3,1,true,64);
         sample(); pump();
         const auto repeated=launch(false,direction,3,1,false);
-        const double remaining=std::max(0.,std::abs(first.combined)-first.deceleration*1000.*(repeated.at.QuadPart-first.at.QuadPart)/input.frequency.QuadPart);
+        const double gapMs=1000.*(repeated.at.QuadPart-first.at.QuadPart)/input.frequency.QuadPart;
+        const double remaining=std::max(0.,std::abs(first.combined)-first.deceleration*gapMs);
+        if(!(remaining>0. && std::abs(repeated.combined-repeated.nativeVelocity-direction*remaining)<.02))
+            std::cerr<<"REPEAT gapMs="<<gapMs<<" lifeMs="<<std::abs(first.combined)/first.deceleration
+                <<" firstSpeed="<<first.combined<<" deceleration="<<first.deceleration<<" remaining="<<remaining
+                <<" combined="<<repeated.combined<<" native="<<repeated.nativeVelocity<<" inertiaAtCatch="
+                <<(repeated.combined!=repeated.nativeVelocity)<<std::endl;
         Check(remaining>0. && std::abs(repeated.combined-repeated.nativeVelocity-direction*remaining)<.02,
             "successive same-direction flick did not add the remaining momentum");
         const auto accumulatedDistance=finish(repeated);
-        Check(accumulatedDistance>fastDistance,"added momentum did not extend the displayed coast");
+        // Compare this flight with itself, not with another flick: each
+        // flick's native velocity follows real input pacing. The remaining
+        // momentum must lengthen the coast beyond what the new flick alone
+        // carries, by the distance kinematics gives for the added speed.
+        const double ownDistance=repeated.nativeVelocity*repeated.nativeVelocity/(2.*repeated.deceleration);
+        const double addedDistance=(repeated.combined*repeated.combined-
+            repeated.nativeVelocity*repeated.nativeVelocity)/(2.*repeated.deceleration);
+        Check(addedDistance>0. && std::abs(accumulatedDistance-ownDistance-addedDistance)<.5,
+            "added momentum did not extend the displayed coast");
         launch(false,direction,3,1,true);
         const auto reverse=launch(false,-direction,3,1,false);
         Check(std::abs(reverse.combined-reverse.nativeVelocity)<.001,"reversal inherited opposite momentum");
@@ -2065,6 +2082,40 @@ static void TestTouchInput(const std::wstring& fixture) {
             "mouse ownership did not resume hover after an explicit modality change");
         input.Next(); input.Send(state,{input.Packet(state,input.primary,point,move)});
         Check(state.pointingDevice==PointingDevice::Mouse,"stale touch update reclaimed active mouse ownership");
+        // As in native Explorer: the item a finger touched is hot, so with
+        // "underline only when I point" its name stays underlined after the
+        // finger lifts, until the mouse or another touch takes over.
+        StyleFixture::iconUnderline=2; state.clickPolicy=ReadShellClickPolicy();
+        Check(state.clickPolicy.singleClick && state.clickPolicy.underlineHot && !state.clickPolicy.underlineCold,
+            "PRESTATE: hover-only underline policy");
+        Reset(state,input); SetScrollImmediate(state,0);
+        const int touchedRow=RowFromPoint(state,point.y,point.x);
+        const POINT other{point.x,LONG(point.y+state.rowPx*2)};
+        const int otherRow=RowFromPoint(state,other.y,other.x);
+        Check(touchedRow>=0 && otherRow>=0 && otherRow!=touchedRow && TouchHotRow(state)==-1,
+            "PRESTATE: two item rows and no touched item");
+        const auto tap=[&](POINT at) {
+            input.Next(GetDoubleClickTime()+1); ++input.primary;
+            input.Send(state,{input.Packet(state,input.primary,at,down)});
+            input.Next(); input.Send(state,{input.Packet(state,input.primary,at,up)});
+            WaitForPreparedSelection(state);
+        };
+        tap(point);
+        Check(TouchHotRow(state)==touchedRow,"the touched item did not stay hot after the finger lifted");
+        tap(other);
+        Check(TouchHotRow(state)==otherRow,"touching another item did not move the hot item");
+        const std::wstring touchedPath=state.entries[size_t(otherRow)].path;
+        state.entries[size_t(otherRow)].path+=L".moved";
+        Check(TouchHotRow(state)==-1,"a row holding a different item inherited the touched item");
+        state.entries[size_t(otherRow)].path=touchedPath;
+        Check(TouchHotRow(state)==otherRow,"PRESTATE: touched item restored");
+        SetTouchInputMode(state,false);
+        Check(TouchHotRow(state)==-1,"the mouse taking over left a touched item hot");
+        tap(point);
+        Check(TouchHotRow(state)==touchedRow,"touch did not resume its hot item after the mouse");
+        ResetMouseGestureForNavigation(state);
+        Check(TouchHotRow(state)==-1,"navigation kept the previous listing's touched item");
+        Reset(state,input);
         StyleFixture::singleClick=false; state.clickPolicy=ReadShellClickPolicy();
     }
     StopTouchpad(state);

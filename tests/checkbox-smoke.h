@@ -311,6 +311,15 @@ void Pixels() {
         ApplyViewLayout(view,{mode,48},false); view.cachedNativeMode=mode;
         view.clickPolicy.checkSelect=true;
         UpdateMetrics(view); UpdateColumns(view);
+        // Check every fixture item, including its complete checkbox. A row
+        // intersecting the viewport can have its checkbox below the bitmap.
+        RECT client{}; GetClientRect(view.hwnd,&client);
+        const int height=int(std::ceil(view.headerPx+DocumentHeight(view)));
+        if(height>client.bottom) {
+            Check(SetWindowPos(view.hwnd,nullptr,0,0,client.right,height,
+                SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"checkbox fixture viewport");
+            UpdateMetrics(view); UpdateColumns(view);
+        }
         view.selectedFlags.Fill(0); view.hovered=-1;
         LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); view.qpcFrequency=double(frequency.QuadPart);
         TouchInputTest::RenderedTouch frame;
@@ -321,24 +330,29 @@ void Pixels() {
         const auto before=frame.Capture(view);
         view.hovered=0; const auto hovered=frame.Capture(view);
         const auto box=Center(view,geometry.checkbox);
-        const int pixelWidth=frame.renderer.backbuffer->GetPixelSize().width;
+        const auto surface=frame.renderer.backbuffer->GetPixelSize();
+        const auto pixelOffset=[&](LONG x,LONG y) {
+            Check(x>=0 && y>=0 && UINT(x)<surface.width && UINT(y)<surface.height,
+                "checkbox sample outside captured surface");
+            return (size_t(y)*surface.width+x)*4;
+        };
         unsigned changes=0;
         const int extent=std::max(1,Scale96(10,dpi));
         for(int y=box.y-extent;y<box.y+extent;++y) for(int x=box.x-extent;x<box.x+extent;++x) {
-            const size_t offset=(size_t(y)*pixelWidth+x)*4;
+            const size_t offset=pixelOffset(x,y);
             changes+=memcmp(before.data()+offset,hovered.data()+offset,4)!=0;
         }
         Check(changes>20,"hovered checkbox did not appear immediately at its mirrored hit target");
         const auto edge=[&](int row) {
             const auto item=LayoutItem(view,LayoutRowVisual(view,row,1.f));
             const auto point=Center(view,item.checkbox);
-            return (size_t(LONG(item.checkbox.top+(item.checkbox.right-item.checkbox.left)/40.f))*pixelWidth+point.x)*4;
+            return pixelOffset(point.x,LONG(item.checkbox.top+(item.checkbox.right-item.checkbox.left)/40.f));
         };
         SetTouchInputMode(view,true); const auto touch=frame.Capture(view);
-        for(int i:VisibleItemRows(view,0)) Check(touch[edge(i)+3]>100,"touch checkbox did not appear immediately");
+        for(int i=0;i<view.total;++i) Check(touch[edge(i)+3]>100,"touch checkbox did not appear immediately");
         view.selectedFlags[0]=1; view.selected=0;
         SetTouchInputMode(view,false); view.hovered=-1; const auto mouse=frame.Capture(view);
-        for(int i:VisibleItemRows(view,0))
+        for(int i=0;i<view.total;++i)
             Check(i==0 ? mouse[edge(i)+3]>100 : mouse[edge(i)+3]==before[edge(i)+3],
                 "mouse checkbox visibility did not immediately follow actual selection");
         view.hovered=0; frame.Capture(view); view.hovered=-1; auto checked=frame.Capture(view);

@@ -2,6 +2,7 @@
 #include <unknwn.h>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <uiautomationcore.h>
 
 static HANDLE entered,released,returned,exitWorker,unloaded;
@@ -43,12 +44,28 @@ static HMODULE Load(const wchar_t* path) {
 }
 
 int wmain(int argc,wchar_t** argv) {
-    if(argc==3 && wcscmp(argv[2],L"--process-exit")==0) {
+    if(argc==4 && wcscmp(argv[2],L"--process-exit")==0) {
         HMODULE module=Load(argv[1]);
         if(!Export<BOOL(*)()>(module,"BlockedPoolAtProcessExit")()) return 3;
+        // Setup is complete: from here only loader teardown remains.
+        HANDLE ready=OpenEventW(EVENT_MODIFY_STATE,FALSE,argv[3]);
+        if(!ready || !SetEvent(ready)) return 4;
         ExitProcess(0); // Loader teardown, deliberately without Wh_ModUninit.
     }
     if(argc!=2) return 2;
+    // USER records in-context hook modules in one session-wide table keyed by
+    // image path. Concurrent test processes loading the same DLL path share
+    // that entry, so one process's unhook cannot expunge its copy while a
+    // sibling still hooks it, leaving one reference that defeats the
+    // verified-unmapping checks. Load a private copy of the image instead.
+    const std::wstring source=argv[1];
+    const std::wstring image=source.substr(0,source.size()-4)+L"-"+std::to_wstring(GetCurrentProcessId())+L"-"+
+        std::to_wstring(GetTickCount64())+L".dll";
+    if(source.size()<5 || !CopyFileW(source.c_str(),image.c_str(),TRUE)) {
+        std::cerr<<"FAIL: private test DLL copy (error "<<GetLastError()<<")\n";
+        return 1;
+    }
+    argv[1]=const_cast<wchar_t*>(image.c_str());
     entered=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     released=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     returned=CreateEventW(nullptr,TRUE,FALSE,nullptr);
@@ -57,16 +74,32 @@ int wmain(int argc,wchar_t** argv) {
     try {
         {
             wchar_t executable[MAX_PATH]{}; Check(GetModuleFileNameW(nullptr,executable,MAX_PATH)!=0,"exit fixture executable");
-            std::wstring command=L"\""+std::wstring(executable)+L"\" \""+argv[1]+L"\" --process-exit";
+            // Setup (process start, DLL and text runtime load, worker start)
+            // and teardown are separate phases: a slow or throttled machine
+            // only delays the first, while the assertion concerns the second.
+            const std::wstring readyName=L"Local\\gpu-unload-exit-ready-"+std::to_wstring(GetCurrentProcessId())+L"-"+
+                std::to_wstring(GetTickCount64());
+            HANDLE ready=CreateEventW(nullptr,TRUE,FALSE,readyName.c_str());
+            Check(ready!=nullptr,"process-exit readiness event");
+            std::wstring command=L"\""+std::wstring(executable)+L"\" \""+argv[1]+L"\" --process-exit \""+readyName+L"\"";
             STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION process{};
             Check(CreateProcessW(executable,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process),
                 "process-exit child creation");
-            const DWORD wait=WaitForSingleObject(process.hProcess,10000);
-            DWORD code=1;
-            if(wait==WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess,&code);
+            // Failure bounds only; both together stay well inside the 120 s test limit.
+            const HANDLE setup[]{ready,process.hProcess};
+            const ULONGLONG started=GetTickCount64();
+            const DWORD setupWait=WaitForMultipleObjects(2,setup,FALSE,45000);
+            const ULONGLONG readyAt=GetTickCount64();
+            const DWORD exitWait=setupWait==WAIT_OBJECT_0 ? WaitForSingleObject(process.hProcess,30000) : setupWait;
+            DWORD code=STILL_ACTIVE;
+            if(WaitForSingleObject(process.hProcess,0)==WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess,&code);
             else {TerminateProcess(process.hProcess,1); WaitForSingleObject(process.hProcess,5000);}
-            CloseHandle(process.hThread); CloseHandle(process.hProcess);
-            Check(wait==WAIT_OBJECT_0 && code==0,"loader teardown joined an abandoned pool callback at process exit");
+            CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(ready);
+            std::cout<<"PROFILE: process-exit child setup="<<readyAt-started<<" ms teardown="<<GetTickCount64()-readyAt<<" ms\n";
+            Check(setupWait!=WAIT_TIMEOUT,"process-exit child did not finish its setup");
+            Check(setupWait==WAIT_OBJECT_0,("process-exit child failed its setup (exit code "+std::to_string(code)+")").c_str());
+            Check(exitWait==WAIT_OBJECT_0,"loader teardown joined an abandoned pool callback at process exit");
+            Check(code==0,("process-exit child exited with code "+std::to_string(code)).c_str());
             std::cout<<"PASS: graceful process exit with a blocked pool callback and registry-only worker ownership, without explicit mod cleanup\n";
         }
         {
@@ -155,10 +188,6 @@ int wmain(int argc,wchar_t** argv) {
             unload();
             Check(FreeLibrary(barrier)!=FALSE,"native barrier DLL release");
             MEMORY_BASIC_INFORMATION memory{};
-            if(VirtualQuery(barrier,&memory,sizeof(memory)) && memory.AllocationBase==barrier) {
-                wchar_t file[MAX_PATH]{}; GetModuleFileNameW(barrier,file,MAX_PATH);
-                std::wcerr<<L"Native barrier retained image="<<file<<L" type="<<memory.Type<<L" state="<<memory.State<<L'\n';
-            }
             Check(VirtualQuery(barrier,&memory,sizeof(memory)) && memory.AllocationBase!=barrier,
                 "synchronous native barrier retained its DLL after teardown");
             std::cout<<"PASS: actual disable retires a native touch recognizer/hold deadline, restores native visibility/geometry and permits verified DLL unmapping\n";
@@ -178,6 +207,7 @@ int wmain(int argc,wchar_t** argv) {
         CloseHandle(unloader); FreeLibrary(module);
         std::cout<<"PASS: an external COM reference keeps callback vtables mapped until its final Release\n";
         for(HANDLE event : {entered,released,returned,exitWorker,unloaded}) CloseHandle(event);
+        DeleteFileW(image.c_str()); // Best effort; the copy lives in the run's private artifact directory.
         return 0;
     } catch(const std::exception& error) {
         std::cerr<<"FAIL: "<<error.what()<<'\n';

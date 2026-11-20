@@ -46,6 +46,7 @@ struct Surface {
         Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(width,height),nullptr,0,&props,&cpu)),"theme readback");
         state.target->SetTarget(target.Get()); state.paintWidth=width;
         state.presentationOnly=true; state.presentationDpi=96;
+        Check(GetClientRect(state.hwnd,&state.presentationClient),"theme presentation viewport");
     }
     ~Surface() {
         if(state.target) state.target->SetTarget(previous.Get()); target.Reset(); cpu.Reset(); previous.Reset();
@@ -606,7 +607,7 @@ static void TestThemedStoragePaint(bool fill) {
 static void TestThemedStorageHeights() {
     using namespace ThemeRegression;
     StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;
-    settings.Set(L"Appearance.fontSizePercent",L"50"); settings.Set(L"Appearance.gridFontSizePercent",L"50");
+    settings.Set(L"Appearance.fontSizePercent",L"50"); settings.Set(L"Appearance.nativeGridTextPercent",L"50");
     auto entries=std::make_shared<std::vector<Entry>>(1);
     entries->front().name=L"Disk"; entries->front().driveTotal=1000;
     surface.state.presentationEntries=entries; surface.state.total=1; surface.state.thisPcGpu=true;
@@ -1006,4 +1007,141 @@ static void TestThemedCheckboxCheckmarkCache() {
     for(const auto& gradient:state.checkboxResources.gradients) Check(!gradient,"device teardown retained checkbox gradient");
     for(const auto& ramps:state.checkboxResources.ramps) for(const auto& ramp:ramps.slots) Check(!ramp.brush,"device teardown retained checkbox texture");
     std::cout<<"PASS: visible translucent checkmarks, first-stop contrast, accent/native background invalidation, warm geometry/brush reuse and bounded device caches\n";
+}
+
+// Both consumers share cached palette/gradient preparation, but retain their own geometry.
+static void TestThemedAccentSurface(bool badgeSurface) {
+    using namespace ThemeRegression;
+    OptionEffects::Settings settings; Fonts(); StyleFixture::Session style; Surface surface;
+    auto& state=surface.state; state.nativeTextColor=RGB(240,240,240); state.nativeEditBackground=RGB(32,32,32);
+    Check(MakeTextFormats(state),"badge count text format");
+    const wchar_t* name=badgeSurface ? L"PaintGroupBadge":L"DrawSwipeIndicator";
+    auto& cache=badgeSurface ? state.groupBadgeResources:state.swipeResources;
+    SectionBadge count; count.text=L"12";
+    GroupBadgeLayout badge; badge.badge=&count; badge.reveal=1.f;
+    SwipeIndicator motion; motion.direction=1; motion.originY=40;
+    const auto pose=[&](SwipeIndicator::Property property,float value) {motion.springs[property].value=motion.springs[property].target=value;};
+    pose(SwipeIndicator::Scale,1); pose(SwipeIndicator::X,20); pose(SwipeIndicator::Width,120);
+    pose(SwipeIndicator::Height,40); pose(SwipeIndicator::Alpha,1); pose(SwipeIndicator::Length,16); pose(SwipeIndicator::ArrowHeight,9);
+    float opacity=1.f; bool content=false;
+    const auto render=[&] {return surface.Render([&](ViewState& view) {
+        const float scale=view.presentationDpi/96.f;
+        badge.pill=D2D1::RectF(20*scale,20*scale,140*scale,60*scale);
+        badge.glyph=content ? 20*scale:0; badge.glyphLeft=28*scale;
+        badge.textLeft=60*scale; badge.textWidth=content ? 40*scale:0;
+        const auto saved=count.text; if(!content) count.text.clear();
+        motion.originY=40*scale; pose(SwipeIndicator::Alpha,opacity); pose(SwipeIndicator::ArrowAlpha,content ? 1.f:0.f);
+        if(badgeSurface) PaintGroupBadge(view,badge,opacity);
+        else DrawSwipeIndicator(view,motion,LARGE_INTEGER{},float(Surface::width),0,float(Surface::height));
+        count.text=saved;
+    });};
+    const auto compiled=Parse(Element(name,LR"(background="#123456" border-width="2px" border-style="dashed" border-radius="3px")"));
+    for(size_t mode=0;mode<2;++mode) {
+        const auto& styles=badgeSurface ? compiled->groupBadges[mode]:compiled->swipeIndicators[mode];
+        Check(styles[0].background.color.rgb==0x123456 && styles[0].borderWidth==2 && styles[0].borderStyle==Theme::BorderStyle::Dashed,
+            "accent surface properties did not compile");
+    }
+    for(UINT dpi:{96u,144u,192u}) for(bool rtl:{false,true}) for(int direction:{1,-1}) {
+        if(badgeSurface && direction<0) continue;
+        Regression::Scope scope(std::string(badgeSurface ? "badge":"swipe")+" dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl)+" direction="+std::to_string(direction));
+        state.presentationDpi=dpi; state.rtlLayout=rtl; state.themeMode=Theme::Mode::Light; motion.direction=direction;
+        const bool left=badgeSurface ? !rtl:(direction>0)!=rtl;
+        const int x=left ? MulDiv(20,dpi,96):int(Surface::width)-MulDiv(140,dpi,96);
+        const int y=MulDiv(40,dpi,96),width=MulDiv(120,dpi,96),top=MulDiv(20,dpi,96);
+        Load(settings,L""); const auto native=render();
+        Load(settings,Element(name,LR"(background="transparent" border-color="#ff0000" border-width="1px" border-radius="0")"));
+        const auto border=render(); const int thickness=MulDiv(1,dpi,96);
+        for(int px=x-2;px<x+thickness+3;++px) Check(At(border,px,y)==(px>=x && px<x+thickness ? 0xffff0000u:0u),
+            "accent surface border escaped bounds or lost DPI thickness");
+        Check(At(border,x+width/2,y)==0,"border-only accent surface gained a fill");
+        BorderPatterns([&](const wchar_t* pattern) {
+            Load(settings,Element(name,L"background=\"transparent\" border-color=\"#ff0000\" border-width=\"2px\" border-radius=\"0\" border-style=\""+std::wstring(pattern)+L"\""));
+            const auto pixels=render(); std::vector<DWORD> samples;
+            for(int px=x+MulDiv(8,dpi,96);px<x+width-MulDiv(8,dpi,96);++px) samples.push_back(At(pixels,px,top));
+            return samples;
+        });
+        Load(settings,L"<theme><element name=\""+std::wstring(name)+L"\" border-width=\"0\" border-radius=\"0\"><light background=\"#ff0000\" /><dark background=\"#00ff00\" /></element></theme>");
+        Check(At(render(),x+width/2,y)==0xffff0000u,"light accent surface override is wrong");
+        state.themeMode=Theme::Mode::Dark; Check(At(render(),x+width/2,y)==0xff00ff00u,"dark accent surface override is stale"); state.themeMode=Theme::Mode::Light;
+        Load(settings,Element(name,LR"(background="#ff000080" border-width="0" border-radius="0")"));
+        opacity=.5f; if(badgeSurface) badge.reveal=.5f;
+        Check(At(render(),x+width/2,y)==(badgeSurface ? 0x20200000u:0x40400000u),"accent surface alpha did not multiply animation/reveal");
+        opacity=1; badge.reveal=1;
+        Load(settings,Element(name,LR"xml(background="linear-gradient(to right, #ff0000, #0000ff)" border-width="0" border-radius="0")xml"));
+        const auto gradient=render(); const auto reads=SettingsFixture::reads;
+        auto brush=cache.gradients[0]; auto ramp=cache.ramps[0].slots[0].brush;
+        Check(gradient==render() && cache.gradients[0]==brush && cache.ramps[0].slots[0].brush==ramp && SettingsFixture::reads==reads,
+            "warm accent surface changed pixels, rebuilt brushes or read settings");
+        Check(brush && ramp,"accent gradient did not use cached native/dither brushes");
+        for(int px=x+3;px<x+width-3;++px) {
+            const double t=(px-x+.5)/width; const auto p=At(gradient,px,y);
+            Check(std::abs(int(Channel(p,16))-255*(1-t))<2 && std::abs(int(Channel(p,0))-255*t)<2,
+                "accent gradient differs from independent physical-direction interpolation or has a center seam");
+        }
+        if(!badgeSurface) {
+            pose(SwipeIndicator::Far,20);
+            Load(settings,Element(name,LR"(background="#ff0000" border-width="0" border-radius="0")")); const auto a=render();
+            Load(settings,Element(name,LR"(background="#ff0000" border-width="0" border-radius="9999px")"));
+            Check(a==render(),"swipe theme radius changed its animated shape");
+            Check(At(a,left ? x+width-1:x,top)==0,"swipe lost its dynamic far corner");
+            pose(SwipeIndicator::Far,0);
+        } else {
+            Load(settings,Element(name,LR"(background="#ff0000" border-width="0" border-radius="99999px")"));
+            Check(At(render(),x,top)==0,"group badge radius did not clamp to its bounds");
+        }
+        state.themeHighContrast=true; Check(render()==native,"accent surface high contrast did not restore native pixels"); state.themeHighContrast=false;
+        Load(settings,L""); Check(render()==native,"clearing theme did not restore native accent surface");
+    }
+    state.presentationDpi=96; state.rtlLayout=false; motion.direction=1; content=true;
+    for(const auto* background:{L"#101010",L"#eeeeee",L"linear-gradient(to right, #101010, #eeeeee)"}) {
+        Load(settings,Element(name,L"background=\""+std::wstring(background)+L"\" border-width=\"0\" border-radius=\"0\""));
+        content=false; const auto plain=render(); content=true; const auto pixels=render();
+        const bool dark=std::wstring_view(background)!=L"#eeeeee";
+        Check(cache.marks[0].r==(dark ? 1.f:0.f) && cache.marks[0].a>0 && cache.marks[0].a<1,
+            "accent foreground is not translucent or ignores the first gradient stop");
+        size_t glyph=0,text=0;
+        for(int yy=20;yy<60;++yy) for(int xx=20;xx<140;++xx) if(At(plain,xx,yy)!=At(pixels,xx,yy)) {
+            if(xx<55) ++glyph; if(xx>=60) ++text;
+        }
+        Check(badgeSurface ? glyph>20 && text>5:text>20,"badge checkmark/count or swipe chevron did not draw with calculated foreground");
+    }
+    auto glyph=state.selectionCheckGlyph; render(); render();
+    Check(!badgeSurface || (glyph && glyph==state.selectionCheckGlyph),"warm badge rebuilt its shared checkmark geometry");
+    DropTarget(state); Check(!cache.snapshot && !cache.gradients[0],"device teardown retained accent surface cache");
+    for(const auto& ramp:cache.ramps[0].slots) Check(!ramp.brush,"device teardown retained accent gradient texture");
+    BorderCacheReleased(state.themeBorderStrokes);
+    std::cout<<"PASS: "<<(badgeSurface ? "group badge":"swipe indicator")<<" DPI/RTL, physical gradients, border patterns, opacity, contrast, native fallback and caches\n";
+}
+
+static void TestThemedSwipeComposition() {
+    using namespace ThemeRegression;
+    OptionEffects::Settings settings; Fonts(); StyleFixture::Session style; Surface surface;
+    auto& state=surface.state; state.nativeTextColor=RGB(240,240,240); state.nativeEditBackground=RGB(32,32,32);
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); state.qpcFrequency=double(frequency.QuadPart);
+    auto& motion=state.swipeIndicator; motion.direction=1; motion.originY=80; QueryPerformanceCounter(&motion.origin);
+    for(auto [p,value]:std::initializer_list<std::pair<SwipeIndicator::Property,double>>{{SwipeIndicator::X,20},{SwipeIndicator::Scale,1},
+        {SwipeIndicator::Width,120},{SwipeIndicator::Height,40},{SwipeIndicator::Alpha,1},{SwipeIndicator::ArrowAlpha,1},
+        {SwipeIndicator::Length,16},{SwipeIndicator::ArrowHeight,9}}) motion.springs[p].value=motion.springs[p].target=value;
+    const auto render=[&] {state.themeSnapshot=Theme::Snapshot(); Check(RenderSwipeFeedback(state),"themed swipe compositor submission");};
+    Load(settings,Element(L"DrawSwipeIndicator",LR"(background="#101010" border-width="1px")")); render();
+    Check(state.swipeComposition[0].visible && state.swipeCompositionSerial>0,"swipe fixture produced no foreground visual");
+    const auto serial=state.swipeCompositionSerial; render(); Check(state.swipeCompositionSerial==serial,"unchanged swipe was needlessly recomposed");
+    Load(settings,Element(L"DrawSwipeIndicator",LR"(background="#eeeeee" border-width="2px")")); render();
+    Check(state.swipeCompositionSerial>serial && state.swipeResources.marks[0].r==0,"settled swipe retained old theme or contrast");
+    Load(settings,Element(L"DrawSwipeIndicator",LR"(background="accent" border-width="0")"));
+    const auto palette=g_swipePalette.load();
+    struct RestorePalette {unsigned long long value; ~RestorePalette(){g_swipePalette.store(value);}} restore{palette};
+    g_swipePalette.store((palette&~0xffffffull)|RGB(16,16,16)); render(); const auto accentSerial=state.swipeCompositionSerial;
+    g_swipePalette.store((palette&~0xffffffull)|RGB(238,238,238)); render();
+    Check(state.swipeCompositionSerial>accentSerial && state.swipeResources.marks[0].r==0,"settled swipe retained old accent contrast");
+    motion.committed=true; ++state.swipeFeedbackRevision; QueryPerformanceCounter(&motion.origin); render();
+    auto fade=state.swipeComposition[0].fade; const auto started=state.swipeComposition[0].fadeStarted.QuadPart;
+    Check(fade,"committed themed swipe has no compositor fade");
+    const auto fadingSerial=state.swipeCompositionSerial;
+    state.themeMode=Theme::Mode::Dark; render();
+    Check(state.swipeCompositionSerial>fadingSerial && fade==state.swipeComposition[0].fade && started==state.swipeComposition[0].fadeStarted.QuadPart,
+        "appearance update failed to repaint or restarted committed swipe fade");
+    state.themeHighContrast=true; render(); Check(!state.swipeResources.snapshot,"high contrast retained custom swipe resources");
+    DropTarget(state); Check(!state.swipeComposition[0].visual && !state.swipeResources.snapshot,"device teardown retained themed compositor state");
+    std::cout<<"PASS: settled/committed swipe theme updates, composition reuse, preserved fade clock, high contrast and teardown\n";
 }

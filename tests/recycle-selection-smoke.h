@@ -80,7 +80,7 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
     };
     UpdateMetrics(state);
     for(int sample=0;sample<80;++sample)
-        OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(MK_CONTROL,WHEEL_DELTA),0);
+        OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(MK_CONTROL,8*WHEEL_DELTA),0);
     RECT viewport{}; ViewClientRect(state,&viewport);
     Check(state.iconPx>1000.f && IconRequestSize(state)>=32 &&
         IconRequestSize(state)<=UINT(std::max(viewport.right,viewport.bottom)) && state.visible,
@@ -98,7 +98,7 @@ static void TestRecycleSelectionZoom(ViewState& state,SelectionFolderView& nativ
             state.selected==70 && state.selectedFlags[7] && state.selectedFlags[70] && !state.selectedFlags[128] &&
             std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)==2 && !state.directoryPending &&
             state.directoryToken==generation,"large-zoom selection echo detached, refreshed names or selected a duplicate");
-        OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(MK_CONTROL,WHEEL_DELTA),0);
+        OverlayProc(state.hwnd,WM_MOUSEWHEEL,MAKEWPARAM(MK_CONTROL,8*WHEEL_DELTA),0);
     }
     Check(native.commits==commits && native.itemArrayReads==arrays && state.columnEpoch==columnEpoch &&
         state.propertyEpoch==propertyEpoch,"namespace import echoed commands or used the UI item-array/provider path");

@@ -161,6 +161,28 @@ static void TestRenderQuality() {
         state.textRenderingParams && native->GetGamma()==state.textRenderingParams->GetGamma() &&
         native->GetEnhancedContrast()==state.textRenderingParams->GetEnhancedContrast(),"Windows mode replaced native monitor tuning");
 
+    // Fractions on either side of a device-pixel center must produce the
+    // exact glyph coverage of the integral origin, on each rendering path.
+    for(int dpi:{120,144,168,192}) {
+        state.target->SetDpi(float(dpi),float(dpi));
+        for(bool direct:{true,false}) for(bool wrapped:{false,true}) {
+            state.textRasterUnavailable=direct;
+            std::vector<DWORD> reference;
+            for(float fraction:{0.f,-.24f,.24f}) {
+                const float shift=fraction*96.f/dpi;
+                state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
+                Text(state,L"Hg grid caption",16+shift,16+shift,136+shift,64+shift,
+                    0xFFFFFF,false,1.f,false,wrapped);
+                auto pixels=read();
+                if(reference.empty()) {
+                    Check(std::any_of(pixels.begin(),pixels.end(),[](DWORD p){return p!=0;}),"empty text origin reference");
+                    reference=std::move(pixels);
+                } else Check(pixels==reference,"subpixel label origin changed physical glyph coverage");
+            }
+        }
+    }
+    state.textRasterUnavailable=false;
+    state.target->SetDpi(96,96);
     // Exact 1:1 texels stay exact through fractional placement/source transforms.
     IconRecord icon; std::array<DWORD,64> texels{};
     for(unsigned y=0;y<8;++y) for(unsigned x=0;x<8;++x) texels[y*8+x]=((x+y)&1) ? 0xFFFFFFFF : 0xFF000000;

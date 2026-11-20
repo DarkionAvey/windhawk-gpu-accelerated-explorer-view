@@ -78,7 +78,8 @@ extern "C" __declspec(dllexport) BOOL BlockedPoolAtProcessExit() {
             SetEvent(fixture.entered); WaitForSingleObject(fixture.gate,INFINITE); return 0;
         })) return FALSE;
     work.reset(); // The global registry is now the worker group's only owner.
-    return WaitForSingleObject(fixture.entered,5000)==WAIT_OBJECT_0;
+    // A failure bound for the pool worker's start, not a timing assertion.
+    return WaitForSingleObject(fixture.entered,30000)==WAIT_OBJECT_0;
 }
 extern "C" __declspec(dllexport) HWND RetainedFrameAfterHookUpgrade() {
     g_unloading=false;

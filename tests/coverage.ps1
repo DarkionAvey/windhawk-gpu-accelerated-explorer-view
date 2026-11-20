@@ -1,6 +1,6 @@
 # Compiler-measured coverage; dot-sourced by the regression runner.
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
-function Resolve-CoverageTools([string]$Compiler, [string]$Directory) {
+function Resolve-CoverageTools([string]$Compiler, [string]$Directory, [switch]$Optional) {
     if ($Directory -and ![IO.Path]::IsPathRooted($Directory)) {
         $Directory = Join-Path (Split-Path -Parent $PSScriptRoot) $Directory
     }
@@ -34,7 +34,12 @@ function Resolve-CoverageTools([string]$Compiler, [string]$Directory) {
         if (@($versions | Where-Object { $_ -notmatch "LLVM version $major\." }).Count) { continue }
         return [pscustomobject]@{Cov=(Resolve-Path -LiteralPath $cov).Path; Profdata=(Resolve-Path -LiteralPath $prof).Path; Major=$major}
     }
-    throw "Coverage needs llvm-cov.exe and llvm-profdata.exe from LLVM $major. Install matching LLVM tools or pass -LlvmToolsDirectory."
+    $message = "Coverage needs llvm-cov.exe and llvm-profdata.exe from LLVM $major. Install matching LLVM tools or pass -LlvmToolsDirectory."
+    if ($Optional) {
+        Write-Warning "Skipping coverage. $message"
+        return $null
+    }
+    throw $message
 }
 
 function New-RegressionCoverage([string]$Source, [string]$OutputDirectory, $Tools) {

@@ -285,7 +285,11 @@ static void TestExplorerColumnBridge(const std::wstring& directory) {
             }
         }
         Check(!receipts.premature,"horizontal scrollbar entered a published model before native columns/fitting settled");
-        if(enabled) Check(receipts.deferredOverflow>0,"cold column bridge did not exercise deferred provisional overflow");
+        // Witnessed where the owner decides, not by sampling models the
+        // presentation lane may already have consumed between dispatches.
+        std::cout<<"PROFILE: column bridge deferred overflow decisions="<<state->horizontalScrollbarDeferrals
+            <<" sampled models="<<receipts.deferredOverflow<<std::endl;
+        if(enabled) Check(state->horizontalScrollbarDeferrals>0,"cold column bridge did not exercise deferred provisional overflow");
     }
     std::filesystem::remove(empty);
     ShutDownFrames(); g_frameStopping=false; g_autoRefitColumns=automatic; g_writeFactory=factory;

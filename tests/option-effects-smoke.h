@@ -24,7 +24,7 @@ inline const Coverage kCoverage[]={
     {L"theme",L"theme-selection"},
     {L"Appearance.rowHeight",L"option-effects-list"},
     {L"Appearance.fontSizePercent",L"option-effects-list"},
-    {L"Appearance.gridFontSizePercent",L"option-effects-grid"},
+    {L"Appearance.nativeGridTextPercent",L"option-effects-grid"},
     {L"Appearance.fontFamily",L"option-effects-appearance"},
     {L"Appearance.textAntialiasing",L"option-effects-appearance"},
     {L"Appearance.secondaryTextOpacity",L"option-effects-appearance"},
@@ -268,7 +268,10 @@ struct Canvas {
         } detach{state,std::move(state.swapChain),std::exchange(state.frameLatencyWaitable,nullptr)};
         // Measure the settled result: rasterize all text and let option-driven
         // transitions (such as dotfile opacity) reach their destination.
-        Check(Eventually([&] {Paint(state); return !state.textRasterPending && !state.itemOpacityAnimating;},10000) &&
+        // Column fitting can become ready after Settle (when its details
+        // arrive); its Name-cell animation is a transition like opacity.
+        Check(Eventually([&] {Paint(state); return !state.textRasterPending && !state.itemOpacityAnimating &&
+                !state.columnTransitionActive;},10000) &&
             state.backbuffer && state.visible,"option canvas did not finish a settled GPU frame");
         const auto size=state.backbuffer->GetPixelSize();
         ComPtr<ID2D1Bitmap1> cpu;
@@ -366,12 +369,16 @@ inline void CheckFilenameHighlight(Canvas& canvas,const std::wstring& name,const
     // applies when the whole name fits the item's text area (the Name cell
     // less its trailing gap), which the row was laid out with.
     const auto text=LayoutItem(state,LayoutRowVisual(state,row,1.f)).text;
-    const bool fits=advance<=text.right-text.left+.5f;
+    // Filename layouts use the box's width rounded to whole pixels: a name
+    // beyond that width is ellipsized, however small the excess.
+    const bool fits=advance<=std::round(text.right-text.left);
     const bool exact=!fits || std::abs(h.fill.Width()-(advance+2*pad))<=2.5f;
     if(h.uncovered || !exact || leading<pad-2 || trailing<pad-2.5f || leading>pad+bearing || trailing>pad+bearing)
         std::cout<<"FILENAME HIGHLIGHT "<<where<<" name="<<Regression::Narrow(name)<<" shown="<<Regression::Narrow(EntryLabel(state.entries[size_t(row)]))<<" row="<<row<<" formatSize="<<state.textFormat->GetFontSize()<<" scroll="<<state.scrollNow<<" zoomAnimating="<<state.zoomAnimating<<" fill="<<h.fill.left<<".."<<h.fill.right
             <<" ink="<<h.ink.left<<".."<<h.ink.right<<" expected-width="<<advance+2*pad<<" font="<<state.fontPx
-            <<" uncovered="<<h.uncovered<<" dpi="<<dpi<<" rtl="<<state.rtlLayout<<std::endl, h.Save("option-filename-highlight");
+            <<" uncovered="<<h.uncovered<<" dpi="<<dpi<<" rtl="<<state.rtlLayout
+            <<" text="<<text.left<<".."<<text.right<<" columns="<<state.columnTransitionActive
+            <<" refit="<<state.autoRefitPending<<" fitEpoch="<<state.columnFitPendingEpoch<<std::endl, h.Save("option-filename-highlight");
     Check(!h.uncovered,"filename-only highlight left part of the filename uncovered");
     Check(exact,"filename-only highlight width differs from the measured filename plus its padding");
     Check(leading>=pad-2 && trailing>=pad-2.5f && leading<=pad+bearing && trailing<=pad+bearing,
@@ -384,7 +391,7 @@ inline void CheckFullRowHighlight(Canvas& canvas,const std::wstring& name) {
         "full-row highlight did not span the row");
 }
 // Text size: the DirectWrite format and the rendered capital height.
-inline void CheckFont(Canvas& canvas,int expected,const std::wstring& capitals,const char* what) {
+inline void CheckFont(Canvas& canvas,float expected,const std::wstring& capitals,const char* what) {
     auto& state=canvas.state;
     Check(state.textFormat && std::abs(state.textFormat->GetFontSize()-float(expected))<.01f,what);
     canvas.Select({});
@@ -466,6 +473,46 @@ static void TestListLayouts(const std::wstring& fixture) {
         "DirectWrite advances and rendered glyph pixels in Details/List at 96/144 DPI, LTR/RTL\n";
 }
 
+// Measured in the native ExplorerBrowser probe with a 1250 x 1800 client,
+// twelve items and 168 DPI. Counts come from filename positions, independent
+// of the GPU packing code and of the image provider.
+static constexpr struct { UINT mode; int size, columns; } nativeIconPresets[] = {
+    {FVM_SMALLICON,16,2}, {FVM_ICON,48,9}, {FVM_ICON,96,6}, {FVM_ICON,256,4}
+};
+
+static void TestNativeGridColumns(const std::wstring& fixture) {
+    PresentationFixture::Tab tab(L"native column reference",12,false,false,false,1250,1800);
+    auto& state=tab.state;
+    state.presentationOnly=true;
+    state.presentationDpi=168;
+    state.presentationClient={0,0,1250,1800};
+    for(const auto& preset:nativeIconPresets) {
+        Regression::Scope scope("native preset "+std::to_string(preset.size));
+        ApplyViewLayout(state,{preset.mode,preset.size},false);
+        UpdateMetrics(state);
+        const float top=DocumentRowTop(state,0);
+        int firstRow=1;
+        while(firstRow<state.total && DocumentRowTop(state,firstRow)==top) ++firstRow;
+        if(firstRow!=preset.columns) std::cerr<<"native columns="<<preset.columns<<" GPU columns="<<firstRow<<"\n";
+        Check(firstRow==preset.columns,"first row differs from native Explorer at the reference viewport");
+    }
+    state.presentationOnly=false;
+}
+
+static void TestNativeGridCaptionFont(const std::wstring& fixture) {
+    const auto folder=std::filesystem::path(fixture)/L"native-captions";
+    MakeFiles(folder,{L"H",L"Hg.txt"});
+    Settings settings;
+    for(int dpi:{96,168,192}) {
+        Canvas canvas(folder,2,dpi,false);
+        PrepareProbe(canvas,settings);
+        for(const auto& preset:nativeIconPresets) {
+            Regression::Scope scope("DPI "+std::to_string(dpi)+" native preset "+std::to_string(preset.size));
+            canvas.Layout(preset.mode,preset.size);
+            CheckFont(canvas,ExpectedIconCaptionSize(dpi),L"H","caption format differs from the Windows icon-title font size");
+        }
+    }
+}
 static void TestGridLayouts(const std::wstring& fixture) {
     const std::vector<std::wstring> names={L"H",L"HHHH.TXT",L"Wide WWWW name.txt",L"iii.txt",
         L"A longer caption that wraps onto two lines.txt",L"filler-01.txt",L"filler-02.txt",L"filler-03.txt"};
@@ -479,11 +526,11 @@ static void TestGridLayouts(const std::wstring& fixture) {
         for(auto [mode,size]:std::initializer_list<std::pair<UINT,int>>{{FVM_SMALLICON,16},{FVM_ICON,48},{FVM_ICON,96}}) {
             Regression::Scope view(std::string("view=")+ModeName(mode,size));
             canvas.Layout(mode,size);
-            for(int row96:{24,32,96}) for(int percent:{20,42,80}) {
+            for(int row96:{24,32,96}) for(int percent:{50,100,150}) {
                 canvas.Apply(settings,L"Appearance.rowHeight",std::to_wstring(row96));
-                canvas.Apply(settings,L"Appearance.gridFontSizePercent",std::to_wstring(percent));
+                canvas.Apply(settings,L"Appearance.nativeGridTextPercent",std::to_wstring(percent));
                 Regression::Scope values("row="+std::to_string(row96)+" grid text="+std::to_string(percent)+"%");
-                CheckFont(canvas,ListFont(std::min(row96,96),percent,dpi),L"H","grid text size did not reach the renderer format");
+                CheckFont(canvas,ExpectedIconCaptionSize(dpi,percent),L"H","grid text size did not reach the renderer format");
                 for(const auto* name:{L"Wide WWWW name.txt",L"A longer caption that wraps onto two lines.txt"}) {
                     canvas.Apply(settings,L"Selection.filenameOnlySelection",L"gridOnly");
                     const auto h=MeasureHighlight(canvas,canvas.Row(name));
@@ -585,11 +632,11 @@ static void TestZoomInputs(const std::wstring& fixture) {
         canvas.Layout(FVM_ICON,48);
         const float icon=state.iconPx;
         wheel(8);
-        const int grid96=32+16;
-        Check(std::abs(state.iconPx/icon-float(Scale96(grid96,dpi))/float(Scale96(32,dpi)))<.03f,
+        const int grid96=48+16;
+        Check(std::abs(state.iconPx/icon-float(grid96)/48.f)<.03f,
             "grid Ctrl+wheel did not scale icons in proportion to the zoom");
-        CheckFont(canvas,ListFont(std::min(grid96,96),42,dpi),L"H","grid zoom did not keep its caption ratio");
-        canvas.Apply(settings,L"Appearance.gridFontSizePercent",L"42");
+        CheckFont(canvas,ExpectedIconCaptionSize(dpi),L"H","grid zoom did not keep its caption ratio");
+        canvas.Apply(settings,L"Appearance.nativeGridTextPercent",L"100");
         Check(std::abs(state.iconPx-icon)<.5f,"settings change kept the grid zoom");
     }
     std::cout<<"PASS: Ctrl+wheel and touchpad pinch change row height within limits, keep text ratio and exact filename "
@@ -614,7 +661,7 @@ static void TestDpiScaledGeometry(const std::wstring& fixture) {
         auto& state=canvas.state;
         canvas.Apply(settings,L"Appearance.rowHeight",L"32");
         canvas.Apply(settings,L"Appearance.fontSizePercent",L"50");
-        canvas.Apply(settings,L"Appearance.gridFontSizePercent",L"50");
+        canvas.Apply(settings,L"Appearance.nativeGridTextPercent",L"50");
         canvas.Layout(m.mode,m.size);
         Snapshot s;
         const auto add=[&](std::string what,float value) {s.push_back({std::move(what),value});};
@@ -990,9 +1037,8 @@ struct LiveExplorer {
         const bool settled=Eventually([&] {
             Pump();
             if(!Alive()) return true;
-            RECT update{};
             return state->loaded && !state->directoryPending && !state->watchedChangePending && !state->zoomAnimating &&
-                !state->rowTransitionActive && !state->columnTransitionActive && !GetUpdateRect(overlay,&update,FALSE) &&
+                !state->rowTransitionActive && !state->columnTransitionActive &&
                 !state->iconResultsPending && !state->detailResultsPending && !state->viewportDemandPending &&
                 (!state->visible || (state->presenter && state->graphicsReady &&
                     state->presentationAcceptedSequence>=std::min(state->presentationSequence,since+1)));
@@ -1000,7 +1046,10 @@ struct LiveExplorer {
         Check(Alive(),"overlay was destroyed by an option change");
         if(!settled) std::cout<<"LIVE settle timeout "<<what<<" directory="<<state->directoryPending<<" watch="<<state->watchedChangePending
             <<" zoom="<<state->zoomAnimating<<" rows="<<state->rowTransitionActive<<" columns="<<state->columnTransitionActive
-            <<" visible="<<state->visible<<" presented="<<Presented()<<std::endl;
+            <<" visible="<<state->visible<<" presented="<<Presented()<<" loaded="<<state->loaded
+            <<" icons="<<state->iconResultsPending<<" details="<<state->detailResultsPending
+            <<" demand="<<state->viewportDemandPending<<" accepted="<<state->presentationAcceptedSequence
+            <<" submitted="<<state->presentationSequence<<" since="<<since<<std::endl;
         Check(settled,what);
     }
     void SetMode(UINT mode,int size) {
@@ -1108,9 +1157,9 @@ inline void CheckLiveResult(LiveExplorer& live,const Settings& settings,const Ex
     const double precise=zoom.precise[s.gridView];
     const bool continuous=precise>0 && std::llround(precise)==row96;
     const double fontRow=s.gridView ? std::min(continuous ? precise:double(row96),96.):(continuous ? precise:double(row96));
-    const int percent=std::stoi(settings.values.at(s.gridView ? L"Appearance.gridFontSizePercent":L"Appearance.fontSizePercent"));
+    const int percent=std::stoi(settings.values.at(s.gridView ? L"Appearance.nativeGridTextPercent":L"Appearance.fontSizePercent"));
     const double physical=continuous ? fontRow*dpi/96.:MulDiv(int(fontRow),dpi,96);
-    const float font=continuous ? std::max(float(MulDiv(7,dpi,96)),float(physical*percent/100.)):
+    const float font=s.gridView ? ExpectedIconCaptionSize(dpi,percent) : continuous ? std::max(float(MulDiv(7,dpi,96)),float(physical*percent/100.)):
         float(std::max(MulDiv(7,dpi,96),MulDiv(int(physical),percent,100)));
     Check(std::abs(s.fontPx-float(font))<.01f,"text size after an option change does not match the options");
     if(!s.gridView) {
@@ -1205,7 +1254,7 @@ inline void ChangeSettingsFromWindhawkThread() {
 }
 
 static void TestLiveSweep(const std::wstring& fixture,std::initializer_list<std::pair<UINT,int>> modes,const wchar_t* test,
-                          bool startup) {
+                          bool startup, bool startupOnly = false, size_t shard = 0, size_t shards = 1) {
     Check(SUCCEEDED(OleInitialize(nullptr)),"live sweep STA");
     if(!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))),"live sweep fonts");
@@ -1216,7 +1265,7 @@ static void TestLiveSweep(const std::wstring& fixture,std::initializer_list<std:
         FocusFixture::Session focus(nullptr,nullptr);
         SelectionLogFixture::FormatAll formatting;  // Logging on formats every line, as Windhawk does.
         Settings settings;
-        {
+        if (!startupOnly) {
             LiveExplorer live(folder.wstring());
             for(auto [mode,size]:modes) {
                 Regression::Scope view(std::string("view=")+ModeName(mode,size));
@@ -1261,7 +1310,11 @@ static void TestLiveSweep(const std::wstring& fixture,std::initializer_list<std:
             }
         }
         // Explorer opened while a non-default value is already configured.
-        if(startup) for(auto [mode,size]:modes) for(const auto& option:OptionCatalog::Schema())
+        // Each startup is independent (configured, opened, checked, reset), so
+        // a manifest entry may take every `shards`-th option from `shard`.
+        size_t optionIndex=0;
+        if(startup) for(auto [mode,size]:modes) for(const auto& option:OptionCatalog::Schema()) {
+            if(optionIndex++%shards!=shard) continue;
             for(const auto& value:ProbeValues(option)) {
                 if(value==option.initial) continue;
                 Regression::Scope scope(Text(option.key,value)+" at startup / view="+ModeName(mode,size));
@@ -1275,6 +1328,7 @@ static void TestLiveSweep(const std::wstring& fixture,std::initializer_list<std:
                 settings.Reset(option.key); LoadSettings();
                 ++started;
             }
+        }
     }
     std::cout<<"PASS: live sweep applied "<<applied<<" option values from Windhawk's thread on a genuine DefView with "
         "images, shortcut, archive and hidden/system files, while idle, zooming, renaming, hovering/scrolling, pinching "

@@ -151,6 +151,11 @@ static void TestPixelSnapping() {
         StyleFixture::Session style; StyleFixture::dpi=dpi;
         PresentationFixture::Tab tab(L"pixel snapping",40,rtl,IsIconViewMode(mode));
         auto& view=tab.state;
+        // Keep the opaque white image. A white 80% checkbox outline between
+        // blue and white is indistinguishable from fractional edge coverage.
+        // Give the outline a third hue so the detector can distinguish the
+        // actual stroke from a blend of its two neighbours.
+        view.nativeTextColor=RGB(180,20,110);
         ApplyViewLayout(view,{mode,48},false); view.cachedNativeMode=mode;
         view.clickPolicy.checkSelect=true;
         UpdateMetrics(view); UpdateColumns(view);

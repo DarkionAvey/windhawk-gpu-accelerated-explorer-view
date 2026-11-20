@@ -10,13 +10,13 @@ static void TestOptionConsumers(Set set) {
         PresentationFixture::Tab tab(L"option-consumers",150);
         auto& state=tab.state;
         FocusFixture::Session focus(tab.frame,state.hwnd);
-        for(int row:{24,48,96}) for(int listFont:{20,52,80}) for(int gridFont:{20,42,80}) {
+        for(int row:{24,48,96}) for(int listFont:{20,52,80}) for(int gridFont:{50,100,150}) {
             set(L"Appearance.rowHeight",std::to_wstring(row));
             set(L"Appearance.fontSizePercent",std::to_wstring(listFont));
-            set(L"Appearance.gridFontSizePercent",std::to_wstring(gridFont));
+            set(L"Appearance.nativeGridTextPercent",std::to_wstring(gridFont));
             for(UINT mode:{FVM_DETAILS,FVM_LIST,FVM_ICON,FVM_SMALLICON}) {
                 ApplyViewLayout(state,{mode,48},false); UpdateMetrics(state);
-                const int expected=std::max(7,MulDiv(Scale96(row,ViewDpi(state)),
+                const float expected=state.gridView ? ExpectedIconCaptionSize(ViewDpi(state),gridFont) : std::max(7,MulDiv(Scale96(row,ViewDpi(state)),
                     state.gridView ? gridFont : listFont,100));
                 Check(state.fontPx==expected && (state.gridView || state.rowPx==Scale96(row,ViewDpi(state))),
                     "independent list/grid font setting did not reach layout metrics");
@@ -27,16 +27,16 @@ static void TestOptionConsumers(Set set) {
         // Caption size remains bounded at very large image zoom, independently
         // of the list font preference and at each tested density.
         state.presentationOnly=true; state.rowHeight96[true]=384;
-        for(int dpi:{96,144,192}) for(int gridFont:{20,42,80}) {
+        for(int dpi:{96,144,192}) for(int gridFont:{50,100,150}) {
             state.presentationDpi=dpi;
-            set(L"Appearance.gridFontSizePercent",std::to_wstring(gridFont)); UpdateMetrics(state);
-            Check(state.fontPx==std::max(7,MulDiv(Scale96(96,dpi),gridFont,100)),
+            set(L"Appearance.nativeGridTextPercent",std::to_wstring(gridFont)); UpdateMetrics(state);
+            Check(state.fontPx==ExpectedIconCaptionSize(dpi,gridFont),
                 "large grid zoom bypassed its independent caption setting or font cap");
         }
         state.presentationOnly=false; state.rowHeight96[true]=0;
         ApplyViewLayout(state,{FVM_DETAILS,48},false);
         set(L"Appearance.rowHeight",L"32"); set(L"Appearance.fontSizePercent",L"44");
-        set(L"Appearance.gridFontSizePercent",L"42"); UpdateMetrics(state);
+        set(L"Appearance.nativeGridTextPercent",L"100"); UpdateMetrics(state);
         set(L"Appearance.fontFamily",L"Segoe UI"); Check(MakeTextFormats(state),"configured font formats");
         for(auto* format:{state.textFormat.Get(),state.headerFormat.Get(),state.sortedHeaderFormat.Get()}) {
             std::wstring family(format->GetFontFamilyNameLength()+1,L'\0');
@@ -116,7 +116,7 @@ struct Integer {
 inline const Integer integers[]={
     {L"Appearance.rowHeight",32,24,96,&g_row96},
     {L"Appearance.fontSizePercent",44,20,80,&g_fontPercent},
-    {L"Appearance.gridFontSizePercent",42,20,80,&g_gridFontPercent},
+    {L"Appearance.nativeGridTextPercent",100,25,300,&g_gridFontPercent},
     {L"Appearance.secondaryTextOpacity",45,0,100,&g_secondaryOpacity},
     {L"Appearance.zebraOpacity",4,0,100,&g_zebraOpacity},
     {L"Appearance.edgeMargin",10,0,400,&g_edgeMargin96},

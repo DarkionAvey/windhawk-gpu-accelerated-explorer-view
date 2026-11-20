@@ -812,10 +812,11 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     }
     // Wheel and pinch share their implementation, but each layout family
     // must restore its own metrics, text size and tab-local preference.
+    const int startingIcon = state->layoutIconSize;
     const int listHeight = state->rowHeight96[false] ? state->rowHeight96[false] : g_row96.load();
     OverlayProc(overlay,WM_MOUSEWHEEL,MAKEWPARAM(MK_CONTROL,48*WHEEL_DELTA),0);
     const int gridHeight = state->rowHeight96[true];
-    Check(state->zoomAnimating && gridHeight==g_row96.load()+96 && gridHeight>96 &&
+    Check(state->zoomAnimating && gridHeight==startingIcon+96 && gridHeight>96 &&
         !state->rowHeight96[false],"grid wheel zoom changed the list zoom preference");
     state->wheelRemainder=WHEEL_DELTA/2;
     state->touchpadPinching=true; state->touchpadPinchHeight96=static_cast<float>(gridHeight);
@@ -823,7 +824,7 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
     Check(!state->gridView && !state->zoomAnimating && !state->touchpadPinching &&
         !state->wheelRemainder && state->rowPx==Scale96(listHeight,DpiOf(overlay)) &&
         fabsf(state->textFormat->GetFontSize()-state->fontPx)<.001f &&
-        state->rowHeight96[true]==gridHeight,
+        state->rowHeight96[true]==0,
         "leaving a running grid zoom leaked its size, font or input accumulator into Details");
     const bool manipulation = state->manipulationEnabled;
     state->manipulationEnabled=true;
@@ -831,14 +832,13 @@ static void TestAttachedLifecycle(const std::wstring& directory) {
         static_cast<LPARAM>(std::lround(logf(1.08f)*65536.f)));
     const int pinchedList = static_cast<int>(std::lround(listHeight*1.08f));
     AdvanceRowHeight(*state,true);
-    Check(state->rowHeight96[false]==pinchedList && state->rowHeight96[true]==gridHeight,
+    Check(state->rowHeight96[false]==pinchedList && state->rowHeight96[true]==0,
         "pinch resumed from the old grid height or changed the grid preference");
     state->manipulationEnabled=manipulation; state->touchpadPinching=false;
     for (UINT mode : {FVM_LIST,FVM_ICON,FVM_DETAILS,FVM_ICON}) {
         userMode(mode); FinishColumnTransition(*state);
-        Check(state->rowHeight96[false]==pinchedList && state->rowHeight96[true]==gridHeight &&
-            fabsf(state->fontPx-Scale96(state->gridView ? std::min(gridHeight,96) : pinchedList,DpiOf(overlay))*
-                (state->gridView ? g_gridFontPercent.load() : g_fontPercent.load())/100.f)<1.f &&
+        Check(state->rowHeight96[false]==pinchedList && state->rowHeight96[true]==0 &&
+            fabsf(state->fontPx-(state->gridView ? ExpectedIconCaptionSize(DpiOf(overlay),g_gridFontPercent.load()) : Scale96(pinchedList,DpiOf(overlay))*g_fontPercent.load()/100.f))<1.f &&
             fabsf(state->textFormat->GetFontSize()-state->fontPx)<.001f &&
             state->tabPresentations[state->activeTabHost].zoomHeight96==state->rowHeight96 &&
             !(GetWindowLongPtrW(host,GWL_STYLE)&WS_VISIBLE),

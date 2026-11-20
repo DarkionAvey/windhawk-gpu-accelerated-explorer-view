@@ -14,7 +14,7 @@ static void TestLargeTileBackpressure() {
             latency==1,"swap chain queues stale frames");
         state.presentationOnly=true; state.presentationActive=true;
         state.presentationClient={0,0,2560,1440}; state.presentationDpi=96;
-        state.rowHeight96[1]=1600; UpdateMetrics(state); UpdateColumns(state);
+        state.rowHeight96[1]=state.presentationClient.right; UpdateMetrics(state); UpdateColumns(state);
         Check(state.itemsPerRow==1 && state.iconPx>2000,"large tile fixture did not reach one item per row");
         state.graphicsPaintSerial=state.lastAcceptedPaint=10;
         state.presentationContentAccepted=true;
@@ -77,7 +77,7 @@ static void TestLargeTileBackpressure() {
     {
         PresentationFixture::Tab tab(L"busy render owner",12,false,true,false,2560,1440);
         FocusFixture::Session focus(tab.frame,tab.state.hwnd);
-        tab.state.rowHeight96[1]=1600; UpdateMetrics(tab.state); UpdateColumns(tab.state);
+        tab.state.rowHeight96[1]=2560; UpdateMetrics(tab.state); UpdateColumns(tab.state);
         tab.Start();
         tab.Await([](const auto& r) {return r.accepted && !r.opacity;});
         Check(Eventually([&] {return !tab.state.presenter->animating.load();}),"large tile worker did not settle");

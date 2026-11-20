@@ -1,7 +1,8 @@
 param(
     [string]$SourceFile,
     [string]$WindhawkDirectory,
-    [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
+    # 0: derived from this machine's physical cores (Get-RegressionJobCount).
+    [ValidateRange(0,32)][int]$Jobs = 0,
     [switch]$KeepArtifacts,
     [switch]$Coverage,
     [string]$LlvmToolsDirectory,
@@ -11,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'repository.ps1')
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root 'tests\parallel-runner.ps1')
+if (!$Jobs) { $Jobs = Get-RegressionJobCount }
 if ($OutputDirectory -and ![IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory = Join-Path $root $OutputDirectory }
 $resultDirectory = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) }
     else { Join-Path ([IO.Path]::GetTempPath()) ('gpu-overlay-build-' + [guid]::NewGuid().ToString('N')) }

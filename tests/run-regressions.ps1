@@ -6,7 +6,8 @@ param(
     # Selected tests keep their Parallel/Serial scheduling.
     [string[]]$Tests = @(),
     [string]$MinifiedSourceFile,
-    [ValidateRange(1,32)][int]$Jobs = [Math]::Min(4,[Environment]::ProcessorCount),
+    # 0: derived from this machine's physical cores (Get-RegressionJobCount).
+    [ValidateRange(0,32)][int]$Jobs = 0,
     # A hard ceiling: may be lowered for diagnosis, never raised. See tests/README.md.
     [ValidateRange(1,120)][int]$TestTimeoutSeconds = 120,
     [switch]$KeepArtifacts,
@@ -14,6 +15,7 @@ param(
     [switch]$Diagnostic,
     [scriptblock]$ProgressAction,
     [switch]$Coverage,
+    [switch]$OptionalCoverage,
     [string]$LlvmToolsDirectory,
     [string]$OutputDirectory
 )
@@ -27,6 +29,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\repository.ps1')
 . (Join-Path $PSScriptRoot 'parallel-runner.ps1')
 . (Join-Path $PSScriptRoot 'coverage.ps1')
+if (!$Jobs) { $Jobs = Get-RegressionJobCount }
 $totalClock = [Diagnostics.Stopwatch]::StartNew()
 if ($OutputDirectory -and ![IO.Path]::IsPathRooted($OutputDirectory)) {
     $OutputDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) $OutputDirectory
@@ -43,7 +46,10 @@ try {
     $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
     $compilerDirectory = Join-Path $WindhawkDirectory 'Compiler'
     $compiler = Join-Path $compilerDirectory 'bin\clang++.exe'
-    $coverageTools = if ($Coverage) { Resolve-CoverageTools $compiler $LlvmToolsDirectory } else { $null }
+    $coverageTools = if ($Coverage) {
+        Resolve-CoverageTools $compiler $LlvmToolsDirectory -Optional:$OptionalCoverage
+    }
+    if ($Coverage -and !$coverageTools) { $Coverage = $false }
     $testDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
     if (![IO.Path]::IsPathRooted($SourceFile)) { $SourceFile = Join-Path (Split-Path -Parent $testDirectory) $SourceFile }
     $sourcePath = (Resolve-Path -LiteralPath $SourceFile).ProviderPath
@@ -167,10 +173,21 @@ try {
     $previousPath = $env:PATH
     $previousProfile = $env:LLVM_PROFILE_FILE
     $testsPassed = $false
+    $coverageStarted = $false
     try {
-        if ($Coverage) { $env:LLVM_PROFILE_FILE = $coverageRun.Pattern }
         $env:PATH = (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin') + ';' +
             (Join-Path $compilerDirectory 'bin') + ';' + $previousPath
+        if ($compilePipeline) {
+            & $executable --check-mactype
+            if ($LASTEXITCODE -eq 1) {
+                throw 'PENDING: MacType is injected into background-regression.exe. Add the filename background-regression.exe under [UnloadDll] in the active MacType profile before running regressions.'
+            }
+            if ($LASTEXITCODE -ne 0) { throw "MacType preflight could not run (exit $LASTEXITCODE)." }
+        }
+        if ($Coverage) {
+            $env:LLVM_PROFILE_FILE = $coverageRun.Pattern
+            $coverageStarted = $true
+        }
         $testTasks = @()
         if ($unloadExe) { $testTasks += [pscustomobject]@{
             Name='unload'; FilePath=$unloadExe; Arguments=@($unloadDll); Serial=$false} }
@@ -207,7 +224,7 @@ try {
     } finally {
         $env:LLVM_PROFILE_FILE = $previousProfile
         try {
-            if ($Coverage) {
+            if ($coverageStarted) {
                 $objects = @()
                 if ($compilePipeline) { $objects += $executable }
                 if ($compileUnload) { $objects += $unloadDll }

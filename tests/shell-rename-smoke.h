@@ -323,6 +323,9 @@ static void TestNativeMultipleRename(const std::wstring& fixture) {
 // the wake, and the hit target is the filename text, not the Name column.
 static void TestClickRename(const std::wstring& fixture) {
     using namespace ShellRenameFixture;
+    ModifierFixture::Session modifiers;
+    StyleFixture::Session style;
+    StyleFixture::singleClick = false;
     const auto root = std::filesystem::path(fixture) / L"click-rename";
     CreateFiles(root, {L"alpha.txt", L"beta.txt", L"gamma.txt"});
     ProviderSelectionFixture::Browser host, other;
@@ -611,7 +614,7 @@ static void TestRenameTextMetrics(const std::wstring& fixture) {
     auto values = OptionCatalog::Defaults();
     values[L"Appearance.rowHeight"] = L"32";
     values[L"Appearance.fontSizePercent"] = L"52";
-    values[L"Appearance.gridFontSizePercent"] = L"42";
+    values[L"Appearance.nativeGridTextPercent"] = L"100";
     struct Restore { ~Restore() { SettingsFixture::values = nullptr; } } restore;
     SettingsFixture::values = &values;
     const auto factoryBefore = g_writeFactory;

@@ -69,9 +69,23 @@ static void TestIconQueueIsolation() {
               "empty Shell responses were cached forever or retried without a bound");
         RequestVisibleIcons(other); ReceiveIcons(other);
         Check(IconFixture::permanentCalls == 2, "permanent icon failure was resubmitted after its retry limit");
+        // A demand pass may yield its queue lock or admission work to a provider.
+        // Wait for that pass to finish, rather than inspecting an intermediate queue.
+        const auto completeDemand=[&](State& state) {
+            Check(Eventually([&] {
+                if(state.viewportDemandPending) RequestVisibleIcons(state);
+                return !state.viewportDemandPending;
+            }),"deferred icon viewport demand did not complete");
+        };
+        completeDemand(blocked);
         const auto oldId = blocked.icons.at(blocked.entries[5].path).pendingRequestId;
         blocked.scrollNow = blocked.scrollTarget = 15 * blocked.rowPx;
-        RequestVisibleIcons(blocked);
+        {
+            ExclusiveSrwLock held(blocked.background->iconLock);
+            RequestVisibleIcons(blocked); // Force the same bounded deferral as a busy provider.
+            Check(blocked.viewportDemandPending,"contended viewport demand was not scheduled for a follow-up");
+        }
+        completeDemand(blocked);
         Check(!blocked.icons.at(blocked.entries[5].path).pending &&
               !blocked.icons.at(blocked.entries[5].path).resolved, "offscreen queued icons were stranded as pending/resolved");
         const auto visible = VisibleItemRows(blocked, 0.f);
@@ -84,9 +98,21 @@ static void TestIconQueueIsolation() {
             Check(std::any_of(visible.begin(), visible.end(), [&](int row) {
                 return front->key == blocked.entries[row].path;
             }), "overscan or old viewport stayed ahead of visible icons");
+            bool overscanSeen=false; size_t visibleJobs=0,overscanJobs=0;
+            for(const auto& job:blocked.background->iconJobs) {
+                if(job.useAttributes || job.overlayQuery) continue;
+                const bool onscreen=std::any_of(visible.begin(),visible.end(),[&](int row) {
+                    return job.key==blocked.entries[row].path;
+                });
+                if(onscreen) {
+                    Check(!overscanSeen,"new visible icons were appended behind retained overscan");
+                    ++visibleJobs;
+                } else {overscanSeen=true; ++overscanJobs;}
+            }
+            Check(visibleJobs>0 && overscanJobs>0,"viewport priority fixture lost visible/overscan coverage");
         }
         blocked.scrollNow = blocked.scrollTarget = 0;
-        RequestVisibleIcons(blocked);
+        RequestVisibleIcons(blocked); completeDemand(blocked);
         Check(blocked.icons.at(blocked.entries[5].path).pending &&
               blocked.icons.at(blocked.entries[5].path).pendingRequestId != oldId,
               "cancelled queued icon could not be requested on return");

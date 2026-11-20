@@ -1,0 +1,90 @@
+<theme>
+  <element name="FillSelectionRect:hover" border-width="0px">
+    <light background="linear-gradient(to bottom, #c0c0c0, #909090)" />
+    <dark background="linear-gradient(to bottom, #727272, #444444)" />
+  </element>
+  <element name="FillSelectionRect:selected" border-width="0px">
+    <light background="linear-gradient(to bottom, #8a8a8a, #505050)" />
+    <dark background="linear-gradient(to bottom, #aaaaaa, #707070)" />
+  </element>
+  <element name="FillSelectionRect:selected:hover" border-width="0px">
+    <light background="linear-gradient(to bottom, #787878, #424242)" />
+    <dark background="linear-gradient(to bottom, #bababa, #828282)" />
+  </element>
+  <element name="DrawMarquee" border-width="0px" border-radius="3px">
+    <light background="linear-gradient(to bottom, #909090, #646464)" />
+    <dark background="linear-gradient(to bottom, #a4a4a4, #767676)" />
+  </element>
+  <element name="DrawScrollbar:track" border-width="0px" border-radius="3px">
+    <light background="#e6e6e6" />
+    <dark background="#323232" />
+  </element>
+  <element name="DrawScrollbar:thumb" border-width="0px" border-radius="3px">
+    <light background="linear-gradient(to bottom, #919191, #646464)" />
+    <dark background="linear-gradient(to bottom, #909090, #606060)" />
+  </element>
+  <element name="DrawScrollbar:thumb:hover" border-width="0px">
+    <light background="linear-gradient(to bottom, #7d7d7d, #525252)" />
+    <dark background="linear-gradient(to bottom, #a4a4a4, #767676)" />
+  </element>
+  <element name="DrawScrollbar:thumb:pressed" border-width="0px">
+    <light background="linear-gradient(to bottom, #696969, #404040)" />
+    <dark background="linear-gradient(to bottom, #b4b4b4, #888888)" />
+  </element>
+  <element name="RenderItemTip" border-width="0px" border-radius="3px">
+    <light background="linear-gradient(to bottom, #f6f6f6, #d9d9d9)" />
+    <dark background="linear-gradient(to bottom, #404040, #222222)" />
+  </element>
+  <element name="DrawSelectionCheckbox" border-width="0px" border-radius="3px">
+    <light background="linear-gradient(to bottom, #bcbcbc, #939393)" />
+    <dark background="linear-gradient(to bottom, #737373, #515151)" />
+  </element>
+  <element name="DrawSelectionCheckbox:hover" border-width="0px">
+    <light background="linear-gradient(to bottom, #afafaf, #838383)" />
+    <dark background="linear-gradient(to bottom, #848484, #626262)" />
+  </element>
+  <element name="DrawSelectionCheckbox:pressed" border-width="0px">
+    <light background="linear-gradient(to bottom, #a0a0a0, #767676)" />
+    <dark background="linear-gradient(to bottom, #949494, #707070)" />
+  </element>
+  <element name="DrawSelectionCheckbox:checked" border-width="0px">
+    <light background="linear-gradient(to bottom, #626262, #383838)" />
+    <dark background="linear-gradient(to bottom, #cacaca, #9c9c9c)" />
+  </element>
+  <element name="DrawSelectionCheckbox:checked:hover" border-width="0px">
+    <light background="linear-gradient(to bottom, #545454, #303030)" />
+    <dark background="linear-gradient(to bottom, #d6d6d6, #aaaaaa)" />
+  </element>
+  <element name="DrawSelectionCheckbox:checked:pressed" border-width="0px">
+    <light background="linear-gradient(to bottom, #444444, #262626)" />
+    <dark background="linear-gradient(to bottom, #bcbcbc, #929292)" />
+  </element>
+  <element name="PaintGroupBadge" border-width="0px" border-radius="3px">
+    <light background="linear-gradient(to bottom, #626262, #383838)" />
+    <dark background="linear-gradient(to bottom, #cacaca, #9c9c9c)" />
+  </element>
+  <element name="DrawSwipeIndicator" border-width="0px">
+    <light background="linear-gradient(to bottom, #d4d4d4, #ababab)" />
+    <dark background="linear-gradient(to bottom, #737373, #484848)" />
+  </element>
+  <element name="DrawDriveBar:track" border-width="0px" border-radius="3px">
+    <light background="#dadada" />
+    <dark background="#3a3a3a" />
+  </element>
+  <element name="DrawDriveBar:fill" border-width="0px" border-radius="3px">
+    <scale>
+      <stop offset="0%">
+        <light background="linear-gradient(to bottom, #919191, #656565)" />
+        <dark background="linear-gradient(to bottom, #9a9a9a, #727272)" />
+      </stop>
+      <stop offset="90%">
+        <light background="linear-gradient(to bottom, #919191, #656565)" />
+        <dark background="linear-gradient(to bottom, #9a9a9a, #727272)" />
+      </stop>
+      <stop offset="90%">
+        <light background="linear-gradient(to bottom, #626262, #363636)" />
+        <dark background="linear-gradient(to bottom, #cecece, #a0a0a0)" />
+      </stop>
+    </scale>
+  </element>
+</theme>

@@ -1,3 +1,38 @@
+static void TestThisPcDriveLetterSort(const std::wstring&) {
+    ViewState state;
+    state.thisPcGpu = state.nativeRowsComplete = true;
+    state.nativeRowsNeedCapture = false;
+    state.folderPath = kThisPcLocation;
+    state.sort.key = PKEY_ItemNameDisplay;
+    state.sort.kind = SortKind::Name;
+    state.sort.explicitOrder = true;
+
+    // Snapshot identities only. These paths are never opened.
+    for (const auto& [path, label] : {
+            std::pair{L"Z:\\", L"Archive (Z:)"},
+            std::pair{L"Y:\\", L"Work (Y:)"}}) {
+        Entry entry;
+        entry.path = path;
+        entry.name = label;
+        entry.folder = true;
+        state.nativeRows.push_back(std::move(entry));
+    }
+
+    state.sort.direction = SORT_ASCENDING;
+    RefreshThisPcRows(state, false);
+    Check(state.entries.size() == 2 &&
+          state.entries[0].path == L"Y:\\" && state.entries[1].path == L"Z:\\" &&
+          EntryLabel(state.entries[0]) == L"Work (Y:)",
+          "This PC ascending Name sort must use drive letters and retain labels");
+
+    state.sort.direction = SORT_DESCENDING;
+    RefreshThisPcRows(state, false);
+    Check(state.entries.size() == 2 &&
+          state.entries[0].path == L"Z:\\" && state.entries[1].path == L"Y:\\",
+          "This PC descending Name sort must reverse drive-letter order");
+}
+
+
 // Private filesystem PIDLs exercise Recycle Bin presentation without placing
 // anything in the user's Recycle Bin. The resolver receives a provider's full
 // display name while Windows still owns item binding and selection identities.

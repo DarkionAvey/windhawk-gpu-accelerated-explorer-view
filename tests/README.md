@@ -72,7 +72,8 @@ Every regression is one entry in `tests/regression-manifest.h` and runs in its
 own process, with its own mod globals, COM apartments, window classes, workers
 and private fixture directory. No test can depend on another test's state.
 The runner starts all Parallel entries first (up to `-Jobs` processes; default
-four, bounded by the logical CPU count), then each Serial entry alone. It
+derived per machine: physical cores less four, at least two, at most 32), then
+each Serial entry alone. It
 stops at the first failure: running tests are cancelled and no others start.
 It names crash codes (access violation, fail-fast,
 stack overflow...), prints the crashing test with its option/view context, and
@@ -80,8 +81,8 @@ fails a test that exceeds `-TestTimeoutSeconds` (default 120) instead of
 blocking the gate. Up to two compiler processes run concurrently.
 
 ```powershell
-tests/run-regressions.ps1 -SourceFile 0.9.341.cpp                     # release gate
-tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Jobs 16            # wider
+tests/run-regressions.ps1 -SourceFile 0.9.341.cpp                     # release gate, machine default
+tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Jobs 2             # explicit override
 tests/run-regressions.ps1 -SourceFile 0.9.341.cpp -Tests option-effects-list,touch-input
 background-regression.exe --list-tests                                # name, concurrency, gate, resources
 background-regression.exe --test option-live-sweep-details            # one test, this process
@@ -130,7 +131,7 @@ worker desktop attachments before the parent checks desktop cleanup.
 
 ## Code coverage
 
-`build.bat -Coverage -Jobs 16` runs the full gate with compiler-measured line,
+`build.bat -Coverage` runs the full gate with compiler-measured line,
 function, region and branch coverage. Focused runs also support `-Coverage`:
 
 ```powershell
@@ -173,8 +174,8 @@ is not a full-suite coverage baseline. The implementation uses LLVM's
    `REGRESSION("something", PARALLEL, TestSomething(fixture)),`
    `tests/repository-regression.ps1` fails if a `Test*` function is not
    reachable from the manifest.
-3. Run it alone (`--test something`) and beside the suite
-   (`-Jobs 16`); both must pass.
+3. Run it alone (`--test something`) and beside the full suite at the
+   machine's default parallelism; both must pass.
 
 **Every test finishes within 120 seconds. This is a fixed ceiling, not a
 default.** Tests are deterministic; there is nothing a test needs a large

@@ -21,7 +21,7 @@ try {
     Write-Host 'Checking Windhawk and preparing test binaries. This can take a few minutes.'
     # Console output bypasses the redirected PowerShell streams below.
     $progress = { param($message) [Console]::WriteLine($message) }
-    $arguments = @{ SourceFile=$SourceFile; OutputDirectory=$artifacts; Diagnostic=$true; Coverage=$true; ProgressAction=$progress }
+    $arguments = @{ SourceFile=$SourceFile; OutputDirectory=$artifacts; Diagnostic=$true; Coverage=$true; OptionalCoverage=$true; ProgressAction=$progress }
     if ($WindhawkDirectory) { $arguments.WindhawkDirectory=$WindhawkDirectory }
     if ($LlvmToolsDirectory) { $arguments.LlvmToolsDirectory=$LlvmToolsDirectory }
     if ($Tests.Count) { $arguments.Tests=$Tests }

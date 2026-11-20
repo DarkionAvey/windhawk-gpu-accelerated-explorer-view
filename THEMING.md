@@ -448,6 +448,48 @@ or the first color of a gradient. Its shape and derived colors are cached.
 </theme>
 ```
 
+## Group selection badges
+
+Use `PaintGroupBadge` for the chip showing the number of selected items in a
+collapsed group. Set `background`, `background-color`, `border-color`,
+`border-width`, `border-style`, and `border-radius`. Light and dark blocks work
+as usual. The default shape is a pill; use `border-radius="0px"` for square
+corners. Large radii are capped at half the badge height.
+
+The checkmark and count share a soft, contrasting color calculated from the
+background, or its first gradient color. Their colors and drawing resources
+are cached. The theme does not change the chip's size, count or reveal animation.
+
+```xml
+<theme>
+  <element name="PaintGroupBadge" background="accent"
+           border-color="accent" border-width="1px" border-radius="6px" />
+</theme>
+```
+
+## Swipe navigation indicators
+
+Use `DrawSwipeIndicator` for both Back and Forward indicators. Set `background`,
+`background-color`, `border-color`, `border-width`, and `border-style`.
+The shape and corners follow the navigation animation. The chevron gets the
+same automatic contrasting color as checkbox checkmarks. Light and dark blocks
+can give the indicators different backgrounds:
+
+```xml
+<theme>
+  <element name="DrawSwipeIndicator" border-width="1px">
+    <dark background="linear-gradient(to bottom, #505050, #292929)"
+          border-color="#777777" />
+    <light background="linear-gradient(to bottom, #ffffff, #d6d6d6)"
+           border-color="#999999" />
+  </element>
+</theme>
+```
+
+Background and border transparency combine with the existing animation opacity.
+Theme and appearance changes update a visible indicator without restarting its
+fade. The normal appearance returns in Windows high-contrast mode.
+
 ## Writing XML
 
 - Put every property value in quotes, including numbers such as `border-width="1"`.

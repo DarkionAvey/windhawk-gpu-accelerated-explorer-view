@@ -1,3 +1,22 @@
+// Diagnostics for the batched-deletion frame check: WM_PAINT deliveries.
+namespace DeletionPaintProbe {
+inline std::atomic<int> paints{0};
+// Window-manager state that can drop an update region without WM_PAINT.
+inline std::string Describe(HWND hwnd, HWND frame) {
+    BOOL cloaked=FALSE; DwmGetWindowAttribute(frame,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));
+    RECT visible{}; int visibleKind=ERROR;
+    if (HDC dc=GetDCEx(hwnd,nullptr,DCX_CACHE|DCX_CLIPSIBLINGS)) {
+        visibleKind=GetClipBox(dc,&visible); ReleaseDC(hwnd,dc);
+    }
+    const BOOL invalidated=InvalidateRect(hwnd,nullptr,FALSE);
+    const BOOL reinvalidated=GetUpdateRect(hwnd,nullptr,FALSE);
+    return " hung="+std::to_string(IsHungAppWindow(frame))+" cloaked="+std::to_string(cloaked)+
+        " clip="+std::to_string(visibleKind)+":"+std::to_string(visible.right-visible.left)+"x"+
+        std::to_string(visible.bottom-visible.top)+" invalidate="+std::to_string(invalidated)+
+        " regionAfterInvalidate="+std::to_string(reinvalidated);
+}
+}
+
 // Compare the same steady translated-text workload on the selected source.
 // This measures the render component, not Explorer or monitor frame timing.
 template<class State>
@@ -454,6 +473,7 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         UpdateRefreshRate(state);
         auto original = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(state.hwnd, GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(+[](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+                if (msg == WM_PAINT) DeletionPaintProbe::paints.fetch_add(1);
                 if (msg == WM_PAINT || msg == kMsgFrame || msg == WM_KEYDOWN ||
                     msg == WM_WINDOWPOSCHANGED) return OverlayProc(hwnd, msg, wp, lp);
                 return DefWindowProcW(hwnd, msg, wp, lp);
@@ -482,8 +502,28 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
         {
             AnimationClockFixture::Freeze intermediateClock;
             state.rowTransitionStartedQpc.QuadPart -= static_cast<LONGLONG>(state.qpcFrequency*.045);
-            Check(Eventually([&] { frame(); return state.rowTransitionPresentedProgress > 0.f; }),
-                  "deletion has no intermediate submitted frame");
+            const int paintsBefore = DeletionPaintProbe::paints.load();
+            const bool presented = Eventually([&] { frame(); return state.rowTransitionPresentedProgress > 0.f; });
+            if (!presented) {
+                RECT update{};
+                std::cerr << "DELETION PAINT paints=" << DeletionPaintProbe::paints.load()-paintsBefore
+                    << " updateRegion=" << GetUpdateRect(state.hwnd, &update, FALSE)
+                    << " queuedInput=0x" << std::hex << HIWORD(GetQueueStatus(QS_INPUT)) << std::dec
+                    << " ownsView=" << TabOwnsActiveView(state) << " windowVisible=" << IsWindowVisible(state.hwnd)
+                    << " frameIconic=" << IsIconic(state.frameHwnd) << " inputDeferred=" << state.frameInputDeferred
+                    << DeletionPaintProbe::Describe(state.hwnd, state.frameHwnd) << std::endl;
+            }
+            if (!presented)
+                std::cerr << "DELETION FRAME active=" << state.rowTransitionActive
+                    << " presented=" << state.rowTransitionPresentedProgress
+                    << " current=" << CurrentRowProgress(state)
+                    << " ready=" << state.graphicsReady << " suspended=" << state.graphicsSuspended
+                    << " standby=" << state.graphicsStandby << " presenter=" << bool(state.presenter)
+                    << " framePending=" << state.framePaintPending << " presentPending=" << state.presentPending
+                    << " visible=" << state.visible << " presentationVisible=" << PresentationVisible(state)
+                    << " minimized=" << PresentationMinimized(state) << " failure=0x" << std::hex
+                    << static_cast<unsigned long>(state.graphicsFailure) << std::dec << std::endl;
+            Check(presented, "deletion has no intermediate submitted frame");
         }
         // The checks below advance each animation explicitly. Hold that clock
         // across provider waits and GPU submissions as well as the retarget
@@ -549,10 +589,15 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
                 SendMessageW(state.hwnd,kMsgFrame,0,0);
                 if(!(state.framePaintPending && state.paintCalls==before && stillQueued() &&
                     GetUpdateRect(state.hwnd,nullptr,FALSE)))
-                    std::cout<<"INPUT FRAME bits="<<bits<<" pending="<<state.framePaintPending
+                    std::cout<<"INPUT FRAME paints-delivered="<<DeletionPaintProbe::paints.load()
+                        <<" client="<<[&]{RECT c{}; GetClientRect(state.hwnd,&c); return std::to_string(c.right)+"x"+std::to_string(c.bottom);}()
+                        <<" window="<<[&]{RECT w{}; GetWindowRect(state.hwnd,&w); return std::to_string(w.left)+","+std::to_string(w.top)+" "+
+                            std::to_string(w.right-w.left)+"x"+std::to_string(w.bottom-w.top);}()
+                        <<" bits="<<bits<<" pending="<<state.framePaintPending
                         <<" paints="<<before<<"->"<<state.paintCalls<<" queued="<<stillQueued()
                         <<" update="<<GetUpdateRect(state.hwnd,nullptr,FALSE)<<" deferred="<<state.frameInputDeferred
-                        <<" needs="<<NeedsAnimationPaint(state)<<" visible="<<IsWindowVisible(state.hwnd)<<std::endl;
+                        <<" needs="<<NeedsAnimationPaint(state)<<" visible="<<IsWindowVisible(state.hwnd)
+                        <<DeletionPaintProbe::Describe(state.hwnd,state.frameHwnd)<<std::endl;
                 Check(state.framePaintPending && state.paintCalls==before && stillQueued() &&
                     GetUpdateRect(state.hwnd,nullptr,FALSE),
                     "paced frame painted ahead of pending hardware input");
@@ -579,7 +624,11 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
                 // was acknowledged: its queued latch blocked further posts.
                 const bool acknowledged=!queued || nextWake;
                 if(state.framePaintPending || !acknowledged || state.paintCalls!=before+1)
-                    std::cout<<"INPUT FRAME bits="<<bits<<" pending="<<state.framePaintPending
+                    std::cout<<"INPUT FRAME paints-delivered="<<DeletionPaintProbe::paints.load()
+                        <<" client="<<[&]{RECT c{}; GetClientRect(state.hwnd,&c); return std::to_string(c.right)+"x"+std::to_string(c.bottom);}()
+                        <<" window="<<[&]{RECT w{}; GetWindowRect(state.hwnd,&w); return std::to_string(w.left)+","+std::to_string(w.top)+" "+
+                            std::to_string(w.right-w.left)+"x"+std::to_string(w.bottom-w.top);}()
+                        <<" bits="<<bits<<" pending="<<state.framePaintPending
                         <<" queued="<<queued<<" next="<<nextWake<<" paints="<<before<<"->"<<state.paintCalls
                         <<" deferred="<<state.frameInputDeferred<<" graphics="<<state.graphicsOperations
                         <<" update="<<GetUpdateRect(state.hwnd,nullptr,FALSE)<<std::endl;

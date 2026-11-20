@@ -1420,6 +1420,13 @@ static void TestZoomPresentation(ViewState& state, const ViewState& other) {
 #include "presentation-owner-smoke.h"
 #include "group-heading-smoke.h"
 #include "text-render-smoke.h"
+static float ExpectedIconCaptionSize(int dpi, int percent = 100) {
+    LOGFONTW title{};
+    Check(SystemParametersInfoForDpi(SPI_GETICONTITLELOGFONT,sizeof(title),&title,0,dpi) && title.lfHeight<0,
+        "Windows icon-title font unavailable");
+    return -title.lfHeight * percent / 100.f;
+}
+
 #include "grid-smoke.h"
 #include "edge-autoscroll-smoke.h"
 #include "recycle-smoke.h"
@@ -2025,6 +2032,8 @@ static void TestPreviewInput() {
 #include "item-tip-smoke.h"
 #include "pixel-snap-smoke.h"
 #include "review-fixes-smoke.h"
+#include "review-1013-smoke.h"
+#include "review-1014-smoke.h"
 #include "cloud-item-tip-smoke.h"
 
 #include "option-effects-smoke.h"
@@ -2090,6 +2099,12 @@ static const Regression::Test* FindRegression(const wchar_t* name) {
 
 int wmain(int argc,wchar_t** argv) {
     SetUnhandledExceptionFilter(UnhandledCrash);
+    // Test threads run long synchronous steps between pumps. On a loaded or
+    // power-managed machine that exceeds the 5 s hung-window threshold; the
+    // window manager then substitutes a ghost, empties the test window's
+    // visible region and drops its invalidations, so no WM_PAINT/input ever
+    // reaches the fixture. Explorer itself is not exercised here.
+    DisableProcessWindowsGhosting();
     std::set_terminate([] {
         std::string detail = "std::terminate";
         if (const auto error = std::current_exception()) {
@@ -2100,6 +2115,23 @@ int wmain(int argc,wchar_t** argv) {
         ReportCrash("abort", detail);
         std::abort();
     });
+    if (argc == 2 && wcscmp(argv[1], L"--check-mactype") == 0) {
+        // MacType can load when the graphics libraries initialize.
+        WorkerComApartment apartment;
+        ComPtr<IDWriteFactory> write;
+        ComPtr<ID2D1Factory> drawing;
+        ComPtr<ID2D1DCRenderTarget> target;
+        const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(write.GetAddressOf()))) ||
+            FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, drawing.GetAddressOf())) ||
+            FAILED(drawing->CreateDCRenderTarget(&properties, target.GetAddressOf())))
+            return 2;
+        const bool injected = GetModuleHandleW(L"MacType64.dll") ||
+            GetModuleHandleW(L"MacType64.Core.dll");
+        return injected ? 1 : 0;
+    }
     if(argc==2 && wcscmp(argv[1],L"--list-tests")==0) {
         // name, concurrency, gate, resources: consumed by run-regressions.ps1.
         std::set<std::wstring> names;

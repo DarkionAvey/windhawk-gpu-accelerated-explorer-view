@@ -180,12 +180,12 @@ static void TestFractionalTouchZoom(UINT dpi) {
         for(int sample=0;sample<20;++sample) {
             const double preference=32.11+sample*.027;
             ApplyRowHeight(state,preference,&contact);
-            const float font=std::max(float(MulDiv(7,int(dpi),96)),
+            const float font=mode==FVM_TILE ? ExpectedIconCaptionSize(dpi,g_gridFontPercent.load()) : std::max(float(MulDiv(7,int(dpi),96)),
                 float(preference*dpi/96.)*(mode==FVM_TILE ? g_gridFontPercent.load() : g_fontPercent.load())/100.f);
             const float line=font*1.5f,gap=float(MulDiv(2,int(dpi),96));
             const float expected=mode==FVM_CONTENT ? line*2+gap : drive ?
                 line*2+MulDiv(kDriveBarHeight96,int(dpi),96)+gap*2 : line*3+gap*2;
-            Near(state.iconPx,expected,"text-sized icon quantized fractional touch scale");
+            Near(state.iconPx,mode==FVM_TILE ? float(expected*preference/g_row96.load()) : expected,"text-sized icon quantized fractional touch scale");
             const auto item=LayoutItem(state,LayoutRowVisual(state,0,1));
             Near(item.text.bottom-item.text.top,line,"layout line pitch disagrees with fractional metrics");
             Check(!state.zoomAnimating && (sample==0 || state.iconPx>previous),

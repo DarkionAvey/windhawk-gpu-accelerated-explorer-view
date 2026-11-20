@@ -1,11 +1,16 @@
  # Changelog
 
-## Since 1.0.5 — Unreleased
+## 1.1.2
+- **IMPROVED** Icon captions follow the Windows text size during zoom. Crossing an icon-size preset updates Explorer’s folder view.
+
+## 1.1.1
 - **ADDED** Theme XML setting with shared properties and optional light and dark overrides for each element. Works on a single line; see THEMING.md for instructions.
 - **ADDED** Selection and hover backgrounds support solid colors, linear gradients with multiple color stops, and DPI-scaled borders aligned to whole pixels.
 - **ADDED** File hover tooltips support themed backgrounds, borders, rounded corners and cached CSS-style shadows. Muted metadata text follows the custom background.
 - **ADDED** Both scrollbars share themeable thumbs and tracks, with backgrounds, borders, rounded corners and hover and pressed styles.
 - **ADDED** Drag-selection rectangles support themed backgrounds, borders and rounded corners, with light and dark overrides.
+- **ADDED** Group selection badges support themed backgrounds, borders and rounded corners, with matching checkmark and count colors calculated from the background.
+- **ADDED** Swipe navigation indicators support themed backgrounds and borders, with automatic chevron contrast and their existing animated shape.
 - **ADDED** Selection checkboxes support themed backgrounds, borders and rounded corners for unchecked, checked, hovered and pressed states. Checkmarks adapt to the background.
 - **ADDED** Theme borders support solid, dashed and dotted patterns, or no border.
 - **ADDED** Storage bars support themed fills and tracks, usage-based colors and gradients, and full-track gradients revealed by used space.
@@ -20,7 +25,7 @@
 - **ADDED** Tiles view in every folder, showing each item's name, type and size.
 - **ADDED** Content view, showing each item's name, type, date modified and size. Switching to or from List and Details animates.
 - **ADDED** Support for Explorer's Compact view. List and Details rows shrink with an animation, like Ctrl+wheel zoom, and keep their text size.
-- **ADDED** Libraries, Applications and other item lists such as Printers now open in the GPU view.
+- **ADDED** Libraries, search results, Applications and Printers now open in the GPU view.
 - **ADDED** Search results highlight the parts of names that match your search, like native Explorer.
 
 - **IMPROVED** Drag files directly from their icon or filename without selecting first. Unselected list targets use the full row height; their blank row and grid padding remain available for rectangle selection. Selected items drag from the whole row or cell.
@@ -37,14 +42,23 @@
 - **IMPROVED** Build validation reliability with additional retries and diagnostics.
 - **IMPROVED** View switch button and tooltip now use Explorer's own status bar button and tooltip styles.
 - **IMPROVED** Thumbnails in the drag pile have rounded corners, sized for the pile like grid thumbnails are for the grid.
-- **IMPROVED** The log now records sort, navigation and GPU device details that help diagnose a stuck or blank view.
+- **IMPROVED** When logging is enabled, the log records sort, navigation and GPU device details that help diagnose a stuck or blank view.
 - **IMPROVED** Sorting by Size orders folders by their size when another mod provides folder sizes.
 - **IMPROVED** Folder sizes update when files are added, removed or changed inside them.
 - **IMPROVED** Refining a search updates the results in place, animating added and removed items instead of reloading.
 - **IMPROVED** This PC in Large icons is now a plain icon grid; its Tiles view keeps the drive usage bars.
 - **IMPROVED** File hover tooltips now match Explorer's own tooltips: native colors, font and size, sharper text, and even spacing.
 - **IMPROVED** In Tiles view, icons span all three text lines and the lines are evenly spaced.
+- **IMPROVED** Cloud sync icon updates (such as OneDrive) no longer reload every file's details, only the status icons that show them.
+- **IMPROVED** Activity inside subfolders (builds, installs, downloads) refreshes folder sizes only when sizes are shown or used for sorting.
+- **IMPROVED** Leaving a folder stops pending folder-size calculations sooner.
+- **IMPROVED** Drawing unthemed checkboxes, group badges and swipe indicators no longer rebuilds theme resources for every item.
+- **IMPROVED** Alternating row stripes, search-result highlights and Content view lines no longer allocate memory for every item on every frame while scrolling.
+- **IMPROVED** Regression tests run as many tests at once as the computer's processor cores allow, instead of a fixed number.
 
+- **FIXED** Item names show the single-click underline when pressed with touch.
+- **FIXED** Sorting by Name in This PC orders drives by drive letter.
+- **FIXED** Newly visible file icons stay ahead of offscreen requests after scrolling, including when a busy provider briefly defers queue updates.
 - **FIXED** Three-digit theme colors such as `#39f` now expand to the correct color.
 - **FIXED** Selection highlights morph from their displayed shape when switching views, including filename-only grid selections and full-row list selections.
 - **FIXED** The first item and group heading stay visible when a grouped folder opens in a new Explorer window.
@@ -78,6 +92,18 @@
 - **FIXED** Library folders that would not open on double-click, sizes shown as raw byte counts, and sorting that redrew the whole list.
 - **FIXED** Apps with small icons appeared boxed and tiny in grid views; their icons now fill the icon space.
 - **FIXED** The view switch button's tooltip could appear clipped the first time it showed after Explorer started.
+- **FIXED** Content view in several Explorer windows at once could crash Explorer. The "Date modified" and "Size" labels are now read once at startup.
+- **FIXED** Folders such as Control Panel, Network and devices could open in the GPU view, and opening some folders could pause Explorer while it checked them. Only libraries, search results, Applications and Printers are added.
+- **FIXED** Folder names, paths and extra Shell queries were written to the log even with logging turned off.
+- **FIXED** Refining a search could carry an open rename, a pending click-to-rename or a drag over to different items in the new results.
+- **FIXED** Typing a name with an input method editor (for example Chinese, Japanese or Korean) hid the composition while renaming.
+- **FIXED** Automatic renaming of new items could misbehave when Explorer created them from another thread.
+- **FIXED** Changing display scaling, theme or colors while renaming could briefly show old pixels where the rename field had been.
+- **FIXED** Renaming several selected items could be abandoned when Explorer's editor appeared before receiving keyboard focus.
+- **FIXED** With single-click and "underline when I point", a touched item now stays underlined after lifting the finger, like native Explorer.
+- **FIXED** The message for a failed rename of several items could crash Explorer on a Windows version whose text differs from the expected one. Unexpected text is now skipped and only logged.
+- **FIXED** Turning off or updating the mod while Explorer showed a New-item permission prompt, or while renaming, could crash Explorer.
+- **FIXED** A failed multiple-item rename showed an English-only message that could freeze or break the view while open. It now uses Windows' own localized "Cannot rename" message, shown after the rename finishes.
 
 - **REMOVED** The option to disable Explorer's saved folder sorting; the mod now always follows it.
 - **REMOVED** The accent-colored background behind a dragged Details column header.

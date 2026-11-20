@@ -384,10 +384,17 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         auto savedBitmap = std::move(state.backbuffer);
         const auto targetProps = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
             savedBitmap->GetPixelFormat());
-        Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(640,480), nullptr, 0,
-            &targetProps, &state.backbuffer)), "grid fixed target");
-        state.target->SetTarget(state.backbuffer.Get());
         for (int size : {16,48,96,256}) {
+            // The adjacent-cell checks require room for two native Small
+            // columns, the edge margins and a vertical scrollbar.
+            const int width=size==16 ? Scale96(680,DpiOf(state.hwnd)) : 640;
+            Check(SetWindowPos(state.hwnd,nullptr,0,0,width,480,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),
+                "grid fixture viewport");
+            if (!state.backbuffer || state.backbuffer->GetPixelSize().width!=UINT(width)) {
+                Check(SUCCEEDED(state.target->CreateBitmap(D2D1::SizeU(width,480),nullptr,0,&targetProps,
+                    state.backbuffer.ReleaseAndGetAddressOf())),"grid viewport readback target");
+                state.target->SetTarget(state.backbuffer.Get());
+            }
             // This fixture installs a settled view, so observation and applied
             // layout agree; real transitions keep these independent.
             state.layoutNativeMode = state.cachedNativeMode = size == 16 ? FVM_SMALLICON : FVM_ICON;
@@ -404,7 +411,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                 "grid scroll extent counted individual files as full rows");
             for (int index : {0,1,state.itemsPerRow,state.total-1}) {
                 const float logical = ListStartX(state)+DocumentRowLeft(state,index)+state.itemWidth*.5f;
-                const int x = static_cast<int>(rtl ? 640.f-logical : logical);
+                const int x = static_cast<int>(rtl ? width-logical : logical);
                 const int y = static_cast<int>(DocumentRowTop(state,index)+state.rowPx*.5f);
                 if (y < 480) Check(RowFromPoint(state,y,x) == index, "grid pointer hit selected another cell");
             }
@@ -430,7 +437,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             const RECT rename = RenameEditorRect(state,1);
             RECT local=rename; MapWindowPoints(frame,state.hwnd,reinterpret_cast<POINT*>(&local),2);
             const auto physical=[&](D2D1_RECT_F rect) {
-                if(rtl) { const float left=rect.left; rect.left=640.f-rect.right; rect.right=640.f-left; }
+                if(rtl) { const float left=rect.left; rect.left=width-rect.right; rect.right=width-left; }
                 return rect;
             };
             const auto cell=physical(labelGeometry.cell), icon=physical(labelGeometry.icon);
@@ -751,7 +758,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             state.fontPx==cappedFont && state.textFormat.Get()==cappedFormat,
             "extended grid zoom lost interpolation or rebuilt capped caption formats");
         AdvanceRowHeight(state,true);
-        ApplyRowHeight(state,512); AdvanceRowHeight(state,true);
+        ApplyRowHeight(state,1024); AdvanceRowHeight(state,true);
         const float largeIcon=state.iconPx;
         const auto imageKey=[&] {
             std::wstring lookup; bool attrs=false;
@@ -780,7 +787,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             "extended grid zoom removed the list cap or leaked between view families");
         state.rowHeight96[false]=listZoom; state.gridView=true;
         ApplyRowHeight(state,24); AdvanceRowHeight(state,true);
-        Check(state.rowHeight96[true]==24 && state.fontPx<cappedFont,
+        Check(state.rowHeight96[true]==24 && state.fontPx==cappedFont,
             "extended zoom could not return to its minimum caption/image size");
         ApplyRowHeight(state,50); AdvanceRowHeight(state,true);
         SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,windowData);
@@ -883,7 +890,9 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
             Paint(state); if(!rtl) SaveGridPreview(state,L"GPU_OVERLAY_DRIVE_TILE_PREVIEW");
             state.nativeTextColor=textColor;
         }
-        ApplyRowHeight(state,60); AdvanceRowHeight(state,true);
+        RECT tileViewport{}; ViewClientRect(state,&tileViewport);
+        const float baselineIcon=state.iconPx;
+        ApplyRowHeight(state,std::ceil(g_row96.load()*tileViewport.right/baselineIcon)); AdvanceRowHeight(state,true);
         Check(state.itemsPerRow==1 && state.iconPx>48 &&
             LayoutItem(state,LayoutRowVisual(state,0,1.f)).capacity.bottom<state.rowPx,
             "drive tile zoom did not reuse grid reflow or reserve capacity bounds");

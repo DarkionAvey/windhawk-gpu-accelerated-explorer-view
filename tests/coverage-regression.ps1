@@ -51,7 +51,7 @@ try {
     $tasks = @(0,1 | ForEach-Object { [pscustomobject]@{
         Name="coverage-branch-$_"; FilePath=$hostExe; Arguments=@($dll,$unusedDll,"$_"); Serial=$false
     } })
-    Invoke-RegressionTasks -Tasks $tasks -OutputDirectory $fixture -Jobs 16 -Phase regression
+    Invoke-RegressionTasks -Tasks $tasks -OutputDirectory $fixture -Jobs (Get-RegressionJobCount) -Phase regression
 } finally { $env:LLVM_PROFILE_FILE = $savedProfile }
 Write-RegressionCoverage $coverage @($dll,$unusedDll) (Join-Path $fixture 'regression-results.csv') $true
 $report = Get-Content -LiteralPath (Join-Path $coverage.Directory 'coverage.json') -Raw | ConvertFrom-Json

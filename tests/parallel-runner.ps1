@@ -1,5 +1,19 @@
 # Process isolation is required: mod globals, COM apartments, fixture hooks and
 # frame/background shutdown cannot be shared between concurrently running tests.
+
+# Default parallelism for this machine: physical cores (all sockets) less four,
+# left to Explorer, DWM and the GPU driver that every UI test shares, and at
+# least two. Logical processors are not used: SMT siblings share the execution
+# units these GPU/UI tests saturate. -Jobs N overrides it.
+function Get-RegressionJobCount {
+    $cores = 0
+    try {
+        $cores = [int](@(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+            Measure-Object -Property NumberOfCores -Sum).Sum)
+    } catch {}
+    if ($cores -lt 1) { $cores = [Math]::Max(1, [int][Math]::Floor([Environment]::ProcessorCount / 2)) }
+    [Math]::Min(32, [Math]::Max(2, $cores - 4))
+}
 function ConvertTo-ProcessArgument([string]$Value) {
     # Windows argv quoting, with no command shell or expression evaluation.
     '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
