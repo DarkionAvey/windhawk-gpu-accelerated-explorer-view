@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.1
+// @version         1.1.2
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -62,9 +62,9 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
     - fontSizePercent: 44
       $name: List text size (% of row height)
       $description: Text size in List and Details views. Ctrl+wheel also changes size temporarily. 
-    - gridFontSizePercent: 42
-      $name: Grid text size (% of row height)
-      $description: Text size in icon grids and drive tiles. Ctrl+wheel also changes size temporarily.
+    - nativeGridTextPercent: 100
+      $name: Grid text size (% of Explorer text size)
+      $description: 100 uses the Windows icon caption size in icon grids and drive tiles.
     - fontFamily: ""
       $name: Font family
       $description: Enter an installed font name. Leave blank to use Explorer's font.
@@ -1334,7 +1334,7 @@ constexpr unsigned kColumnWiggleWindowDoubleClickIntervals = 4;
 std::atomic<bool> g_unloading{false};
 std::atomic<int> g_row96{32};
 std::atomic<int> g_fontPercent{44}; // List/Details; keep the existing settings key.
-std::atomic<int> g_gridFontPercent{42};
+std::atomic<int> g_gridFontPercent{100};
 std::atomic<bool> g_autoRefitColumns{true};
 // The settings callback may run on a different thread from Explorer's view.
 // Text formats take a snapshot only when they are created, never per frame.
@@ -5555,13 +5555,15 @@ void LayoutGroupSections(ViewState& state) {
         const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
         const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
         const float checkboxSpace = (TileLayout(state) || state.layoutNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
-        const float minimum = checkboxSpace + (TileLayout(state) ?
+        // ExplorerFrame collection.smallicons: ItemGridLayout columnwidth
+        // 308rp and itemspacing 1rp. The checkbox lives inside that column.
+        const bool small = state.layoutNativeMode == FVM_SMALLICON;
+        const float smallPitch = float(Scale96(308,dpi) + Scale96(1,dpi));
+        const float minimum = (small ? 0.f : checkboxSpace) + (TileLayout(state) ?
             std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
                 icon + font * 12.f + Scale96(24, dpi)) :
-            state.layoutNativeMode == FVM_SMALLICON ?
-            std::max(Scale96(180, dpi) * font / std::max(1.f, static_cast<float>(Scale96(15, dpi))),
-                icon + font * 6.f) :
-            std::max(static_cast<float>(Scale96(96, dpi)), icon + Scale96(32, dpi)));
+            small ? std::max(smallPitch, checkboxSpace + icon + font * 6.f) :
+            std::max(static_cast<float>(GetSystemMetricsForDpi(SM_CXICONSPACING,dpi)), icon + Scale96(16, dpi)));
         float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
         auto extent = [&](int columns) {
             const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
@@ -5581,7 +5583,7 @@ void LayoutGroupSections(ViewState& state) {
             width = std::max(1.f, width - VerticalScrollbarClearance(dpi));
             state.itemsPerRow = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
         }
-        state.itemWidth = width / state.itemsPerRow;
+        state.itemWidth = small ? std::min(width,minimum) : width / state.itemsPerRow;
     }
     float y = state.presentationOnly && !state.presentationEntries && !state.sections.empty() ? state.sections.front().documentTop : 0.f;
     for (auto& section : state.sections) {
@@ -5791,8 +5793,15 @@ float ContentReveal(const ViewState& state) {
     return state.zoomFromContent +
         (to - state.zoomFromContent) * EaseOutCubic(UiTransitionProgress(state, state.zoomStartedQpc));
 }
+bool NativeIconGrid(const ViewState& state) {
+    return state.gridView && !TileLayout(state);
+}
+int ZoomHeight96(const ViewState& state) {
+    if (const int saved = state.rowHeight96[state.gridView]) return saved;
+    return NativeIconGrid(state) ? std::max(16, state.layoutIconSize) : g_row96.load();
+}
 double PresentedZoomHeight96(const ViewState& state) {
-    const int saved = state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
+    const int saved = ZoomHeight96(state);
     const double precise = state.preciseRowHeight96[state.gridView];
     const double target = precise > 0. && std::llround(precise) == saved ? precise : saved;
     if (!state.zoomAnimating) return target;
@@ -7987,7 +7996,7 @@ bool LoadSettings() {
     Theme::Load();
     g_row96.store(std::clamp(intSetting(L"Appearance.rowHeight"), 24, 96));
     g_fontPercent.store(std::clamp(intSetting(L"Appearance.fontSizePercent"), 20, 80));
-    g_gridFontPercent.store(std::clamp(intSetting(L"Appearance.gridFontSizePercent"), 20, 80));
+    g_gridFontPercent.store(std::clamp(intSetting(L"Appearance.nativeGridTextPercent"), 25, 300));
     auto fontSetting = stringSetting(L"Appearance.fontFamily");
     std::wstring fontFamily = fontSetting.get();
     const size_t first = fontFamily.find_first_not_of(L" \t\r\n");
@@ -14968,6 +14977,11 @@ float ItemTextLinePitch(float font) {
     // Rounding here multiplies each lost fraction by the number of lines.
     return font * 1.5f;
 }
+// The wrapped caption shares this vertical budget with LayoutItem. Reserve
+// both filename lines plus the icon inset, caption gap and bottom inset.
+float GridCaptionInset(int dpi) {
+    return static_cast<float>(Scale96(2, dpi));
+}
 float TileTextHeight(const ViewState& state, float font, int dpi) {
     const float line = ItemTextLinePitch(font), gap = float(Scale96(2, dpi));
     return DriveTiles(state) ? line * 2.f + float(Scale96(kDriveBarHeight96, dpi)) + gap * 2.f :
@@ -14993,8 +15007,7 @@ float ContentTextHeight(float font, int dpi) {
 void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     state.zebraExtentAnimating = false;
     int dpi = ViewDpi(state);
-    const int height96 = state.rowHeight96[state.gridView] ?
-        state.rowHeight96[state.gridView] : g_row96.load();
+    const int height96 = ZoomHeight96(state);
     const double precise = state.preciseRowHeight96[state.gridView];
     const bool direct = precise > 0. && std::llround(precise) == height96;
     const double size96 = direct ? precise : height96;
@@ -15002,14 +15015,23 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // metrics before integer DPI conversion, even at very large image scales.
     const float baseRow = direct ? static_cast<float>((state.gridView ? std::min(size96, 96.) : size96) * dpi / 96.) :
         static_cast<float>(Scale96(state.gridView ? std::min(height96, 96) : height96, dpi));
-    const int fontPercent = state.gridView ? g_gridFontPercent.load() : g_fontPercent.load();
-    const float font = direct ? std::max(float(Scale96(7, dpi)), baseRow * fontPercent / 100.f) :
+    const int fontPercent = g_fontPercent.load();
+    ICONMETRICSW iconMetrics{sizeof(iconMetrics)};
+    const bool haveIconMetrics = state.gridView && SystemParametersInfoForDpi(
+        SPI_GETICONMETRICS, sizeof(iconMetrics), &iconMetrics, 0, dpi);
+    const float caption = haveIconMetrics ? float(std::abs(iconMetrics.lfFont.lfHeight)) : float(Scale96(12, dpi));
+    const float font = state.gridView ? caption * g_gridFontPercent.load() / 100.f : direct ? std::max(float(Scale96(7, dpi)), baseRow * fontPercent / 100.f) :
         static_cast<float>(std::max(Scale96(7, dpi), MulDiv(static_cast<int>(baseRow), fontPercent, 100)));
     // Display size is independent of the bounded Shell image request tiers.
     // Keep this arithmetic floating point: MulDiv/int casts would overflow
     // well before the tab's zoom preference reaches its storage limit.
-    const double iconSize = state.layoutIconSize * (direct ? size96 * dpi / 96. : std::round(size96 * dpi / 96.)) /
-        std::max(1, Scale96(g_row96.load(), dpi));
+    // The jumbo Shell image list tops out at 256 physical pixels. Interpolate
+    // to that endpoint and keep increasing display size beyond the last preset.
+    const double scale = dpi / 96.;
+    const double large = 96 * scale, jumbo = std::min(256., 256 * scale);
+    const double iconSize = size96 <= 96 ? size96 * scale : size96 <= 256 ?
+        std::lerp(large, std::max(large,jumbo), (size96-96)/160.) :
+        std::max(large,jumbo) + (size96-256)*scale;
     // A tile's icon spans its text block, so both grow together with zoom
     // and DPI. Every tile reserves all its lines, so two-line items match
     // three-line neighbours.
@@ -15020,7 +15042,7 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     // Compact list rows drop padding, not text: the font keeps the full row.
     const float listRow = state.compactRows && !ContentLayout(state) ?
         (direct ? baseRow * kCompactRowFraction : std::round(baseRow * kCompactRowFraction)) : baseRow;
-    const float icon = TileLayout(state) ? tileText :
+    const float icon = TileLayout(state) ? static_cast<float>(tileText * size96 / g_row96.load()) :
         ContentLayout(state) ? contentText :
         state.gridView ? std::max(float(Scale96(16, dpi)), static_cast<float>(direct ? iconSize : std::round(iconSize))) :
         std::clamp(direct ? font * 1.25f : std::round(font * 1.25f),
@@ -15030,7 +15052,7 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
         TileLayout(state) ? std::max(static_cast<float>(icon), tileText) + Scale96(12, dpi) :
         state.layoutNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
-            icon + font * 2.8f + Scale96(20, dpi);
+            icon + 2.f * ItemTextLinePitch(font) + 3.f * GridCaptionInset(dpi);
     state.zoomToIconPx = static_cast<float>(icon);
     state.zoomToFontPx = static_cast<float>(font);
     state.zoomToRowPx = row;
@@ -15202,13 +15224,13 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         const float reservedBar=bar>0.f ? bar:nativeBar;
         const float content = drive ? line*2.f+reservedBar+gap*2.f:TileTextHeight(state,state.fontPx,dpi);
         const float tileTop = visual.top + (state.rowPx - std::max(side, content)) * .5f;
-        const float iconY = tiles ? tileTop : compact ? visual.top + (state.rowPx-side)*.5f : visual.top + pad;
+        const float iconY = tiles ? tileTop : compact ? visual.top + (state.rowPx-side)*.5f : visual.top + GridCaptionInset(dpi);
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
         const float textGap = tiles ? static_cast<float>(Scale96(12, dpi)) : pad;
         g.text = compact ? D2D1::RectF(g.icon.right + textGap, visual.top,
             g.cell.right-pad, visual.top+state.rowPx) :
-            D2D1::RectF(g.cell.left+pad, g.icon.bottom+pad,
-                g.cell.right-pad, visual.top+state.rowPx-pad);
+            D2D1::RectF(g.cell.left+pad, g.icon.bottom+GridCaptionInset(dpi),
+                g.cell.right-pad, visual.top+state.rowPx-GridCaptionInset(dpi));
         if (tiles) {
             // Reserve every line before its value arrives. Enrichment changes
             // pixels only; packing, hit testing and selection never jump.
@@ -19325,7 +19347,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             // Same canonical box and whole-pixel origin as the cached mask.
             float boxLeft=l, boxWidth=r-l;
             const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename);
-            const auto origin=intrinsic ? SnapDrawPoint(state.target.Get(),D2D1::Point2F(boxLeft,t)) : D2D1::Point2F(l,t);
+            const auto origin=SnapDrawPoint(state.target.Get(),D2D1::Point2F(boxLeft,t));
             if (intrinsic) layout->SetMaxWidth(boxWidth);
             // A translucent brush changes Direct2D's grayscale text alpha
             // correction; masks scale opaque coverage instead. Draw translucent
@@ -27953,11 +27975,16 @@ void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) 
     const SIZE preferred{rect.right-rect.left,rect.bottom-rect.top};
     const SIZE available{viewport.right-viewport.left,viewport.bottom-viewport.top};
     const auto same=[](SIZE a,SIZE b) {return a.cx==b.cx && a.cy==b.cy;};
+    const bool centered = !RenameItemGeometry(state,rename.index).wrapped;
+    const auto applyHeight = [&](LONG height) {
+        if (centered) rect.top -= (height-preferred.cy)/2;
+        rect.bottom = rect.top + height;
+    };
     if (rename.layoutValid && same(preferred,rename.layoutPreferred) &&
         same(available,rename.layoutAvailable) && same(padding,rename.layoutPadding)) {
         if (rename.layoutSize.cx!=preferred.cx) rect.left=viewport.left;
         rect.right=rect.left+rename.layoutSize.cx;
-        rect.bottom=rect.top+rename.layoutSize.cy;
+        applyHeight(rename.layoutSize.cy);
         return;
     }
     const auto measure = [&](LONG width) {
@@ -27976,7 +28003,7 @@ void FitWrappedRenameEditor(ViewState& state, RECT& rect, const RECT& viewport) 
         rect.left = viewport.left; rect.right = viewport.right;
         height = std::max(rect.bottom - rect.top, measure(rect.right - rect.left));
     }
-    rect.bottom = rect.top + std::max(1L, std::min(height, viewport.bottom - viewport.top));
+    applyHeight(std::max(1L, std::min(height, viewport.bottom - viewport.top)));
     // Text/font changes invalidate this measurement. Geometry/padding are
     // keyed above: moving a settled field must not shrink it to measure its
     // old narrow width and immediately expand it again on every owner update.
@@ -29729,6 +29756,11 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     if (linesBefore!=lineSet(grid,mode)) InvalidateDetailJobs(state);
     const bool changed=state.layoutNativeMode!=mode ||
         (grid && state.layoutIconSize!=requested.iconSize) || state.gridView!=grid;
+    if (changed && (grid || state.gridView)) {
+        state.preciseRowHeight96[1] = 0.;
+        state.rowHeight96[1] = 0;
+        if (IsWindow(state.activeTabHost)) state.tabPresentations[state.activeTabHost].zoomHeight96[1] = 0;
+    }
     // Grid-to-grid icon size or mode changes, and list changes into or out of
     // Content's taller rows, zoom from the presented image exactly like
     // Ctrl+wheel, while packing and hit testing switch at once.
@@ -30178,15 +30210,34 @@ public:
 };
 
 double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact = nullptr) {
-    const int current = state.rowHeight96[state.gridView] ?
-        state.rowHeight96[state.gridView] : g_row96.load();
+    const int current = ZoomHeight96(state);
     if (!std::isfinite(requested96)) return current;
-    const double bounded96 = std::clamp(requested96, 24.,
+    const double bounded96 = std::clamp(requested96, NativeIconGrid(state) ? 16. : 24.,
         state.gridView ? static_cast<double>(std::numeric_limits<int>::max()) : 96.);
     const int height96 = static_cast<int>(std::llround(bounded96));
     if (!contact && height96 == current) {
         ScheduleZoomAutoRefit(state, false);
         return bounded96;
+    }
+    if (NativeIconGrid(state) && state.folderView) {
+        const double previous = state.preciseRowHeight96[1] > 0 ? state.preciseRowHeight96[1] : current;
+        int crossed = 0;
+        for (int preset : {16,48,96,256}) {
+            if (previous < preset && bounded96 >= preset) crossed = preset;
+            if (previous > preset && bounded96 <= preset && !crossed) crossed = preset;
+        }
+        if (crossed && crossed != state.layoutIconSize) {
+            const auto view = state.folderView;
+            const HWND owner = state.hwnd;
+            const auto token = state.token;
+            const auto mode = crossed == 16 ? FVM_SMALLICON : FVM_ICON;
+            HRESULT hr = view->SetViewModeAndIconSize(mode,crossed);
+            if (State(owner)!=&state || state.token!=token || state.folderView.Get()!=view.Get()) return bounded96;
+            if (SUCCEEDED(hr)) {
+                state.cachedNativeMode = state.layoutNativeMode = mode;
+                state.nativeIconSize = state.layoutIconSize = crossed;
+            }
+        }
     }
     RenameZoomUpdate renameZoom(state);
     if (contact) {
@@ -30425,7 +30476,7 @@ void ApplyManipulationStatus(ViewState& state, WPARAM wParam) {
         if (feedback) Redraw(state);
         state.swipeReleased = false;
         state.touchpadPinchHeight96 =
-            state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
+            ZoomHeight96(state);
         if (!state.touch.active) {
             state.manipulationFrameActive = true;
             RegisterAnimationWindow(state.hwnd);
@@ -30561,7 +30612,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
         state.touchpadPinchHeight96 =
             contact ? PresentedZoomHeight96(state) :
             state.preciseRowHeight96[state.gridView] > 0. ? state.preciseRowHeight96[state.gridView] :
-            state.rowHeight96[state.gridView] ? state.rowHeight96[state.gridView] : g_row96.load();
+            ZoomHeight96(state);
     }
     RepositionRenameEdit(state);
     if (!logDelta) return;
@@ -37224,8 +37275,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 const int steps = s->wheelRemainder / WHEEL_DELTA;
                 s->wheelRemainder -= steps * WHEEL_DELTA;
                 if (steps) {
-                    const int old96 = s->rowHeight96[s->gridView] ?
-                        s->rowHeight96[s->gridView] : g_row96.load();
+                    const int old96 = ZoomHeight96(*s);
                     ApplyRowHeight(*s, static_cast<double>(old96) + steps * 2);
                 } else if (delta) ScheduleZoomAutoRefit(*s, false);
             } else {
