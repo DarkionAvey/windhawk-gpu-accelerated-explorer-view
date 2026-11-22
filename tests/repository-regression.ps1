@@ -150,8 +150,27 @@ try {
         foreach ($name in $archiveHashes.Keys) {
             Assert ((Get-SourceHash (Join-Path $archive $name)) -eq $archiveHashes[$name]) 'minified-change guard changed or pruned an archive'
         }
-        Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory)'
-        & $build -WindhawkDirectory $fakeWindhawk
+        Write-Utf8 $runner @'
+param($SourceFile, $WindhawkDirectory, $MinifiedSourceFile, $Jobs, $OutputDirectory, [switch]$Diagnostic)
+if (!$Diagnostic -or $Jobs -ne 2 -or !(Test-Path -LiteralPath $MinifiedSourceFile)) {
+    throw 'Diagnostic publication did not run the full release gate with the requested parallelism'
+}
+Add-Content -LiteralPath (Join-Path $OutputDirectory 'gate-calls.txt') -Value 'test'
+'@
+        $shell = Join-Path $PSHOME 'powershell.exe'
+        if (!(Test-Path -LiteralPath $shell)) { $shell = Join-Path $PSHOME 'pwsh.exe' }
+        $declinedResults = Join-Path $fixture 'declined-results'
+        'n' | & $shell -NoProfile -ExecutionPolicy Bypass -File $build -WindhawkDirectory $fakeWindhawk -Jobs 2 -Diagnostic -ConfirmPublish -OutputDirectory $declinedResults
+        Assert ($LASTEXITCODE -eq 0) 'declining a passing diagnostic returned failure'
+        $declined = Get-Content -LiteralPath (Join-Path $declinedResults 'build-report.json') -Raw | ConvertFrom-Json
+        Assert ($declined.Status -eq 'Pass' -and !$declined.Published) 'declined publication was not reported as a passing test'
+        Assert ((Get-SourceHash $latest) -eq $newHash -and (Test-Path -LiteralPath $next)) 'declining publication changed the release'
+        $acceptedResults = Join-Path $fixture 'accepted-results'
+        'y' | & $shell -NoProfile -ExecutionPolicy Bypass -File $build -WindhawkDirectory $fakeWindhawk -Jobs 2 -Diagnostic -ConfirmPublish -OutputDirectory $acceptedResults
+        Assert ($LASTEXITCODE -eq 0) 'accepting a passing diagnostic did not publish'
+        Assert (@(Get-Content -LiteralPath (Join-Path $acceptedResults 'gate-calls.txt')).Count -eq 1) 'publication reran the release checks'
+        $accepted = Get-Content -LiteralPath (Join-Path $acceptedResults 'build-report.json') -Raw | ConvertFrom-Json
+        Assert ($accepted.Status -eq 'Pass' -and $accepted.Published) 'accepted publication was not reported'
         Assert ((Get-ModVersion $latest) -eq [version]'0.9.11') 'successful run did not finalize'
         Assert ((Get-SourceHash $latest) -eq
             (Get-SourceHash (Join-Path $archive '0.9.11.cpp'))) 'final published/archive copies differ'
@@ -173,6 +192,7 @@ try {
         }
         Assert ((Get-SourceHash $nestedSource) -eq $nestedHash) 'retention changed a nested source'
         Copy-Item -LiteralPath (Join-Path $archive '0.9.11.cpp') -Destination $next
+        Write-Utf8 $runner 'param($SourceFile, $WindhawkDirectory, [switch]$Diagnostic); if ($Diagnostic) { throw "Build should use the fail-fast gate" }'
         & $build -SourceFile '0.9.11.cpp' -WindhawkDirectory $fakeWindhawk
         Assert ([IO.File]::ReadAllText($minified) -ceq (ConvertTo-MinifiedMod $latest)) 'rebuild incorporated downstream edits'
         Assert ((Get-Item -LiteralPath $minified).IsReadOnly) 'rebuild did not restore read-only attribute'

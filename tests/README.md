@@ -52,29 +52,27 @@ testing.
 
 ## Parallel execution
 
-For a quiet local diagnosis, double-click root `test-mod.bat` and enter or drag
-in the mod `.cpp` path. It performs the normal toolchain and injection checks,
-compiles the test binaries once, then runs the standard regression manifest and
-DLL-unload test sequentially. Each test runs once with the same 120-second limit.
-Ordinary failures are collected while later tests continue. Injection or unsafe
-process cleanup still stops the run. The final console lists failures/pending
-tests and the temporary results folder; passing child logs are discarded.
-Preparation stages and `[current/total]` test starts are printed as they happen;
-compiler diagnostics and detailed test output stay in the logs.
-Compiler output, failure stdout/stderr, reports and binaries remain there.
-No sources, version archives or release exports are changed. Specialized opt-in
-probes remain available through `-Tests` rather than being added to this sweep.
-`scripts/test-mod.ps1 -SourceFile <source> -Tests name1,name2` also supports a
-focused diagnosis. This diagnostic mode does not replace the release gate,
-which continues to stop at the first failure.
+Double-click root `test-mod.bat` and enter or drag in a numbered working
+`.cpp` path. Press Enter to use the same source selection as `build.bat`.
+Both commands run the same release checks. Test-mod collects ordinary
+failures while later tests continue, then offers to publish if every check
+passes. Answer Y or press Enter to publish the tested build without rebuilding,
+or N to keep the working source. Build stops on the first test failure and
+publishes automatically after success.
+
+Both commands respect Parallel and Serial scheduling and the same fixed
+120-second limit. Injection or unsafe process cleanup stops either run.
+Test-mod retains binaries, failure logs, and reports in the results directory.
+For a focused diagnosis without publication, use
+`scripts/test-mod.ps1 -SourceFile <source> -Tests name1,name2`.
 
 Every regression is one entry in `tests/regression-manifest.h` and runs in its
 own process, with its own mod globals, COM apartments, window classes, workers
 and private fixture directory. No test can depend on another test's state.
 The runner starts all Parallel entries first (up to `-Jobs` processes; default
 derived per machine: physical cores less four, at least two, at most 32), then
-each Serial entry alone. It
-stops at the first failure: running tests are cancelled and no others start.
+each Serial entry alone. By default the gate stops at the first failure,
+cancels running tests and leaves unstarted tests pending.
 It names crash codes (access violation, fail-fast,
 stack overflow...), prints the crashing test with its option/view context, and
 fails a test that exceeds `-TestTimeoutSeconds` (default 120) instead of
@@ -182,8 +180,8 @@ default.** Tests are deterministic; there is nothing a test needs a large
 buffer for. There are no per-test timeouts, and `-TestTimeoutSeconds` can only
 lower the limit (for diagnosis), never raise it. A test that comes near the
 limit is split into smaller manifest entries along its natural dimensions, as
-`rename-appearance-{user32,comctl32}-{96,144,192}` is. Each test runs once: a
-failure is final, is never retried, and stops the whole run.
+`rename-appearance-{user32,comctl32}-{96,144,192}` is. Each test runs once,
+and the default gate stops at the first failure.
 
 **Parallel is the expected declaration.** Isolation comes with the process:
 - Create files only under `fixture`; never use user folders or fixed paths.

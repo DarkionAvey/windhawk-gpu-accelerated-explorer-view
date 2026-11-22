@@ -60,7 +60,7 @@ function New-RegressionResultDirectory([string]$Path) {
 }
 
 # Runtime policy only. Compiler failures never enter this gate. One attempt per
-# test: a failure is a failure, and the first one cancels the rest of the run.
+# test. Diagnostic mode collects ordinary failures through the end of the run.
 # Tests are deterministic, so the default limit is two minutes, not a buffer.
 function Invoke-RegressionGate {
     param(
@@ -72,7 +72,6 @@ function Invoke-RegressionGate {
         [switch]$Diagnostic,
         [scriptblock]$ProgressAction
     )
-    if ($Diagnostic) { $Jobs = 1 }
     $results = @(Invoke-RegressionTasks -Tasks $Tasks -OutputDirectory $OutputDirectory -Jobs $Jobs `
         -Phase regression -TimeoutSeconds $TimeoutSeconds -CollectResults -StopOnFailure:(!$Diagnostic) -ObserveInterference:$ObserveInterference -ProgressAction $ProgressAction)
     if ($Diagnostic) {

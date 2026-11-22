@@ -2,12 +2,19 @@ param(
     [string]$SourceFile,
     [string]$WindhawkDirectory,
     [string]$LlvmToolsDirectory,
-    [string[]]$Tests = @()
+    [string[]]$Tests = @(),
+    [ValidateRange(0,32)][int]$Jobs = 0
 )
 $ErrorActionPreference = 'Stop'
 $runClock = [Diagnostics.Stopwatch]::StartNew()
 $repository = Split-Path -Parent $PSScriptRoot
-if (!$SourceFile) { $SourceFile = (Read-Host 'Path to the mod .cpp to test (you can drag the file here)').Trim().Trim('"') }
+if (!$SourceFile) {
+    $SourceFile = (Read-Host 'Path to the mod .cpp to test (Enter uses the default working version)').Trim().Trim('"')
+}
+if (!$Tests.Count) {
+    & (Join-Path $PSScriptRoot 'build.ps1') -SourceFile $SourceFile -WindhawkDirectory $WindhawkDirectory -LlvmToolsDirectory $LlvmToolsDirectory -Jobs $Jobs -Diagnostic -ConfirmPublish
+    exit 0
+}
 $output = Join-Path ([IO.Path]::GetTempPath()) ('gpu-mod-diagnostic-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $output
 $console = Join-Path $output 'preparation-and-run.log'
@@ -21,7 +28,7 @@ try {
     Write-Host 'Checking Windhawk and preparing test binaries. This can take a few minutes.'
     # Console output bypasses the redirected PowerShell streams below.
     $progress = { param($message) [Console]::WriteLine($message) }
-    $arguments = @{ SourceFile=$SourceFile; OutputDirectory=$artifacts; Diagnostic=$true; Coverage=$true; OptionalCoverage=$true; ProgressAction=$progress }
+    $arguments = @{ SourceFile=$SourceFile; OutputDirectory=$artifacts; Jobs=$Jobs; Diagnostic=$true; Coverage=$true; OptionalCoverage=$true; ProgressAction=$progress }
     if ($WindhawkDirectory) { $arguments.WindhawkDirectory=$WindhawkDirectory }
     if ($LlvmToolsDirectory) { $arguments.LlvmToolsDirectory=$LlvmToolsDirectory }
     if ($Tests.Count) { $arguments.Tests=$Tests }

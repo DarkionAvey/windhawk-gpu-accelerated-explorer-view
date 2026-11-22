@@ -6,7 +6,9 @@ param(
     [switch]$KeepArtifacts,
     [switch]$Coverage,
     [string]$LlvmToolsDirectory,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [switch]$Diagnostic,
+    [switch]$ConfirmPublish
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'repository.ps1')
@@ -44,18 +46,32 @@ try {
     # A release always runs the complete C++ and DLL-unload suites. Focused test
     # arguments belong to run-regressions.ps1 and cannot accidentally publish.
     try {
-        & (Join-Path $root 'tests\run-regressions.ps1') -SourceFile $source -WindhawkDirectory $WindhawkDirectory -MinifiedSourceFile $minified -Jobs $Jobs -KeepArtifacts:$KeepArtifacts -Coverage:$Coverage -LlvmToolsDirectory $LlvmToolsDirectory -OutputDirectory $resultDirectory
-        if ((Get-SourceHash $source) -ne $sourceHash -or
-            (Get-SourceHash $readme) -ne $readmeHash) {
-            throw 'Source or README changed during testing; run the build again before publishing'
+        & (Join-Path $root 'tests\run-regressions.ps1') -SourceFile $source -WindhawkDirectory $WindhawkDirectory -MinifiedSourceFile $minified -Jobs $Jobs -KeepArtifacts:$KeepArtifacts -Coverage:$Coverage -LlvmToolsDirectory $LlvmToolsDirectory -OutputDirectory $resultDirectory -Diagnostic:$Diagnostic
+        $publish = $true
+        if ($ConfirmPublish) {
+            $choices = @(
+                [System.Management.Automation.Host.ChoiceDescription]::new('&Yes'),
+                [System.Management.Automation.Host.ChoiceDescription]::new('&No')
+            )
+            $publish = $Host.UI.PromptForChoice('All release checks passed', "Publish $(Get-ModVersion $source)?", $choices, 0) -eq 0
         }
-        Publish-ModRelease $root $source $minified
-        $published = $true
+        if ($publish) {
+            if ((Get-SourceHash $source) -ne $sourceHash -or
+                (Get-SourceHash $readme) -ne $readmeHash) {
+                throw 'Source or README changed since testing began; run the build again before publishing'
+            }
+            Publish-ModRelease $root $source $minified
+            $published = $true
+        }
     } finally {
         Remove-Item -LiteralPath $minified -Force
     }
-    Write-Output "PASS: release finalized at $(Join-Path $root 'latest.cpp'), gpu-accelerated-explorer-view.wh.cpp and read-only gpu-accelerated-explorer-view.minified.wh.cpp; previous-versions retains only the 15 newest source versions."
-    [pscustomobject]@{Status='Pass'; Published=$true; Source=$source} |
+    if ($published) {
+        Write-Output "PASS: release finalized at $(Join-Path $root 'latest.cpp'), gpu-accelerated-explorer-view.wh.cpp and read-only gpu-accelerated-explorer-view.minified.wh.cpp; previous-versions retains only the 15 newest source versions."
+    } else {
+        Write-Output "PASS: publication declined. Working source: $source"
+    }
+    [pscustomobject]@{Status='Pass'; Published=$published; Source=$source} |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resultDirectory 'build-report.json') -Encoding UTF8
 } catch {
     $status = if ($_.Exception.Message -match '^PENDING:') { 'Pending' } else { 'Fail' }

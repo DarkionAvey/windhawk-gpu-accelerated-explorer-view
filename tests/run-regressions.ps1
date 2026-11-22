@@ -11,7 +11,7 @@ param(
     # A hard ceiling: may be lowered for diagnosis, never raised. See tests/README.md.
     [ValidateRange(1,120)][int]$TestTimeoutSeconds = 120,
     [switch]$KeepArtifacts,
-    # Local diagnosis only: sequential, one attempt each, collect all failures.
+    # Collect ordinary failures across the whole run, with one attempt per test.
     [switch]$Diagnostic,
     [scriptblock]$ProgressAction,
     [switch]$Coverage,
@@ -20,7 +20,7 @@ param(
     [string]$OutputDirectory
 )
 if ($Tests.Count -and $TestArguments.Count) { throw 'Use either -Tests or -TestArguments' }
-if ($Diagnostic) { $Jobs = 1; $KeepArtifacts = $true }
+if ($Diagnostic) { $KeepArtifacts = $true }
 # Comma-separated names arrive as one string through powershell -File.
 $Tests = @($Tests | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $compileUnload = (!$Tests.Count -and !$TestArguments.Count) -or $TestArguments -contains '--unload' -or $Tests -contains 'unload'
