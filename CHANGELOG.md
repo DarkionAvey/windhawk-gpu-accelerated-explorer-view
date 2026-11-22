@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.5
+- **FIXED** Hovering over items in single-click mode no longer changes the selection.
+
 ## 1.1.4
 - **FIXED** The selection color follows the real Windows accent color, including an Automatic accent picked from the wallpaper. It no longer turns nearly black or uses an outdated title-bar color.
 

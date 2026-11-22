@@ -157,6 +157,7 @@ static const Regression::Test kRegressions[] = {
         OptionEffects::TestLiveSweep(fixture,{{FVM_TILE,48}},L"tiles",true,true,2,3)),
     // Touch, gestures and drag.
     REGRESSION("touch-input", PARALLEL, TestTouchInput(fixture)),
+    REGRESSION("single-click-hover", SERIAL(Regression::InputDesktop), TestSingleClickHover()),
     REGRESSION("drag-preview", PARALLEL, TestDragPreview(fixture)),
     REGRESSION("edge-autoscroll-zones", PARALLEL, TestEdgeAutoscrollZones(fixture)),
     REGRESSION("edge-autoscroll-rate", PARALLEL, TestEdgeAutoscrollRate(fixture)),

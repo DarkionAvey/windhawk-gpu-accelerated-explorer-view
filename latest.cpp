@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.4
+// @version         1.1.5
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -26903,7 +26903,7 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
     }
     const int target = KeyboardNavigationTarget(state, key, !control && !shift);
     // Resolve the initial hover seed before keyboard input retires its visual
-    // and point-to-select tracking. Subsequent keys use the keyboard selection.
+    // tracking. Subsequent keys use the keyboard selection.
     SuppressPointerHoverForKeyboard(state);
     if (g_perf.load(std::memory_order_relaxed) &&
         (target < 0 || !state.postDeletionFocusPath.empty()))
@@ -37529,9 +37529,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // ignore all further drag movements until that button is released.
         if (s && s->columnWiggleAwaitRelease) return 0;
         // Hover re-arms on every move, so WM_MOUSEHOVER means the pointer
-        // rested for the system hover time (single-click select, item tips).
+        // rested for the system hover time before showing an item tip.
         if (s && !PointerHoverSuppressed(*s)) {
-            const bool hover = s->clickPolicy.singleClick || s->clickPolicy.itemTips;
+            const bool hover = s->clickPolicy.itemTips;
             if (!s->mouseTracking || hover) {
                 TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE | (hover ? TME_HOVER : 0u),hwnd,HOVER_DEFAULT};
                 if (TrackMouseEvent(&tme)) s->mouseTracking = true;
@@ -37571,17 +37571,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_MOUSEHOVER:
-        if (s && !s->pointerHoverSuppressed && s->clickPolicy.singleClick && s->pointingDevice != PointingDevice::Touch &&
-            s->visible && !s->emptyNative && !s->optimisticStartedAt &&
-            !PointerDragActive(*s) && !s->shellDragRunning && !s->rename.editor &&
-            !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON)) && TabOwnsActiveView(*s)) {
-            const int row = InsideListX(*s,GET_X_LPARAM(lParam)) ?
-                RowFromPoint(*s,GET_Y_LPARAM(lParam),GET_X_LPARAM(lParam)) : -1;
-            if (row >= 0 && row == s->hovered &&
-                SelectionCheckboxAt(*s,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)})==-1)
-                SelectWithModifiers(*s,row,(wParam & MK_CONTROL)!=0,(wParam & MK_SHIFT)!=0);
-        }
-        if (s && State(hwnd)==s && !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))) {
+        if (s && !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))) {
             const POINT at{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
             const int row = InsideListX(*s,at.x) ? RowFromPoint(*s,at.y,at.x) : -1;
             if (row >= 0 && row == s->hovered && SelectionCheckboxAt(*s,at)==-1) ShowItemTip(*s,at);

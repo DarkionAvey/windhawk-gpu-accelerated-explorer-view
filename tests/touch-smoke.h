@@ -1340,6 +1340,109 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
     }
 }
 
+static void TestSingleClickHover() {
+    using namespace TouchInputTest;
+    Regression::Claim(Regression::InputDesktop, "native TrackMouseEvent at the current cursor");
+    Check(Regression::OnInputDesktop(), "native hover requires the input desktop");
+    WorkerComApartment apartment;
+    StyleFixture::Session style;
+    TouchFixture::Session touch;
+    ModifierFixture::Session modifiers;
+    Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))), "filename fonts");
+
+    PresentationFixture::Tab tab(L"single-click hover", 2);
+    auto& state = tab.state;
+    FocusFixture::Session focus(tab.frame, state.hwnd);
+    Install(state);
+    const POINT rowPoint{LONG((ListStartX(state) + ListEndX(state)) * .5f),
+        LONG(state.headerPx + DocumentRowTop(state, 1) + DisplayRowHeight(state, 1) * .5f)};
+    Check(TabOwnsActiveView(state) && RowFromPoint(state, rowPoint.y, rowPoint.x) == 1,
+        "hover point must hit the second item in the active view");
+    const auto checkLabels = [&](bool first, bool second) {
+        RenderedTouch frame;
+        frame.Capture(state);
+        for (int row = 0; row < 2; ++row) {
+            const auto& labels = frame.renderer.textLayouts[0].layouts;
+            const auto label = labels.find(EntryLabel(state.entries[size_t(row)]));
+            Check(label != labels.end(), "filename was not painted");
+            BOOL underlined = FALSE;
+            Check(label->second.painted == frame.renderer.graphicsPaintSerial &&
+                SUCCEEDED(label->second.text->GetUnderline(0, &underlined)) &&
+                bool(underlined) == (row == 0 ? first : second),
+                "painted filename did not follow Explorer's underline preference");
+        }
+    };
+    const auto nativeHover = [&] {
+        // Put a private, non-activating window under the current cursor so
+        // USER generates the hover without moving the pointer or taking focus.
+        POINT cursor{};
+        Check(GetCursorPos(&cursor), "read cursor for native hover");
+        POINT offset = rowPoint;
+        Check(ClientToScreen(state.hwnd, &offset), "map hover point to screen");
+        RECT frame{};
+        Check(GetWindowRect(tab.frame, &frame) && SetWindowPos(tab.frame, HWND_TOPMOST,
+            cursor.x - (offset.x - frame.left), cursor.y - (offset.y - frame.top), 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE), "position private hover window");
+        Check(WindowFromPoint(cursor) == state.hwnd, "private window is not under the cursor");
+        INPUT moveInput{};
+        moveInput.type = INPUT_MOUSE;
+        moveInput.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+        Check(SendInput(1, &moveInput, sizeof(moveInput)) == 1, "queue a zero-distance mouse move");
+        MSG event{};
+        bool armed = false;
+        const bool delivered = Eventually([&] {
+            while (PeekMessageW(&event, state.hwnd, 0, 0, PM_REMOVE)) {
+                if (event.message == WM_MOUSEHOVER) return true;
+                if (event.message == WM_MOUSEMOVE && !armed) {
+                    OverlayProc(event.hwnd, event.message, event.wParam, event.lParam);
+                    Check(state.hovered == 1, "native mouse move did not hover the second item");
+                    TRACKMOUSEEVENT track{sizeof(track), TME_HOVER, state.hwnd, USER_TIMER_MINIMUM};
+                    Check(TrackMouseEvent(&track), "arm native hover tracking");
+                    armed = true;
+                } else {
+                    DispatchMessageW(&event);
+                }
+            }
+            return false;
+        });
+        Check(SetWindowPos(tab.frame, HWND_NOTOPMOST, frame.left, frame.top, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE), "return hover window offscreen");
+        Check(delivered && RowFromPoint(state, GET_Y_LPARAM(event.lParam), GET_X_LPARAM(event.lParam)) == 1,
+            "Windows did not deliver WM_MOUSEHOVER over the second item");
+        OverlayProc(event.hwnd, event.message, event.wParam, event.lParam);
+    };
+
+    StyleFixture::singleClick = true;
+    StyleFixture::browserUnderline = L"yes";
+    bool selectionPreserved = true;
+    for (const DWORD mode : {3u, 2u}) {
+        Regression::Scope scope(mode == 3 ? "browser underline" : "point-only underline");
+        StyleFixture::iconUnderline = mode;
+        state.clickPolicy = ReadShellClickPolicy();
+        state.clickPolicy.itemTips = false;
+        Select(state, 0);
+        ClearPointerHover(state, false);
+        Check(state.selected == 0 && state.selectedFlags[0] && !state.selectedFlags[1],
+            "selection precondition");
+        checkLabels(mode == 3, mode == 3);
+        nativeHover();
+        selectionPreserved &= state.selected == 0 && state.selectedFlags[0] && !state.selectedFlags[1];
+        checkLabels(mode == 3, true);
+    }
+
+    Device input;
+    ++input.primary;
+    input.Next();
+    input.Send(state, {input.Packet(state, input.primary, rowPoint, down)});
+    Check(state.touch.down && state.hovered == -1, "touch did not take over from the mouse");
+    checkLabels(false, true);
+    StopTouch(state);
+    state.touchRecognizer.reset();
+    SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, 0);
+    Check(selectionPreserved, "resting the mouse over another item changed the selection in single-click mode");
+}
+
 static void TestTouchInput(const std::wstring& fixture) {
     using namespace TouchInputTest;
     WorkerComApartment apartment;
