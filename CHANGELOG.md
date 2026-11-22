@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.4
+- **FIXED** The selection color follows the real Windows accent color, including an Automatic accent picked from the wallpaper. It no longer turns nearly black or uses an outdated title-bar color.
+
 ## 1.1.3
 - **FIXED** Details, List and Small Icons now show each icon's own pixel-perfect small artwork instead of a shrunken large icon, at every display scaling. The current icon stays on screen until the sharper one is ready.
 

@@ -288,6 +288,24 @@ static void TestUserOptions() {
     }
     {
         StyleFixture::Session faults;
+        const auto knownAccent=g_systemAccent.exchange(CLR_INVALID);
+        // The Windows accent (UISettings) wins over a different DWM title-bar
+        // colorization, as with an automatic accent picked from the wallpaper.
+        StyleFixture::accent=0xFFAACC11;
+        set(L"Selection.selectionColor",L"#C08040");
+        set(L"Selection.selectionColor",L"accent");
+        Check(g_dynamicAccent && g_selectionRgb==RGB(0x2E,0x7D,0x32),
+            "selection used DWM colorization instead of the Windows accent");
+        // A settings thread that cannot activate UISettings keeps the last real
+        // accent, never the DWM color.
+        StyleFixture::failApp=true;
+        set(L"Selection.selectionColor",L"#C08040");
+        set(L"Selection.selectionColor",L"accent");
+        Check(g_selectionRgb==RGB(0x2E,0x7D,0x32),
+            "accent lookup without UISettings replaced the last Windows accent");
+        // No Windows accent ever read: DWM colorization, then the system
+        // highlight, are the only fallbacks.
+        g_systemAccent=CLR_INVALID;
         set(L"Selection.selectionColor",L"#C08040");
         StyleFixture::accentStatus=E_FAIL;
         set(L"Selection.selectionColor",L"invalid");
@@ -296,9 +314,13 @@ static void TestUserOptions() {
         StyleFixture::accentStatus=S_OK; StyleFixture::accent=0;
         set(L"Selection.selectionColor",L"accent");
         Check(g_selectionRgb==RGB(12,110,210),"transparent/uninitialized accent accepted");
+        StyleFixture::failApp=false; StyleFixture::appAccent.A=0;
+        set(L"Selection.selectionColor",L"accent");
+        Check(g_selectionRgb==RGB(12,110,210),"transparent Windows accent accepted");
         StyleFixture::accent=0xFFAACC11;
         set(L"Selection.selectionColor",L" accent\t");
-        Check(g_dynamicAccent && g_selectionRgb==RGB(0xAA,0xCC,0x11),"valid DWM accent conversion/trim");
+        Check(g_dynamicAccent && g_selectionRgb==RGB(0xAA,0xCC,0x11),"valid DWM fallback conversion/trim");
+        g_systemAccent=knownAccent;
         StyleFixture::wheel=WHEEL_PAGESCROLL; LoadSettings();
         Check(g_wheelLines==WHEEL_PAGESCROLL,"page-scroll sentinel rejected");
         StyleFixture::wheel=0; LoadSettings(); Check(g_wheelLines==0,"disabled wheel scrolling rejected");

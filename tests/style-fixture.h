@@ -45,6 +45,9 @@ inline thread_local HRESULT accentStatus=S_OK;
 inline thread_local DWORD accent=0xFF0078D7;
 inline thread_local COLORREF window=RGB(255,255,255), text=RGB(0,0,0);
 inline thread_local ABI::Windows::UI::Color appBg{255,24,24,24}, appFg{255,240,240,240};
+// UIColorType_Accent: deliberately unlike the DWM colorization value above,
+// as on real systems with an automatic accent or a stale title-bar color.
+inline thread_local ABI::Windows::UI::Color appAccent{255,0x2E,0x7D,0x32};
 inline thread_local LOGFONTW themeFont{}, systemFont{};
 inline thread_local std::map<std::tuple<int,int,int,int>,COLORREF> colors;
 inline HTHEME Theme(int id) {return reinterpret_cast<HTHEME>(INT_PTR(id));}
@@ -111,7 +114,8 @@ struct AppColors final : ABI::Windows::UI::ViewManagement::IUISettings3 {
     HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel*) override {return E_NOTIMPL;}
     HRESULT STDMETHODCALLTYPE GetColorValue(ABI::Windows::UI::ViewManagement::UIColorType type,
             ABI::Windows::UI::Color* value) override {
-        *value=type==ABI::Windows::UI::ViewManagement::UIColorType_Background ? appBg : appFg;
+        *value=type==ABI::Windows::UI::ViewManagement::UIColorType_Background ? appBg :
+            type==ABI::Windows::UI::ViewManagement::UIColorType_Accent ? appAccent : appFg;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE add_ColorValuesChanged(
@@ -132,7 +136,7 @@ struct Session {
         visibilityQueries=clickQueries=0; showHidden=showProtected=singleClick=false;
         iconUnderline=2; browserUnderline=L"yes";
         window=RGB(255,255,255); text=RGB(0,0,0);
-        appBg={255,24,24,24}; appFg={255,240,240,240};
+        appBg={255,24,24,24}; appFg={255,240,240,240}; appAccent={255,0x2E,0x7D,0x32};
         themeFont={}; systemFont={}; colors.clear();}
     ~Session() {enabled=false; colors.clear();}
 };

@@ -1984,6 +1984,7 @@ static void TestPreviewInput() {
 #include "selection-trace.h"
 #include "timing-readiness-smoke.h"
 #include "options-smoke.h"
+#include "accent-smoke.h"
 #include "style-smoke.h"
 #include "style-events-smoke.h"
 #include "column-bridge-smoke.h"

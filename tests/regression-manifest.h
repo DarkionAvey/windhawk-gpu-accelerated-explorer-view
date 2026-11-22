@@ -173,6 +173,7 @@ static const Regression::Test kRegressions[] = {
     // Styles, refresh, columns and native views.
     REGRESSION("resolved-styles", PARALLEL, TestResolvedStyles()),
     REGRESSION("style-events", PARALLEL, TestStyleEvents(fixture)),
+    REGRESSION("windows-accent", PARALLEL, TestWindowsAccent()),
     REGRESSION("periodic-capacity-refresh", PARALLEL, TestPeriodicCapacityRefresh(fixture)),
     REGRESSION("tab-resume-refresh", PARALLEL, TestTabResumeRefresh(fixture)),
     REGRESSION("window-resume-refresh", PARALLEL, TestWindowResumeRefresh(fixture)),

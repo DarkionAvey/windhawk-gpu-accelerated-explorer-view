@@ -81,7 +81,8 @@ static void TestStyleEvents(const std::wstring& fixture) {
     Check(StyleFixture::visibilityQueries==0,
         "directory maintenance polled Shell visibility settings");
     StyleFixture::colors={{{1,0,0,TMT_TEXTCOLOR},RGB(210,230,240)}};
-    StyleFixture::accent=0xFF18A060;
+    // The Windows accent changes; DWM colorization reports something else.
+    StyleFixture::appAccent={255,0x18,0xA0,0x60}; StyleFixture::accent=0xFFAACC11;
     SendMessageW(frame,WM_THEMECHANGED,0,0);
     SendMessageW(frame,WM_SYSCOLORCHANGE,0,0);
     SendMessageW(frame,WM_DWMCOLORIZATIONCOLORCHANGED,StyleFixture::accent,TRUE);

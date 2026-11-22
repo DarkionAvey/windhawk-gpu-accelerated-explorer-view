@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.3
+// @version         1.1.4
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -7677,11 +7677,38 @@ D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
     return D2D1::ColorF(rgb & 0xFFFFFF, alpha);
 }
 
-void RefreshThemeColor() {
+// Windows' accent is UISettings' UIColorType_Accent, the color Settings shows,
+// including "Automatic" accents picked from the wallpaper. DWM colorization is
+// the title-bar glass color: with an automatic accent it is a darkened, blended
+// variant (and it lags manual changes), so it is only a last resort. The last
+// accent read on a WinRT-capable thread is kept for threads that cannot
+// activate UISettings (settings load), never replaced by a guess.
+std::atomic<COLORREF> g_systemAccent{CLR_INVALID};
+bool ReadSystemAccent(COLORREF& accent) {
+    using namespace ABI::Windows::UI::ViewManagement;
+    constexpr wchar_t name[] = L"Windows.UI.ViewManagement.UISettings";
+    HSTRING_HEADER header{}; HSTRING className = nullptr;
+    ComPtr<IInspectable> instance; ComPtr<IUISettings3> colors;
+    ABI::Windows::UI::Color value{};
+    if (FAILED(WindowsCreateStringReference(name, ARRAYSIZE(name)-1, &header, &className)) ||
+        FAILED(RoActivateInstance(className, &instance)) || FAILED(instance.As(&colors)) ||
+        FAILED(colors->GetColorValue(UIColorType_Accent, &value)) || value.A != 255) return false;
+    accent = RGB(value.R, value.G, value.B);
+    g_systemAccent.store(accent, std::memory_order_relaxed);
+    return true;
+}
+
+// queryAccent=false reuses the accent a tab's palette refresh just read with
+// its own UISettings activation, so a color event costs one activation per tab.
+void RefreshThemeColor(bool queryAccent = true) {
     DWORD dwm = 0; BOOL opaque = FALSE;
     COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     if (!ValidRgb(accent)) accent = RGB(0,120,215);
-    if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
+    COLORREF system = CLR_INVALID;
+    if ((queryAccent && ReadSystemAccent(system)) ||
+        ValidRgb(system = g_systemAccent.load(std::memory_order_relaxed)))
+        accent = system;
+    else if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
         accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
     HIGHCONTRASTW contrast{sizeof(contrast)};
     const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
@@ -7825,6 +7852,14 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
                 state.nativeAppBackground = RGB(bg.R,bg.G,bg.B);
             if (SUCCEEDED(colors->GetColorValue(UIColorType_Foreground, &fg)) && fg.A == 255)
                 state.nativeAppForeground = RGB(fg.R,fg.G,fg.B);
+            // Explorer's UI thread can always read the accent; refresh it here,
+            // so a settings-load thread without WinRT never leaves the
+            // selection on another source's color.
+            ABI::Windows::UI::Color accent{};
+            if (SUCCEEDED(colors->GetColorValue(UIColorType_Accent, &accent)) && accent.A == 255 &&
+                g_systemAccent.exchange(RGB(accent.R,accent.G,accent.B),std::memory_order_relaxed) !=
+                    RGB(accent.R,accent.G,accent.B))
+                RefreshThemeColor(false);
         }
     }
     HIGHCONTRASTW contrast{sizeof(contrast)};
@@ -36158,7 +36193,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!changes) return 0;
             HideItemTip(*s); // Its face, palette or Folder Options policy may change.
             if (changes & kStyleColors) {
-                RefreshThemeColor();
+                // High contrast and the cached accent apply now; the palette
+                // refresh below reads a changed accent and reapplies it.
+                RefreshThemeColor(false);
                 s->viewTogglePaletteDirty=true;
                 RefreshNativePalette(*s,true);
             }
