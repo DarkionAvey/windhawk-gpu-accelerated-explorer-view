@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.2
+// @version         1.1.3
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -8398,6 +8398,24 @@ void RefreshImageMemoryAllowance(TabBackground& work) {
         static_cast<size_t>(std::max<ULONGLONG>(4ULL*1024*1024,memory.ullAvailPhys/64)),std::memory_order_relaxed);
 }
 
+// Shell image lists hold the artwork each icon resource designs for that size
+// (small icons are often hand-tuned, not downscaled). Their sizes follow the
+// process DPI and icon metrics, so query them: prefer an exact match, then the
+// smallest list not smaller than the slot, then the largest available.
+HRESULT ShellImageListForSize(UINT pixelSize, ComPtr<IImageList>& images) {
+    images.Reset();
+    int best = 0; HRESULT hr = E_FAIL;
+    for (const int list : {SHIL_SMALL, SHIL_SYSSMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO}) {
+        ComPtr<IImageList> candidate; int width = 0, height = 0;
+        hr = SHGetImageList(list, IID_PPV_ARGS(&candidate));
+        if (FAILED(hr) || FAILED(candidate->GetIconSize(&width,&height)) || width <= 0 || height <= 0) continue;
+        const int side = std::max(width,height), want = static_cast<int>(pixelSize);
+        if (!images || (side >= want ? best < want || side < best : side > best)) { images = candidate; best = side; }
+        if (side == want) break;
+    }
+    return images ? S_OK : FAILED(hr) ? hr : E_FAIL;
+}
+
 // A cold Shell image-list lookup can return no HICON while its per-instance
 // cache is initializing. Use the Shell image factory before caching a miss;
 // Details/Small Icons request icons only; large grids allow Shell thumbnails
@@ -8549,8 +8567,7 @@ DWORD WINAPI IconWorkerProc(LPVOID context) {
             ComPtr<IImageList> images;
             HICON raw = nullptr;
             int width = 0, height = 0;
-            if (memoryReady) decodeResult = SHGetImageList(job.pixelSize > 48 ? SHIL_JUMBO :
-                job.pixelSize > 32 ? SHIL_EXTRALARGE : SHIL_LARGE, IID_PPV_ARGS(&images));
+            if (memoryReady) decodeResult = ShellImageListForSize(job.pixelSize, images);
             if (memoryReady && SUCCEEDED(decodeResult))
                 decodeResult = images->GetIcon(job.imageListIndex, ILD_TRANSPARENT, &raw);
             icon.reset(raw);
@@ -8585,9 +8602,7 @@ DWORD WINAPI IconWorkerProc(LPVOID context) {
             if (memoryReady && !pixels.Ready() && haveIndex && IconJobCurrent(work, job)) {
                 ComPtr<IImageList> images;
                 HICON large = nullptr;
-                if (SUCCEEDED(SHGetImageList(job.pixelSize > 48 ? SHIL_JUMBO :
-                    job.pixelSize > 32 ? SHIL_EXTRALARGE : SHIL_LARGE,
-                    IID_PPV_ARGS(&images))) && SUCCEEDED(images->GetIcon(info.iIcon, ILD_TRANSPARENT, &large))) {
+                if (SUCCEEDED(ShellImageListForSize(job.pixelSize, images)) && SUCCEEDED(images->GetIcon(info.iIcon, ILD_TRANSPARENT, &large))) {
                     icon.reset(large);
                     int width=0,height=0;
                     if(SUCCEEDED(images->GetIconSize(&width,&height)) && width>0 && height>0)
@@ -8749,11 +8764,39 @@ std::wstring IconKey(const Entry& e, std::wstring& lookup, bool& useAttrs, bool 
     return e.path;
 }
 
-template<class Visit> void VisitImageTiers(Visit visit) {
-    for (UINT base=32;base<=kPlatformImageDimension;base*=2) {
-        if (!visit(base)) return;
-        if (base+base/2<=kPlatformImageDimension && !visit(base+base/2)) return;
+// Sizes of the Shell's small, large and extra-large image lists. They follow
+// the system DPI and icon metrics (SHGetImageList docs), so derive them from
+// the live metrics: no cold image-list call on the UI thread, no stale cache.
+using ShellListSides = std::array<UINT,3>;
+ShellListSides ShellImageListSides() {
+    return {UINT(std::max(1,GetSystemMetrics(SM_CXSMICON))),UINT(std::max(1,GetSystemMetrics(SM_CXICON))),
+        UINT(std::max(1,MulDiv(48,int(GetDpiForSystem()),96)))};
+}
+// Ascending image tiers: a 16..max ladder plus the Shell list sizes, so a
+// fractional-scaling slot (20px at 125%, 28px at 175%) is requested at its
+// own list size instead of rounding past it onto larger artwork.
+template<class Visit> void VisitImageTiers(ShellListSides shell, Visit visit) {
+    std::sort(shell.begin(),shell.end());
+    size_t next=0; UINT last=0;
+    const auto emit=[&](UINT size) { if (size==last) return true; last=size; return visit(size); };
+    const auto ladder=[&](UINT size) {
+        for (;next<shell.size() && shell[next]<=size;++next)
+            if (shell[next]>=16 && !emit(shell[next])) return false;
+        return emit(size);
+    };
+    for (UINT base=16;base<=kPlatformImageDimension;base*=2) {
+        if (!ladder(base)) return;
+        if (base+base/2<=kPlatformImageDimension && !ladder(base+base/2)) return;
     }
+}
+template<class Visit> void VisitImageTiers(Visit visit) {VisitImageTiers(ShellImageListSides(),visit);}
+UINT ImageTierFor(double desired, double limit, const ShellListSides& shell) {
+    UINT chosen=32;
+    VisitImageTiers(shell,[&](UINT size) {
+        if(size>std::max(32.,limit)) return false;
+        chosen=size; return size<desired;
+    });
+    return chosen;
 }
 UINT ImageKeySize(std::wstring_view key) {
     if (!key.starts_with(L"@")) return 32;
@@ -8788,12 +8831,7 @@ UINT IconRequestSize(const ViewState& state) {
         (std::ceil(std::max(0.,height-state.headerPx)/row)+1)*std::max(1,state.itemsPerRow));
     const double memorySide=std::sqrt(double(ImageMemoryBudget(state))/(8.*(slots+2)));
     const double limit=std::min({double(state.imageTextureLimit),memorySide,std::max({32.,width,height})});
-    UINT chosen=32;
-    VisitImageTiers([&](UINT size) {
-        if(size>std::max(32.,limit)) return false;
-        chosen=size; return size<desired;
-    });
-    return chosen;
+    return ImageTierFor(desired,limit,ShellImageListSides());
 }
 IconKeyContext MakeIconKeyContext(const ViewState& state) {
     return {IconRequestSize(state),state.gridView,FileThumbnails(state)};
@@ -8818,7 +8856,7 @@ std::wstring IconKey(const IconKeyContext& context, const Entry& e, std::wstring
     if(previewLimit) size=std::min(size,previewLimit);
     // Separate small per-file thumbnails from existing 32px per-file icons.
     // Larger tiers can reuse the identical decorated grid image unchanged.
-    if (size > 32 || listThumbnail) key = L"@" + std::to_wstring(size) + L"|" + key;
+    if (size != 32 || listThumbnail) key =L"@" + std::to_wstring(size) + L"|" + key;
     return key;
 }
 std::wstring IconKey(const ViewState& state, const Entry& e, std::wstring& lookup,
@@ -19701,7 +19739,15 @@ bool RequestEntryIcon(ViewState& state, const Entry& entry, bool associationOnly
     // large thumbnails still respect this tab's existing adaptive RAM budget.
     const bool thumbnail = !associationOnly && (dragThumbnail ? !entry.folder:UsesThumbnails(state,entry));
     const size_t side = ImageKeySize(key);
-    auto* cached=FindIconRecord(state,key,true);
+    std::wstring cachedKey;
+    auto* cached=FindIconRecord(state,key,true,false,&cachedKey);
+    // Icon resources carry distinct artwork per size; another tier's icon is
+    // only a placeholder, as is a grid thumbnail for an icon-only slot. A
+    // source-limited smaller tier is already the largest artwork available;
+    // thumbnail requests keep reusing scaled thumbnails across tiers.
+    const size_t cachedTier=cached ? ImageKeySize(cachedKey) : side;
+    if(cached && !thumbnail && cachedTier!=side &&
+        !(cachedTier<side && cached->resolved && cached->sourceLimited)) cached=nullptr;
     if(cached && !cached->needsRefresh && (!record || !record->needsRefresh) &&
         cached->pixels.Ready() && cached->pixels.width<=state.imageTextureLimit &&
         cached->pixels.height<=state.imageTextureLimit) {

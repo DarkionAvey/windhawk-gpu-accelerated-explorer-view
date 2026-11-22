@@ -5,6 +5,17 @@ static HWND IconTestWindow() {
     return hwnd;
 }
 
+// Cache keys carry the view's size tier; derive them as the view requests
+// them rather than assuming the unprefixed 32px tier.
+static std::wstring IconLookupKey(const ViewState& state, const Entry& entry) {
+    std::wstring lookup; bool attributes = false;
+    return IconKey(state, entry, lookup, attributes);
+}
+static std::wstring AssociationLookupKey(const ViewState& state, const Entry& entry) {
+    std::wstring lookup; bool attributes = false;
+    return IconKey(state, entry, lookup, attributes, true);
+}
+
 template<class State = ViewState>
 static void TestIconQueueIsolation() {
     State probe;
@@ -34,12 +45,12 @@ static void TestIconQueueIsolation() {
         Check(Eventually([&] {
             ReceiveIcons(first);
             for (int i = 1; i < first.total; ++i) {
-                const auto found = first.icons.find(first.entries[i].path);
+                const auto found = first.icons.find(IconLookupKey(first,first.entries[i]));
                 if (found == first.icons.end() || !found->second.pixels.Ready()) return false;
             }
             return IconFixture::blocked.load() == 1;
         }), "one slow EXE blocked later icons or icon fetching waited for optional startup");
-        Check(first.icons.at(first.entries[0].path).pending, "blocked first EXE unexpectedly completed");
+        Check(first.icons.at(IconLookupKey(first,first.entries[0])).pending, "blocked first EXE unexpectedly completed");
         auto& blocked = makeTab(40, true);
         IconFixture::blockAll = true;
         RequestVisibleIcons(blocked);
@@ -47,7 +58,7 @@ static void TestIconQueueIsolation() {
               "per-tab icon extraction did not fill its independent provider slots");
         Check(Eventually([&] {
             ReceiveIcons(blocked);
-            return blocked.icons.contains(L"type:.exe") && blocked.icons.at(L"type:.exe").pixels.Ready();
+            return blocked.icons.contains(AssociationLookupKey(blocked,blocked.entries[0])) && blocked.icons.at(AssociationLookupKey(blocked,blocked.entries[0])).pixels.Ready();
         }), "association icon waited behind blocked executable providers");
         // Keep these providers blocked, but allow another tab's fast requests.
         IconFixture::blockAll = false;
@@ -60,10 +71,10 @@ static void TestIconQueueIsolation() {
         RequestVisibleIcons(other);
         Check(Eventually([&] {
             ReceiveIcons(other);
-            return other.icons.contains(other.entries[0].path) && other.icons.at(other.entries[0].path).pixels.Ready() &&
-                other.icons.contains(other.entries[1].path) && other.icons.at(other.entries[1].path).pixels.Ready() &&
-                other.icons.contains(other.entries[2].path) && other.icons.at(other.entries[2].path).pixels.Ready() &&
-                other.icons.contains(other.entries[3].path) && other.icons.at(other.entries[3].path).resolved;
+            return other.icons.contains(IconLookupKey(other,other.entries[0])) && other.icons.at(IconLookupKey(other,other.entries[0])).pixels.Ready() &&
+                other.icons.contains(IconLookupKey(other,other.entries[1])) && other.icons.at(IconLookupKey(other,other.entries[1])).pixels.Ready() &&
+                other.icons.contains(IconLookupKey(other,other.entries[2])) && other.icons.at(IconLookupKey(other,other.entries[2])).pixels.Ready() &&
+                other.icons.contains(IconLookupKey(other,other.entries[3])) && other.icons.at(IconLookupKey(other,other.entries[3])).resolved;
         }), "blocked tabs occupied another tab's icon workers");
         Check(IconFixture::transientCalls == 2 && IconFixture::permanentCalls == 2,
               "empty Shell responses were cached forever or retried without a bound");
@@ -78,7 +89,7 @@ static void TestIconQueueIsolation() {
             }),"deferred icon viewport demand did not complete");
         };
         completeDemand(blocked);
-        const auto oldId = blocked.icons.at(blocked.entries[5].path).pendingRequestId;
+        const auto oldId = blocked.icons.at(IconLookupKey(blocked,blocked.entries[5])).pendingRequestId;
         blocked.scrollNow = blocked.scrollTarget = 15 * blocked.rowPx;
         {
             ExclusiveSrwLock held(blocked.background->iconLock);
@@ -86,8 +97,8 @@ static void TestIconQueueIsolation() {
             Check(blocked.viewportDemandPending,"contended viewport demand was not scheduled for a follow-up");
         }
         completeDemand(blocked);
-        Check(!blocked.icons.at(blocked.entries[5].path).pending &&
-              !blocked.icons.at(blocked.entries[5].path).resolved, "offscreen queued icons were stranded as pending/resolved");
+        Check(!blocked.icons.at(IconLookupKey(blocked,blocked.entries[5])).pending &&
+              !blocked.icons.at(IconLookupKey(blocked,blocked.entries[5])).resolved, "offscreen queued icons were stranded as pending/resolved");
         const auto visible = VisibleItemRows(blocked, 0.f);
         {
             ExclusiveSrwLock lock(blocked.background->iconLock);
@@ -96,13 +107,13 @@ static void TestIconQueueIsolation() {
                 blocked.background->iconJobs.end(), [](const IconJob& job) { return !job.useAttributes; });
             Check(front != blocked.background->iconJobs.end(), "scrolled file icon demand was not queued");
             Check(std::any_of(visible.begin(), visible.end(), [&](int row) {
-                return front->key == blocked.entries[row].path;
+                return front->key==IconLookupKey(blocked,blocked.entries[row]);
             }), "overscan or old viewport stayed ahead of visible icons");
             bool overscanSeen=false; size_t visibleJobs=0,overscanJobs=0;
             for(const auto& job:blocked.background->iconJobs) {
                 if(job.useAttributes || job.overlayQuery) continue;
                 const bool onscreen=std::any_of(visible.begin(),visible.end(),[&](int row) {
-                    return job.key==blocked.entries[row].path;
+                    return job.key==IconLookupKey(blocked,blocked.entries[row]);
                 });
                 if(onscreen) {
                     Check(!overscanSeen,"new visible icons were appended behind retained overscan");
@@ -113,18 +124,18 @@ static void TestIconQueueIsolation() {
         }
         blocked.scrollNow = blocked.scrollTarget = 0;
         RequestVisibleIcons(blocked); completeDemand(blocked);
-        Check(blocked.icons.at(blocked.entries[5].path).pending &&
-              blocked.icons.at(blocked.entries[5].path).pendingRequestId != oldId,
+        Check(blocked.icons.at(IconLookupKey(blocked,blocked.entries[5])).pending &&
+              blocked.icons.at(IconLookupKey(blocked,blocked.entries[5])).pendingRequestId != oldId,
               "cancelled queued icon could not be requested on return");
         // Association requests remain useful across navigation; per-file jobs
         // are generation-bound. An obsolete result cannot fill a new request.
-        const auto associationRequest = first.icons.at(L"type:.exe").pendingRequestId;
+        const auto associationRequest = first.icons.at(AssociationLookupKey(first,first.entries[0])).pendingRequestId;
         CancelDepartedIconJobs(first, ++first.iconToken);
         Check(std::all_of(first.icons.begin(), first.icons.end(), [](const auto& pair) {
             return pair.second.association || !pair.second.pending;
         }), "navigation left cancelled per-file requests pinned in the bounded cache");
         RequestVisibleIcons(first);
-        Check(first.icons.at(L"type:.exe").pendingRequestId == associationRequest,
+        Check(first.icons.at(AssociationLookupKey(first,first.entries[0])).pendingRequestId == associationRequest,
               "navigation threw away a reusable association icon");
         std::vector<std::weak_ptr<TabBackground>> lifetimes;
         for (auto& tab : tabs) { lifetimes.push_back(tab->background); Stop(tab->background); }
@@ -165,15 +176,15 @@ static void ProfileExecutableIcons() {
     RequestVisibleIcons(state);
     const bool complete = Eventually([&] {
         ReceiveIcons(state);
-        return std::all_of(paths.begin(), paths.end(), [&](const auto& path) {
-            const auto found = state.icons.find(path);
+        return std::all_of(state.entries.begin(), state.entries.end(), [&](const Entry& entry) {
+            const auto found = state.icons.find(IconLookupKey(state,entry));
             return found != state.icons.end() && found->second.pixels.Ready();
         });
     }, 30000);
-    if (!complete) for (const auto& path : paths) {
-        const auto found = state.icons.find(path);
+    if (!complete) for (const auto& entry : state.entries) {
+        const auto found = state.icons.find(IconLookupKey(state,entry));
         if (found == state.icons.end() || !found->second.pixels.Ready())
-            std::wcerr << L"ICON PROFILE FAILURE: " << path << L'\n';
+            std::wcerr << L"ICON PROFILE FAILURE: " << entry.path << L'\n';
     }
     Check(complete, "real executable icon resolution");
     QueryPerformanceCounter(&end);

@@ -447,7 +447,10 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                 "grid rename covered the icon or escaped its label cell");
             std::wstring path; bool attrs = false;
             const auto key = IconKey(state,state.entries[0],path,attrs);
-            Check(size <= 32 ? key == L"type:.bmp" : key.find(L"@") != std::wstring::npos,
+            // None of 16/48/96/256 is the unprefixed 32px tier: each has its own
+            // sized key. Small icons keep the shared association; larger grids
+            // may use the per-file thumbnail, and viewport/memory may cap tiers.
+            Check(key.starts_with(L"@") && (size > 32 || key.ends_with(L"|type:.bmp")),
                 "different icon resolutions aliased the same cache key");
             if (size == 48) {
                 ComPtr<ID2D1Bitmap1> pixel;
@@ -502,7 +505,9 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                     "32px list request did not fetch a real thumbnail, or modified the grid image");
                 g_listThumbnails=false;
                 const auto iconKey=IconKey(state,state.entries[0],path,attrs);
-                Check(attrs && iconKey==L"type:.bmp","disabled list thumbnails did not return to normal icon demand");
+                // Back on the shared association at this slot's own size tier.
+                Check(attrs && (iconKey==L"type:.bmp" || iconKey.ends_with(L"|type:.bmp")) &&
+                    iconKey.find(picture)==std::wstring::npos,"disabled list thumbnails did not return to normal icon demand");
                 g_listThumbnails=listThumbnails; state.gridView=true; state.iconPx=gridIcon;
                 const float previousSize=state.iconPx; state.iconPx=256;
                 const auto larger=IconKey(state,state.entries[0],path,attrs);

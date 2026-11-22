@@ -61,7 +61,10 @@ static void TestRecycleIdentities(HWND frame, const std::wstring& fixture) {
     }
     Entry hiddenExtension=state.entries.front(); hiddenExtension.name=L"duplicate";
     std::wstring iconPath; bool attributes=false;
-    Check(IconKey(state,hiddenExtension,iconPath,attributes)==hiddenExtension.path && !attributes,
+    // The per-item identity, at whatever size tier the view requests.
+    const auto hiddenKey=IconKey(state,hiddenExtension,iconPath,attributes);
+    Check((hiddenKey==hiddenExtension.path || hiddenKey.ends_with(L"|"+hiddenExtension.path)) &&
+        hiddenKey.starts_with(L"@")==(hiddenKey!=hiddenExtension.path) && !attributes,
         "namespace icons relied on a display name having a file extension");
     auto sorted=state.entries;
     SortSpec size=DefaultSort(); size.explicitOrder=true; size.kind=SortKind::Size;

@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.3
+- **FIXED** Details, List and Small Icons now show each icon's own pixel-perfect small artwork instead of a shrunken large icon, at every display scaling. The current icon stays on screen until the sharper one is ready.
+
 ## 1.1.2
 - **IMPROVED** Icon captions follow the Windows text size during zoom. Crossing an icon-size preset updates Explorer’s folder view.
 

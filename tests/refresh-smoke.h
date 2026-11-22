@@ -70,7 +70,21 @@ static void TestTabResumeRefresh(const std::wstring& directory) {
     std::cout<<"PASS: three private tabs resume once after cached presentation, including This PC; stale wakes/navigation and duplicate hints are rejected\n";
 }
 
-static void TestWindowResumeRefresh() {
+// The synthetic Z:\ volume needs a Shell identity. An empty PIDL is the real
+// Desktop, whose property store reaches the user's namespace providers and is
+// unbounded under load. Use a private fixture folder instead.
+static SharedPidl PrivateVolumeIdentity(const std::wstring& fixture) {
+    static unsigned next=0;
+    const auto folder=JoinPath(fixture,L"synthetic-volume-"+std::to_wstring(++next));
+    Check(CreateDirectoryW(folder.c_str(),nullptr) || GetLastError()==ERROR_ALREADY_EXISTS,
+        "private synthetic volume folder");
+    PIDLIST_ABSOLUTE identity=nullptr;
+    Check(SUCCEEDED(SHParseDisplayName(folder.c_str(),nullptr,&identity,0,nullptr)) && identity,
+        "private synthetic volume identity");
+    return SharedPidl(identity,TaskMemDeleter{});
+}
+
+static void TestWindowResumeRefresh(const std::wstring& fixture) {
     WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
     cls.lpszClassName=L"CabinetWClass"; RegisterClassW(&cls);
     CapacityFixture::Session volume;
@@ -82,9 +96,7 @@ static void TestWindowResumeRefresh() {
         s.token=g_nextToken.fetch_add(1); s.thisPcGpu=true; s.folderPath=kThisPcLocation;
         s.nativeRowsComplete=true; s.nativeRowsNeedCapture=false; s.nativeRowsViewToken=s.token;
         Entry drive; drive.path=L"Z:\\"; drive.name=L"Synthetic volume"; drive.folder=true;
-        auto empty=static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(sizeof(USHORT)));
-        Check(empty!=nullptr,"window resume synthetic volume identity"); empty->mkid.cb=0;
-        drive.shellIdentity=SharedPidl(empty,TaskMemDeleter{});
+        drive.shellIdentity=PrivateVolumeIdentity(fixture);
         s.entries=s.nativeRows={drive}; s.selected=0; s.selectedFlags={1};
         SetWindowLongPtrW(s.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&s));
         {ExclusiveSrwLock lock(g_tabRegistryLock);
@@ -215,7 +227,7 @@ static void TestUnchangedRefreshPresentation() {
     std::cout<<"PASS: unchanged refresh advances presenter generation without a GPU paint; identical This PC identities and capacities preserve rows/pixels\n";
 }
 
-static void TestPeriodicCapacityRefresh() {
+static void TestPeriodicCapacityRefresh(const std::wstring& fixture) {
     CapacityFixture::Session volume;
     std::weak_ptr<TabBackground> lifetime;
     {
@@ -237,9 +249,7 @@ static void TestPeriodicCapacityRefresh() {
     state.viewEvents=reinterpret_cast<HWINEVENTHOOK>(UINT_PTR(1));
     state.nativeRowsViewToken=state.token;
     auto& drive=state.entries.front(); drive.path=L"Z:\\"; drive.name=L"Synthetic volume";
-    auto empty=static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(sizeof(USHORT)));
-    Check(empty!=nullptr,"capacity maintenance synthetic identity"); empty->mkid.cb=0;
-    drive.shellIdentity=SharedPidl(empty,TaskMemDeleter{});
+    drive.shellIdentity=PrivateVolumeIdentity(fixture);
     state.nativeRows=state.entries;
     state.lastActiveViewProbe=GetTickCount64();
     state.driveCapacityRequestedAt=GetTickCount64()-kDriveSpaceRefreshMs;
@@ -280,7 +290,7 @@ static void TestPeriodicCapacityRefresh() {
     std::cout<<"PASS: subscribed capacity timer uses only the background volume lane; drive events and missing-subscription recovery still request identities\n";
 }
 
-static void TestDriveSpaceRefresh() {
+static void TestDriveSpaceRefresh(const std::wstring& fixture) {
     CapacityFixture::Session volume;
     Check(CapacityFixture::gate!=nullptr,"synthetic volume gate");
     ViewState state, other;
@@ -290,9 +300,7 @@ static void TestDriveSpaceRefresh() {
     state.nativeRowsNeedCapture=false;
     state.directoryToken=991; state.background->directoryGeneration=state.directoryToken;
     Entry drive; drive.path=L"Z:\\"; drive.name=L"Synthetic volume"; drive.folder=true;
-    auto empty=static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(sizeof(USHORT)));
-    Check(empty!=nullptr,"synthetic volume identity"); empty->mkid.cb=0;
-    drive.shellIdentity=SharedPidl(empty,TaskMemDeleter{});
+    drive.shellIdentity=PrivateVolumeIdentity(fixture);
     state.nativeRows=state.entries={drive}; state.total=1;
     ExplorerColumn name; name.key=PKEY_FileName;
     ExplorerColumn extra; extra.key=PKEY_Author;
