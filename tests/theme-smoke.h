@@ -640,12 +640,27 @@ static void TestThemedScrollbar(bool thumb) {
         surface.state.themeMode=Theme::Mode::Dark;
         Check(pixel(render(),crossEdge,axialEdge)==0xffff0000u,"scrollbar dark zero percent did not square the corner");
         surface.state.themeMode=Theme::Mode::Light;
-        Load(settings,L""); const auto native=render(); noRamps();
-        Load(settings,theme(LR"(background="#ff0000" border-width="3px" border-radius="0" />)"));
+        Load(settings,L"");
+        constexpr DWORD shades[2][3]={{0xffa5a5a5,0xff959595,0xff858585},
+                                      {0xff757575,0xff858585,0xff959595}};
+        for(auto mode:{Theme::Mode::Light,Theme::Mode::Dark}) for(interaction=0;interaction<3;++interaction) {
+            surface.state.themeMode=mode;
+            Check(pixel(render(),MulDiv(32,dpi,96),MulDiv(70,dpi,96))==
+                shades[mode==Theme::Mode::Dark][interaction],"default scrollbar thumb shade differs");
+        }
+        interaction=0; surface.state.themeMode=Theme::Mode::Light;
+        const auto normal=render(); noRamps();
         surface.state.themeHighContrast=true;
-        Check(render()==native,"high contrast did not restore native scrollbar pixels");
+        const auto contrast=render();
+        // Idle high contrast uses the supplied white foreground at 44% on
+        // the transparent target. The idle track contributes no coverage.
+        Check(pixel(contrast,MulDiv(32,dpi,96),MulDiv(70,dpi,96))==0x70707070u &&
+              pixel(contrast,MulDiv(32,dpi,96),MulDiv(30,dpi,96))==0,
+              "high contrast scrollbar lost foreground color or idle opacity");
+        Load(settings,theme(LR"(background="#ff0000" border-width="3px" border-radius="0" />)"));
+        Check(render()==contrast,"custom theme changed high contrast scrollbar pixels");
         surface.state.themeHighContrast=false;
-        Load(settings,L""); Check(render()==native,"clearing theme did not restore native scrollbar pixels");
+        Load(settings,L""); Check(render()==normal,"clearing theme did not restore default scrollbar pixels");
     }
     DropTarget(surface.state); noRamps();
     BorderCacheReleased(surface.state.themeBorderStrokes);

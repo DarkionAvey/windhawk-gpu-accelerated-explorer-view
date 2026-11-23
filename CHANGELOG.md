@@ -1,5 +1,11 @@
  # Changelog
 
+## 1.1.8
+- **IMPROVED** The default scrollbar thumbs have distinct idle, hover, and pressed shades in light and dark mode. Pressing or dragging a thumb shows the native Explorer gray.
+
+## 1.1.7
+- **IMPROVED** Selection checkboxes match the size and placement of native Explorer checkboxes. They sit beside filenames in Details and Small icons and in the upper corner in larger icon views.
+
 ## 1.1.6
 - **ADDED** Theme XML can set thumbnail corner radius in pixels or as a percentage of item height. It also controls shadow opacity and the border's width, color, and pattern.
 - **ADDED** Percentage corner radii for scrollbars, storage bars, the drag-selection rectangle, file hover tooltips, selection checkboxes, and group selection badges.

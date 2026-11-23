@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.7
+// @version         1.1.8
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -20717,8 +20717,19 @@ void DrawScrollbar(ViewState& state, const ScrollbarGeometry& bar,
     const float inset = breadth * (.32f - .20f * std::max(hot, TouchScrollbarAmount(state, horizontal)));
     const size_t interaction = dragging ? 2 : active ? 1 : 0;
     const auto surface = [&](D2D1_RECT_F bounds, float alpha, float radius, size_t part) {
-        if (!DrawScrollbarSurface(state, bounds, color, alpha, radius, part, interaction))
-            Fill(state, bounds.left, bounds.top, bounds.right, bounds.bottom, color, alpha, radius);
+        if (DrawScrollbarSurface(state, bounds, color, alpha, radius, part, interaction)) return;
+        unsigned fill = color;
+        if (part == 0 && !state.themeHighContrast) {
+            // The measured native gray is the drag endpoint. Each interaction
+            // increases contrast by one shade on the existing animation clock.
+            const bool dark = state.themeMode == Theme::Mode::Dark;
+            const float nativeGray = dark ? 149.f : 133.f;
+            const float step = dark ? 16.f : -16.f;
+            const BYTE gray = static_cast<BYTE>(std::lround(nativeGray + step * (hot + pressed - 2.f)));
+            fill = RGB(gray, gray, gray);
+            alpha = 1.f;
+        }
+        Fill(state, bounds.left, bounds.top, bounds.right, bounds.bottom, fill, alpha, radius);
     };
     surface(D2D1::RectF(bar.left, bar.top, bar.right, bar.bottom),
         .09f*hot + .08f*pressed, breadth * .5f, 1);
