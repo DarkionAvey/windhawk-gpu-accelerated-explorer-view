@@ -337,7 +337,7 @@ void Pixels() {
             return (size_t(y)*surface.width+x)*4;
         };
         unsigned changes=0;
-        const int extent=std::max(1,Scale96(10,dpi));
+        const int extent=int((geometry.checkbox.right-geometry.checkbox.left)*.5f);
         for(int y=box.y-extent;y<box.y+extent;++y) for(int x=box.x-extent;x<box.x+extent;++x) {
             const size_t offset=pixelOffset(x,y);
             changes+=memcmp(before.data()+offset,hovered.data()+offset,4)!=0;
@@ -346,7 +346,8 @@ void Pixels() {
         const auto edge=[&](int row) {
             const auto item=LayoutItem(view,LayoutRowVisual(view,row,1.f));
             const auto point=Center(view,item.checkbox);
-            return pixelOffset(point.x,LONG(item.checkbox.top+(item.checkbox.right-item.checkbox.left)/40.f));
+            // The center of the first painted border pixel follows the nearest device edge.
+            return pixelOffset(point.x,LONG(std::floor(item.checkbox.top+.5f)));
         };
         SetTouchInputMode(view,true); const auto touch=frame.Capture(view);
         for(int i=0;i<view.total;++i) Check(touch[edge(i)+3]>100,"touch checkbox did not appear immediately");
@@ -388,7 +389,14 @@ void Pixels() {
         Check(same(geometry.icon,after.icon) && same(geometry.text,after.text) && width==view.itemWidth,
             "checkbox input mode moved item geometry");
         Check(SelectionCheckboxAt(view,box)==0,"checkbox paint and hit geometry disagree");
-        if(view.gridView) Check(geometry.checkbox.left<geometry.cell.left+Scale96(10,dpi),"grid checkbox lost its leading corner");
+        Check(geometry.checkbox.right-geometry.checkbox.left==MulDiv(20,dpi,168),"checkbox size differs from native");
+        if(view.gridView) {
+            const bool corner=mode==FVM_ICON;
+            Check(geometry.checkbox.left-geometry.cell.left==MulDiv(corner ? 7 : 18,dpi,168),
+                "grid checkbox leading inset differs from native");
+            if(corner) Check(geometry.checkbox.top-geometry.cell.top==MulDiv(4,dpi,168),
+                "grid checkbox top inset differs from native");
+        }
         view.clickPolicy.checkSelect=false;
         Check(SelectionCheckboxAt(view,box)==-1,"disabled checkboxes retained an input target");
         const auto disabled=LayoutItem(view,LayoutRowVisual(view,0,1.f));

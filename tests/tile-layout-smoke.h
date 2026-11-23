@@ -214,8 +214,7 @@ static void TestCompactRows(const std::wstring&) {
         AdvanceRowHeight(state, true);
         Check(state.rowPx == std::round(row * 27.f / 37.f), "Compact rows differ from Explorer's measured 27/37 fraction");
         Check(state.fontPx == font, "Compact view changed the text size");
-        // Compact highlights touch; a check box stays inside its highlight
-        // with the same margin proportion it has in a relaxed row.
+        // Compact highlights touch. Center the native-sized checkbox within the available height.
         const float top = LayoutRowVisual(state, 0, 1.f).top;
         const auto band = RowHighlightRect(state, top, state.rowPx);
         Check(band.top == top && band.bottom == top + state.rowPx, "Compact rows kept a gap between highlights");
@@ -223,8 +222,9 @@ static void TestCompactRows(const std::wstring&) {
         const auto box = LayoutItem(state, LayoutRowVisual(state, 0, 1.f)).checkbox;
         const float side = box.bottom - box.top;
         Check(box.top >= band.top && box.bottom <= band.bottom &&
-            std::fabs(side / (band.bottom - band.top) - 20.f / 28.f) < .01f,
-            "the check box overflows or loses its proportion in a compact row");
+            side == std::min(float(MulDiv(20,dpi,168)),band.bottom-band.top) &&
+            box.top + box.bottom == band.top + band.bottom,
+            "compact checkbox lost its native size, containment or vertical centering");
         state.clickPolicy.checkSelect = false;
         ApplyViewLayout(state, {FVM_ICON, 48}, false);
         const float compactGrid = state.rowPx;

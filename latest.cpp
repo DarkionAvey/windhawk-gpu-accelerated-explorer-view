@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.6
+// @version         1.1.7
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -15284,8 +15284,12 @@ float InlineDriveLabelWidth(float available, float label, int dpi) {
 }
 // A fixed Fluent control band at the window DPI, independent of input mode,
 // font zoom and checkbox opacity. Compact grids reserve the same leading band.
+// Physical pixels measured in the native DirectUI view at 168 DPI.
+float CheckboxMetric(int pixelsAt168, int dpi) {
+    return static_cast<float>(MulDiv(pixelsAt168,dpi,168));
+}
 float SelectionCheckboxSize(const ViewState& state) {
-    return static_cast<float>(Scale96(20, ViewDpi(state)));
+    return CheckboxMetric(20,ViewDpi(state));
 }
 float SelectionCheckboxBorder(float side) {
     return std::max(1.f,std::min(roundf(side/20.f),floorf(side*.5f)));
@@ -15445,17 +15449,15 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
         // Boxes slide with the band they lead, like the section badges.
         const float slide = SelectionCheckboxBand(state)*(1.f-reveal);
-        const float inset = state.gridView ? std::min(float(Scale96(6,dpi)),std::max(0.f,g.cell.right-g.cell.left)*.125f) : 0.f;
+        const bool corner = state.gridView && !TileLayout(state) && state.layoutNativeMode != FVM_SMALLICON;
+        const float leading = CheckboxMetric(corner ? 7 : 18,dpi);
+        const float inset = state.gridView ? std::min(leading,std::max(0.f,g.cell.right-g.cell.left)*.125f) : leading;
         const float available = state.gridView ? std::max(0.f,(g.cell.right-g.cell.left)*.5f-inset) : SelectionCheckboxSize(state);
-        // A list box keeps its proportion to the row's highlight band (20 in 28
-        // at rest), so short rows shrink it instead of letting it overflow.
-        const float band = std::max(0.f,(state.gridView ? state.rowPx-Scale96(4,dpi) : state.rowPx-2.f*RowInset(state)));
-        const float size = std::min({SelectionCheckboxSize(state),
-            state.gridView ? band : band*SelectionCheckboxSize(state)/SelectionCheckboxBand(state),available});
-        const float left = (state.gridView ? g.cell.left + inset :
-            (ColumnsPresented(state) ? NameColumnStart(state) : start) + Scale96(12,dpi)) - slide;
-        const float top = state.gridView && !TileLayout(state) && state.layoutNativeMode != FVM_SMALLICON ?
-            g.cell.top + Scale96(4,dpi) : visual.top + (state.rowPx-size)*.5f;
+        const float topInset = corner ? CheckboxMetric(4,dpi) : 0.f;
+        const float size = std::min({SelectionCheckboxSize(state),available,
+            std::max(0.f,g.cell.bottom-g.cell.top-topInset)});
+        const float left = (state.gridView ? g.cell.left : ColumnsPresented(state) ? NameColumnStart(state) : start) + inset - slide;
+        const float top = corner ? g.cell.top + topInset : (g.cell.top+g.cell.bottom-size)*.5f;
         g.checkbox = D2D1::RectF(left,top,left+size,top+size);
     }
     return g;
@@ -15488,7 +15490,7 @@ D2D1_RECT_F SelectionCheckboxHitRect(const ViewState& state,const ItemGeometry& 
 
 D2D1_RECT_F HeaderSelectionCheckbox(ViewState& state) {
     const float size = SelectionCheckboxSize(state);
-    const float left = NameColumnStart(state) + Scale96(12,ViewDpi(state)) -
+    const float left = NameColumnStart(state) + CheckboxMetric(18,ViewDpi(state)) -
         SelectionCheckboxBand(state)*(1.f-SelectionCheckboxReveal(state));
     const float top = ColumnHeaderOffset(state,ViewDpi(state)) +
         (Scale96(kHeader96,ViewDpi(state))-size)*.5f;
