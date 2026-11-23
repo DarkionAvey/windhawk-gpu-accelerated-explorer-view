@@ -65,6 +65,14 @@ struct Surface {
 };
 inline DWORD At(const std::vector<DWORD>& pixels,int x,int y) {return pixels.at(size_t(y)*Surface::width+x);}
 inline unsigned Channel(DWORD pixel,unsigned shift) {return (pixel>>shift)&255;}
+template<class Diagonal> void CheckRadius(Diagonal pixel,float expected,const char* message) {
+    // At x=y, the corner circle crosses at r - r/sqrt(2).
+    // Test whole pixels on either side of the curve, clear of the AA edge.
+    const float crossing=expected*(1.f-std::sqrt(.5f));
+    const int outside=int(std::floor(crossing))-1;
+    const int inside=int(std::ceil(crossing));
+    Check(outside>=0 && Channel(pixel(outside),24)==0 && Channel(pixel(inside),24)==255,message);
+}
 // Inspect a straight border edge, away from corners/text. Expectations describe
 // the visible pattern rather than calling the mod's stroke-style helpers.
 template<class Draw> void BorderPatterns(Draw draw) {
@@ -124,6 +132,143 @@ struct Tooltip {
         return LayeredPixelsFixture::pixels.at(size_t(y+tip.margin)*LayeredPixelsFixture::size.cx+x+tip.margin);
     }
 };
+}
+
+static void TestThemedThumbnail() {
+    using namespace ThemeRegression;
+    StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;
+    auto& state=surface.state;
+    state.gridView=true;
+    IconRecord landscape,portrait,thin,association;
+    landscape.pixels=DecorateThumbnail(DragPileFixture::Solid(64,32,false),ThumbnailStyle{});
+    portrait.pixels=DecorateThumbnail(DragPileFixture::Solid(32,64,false),ThumbnailStyle{});
+    thin.pixels=DecorateThumbnail(DragPileFixture::Solid(64,8,false),ThumbnailStyle{});
+    association.pixels=DragPileFixture::Solid(64,32,false);
+    for(auto* image:{&landscape,&portrait,&thin,&association})
+        Check(UploadIconBitmap(state,*image),"thumbnail theme fixture bitmap");
+    const auto theme=[&](const std::wstring& attributes) { Load(settings,Element(L"DrawThumbnail",attributes)); };
+    const auto render=[&](IconRecord& image,float itemHeight) {
+        return surface.Render([&](ViewState& view) {
+            Check(DrawCachedIcon(view,image,100.f,25.f,1.f,0.f,nullptr,nullptr,itemHeight),"themed thumbnail draw");
+        });
+    };
+    for(int dpi:{96,144,192}) for(bool rtl:{false,true}) {
+        Regression::Scope scope("thumbnail dpi="+std::to_string(dpi)+" rtl="+std::to_string(rtl));
+        const float scale=dpi/96.f;
+        state.presentationDpi=state.textFormatDpi=dpi; state.iconPx=80*scale; state.rtlLayout=rtl;
+        theme(LR"(border-radius="15%" shadow-opacity="none")");
+        for(const auto& sample:{std::array{80,40},std::array{40,80},std::array{80,10}}) {
+            const int width=MulDiv(sample[0],dpi,96),height=MulDiv(sample[1],dpi,96);
+            const int left=100+int(std::ceil((state.iconPx-width)*.5f));
+            const int physical=rtl ? int(Surface::width)-left-width:left;
+            const int top=25+int(std::ceil((state.iconPx-height)*.5f));
+            auto& image=sample[1]==80 ? portrait:sample[1]==10 ? thin:landscape;
+            for(float item:{100.f,140.f}) {
+                const auto pixels=render(image,item*scale);
+                CheckRadius([&](int offset) {return At(pixels,physical+offset,top+offset);},
+                    std::min(item*.15f*scale,std::min(width,height)*.5f),
+                    "thumbnail percentage did not use the item height or cap to the fitted artwork");
+                Check(At(pixels,physical+width/2,top+height/2)==0xffdc0000u,"thumbnail artwork was lost");
+            }
+        }
+
+        const int width=MulDiv(80,dpi,96),height=MulDiv(40,dpi,96),top=25+(width-height)/2,bottom=top+height;
+        const int left=rtl ? int(Surface::width)-100-width:100,mid=left+width/2;
+        const int borderWidth=MulDiv(10,dpi,96),shadowY=bottom+borderWidth+MulDiv(2,dpi,96);
+        theme(LR"(border-radius="0%" border-width="10px" border-color="#ffffff" shadow-opacity="0")");
+        const auto square=render(landscape,100*scale);
+        Check(At(square,left-borderWidth,top-borderWidth)==0xffffffffu &&
+            At(square,left,top)==0xffdc0000u && At(square,left-borderWidth-1,top)==0,
+            "square thumbnail border rounded its corner, covered artwork, or escaped the frame");
+        Check(At(square,mid,bottom+borderWidth-1)==0xffffffffu && At(square,mid,shadowY)==0,
+            "zero shadow opacity drew outside the enlarged frame");
+        theme(LR"(border-radius="0%" border-width="10px" border-color="#ffffff" shadow-opacity="100%")");
+        const auto shadow=At(render(landscape,100*scale),mid,shadowY);
+        theme(LR"(border-radius="0%" border-width="10px" border-color="#ffffff" shadow-opacity="50%")");
+        const auto dim=At(render(landscape,100*scale),mid,shadowY);
+        Check((shadow&0xffffff)==0 && Channel(shadow,24)>Channel(dim,24) && Channel(dim,24)>0,
+            "thumbnail shadow did not follow the outer border or honor its opacity");
+
+        theme(LR"(border-radius="0%" shadow-opacity="none")");
+        const auto undecorated=render(landscape,100*scale);
+        for(const auto* disabled:{LR"(border-width="10px" border-color="transparent")",
+                LR"(border-width="0px" border-color="#ffffff")",LR"(border-width="10px" border-style="none")"}) {
+            theme(std::wstring(LR"(border-radius="0%" shadow-opacity="none" )")+disabled);
+            Check(render(landscape,100*scale)==undecorated,"disabled border changed thumbnail pixels or bounds");
+        }
+        BorderPatterns([&](const wchar_t* pattern) {
+            theme(L"border-radius=\"0%\" shadow-opacity=\"0\" border-width=\"2px\" border-color=\"#ff0000\" border-style=\""+
+                std::wstring(pattern)+L"\"");
+            const auto pixels=render(landscape,100*scale);
+            std::vector<DWORD> edge;
+            for(int offset=MulDiv(10,dpi,96);offset<width-MulDiv(10,dpi,96);++offset)
+                edge.push_back(At(pixels,left+offset,top-MulDiv(1,dpi,96)));
+            return edge;
+        });
+        Load(settings,L"");
+        const auto native=render(landscape,100*scale),icon=render(association,100*scale);
+        theme(LR"(border-radius="0%" border-width="10px" border-color="#ffffff" shadow-opacity="0")");
+        Check(render(association,100*scale)==icon,"thumbnail theme changed a file association icon");
+        state.themeHighContrast=true;
+        Check(render(landscape,100*scale)==native,"high contrast retained thumbnail customization");
+        state.themeHighContrast=false;
+    }
+    std::cout<<"PASS: thumbnail item-height radius, aspect ratios, square exterior borders, shadow extent/opacity and fallbacks\n";
+}
+
+static void TestThemedDragThumbnail() {
+    using namespace ThemeRegression;
+    StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;
+    IconRecord record;
+    record.pixels=DecorateThumbnail(DragPileFixture::Solid(64,32,false),ThumbnailStyle{});
+    Check(UploadIconBitmap(surface.state,record),"drag thumbnail theme fixture bitmap");
+    std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages> artwork;
+    artwork[0]=record.bitmap;
+    for(int dpi:{96,144,192}) {
+        Regression::Scope scope("drag thumbnail dpi="+std::to_string(dpi));
+        DragPreview preview; preview.dpi=dpi; preview.side=float(MulDiv(80,dpi,96));
+        preview.effect=DROPEFFECT_COPY; preview.pixels=record.pixels; preview.itemHeight96=120.f;
+        const auto load=[&](const wchar_t* attributes) {
+            Load(settings,Element(L"DrawThumbnail",attributes));
+            surface.state.themeSnapshot=Theme::Snapshot();
+            preview.thumbnailTheme=CaptureThumbnailTheme(surface.state);
+        };
+        const auto render=[&](bool shadow) {
+            std::array<DragShadow,kDragPreviewImages> shadows;
+            if(shadow) {
+                shadows[0]=CreateDragShadow(surface.state.target.Get(),artwork[0].Get(),preview,preview.side,dpi,
+                    ThumbnailRadius96(*preview.thumbnailTheme,preview.itemHeight96),
+                    DragThumbnailBorder(preview,preview.pixels),surface.state.themeBorderStrokes);
+                Check(shadows[0].bitmap!=nullptr,"drag thumbnail shadow bitmap");
+            }
+            return surface.Render([&](ViewState& view) {
+                DrawDragPreview(view.target.Get(),preview,&artwork,nullptr,nullptr,&shadows,&view.themeBorderStrokes);
+            });
+        };
+        const auto origin=[&] {
+            const auto rect=LayoutDragPreview(preview).artwork;
+            return POINT{LONG(std::floor(rect.left+.5f)),LONG(std::floor(rect.top+.5f))};
+        };
+        load(LR"(border-radius="10%")");
+        auto pos=origin();
+        const auto rounded=render(false);
+        CheckRadius([&](int offset) {return At(rounded,pos.x+offset,pos.y+offset);},
+            float(MulDiv(12,dpi,96)),"drag thumbnail radius did not use the source item height");
+        load(LR"(border-radius="0%")");
+        pos=origin();
+        const int width=MulDiv(10,dpi,96),probe=width+MulDiv(4,dpi,96),mid=MulDiv(20,dpi,96);
+        const auto unframed=At(render(true),pos.x-probe,pos.y+mid);
+        load(LR"(border-radius="0%" border-width="10px" border-color="#ffffff")");
+        pos=origin();
+        const auto framed=render(false);
+        Check(At(framed,pos.x-width,pos.y-width)==0xffffffffu && At(framed,pos.x,pos.y)==0xffdc0000u,
+            "drag thumbnail did not keep the artwork and exterior border square");
+        Check(At(framed,pos.x-probe,pos.y+mid)==0,"drag thumbnail border exceeded its requested width");
+        const auto shadow=At(render(true),pos.x-probe,pos.y+mid);
+        Check((shadow&0xffffff)==0 && Channel(shadow,24)>Channel(unframed,24),
+            "drag thumbnail shadow did not grow with the visible frame");
+    }
+    std::cout<<"PASS: drag thumbnail percentage radius, square exterior frame and blurred frame silhouette\n";
 }
 
 static void TestThemeParserXml() {
@@ -488,6 +633,13 @@ static void TestThemedScrollbar(bool thumb) {
         const int axialEdge=thumb ? start:MulDiv(20,dpi,96);
         Check(pixel(rounded,crossEdge,axialEdge)==0 && pixel(rounded,MulDiv(32,dpi,96),along)==0xffff0000u,
             "scrollbar radius did not clamp to the existing shape");
+        Load(settings,theme(LR"(background="#ff0000" border-radius="25%"><dark border-radius="0%" /></element>)"));
+        const auto percent=render();
+        CheckRadius([&](int offset) {return pixel(percent,crossEdge+offset,axialEdge+offset);},
+            .25f*24.f*(thumb ? .76f:1.f)*s,"scrollbar percent radius did not use cross-axis thickness");
+        surface.state.themeMode=Theme::Mode::Dark;
+        Check(pixel(render(),crossEdge,axialEdge)==0xffff0000u,"scrollbar dark zero percent did not square the corner");
+        surface.state.themeMode=Theme::Mode::Light;
         Load(settings,L""); const auto native=render(); noRamps();
         Load(settings,theme(LR"(background="#ff0000" border-width="3px" border-radius="0" />)"));
         surface.state.themeHighContrast=true;
@@ -593,6 +745,10 @@ static void TestThemedStoragePaint(bool fill) {
         Check(At(render(),left,top)==0,"storage rounded corner missing");
         surface.state.themeMode=Theme::Mode::Dark;
         Check(At(render(),(left+right)/2,y)==0xff00ff00u,"storage dark paint retained stale gradient");
+        Load(settings,Element(name,LR"(background="#ff0000" border-radius="30%")"));
+        const auto percent=render();
+        CheckRadius([&](int offset) {return At(percent,left+offset,top+offset);},
+            float(MulDiv(20,dpi,96))*.30f,"storage percent radius did not use the part height");
         surface.state.themeHighContrast=true; const auto contrast=surface.Render([&](ViewState& view) {
             Check(!DrawDriveBar(view,part,D2D1::RectF(20,20,200,40),fraction,0xffffff,1.f),"high contrast did not return to native storage painting");
         });
@@ -741,6 +897,10 @@ static void TestThemedMarquee() {
         for(const auto& ramp:surface.state.marqueeResources.ramps.slots) Check(!ramp.brush,"solid marquee retained a stale ramp");
         surface.state.themeMode=Theme::Mode::Dark;
         Check(At(render(),(left+right)/2,y)==0xff00ff00u,"marquee dark override did not render");
+        Load(settings,Element(L"DrawMarquee",LR"(background="#ff0000" border-width="0" border-radius="25%")"));
+        const auto percent=render();
+        CheckRadius([&](int offset) {return At(percent,left+offset,top+offset);},
+            float(MulDiv(60,dpi,96))*.25f,"marquee percent radius did not use the shorter side");
         surface.state.themeHighContrast=true; const auto contrast=render();
         Check(!handled && std::all_of(contrast.begin(),contrast.end(),[](DWORD p){return p==0;}),"high contrast did not defer to native marquee drawing");
         surface.state.themeHighContrast=false; surface.state.themeMode=Theme::Mode::Light;
@@ -758,9 +918,9 @@ static void TestThemedTooltip() {
     for(UINT dpi:{96u,144u,192u}) {
         Regression::Scope scope("tooltip theme dpi="+std::to_string(dpi));
         Tooltip tooltip(dpi); auto& tip=tooltip.state.itemTip;
-        Load(settings,Element(L"RenderItemTip",LR"(background="#202020" border-color="#ff0000" border-width="1px" border-radius="0" box-shadow="none")"));
+        Load(settings,Element(L"RenderItemTip",LR"(background="#202020" border-color="#ff0000" border-width="1px" border-radius="0%" box-shadow="none")"));
         tooltip.Show();
-        Check(tip.margin==0 && tooltip.Pixel(0,tip.size.cy/2)==0xffff0000u,"tooltip square border/disabled shadow pixels");
+        Check(tip.margin==0 && tooltip.Pixel(0,0)==0xffff0000u,"tooltip zero percent square border/disabled shadow pixels");
         Check(tooltip.Pixel(tip.size.cx/2,tip.size.cy-3)==0xff202020u,"tooltip solid background pixel");
         for(int shift:{0,8,16}) {
             const unsigned foreground=(tip.foreground>>shift)&255;
@@ -797,6 +957,11 @@ static void TestThemedTooltip() {
         tooltip.Show();
         Check(tooltip.Pixel(0,0)==0 && (tooltip.Pixel(tip.size.cx/2,tip.size.cy-4)>>24)==255,"rounded gradient has wrong corner/interior alpha");
         Check(Channel(tooltip.Pixel(4,tip.size.cy/2),0)<Channel(tooltip.Pixel(tip.size.cx-5,tip.size.cy/2),0),"tooltip gradient direction missing");
+        Load(settings,Element(L"RenderItemTip",LR"(background="#202020" border-width="0" border-radius="25%" box-shadow="none")"));
+        tooltip.Show();
+        Check(tip.size.cx==size.cx && tip.size.cy==size.cy,"percent radius changed tooltip layout");
+        CheckRadius([&](int offset) {return tooltip.Pixel(offset,offset);},
+            std::min(size.cx,size.cy)*.25f,"tooltip percent radius included shadow margins or used the wrong side");
         Load(settings,L"<theme><element name=\"RenderItemTip\" background=\"#ff0000\" box-shadow=\"none\"><dark background=\"#00ff00\" /></element></theme>");
         tooltip.Show(Theme::Mode::Dark);
         Check(tooltip.Pixel(tip.size.cx/2,tip.size.cy-3)==0xff00ff00u,"tooltip dark override did not render");
@@ -841,10 +1006,10 @@ static void TestThemedTooltipAntialiasing() {
 static void TestThemeCheckboxStates() {
     using namespace ThemeRegression;
     const auto doc=Parse(LR"xml(<theme>
-      <element name="DrawSelectionCheckbox" background="#111111" border-radius="2px" border-width="1px" />
+      <element name="DrawSelectionCheckbox" background="#111111" border-radius="25%" border-width="1px" />
       <element name="DrawSelectionCheckbox" border-color="#123456" />
-      <element name="DrawSelectionCheckbox:hover" background="#222222"><dark border-width="2px" /></element>
-      <element name="DrawSelectionCheckbox:pressed" background="#333333" />
+      <element name="DrawSelectionCheckbox:hover" background="#222222"><dark border-width="2px" border-radius="2px" /></element>
+      <element name="DrawSelectionCheckbox:pressed" background="#333333" border-radius="-1%" />
       <element name="DrawSelectionCheckbox:checked" background="accent"><light border-color="#abcdef" /></element>
       <element name="DrawSelectionCheckbox:checked:hover" background="#444444" />
       <element name="DrawSelectionCheckbox:checked:pressed" background="#555555" />
@@ -854,7 +1019,9 @@ static void TestThemeCheckboxStates() {
         Check(doc->checkboxEnabled[mode],"checkbox styles were not enabled");
         const auto& states=doc->checkboxes[mode];
         for(size_t i=0;i<6;++i) {
-            Check(states[i].borderRadius==2 && states[i].borderWidth==((i==1 || i==2) && mode ? 2.f:1.f),
+            const bool pixelRadius=(i==1 || i==2) && mode;
+            Check(states[i].borderRadius==(pixelRadius ? 2.f:25.f) && states[i].borderRadiusPercent==!pixelRadius &&
+                states[i].borderWidth==(pixelRadius ? 2.f:1.f),
                 "checkbox state lost inherited radius or appearance border width");
             Check(states[i].borderColor.rgb==(i>=3 && !mode ? 0xabcdefu:0x123456u),
                 "checkbox checked appearance leaked into unchecked/other appearance");
@@ -925,6 +1092,11 @@ static void TestThemedCheckboxPixels() {
         Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="#ff0000" border-width="0" border-radius="999999px")"));
         const auto round=render();
         Check(pixel(round,left,left)==0 && pixel(round,(left+right)/2,y)==0xffff0000u,"checkbox extreme radius was not clamped within its size");
+        Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="#ff0000" border-width="0" border-radius="40%")"));
+        const auto percent=render();
+        // The fixture's 20-DIP box gives 8 DIP at 40%, integral at each test DPI.
+        Load(settings,Element(L"DrawSelectionCheckbox",LR"(background="#ff0000" border-width="0" border-radius="8px")"));
+        Check(percent==render() && percent!=round,"checkbox percent radius did not use the box size");
         Load(settings,Element(L"DrawSelectionCheckbox",LR"xml(background="linear-gradient(to right, #ff0000, #0000ff)" border-width="0" border-radius="0")xml"));
         const auto reads=SettingsFixture::reads; const auto gradient=render();
         Check(gradient==render() && SettingsFixture::reads==reads,"warm checkbox gradient changed pixels or reread settings");
@@ -1088,6 +1260,10 @@ static void TestThemedAccentSurface(bool badgeSurface) {
         } else {
             Load(settings,Element(name,LR"(background="#ff0000" border-width="0" border-radius="99999px")"));
             Check(At(render(),x,top)==0,"group badge radius did not clamp to its bounds");
+            Load(settings,Element(name,LR"(background="#ff0000" border-width="0" border-radius="25%")"));
+            const auto percent=render();
+            CheckRadius([&](int offset) {return At(percent,x+offset,top+offset);},
+                MulDiv(40,dpi,96)*.25f,"badge percent radius did not use the shorter side");
         }
         state.themeHighContrast=true; Check(render()==native,"accent surface high contrast did not restore native pixels"); state.themeHighContrast=false;
         Load(settings,L""); Check(render()==native,"clearing theme did not restore native accent surface");

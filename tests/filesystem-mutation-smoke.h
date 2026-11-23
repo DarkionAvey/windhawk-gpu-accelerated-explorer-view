@@ -1,6 +1,7 @@
 // Real kernel notifications and private files; no Explorer input or user data.
 static void TestBurstRowContinuity(const std::wstring& fixture) {
     for (bool grid : {false,true}) for (bool rtl : {false,true}) {
+        Regression::Scope scope(std::string(grid ? "grid":"details")+(rtl ? " RTL":" LTR"));
         const auto directory=JoinPath(fixture,L"burst-rows-"+std::to_wstring(grid)+std::to_wstring(rtl));
         std::filesystem::create_directory(directory);
         std::vector<std::wstring> files, restored;
@@ -31,9 +32,13 @@ static void TestBurstRowContinuity(const std::wstring& fixture) {
             ReceiveDirectoryResults(state);
         };
         refresh(); StopRowTransition(state);
+        AnimationClockFixture::Freeze clock;
+        const auto advance=[&](double milliseconds) {
+            AnimationClockFixture::instant.QuadPart+=std::llround(state.qpcFrequency*milliseconds/1000.);
+        };
         float previousOpacity=0.f;
         for(int i=0;i<10;++i) {
-            if(i) state.rowTransitionStartedQpc.QuadPart-=static_cast<LONGLONG>(state.qpcFrequency*.016);
+            if(i) advance(16.);
             restored.push_back(create(L"M-anchor-1-restored-"+std::to_wstring(i)+L".txt"));
             refresh();
             Check(state.rowTransitionActive,"insertion did not animate");
@@ -41,7 +46,7 @@ static void TestBurstRowContinuity(const std::wstring& fixture) {
                 // Model the first accepted p=0 frame; the real-GPU test checks
                 // first-submission clock ownership. No frame occurs between
                 // any of the following nine directory commits.
-                QueryPerformanceCounter(&state.rowTransitionStartedQpc);
+                AnimationClockFixture::Counter(&state.rowTransitionStartedQpc);
             } else {
                 Check(state.rowTransitionStartedQpc.QuadPart!=0,"insert burst reset its started animation to unpainted");
                 const int first=GpuRowForNativePath(state,restored[0]);
@@ -54,8 +59,12 @@ static void TestBurstRowContinuity(const std::wstring& fixture) {
         }
         StopRowTransition(state);
         float previousGhost=1.f;
+        const auto findFirstGhost=[&] {
+            return std::find_if(state.disappearingRows.begin(),state.disappearingRows.end(),
+                [&](const CapturedRow& row) { return row.entry.path==restored[0]; });
+        };
         for(int i=0;i<10;++i) {
-            if(i) state.rowTransitionStartedQpc.QuadPart-=static_cast<LONGLONG>(state.qpcFrequency*.016);
+            if(i) advance(16.);
             Check(DeleteFileW(restored[i].c_str()),"burst deletion"); refresh();
             if(!state.rowTransitionActive) std::cerr << "BURST no deletion animation grid=" << grid << " rtl=" << rtl <<
                 " step=" << i << " rows=" << state.total << " scroll=" << state.scrollNow <<
@@ -63,26 +72,27 @@ static void TestBurstRowContinuity(const std::wstring& fixture) {
                 " ghosts=" << state.disappearingRows.size() << " empty=" << state.emptyNative <<
                 " shown=" << state.visible << " viewport=" << ViewHeight(state) << "\n";
             Check(state.rowTransitionActive,"deletion did not animate");
-            const auto ghost=std::find_if(state.disappearingRows.begin(),state.disappearingRows.end(),
-                [&](const CapturedRow& row) { return row.entry.path==restored[0]; });
-            Check(ghost!=state.disappearingRows.end() || previousGhost<.01f,
-                "later deletion dropped a preceding grid/list ghost");
-            if(!i) QueryPerformanceCounter(&state.rowTransitionStartedQpc);
+            const auto ghost=findFirstGhost();
+            Check(ghost!=state.disappearingRows.end(),"later deletion dropped a still-visible grid/list ghost");
+            if(!i) AnimationClockFixture::Counter(&state.rowTransitionStartedQpc);
             else {
                 Check(state.rowTransitionStartedQpc.QuadPart!=0,"delete burst restarted its clock");
-                if(ghost!=state.disappearingRows.end()) {
-                    Check(ghost->oldOpacity<previousGhost && ghost->oldOpacity>0.f,
-                        "delete burst froze or restarted the outgoing fade");
-                    previousGhost=ghost->oldOpacity;
-                }
+                Check(ghost->oldOpacity<previousGhost && ghost->oldOpacity>0.f,
+                    "delete burst froze or restarted the outgoing fade");
+                previousGhost=ghost->oldOpacity;
             }
         }
         Check(state.total==24,"visual ghosts changed logical membership");
+        advance(kUiTransitionDurationMs+1.);
+        const auto added=create(L"M-anchor-1-expiry-probe.txt");
+        refresh();
+        Check(state.total==25 && GpuRowForNativePath(state,added)>=0,"expiry probe did not commit a real insertion");
+        Check(findFirstGhost()==state.disappearingRows.end(),"a ghost survived past the end of its fade");
         StopRowTransition(state); Stop(state.background); DestroyWindow(state.hwnd);
         for(const auto& path:files) std::filesystem::remove(path);
         Check(std::filesystem::remove(directory),"burst fixture cleanup");
     }
-    std::cout << "PASS: ten streamed inserts/deletes advance between paints in LTR/RTL list/grid; no zero-clock restart or disappearing-ghost loss\n";
+    std::cout << "PASS: ten streamed inserts/deletes advance between paints in LTR/RTL list/grid; ghosts fade continuously and retire on expiry\n";
 }
 
 static void TestFilesystemMutationDelivery(const std::wstring& fixture) {

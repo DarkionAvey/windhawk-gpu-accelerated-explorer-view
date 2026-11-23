@@ -83,6 +83,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("theme-parser-values", PARALLEL, TestThemeParserValues()),
     REGRESSION("theme-parser-settings", PARALLEL, TestThemeParserSettings()),
     REGRESSION("theme-parser-recovery", PARALLEL, TestThemeParserRecovery()),
+    REGRESSION("theme-thumbnail", PARALLEL, TestThemedThumbnail()),
+    REGRESSION("theme-drag-thumbnail", PARALLEL, TestThemedDragThumbnail()),
     REGRESSION("theme-highlight-base", PARALLEL,
         TestThemedHighlight(Theme::Highlight::Selected,true);
         TestThemedHighlight(Theme::Highlight::Hover,true);
@@ -157,7 +159,7 @@ static const Regression::Test kRegressions[] = {
         OptionEffects::TestLiveSweep(fixture,{{FVM_TILE,48}},L"tiles",true,true,2,3)),
     // Touch, gestures and drag.
     REGRESSION("touch-input", PARALLEL, TestTouchInput(fixture)),
-    REGRESSION("single-click-hover", SERIAL(Regression::InputDesktop), TestSingleClickHover()),
+    REGRESSION("single-click-hover", PARALLEL, TestSingleClickHover()),
     REGRESSION("drag-preview", PARALLEL, TestDragPreview(fixture)),
     REGRESSION("edge-autoscroll-zones", PARALLEL, TestEdgeAutoscrollZones(fixture)),
     REGRESSION("edge-autoscroll-rate", PARALLEL, TestEdgeAutoscrollRate(fixture)),

@@ -1,5 +1,9 @@
  # Changelog
 
+## 1.1.6
+- **ADDED** Theme XML can set thumbnail corner radius in pixels or as a percentage of item height. It also controls shadow opacity and the border's width, color, and pattern.
+- **ADDED** Percentage corner radii for scrollbars, storage bars, the drag-selection rectangle, file hover tooltips, selection checkboxes, and group selection badges.
+
 ## 1.1.5
 - **FIXED** Hovering over items in single-click mode no longer changes the selection.
 

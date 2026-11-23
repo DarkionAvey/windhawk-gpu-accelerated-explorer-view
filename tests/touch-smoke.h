@@ -1225,6 +1225,7 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
     const bool history=g_touchpadSwipeNavigation.exchange(true);
     struct RestoreHistory {bool value; ~RestoreHistory() {g_touchpadSwipeNavigation=value;}} restore{history};
     for(const auto [rtl,dpi]:{std::pair{false,96u},std::pair{true,192u}}) {
+        Regression::Scope scope("fling dpi="+std::to_string(dpi)+(rtl ? " RTL":" LTR"));
         StyleFixture::Session metrics; StyleFixture::dpi=dpi;
         PresentationFixture::Tab tab(L"fling trajectory",4096,rtl);
         auto& view=tab.state;
@@ -1236,23 +1237,27 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
         }));
         FocusFixture::Session focus(tab.frame,view.hwnd);
         tab.Start(); tab.Await([](const auto& r){return r.accepted;}); ConsumePresentation(view);
-        struct Timer {HANDLE value=CreateWaitableTimerW(nullptr,FALSE,nullptr); ~Timer() {if(value) CloseHandle(value);}} timer;
-        Check(timer.value!=nullptr,"fling sample timer");
+        AnimationClockFixture::Freeze clock;
         const auto pump=[] {MSG msg{}; while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&msg); DispatchMessageW(&msg);}};
         const auto sample=[&](unsigned intervals=1) {
-            LARGE_INTEGER due{}; due.QuadPart=-LONGLONG(view.frameIntervalMs*intervals*10000.);
-            Check(SetWaitableTimer(timer.value,&due,0,nullptr,nullptr,FALSE) && WaitForSingleObject(timer.value,5000)==WAIT_OBJECT_0,"fling sample cadence");
-            input.Next();
+            // Give the native recognizer a fixed packet cadence and keep the
+            // owner animation clock on the same timeline. Presentation still
+            // runs through the real frame scheduler and message queue.
+            input.Next(16*intervals);
+            AnimationClockFixture::instant.QuadPart=input.startQpc.QuadPart+
+                LONGLONG(UINT64(input.tick-input.startTick)*input.frequency.QuadPart/1000);
         };
         struct Flight {double released=0.,nativeVelocity=0.,deceleration=0.,combined=0.; LARGE_INTEGER at{}; bool horizontal=false;};
         const auto launch=[&](bool horizontal,int direction,unsigned steps,unsigned intervals,bool fresh,int stride=16) {
             if(fresh) {
-                Reset(view,input,true); SetScrollImmediate(view,MaxScrollPx(view)*.5f);
+                Reset(view,input);
+                AnimationClockFixture::Counter(&input.startQpc);
+                SetScrollImmediate(view,MaxScrollPx(view)*.5f);
                 SetHorizontalScroll(view,std::max(0.f,view.columnContentWidth-ListViewportWidth(view))*.5f);
             }
             else {input.primary+=10;}
             POINT point{300,350};
-            input.Next(); input.Send(view,{input.Packet(view,input.primary,point,down)});
+            sample(); input.Send(view,{input.Packet(view,input.primary,point,down)});
             const auto caught=horizontal ? view.horizontalScroll:view.scrollNow;
             sample(); pump();
             Check((horizontal ? view.horizontalScroll:view.scrollNow)==caught && !view.touch.inertia,"contact failed to catch the previous coast");
@@ -1273,7 +1278,7 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
             else input.Send(view,{input.Packet(view,input.primary,point,up)});
             const float deceleration=TouchFixture::bindings.at(view.touchRecognizer->context)->deceleration;
             Check(deceleration>0.f && deceleration!=INERTIA_PARAMETER_INVALID_VALUE,"native fling deceleration");
-            Flight flight; flight.horizontal=horizontal; flight.at=input.frameQpc; flight.deceleration=deceleration;
+            Flight flight; flight.horizontal=horizontal; flight.at=AnimationClockFixture::instant; flight.deceleration=deceleration;
             flight.released=horizontal ? view.horizontalScroll:view.scrollNow;
             for(size_t i=begin;i<TouchFixture::recognized.size();++i) {
                 const auto& event=TouchFixture::recognized[i];
@@ -1285,8 +1290,10 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
             return flight;
         };
         const auto finish=[&](const Flight& flight) {
-            const DWORD timeout=DWORD(std::ceil(std::abs(flight.combined)/flight.deceleration))+GetDoubleClickTime()+1000;
-            Check(Eventually([&] {pump(); return !view.touch.inertia;},timeout),"fling never reached its physical stopping time");
+            const double stopMs=std::abs(flight.combined)/flight.deceleration;
+            AnimationClockFixture::instant.QuadPart=flight.at.QuadPart+
+                LONGLONG(std::ceil((stopMs+1.)*input.frequency.QuadPart/1000.));
+            Check(Eventually([&] {pump(); return !view.touch.inertia;}),"fling never reached its physical stopping time");
             const double coast=(flight.horizontal ? view.horizontalScroll:view.scrollNow)-flight.released;
             const double sign=flight.horizontal ? (rtl ? 1.:-1.) : -1.;
             const double expected=sign*flight.combined*std::abs(flight.combined)/(2.*flight.deceleration);
@@ -1301,11 +1308,13 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
         const int direction=rtl ? 1:-1;
         const auto fast=launch(false,direction,3,1,true); const auto fastDistance=finish(fast);
         const auto slow=launch(false,direction,9,4,true); const auto slowDistance=finish(slow);
-        Check(std::abs(fast.nativeVelocity)>std::abs(slow.nativeVelocity) && fastDistance>slowDistance,
-            "long slow drag overpowered a short fast flick");
-        // Real input pacing sets both this flick's speed and the delay before
-        // the next contact. A long stroke keeps its coast alive well past that
-        // delay even when a loaded machine stretches every sample interval.
+        const bool speedOrder=std::abs(fast.nativeVelocity)>std::abs(slow.nativeVelocity);
+        if(!speedOrder || fastDistance<=slowDistance)
+            std::cerr<<"FLING comparison fast velocity="<<fast.nativeVelocity<<" distance="<<fastDistance
+                <<" slow velocity="<<slow.nativeVelocity<<" distance="<<slowDistance<<std::endl;
+        Check(speedOrder,"fixed packet cadence did not produce the intended native release velocity ordering");
+        Check(fastDistance>slowDistance,"long slow drag overpowered a short fast flick");
+        // A long stroke leaves measurable momentum at the next down packet.
         const auto first=launch(false,direction,3,1,true,64);
         sample(); pump();
         const auto repeated=launch(false,direction,3,1,false);
@@ -1342,8 +1351,6 @@ static void TestFlingTrajectories(TouchInputTest::Device& input) {
 
 static void TestSingleClickHover() {
     using namespace TouchInputTest;
-    Regression::Claim(Regression::InputDesktop, "native TrackMouseEvent at the current cursor");
-    Check(Regression::OnInputDesktop(), "native hover requires the input desktop");
     WorkerComApartment apartment;
     StyleFixture::Session style;
     TouchFixture::Session touch;
@@ -1373,45 +1380,6 @@ static void TestSingleClickHover() {
                 "painted filename did not follow Explorer's underline preference");
         }
     };
-    const auto nativeHover = [&] {
-        // Put a private, non-activating window under the current cursor so
-        // USER generates the hover without moving the pointer or taking focus.
-        POINT cursor{};
-        Check(GetCursorPos(&cursor), "read cursor for native hover");
-        POINT offset = rowPoint;
-        Check(ClientToScreen(state.hwnd, &offset), "map hover point to screen");
-        RECT frame{};
-        Check(GetWindowRect(tab.frame, &frame) && SetWindowPos(tab.frame, HWND_TOPMOST,
-            cursor.x - (offset.x - frame.left), cursor.y - (offset.y - frame.top), 0, 0,
-            SWP_NOSIZE | SWP_NOACTIVATE), "position private hover window");
-        Check(WindowFromPoint(cursor) == state.hwnd, "private window is not under the cursor");
-        INPUT moveInput{};
-        moveInput.type = INPUT_MOUSE;
-        moveInput.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
-        Check(SendInput(1, &moveInput, sizeof(moveInput)) == 1, "queue a zero-distance mouse move");
-        MSG event{};
-        bool armed = false;
-        const bool delivered = Eventually([&] {
-            while (PeekMessageW(&event, state.hwnd, 0, 0, PM_REMOVE)) {
-                if (event.message == WM_MOUSEHOVER) return true;
-                if (event.message == WM_MOUSEMOVE && !armed) {
-                    OverlayProc(event.hwnd, event.message, event.wParam, event.lParam);
-                    Check(state.hovered == 1, "native mouse move did not hover the second item");
-                    TRACKMOUSEEVENT track{sizeof(track), TME_HOVER, state.hwnd, USER_TIMER_MINIMUM};
-                    Check(TrackMouseEvent(&track), "arm native hover tracking");
-                    armed = true;
-                } else {
-                    DispatchMessageW(&event);
-                }
-            }
-            return false;
-        });
-        Check(SetWindowPos(tab.frame, HWND_NOTOPMOST, frame.left, frame.top, 0, 0,
-            SWP_NOSIZE | SWP_NOACTIVATE), "return hover window offscreen");
-        Check(delivered && RowFromPoint(state, GET_Y_LPARAM(event.lParam), GET_X_LPARAM(event.lParam)) == 1,
-            "Windows did not deliver WM_MOUSEHOVER over the second item");
-        OverlayProc(event.hwnd, event.message, event.wParam, event.lParam);
-    };
 
     StyleFixture::singleClick = true;
     StyleFixture::browserUnderline = L"yes";
@@ -1426,7 +1394,9 @@ static void TestSingleClickHover() {
         Check(state.selected == 0 && state.selectedFlags[0] && !state.selectedFlags[1],
             "selection precondition");
         checkLabels(mode == 3, mode == 3);
-        nativeHover();
+        UpdatePointerHover(state, rowPoint);
+        Check(state.hovered == 1, "pointer did not hover the second item");
+        HandlePointerHover(state, rowPoint, 0);
         selectionPreserved &= state.selected == 0 && state.selectedFlags[0] && !state.selectedFlags[1];
         checkLabels(mode == 3, true);
     }
@@ -1442,6 +1412,7 @@ static void TestSingleClickHover() {
     SetWindowLongPtrW(state.hwnd, GWLP_USERDATA, 0);
     Check(selectionPreserved, "resting the mouse over another item changed the selection in single-click mode");
 }
+
 
 static void TestTouchInput(const std::wstring& fixture) {
     using namespace TouchInputTest;

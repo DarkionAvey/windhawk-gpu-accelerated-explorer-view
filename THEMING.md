@@ -226,9 +226,64 @@ Complete examples to copy into the theme setting:
 Every element that supports borders also accepts `border-style`: `solid`
 (the default), `dashed`, `dotted`, or `none`. Set `border-width` to a positive
 length to see a border. Dash and dot spacing follows its thickness and display
-scaling. These work on highlights, tooltips, scrollbar thumbs and tracks, and
-the drag-selection rectangle. `none` turns off the border without changing its
-other settings.
+scaling. These work on highlights, tooltips, scrollbar thumbs and tracks,
+the drag-selection rectangle, and thumbnails. `none` turns off the border
+without changing its other settings.
+
+## Corner radius units
+
+Targets that support `border-radius` accept a single nonnegative value for
+all four corners. A bare number or a value ending in `px` uses logical pixels
+at 96 DPI. A value ending in `%` uses the dimensions of the target.
+
+| Target | Percentage basis |
+|---|---|
+| Thumbnails | The row or grid cell height |
+| Scrollbar thumbs and tracks | Each part's thickness across the scroll axis |
+| Storage bar fills and tracks | Each part's own height |
+| Drag-selection rectangle, file hover tooltip, selection checkboxes, group selection badges | The shorter side of the drawn shape |
+
+For example, a `25%` radius on a 12-pixel-thick scrollbar is 3 screen pixels.
+Percentages follow the drawn size, so they need no additional DPI scaling.
+Radii are capped at half the shorter side of the shape. Use `0%` or `0px`
+for square corners, or omit the property to keep the target's default.
+
+## Thumbnails
+
+Use `DrawThumbnail` to style actual thumbnail artwork in folder views. Shared
+properties and light and dark overrides work as usual.
+
+| Property | Value |
+|---|---|
+| `border-radius` | One nonnegative length or percentage of the item height for all four corners. Omit it to keep the usual size-dependent rounding. Use `0px` or `0%` for square corners. |
+| `shadow-opacity` | A number from `0` to `1` or a percentage from `0%` to `100%` of the usual shadow strength. Use `0` or `none` to hide it. Defaults to `1`. |
+| `border-width` | A nonnegative length. Defaults to `0`. |
+| `border-color` | A color. Defaults to the Windows accent color. |
+| `border-style` | `solid`, `dashed`, `dotted`, or `none`. Defaults to `solid`. |
+
+Bare numbers and `px` values use logical pixels at 96 DPI. For example, `6px`
+gives a 9-screen-pixel radius at 150% scaling. Use `12%` for a radius of 12 pixels
+in a row or grid cell that is 100 screen pixels tall, regardless of the image's
+aspect ratio. An explicit radius keeps fractional precision and is capped at
+half the thumbnail's shorter edge. Border thickness is rounded to whole screen
+pixels. The border grows outward from the fitted artwork and the shadow follows
+its outer edge. The file type badge still draws over the artwork.
+
+The radius and border also apply to thumbnails in the drag preview, where a
+percentage uses the source item's height at the start of the drag and scales
+with the preview monitor's DPI.
+`shadow-opacity` controls the lightweight shadow drawn behind opaque
+thumbnails in folder views. Windows high-contrast mode uses the usual
+thumbnail appearance.
+
+```xml
+<theme>
+  <element name="DrawThumbnail" border-radius="12%" shadow-opacity="40%"
+           border-width="1px" border-color="accent" border-style="dotted">
+    <dark shadow-opacity="0" border-color="#ffffff80" />
+  </element>
+</theme>
+```
 
 ## Drag-selection rectangle
 
@@ -241,13 +296,13 @@ It supports shared properties and light/dark overrides.
 | `background-color` | A solid color |
 | `border-color` | A color; defaults to the Windows accent color |
 | `border-width` | A nonnegative length such as `1px`; defaults to `1px`; use `0` to remove the border |
-| `border-radius` | One nonnegative length for all corners; defaults to `4px` |
+| `border-radius` | One nonnegative length or percentage for all corners. Defaults to `4px`. |
 
 The existing marquee opacity setting still applies, including its stronger
 border and release fade. Color transparency multiplies that opacity. Borders
-stay inside the rectangle and scale to whole screen pixels. Corner sizes scale
-with DPI and are limited by the rectangle's size. These styles change drawing,
-not which files are selected. High-contrast mode keeps the usual appearance.
+stay inside the rectangle and scale to whole screen pixels. Fixed radii scale
+with DPI, and every radius is limited by the rectangle's size. The selection
+area stays the same. High-contrast mode keeps the usual appearance.
 
 ```xml
 <theme>
@@ -280,13 +335,13 @@ hover. Each element also supports shared, light and dark properties.
 | `background-color` | A solid color |
 | `border-color` | A color; defaults to the Windows accent color |
 | `border-width` | A nonnegative length such as `1px`; defaults to `0` |
-| `border-radius` | One nonnegative length for all corners; keeps the usual capsule shape when omitted |
+| `border-radius` | One nonnegative length or percentage of the part's thickness. Keeps the usual capsule shape when omitted. |
 
 An omitted background keeps the usual animated fill. Custom backgrounds and
 borders use their own color transparency; the selection and hover opacity
 settings do not affect them. Use `background="transparent"` for a border alone.
-Borders stay inside the shape and scale to whole screen pixels. Corner sizes
-scale with DPI and stop at half the shape's thickness.
+Borders stay inside the shape and scale to whole screen pixels. Fixed radii
+scale with DPI. Radii stop at half the shape's shorter side.
 
 The usual scrollbar sizing, hover expansion and touch targets stay the same.
 Hover and pressed styles apply to both parts of the scrollbar being used;
@@ -322,11 +377,11 @@ It supports the same shared, light and dark blocks as selection backgrounds.
 | `background-color` | A solid color |
 | `border-color` | A color; defaults to the Windows accent color |
 | `border-width` | A nonnegative number or length such as `1px`; defaults to `0` |
-| `border-radius` | One nonnegative length for all corners, such as `8px`; defaults to `4px` |
+| `border-radius` | One nonnegative length or percentage for all corners. Defaults to `4px`. |
 | `box-shadow` | One outer CSS shadow, or `none`; keeps the native shadow when omitted |
 
 Borders stay inside the tooltip and scale to whole screen pixels. Changing the
-border or corners does not change text spacing. Lengths scale with display DPI.
+border or corners does not change text spacing. Fixed lengths scale with display DPI.
 Tooltip backgrounds use their color's transparency directly; selection and hover
 opacity settings apply to item highlights, not tooltips.
 

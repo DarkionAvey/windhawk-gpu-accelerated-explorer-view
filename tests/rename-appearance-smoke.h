@@ -45,6 +45,7 @@ void TextAlignment(ViewState& state) {
                 <<" lines="<<SendMessageW(editor,EM_GETLINECOUNT,0,0)<<" line="<<RenameLineHeight(editor)<<std::endl;
         Check(std::abs(format.left-(client.right-format.right))<=1 && vertical,
             "expanded rename text lost symmetric native padding");
+        const RECT nativeFormat=format;
         MapWindowPoints(editor,state.hwnd,reinterpret_cast<POINT*>(&format),2);
         RECT overlay{}; ViewClientRect(state,&overlay);
         const float left=state.rtlLayout ? overlay.right-geometry.text.right : geometry.text.left;
@@ -53,10 +54,41 @@ void TextAlignment(ViewState& state) {
         // alignment whenever it fits, and containment in Bounds otherwise.
         if(geometry.wrapped && left>=viewport.left && left+geometry.text.right-geometry.text.left<=viewport.right &&
             geometry.text.top>=viewport.top && geometry.text.bottom<=viewport.bottom) {
-            Check(std::abs(format.left-left)<=1.f &&
+            const bool matches=std::abs(format.left-left)<=1.f &&
                 std::abs(format.right-format.left-(geometry.text.right-geometry.text.left))<=1.f &&
-                format.top>=0,
-                "grid rename formatting did not match the label origin/wrapping width");
+                format.top>=0;
+            bool requiredFullWidth=false;
+            if(!matches) {
+                // The label can fit while the editable text needs more
+                // lines at that width. Measure the latter in a separate EDIT.
+                const int textLength=GetWindowTextLengthW(editor);
+                std::wstring text(size_t(textLength)+1,L'\0');
+                GetWindowTextW(editor,text.data(),textLength+1);
+                const HWND probe=CreateWindowExW(DWORD(ex),L"EDIT",text.c_str(),DWORD(style)&~WS_VISIBLE,
+                    0,0,client.right,client.bottom,state.frameHwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
+                Check(probe!=nullptr,"independent native wrapping probe");
+                SendMessageW(probe,WM_SETFONT,reinterpret_cast<WPARAM>(font),FALSE);
+                RECT requested{nativeFormat.left,nativeFormat.top,
+                    nativeFormat.left+static_cast<LONG>(std::ceil(geometry.text.right-geometry.text.left)),
+                    nativeFormat.top+4096};
+                SendMessageW(probe,EM_SETRECTNP,0,reinterpret_cast<LPARAM>(&requested));
+                const auto lines=SendMessageW(probe,EM_GETLINECOUNT,0,0);
+                DestroyWindow(probe);
+                RECT actualWindow=window;
+                MapWindowPoints(nullptr,state.hwnd,reinterpret_cast<POINT*>(&actualWindow),2);
+                const LONG padding=nativeFormat.top+GetSystemMetricsForDpi(SM_CYBORDER,StyleFixture::dpi);
+                requiredFullWidth=lines*metrics.tmHeight+2*padding>viewport.bottom-viewport.top &&
+                    actualWindow.left==viewport.left && actualWindow.right==viewport.right;
+            }
+            if(!matches && !requiredFullWidth)
+                std::cerr<<"RENAME wrap dpi="<<StyleFixture::dpi<<" rtl="<<state.rtlLayout
+                    <<" expected="<<left<<","<<geometry.text.top<<","<<geometry.text.right-geometry.text.left
+                    <<" actual="<<format.left<<","<<format.top<<","<<format.right-format.left
+                    <<" viewport="<<viewport.left<<","<<viewport.top<<","<<viewport.right<<","<<viewport.bottom
+                    <<" fit="<<state.rename.layoutSize.cx<<"x"<<state.rename.layoutSize.cy
+                    <<" preferred="<<state.rename.layoutPreferred.cx<<"x"<<state.rename.layoutPreferred.cy
+                    <<" lines="<<SendMessageW(editor,EM_GETLINECOUNT,0,0)<<std::endl;
+            Check(matches || requiredFullWidth,"grid rename formatting did not match the label or require the full viewport width");
         }
     } else {
         MapWindowPoints(editor, nullptr, reinterpret_cast<POINT*>(&client), 2);

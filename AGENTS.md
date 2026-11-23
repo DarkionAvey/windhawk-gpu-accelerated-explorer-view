@@ -13,6 +13,11 @@
   along with it, to either improve stability or the usability to the user.
 - Be conservative and smart with implementing code. Not every little request 
   needs a 100-line code change.
+- Reuse existing methods and shared logic before writing new methods. Check
+  existing callers before adapting shared code so their behavior is preserved.
+- Call out behavior changes that conflict with existing behavior, defaults, or
+  user expectations in the draft review summary. Explain what changes, when it
+  changes, and why.
 - Assess entangled messages and queues. Do not assume your regression tests cover
   real life usage scenarios.
 - Do not create manufactured messages for regression tests. Use Windows’ default 
@@ -28,6 +33,10 @@
   on fallback/unload. Never expose both native and GPU lists.
 - Adapt shared geometry, input, animation and enrichment paths before adding
   parallel implementations. Preserve continuous input and concurrent scrolling.
+- For theming, short-circuit the affected drawing operation when the resolved
+  value disables it. Skip the border for `border-width="0px"` or a fully
+  transparent border, and skip the shadow for zero opacity. A zero corner
+  radius skips rounding and still draws the artwork.
 - Respect owner STA/COM boundaries, cancellation generations and callback
   draining before DLL unload. Do not forcibly terminate provider threads.
 - Never show hardcoded English (or any fixed-language) text to the user:
@@ -51,6 +60,8 @@
 
 ## Regression tests
 
+- When starting a new mod draft, wait for the user to review and explicitly
+  confirm the draft before writing or editing tests or running any regressions.
 - Read `tests/README.md` "Writing a regression" before adding a test. Every
   test is one line in `tests/regression-manifest.h` and runs in its own
   process; tests never rely on another test's state or order.
@@ -60,8 +71,9 @@
   test. If a test fails only in parallel, find and isolate the shared state
   (private fixture, substituted API, per-process observation); never declare
   Serial to hide it, and never relax or retry an assertion.
-- Before reporting, run the new test alone (`--test name`) and with the full
-  suite at the default parallelism. The scripts derive it per machine
+- After draft confirmation and before reporting a release, run the new test
+  alone (`--test name`) and with the full suite at the default parallelism.
+  The scripts derive it per machine
   (physical cores less four, at least two); do not hardcode a job count.
 - **Every test must finish within the fixed 120-second limit. There are no
   per-test timeouts and the limit is never raised, "just to be safe" or
@@ -94,7 +106,8 @@
   changes its version header. `-Version 0.9.N` selects an explicit newer version.
   Continue an existing unfinished working version instead of creating duplicates.
 - Edit the numbered working copy only. Do not edit `latest.cpp` directly.
-- Run `build.bat -SourceFile <working-version>.cpp` before the final report.
+- After the user confirms the draft, run
+  `build.bat -SourceFile <working-version>.cpp` before reporting a release.
   This syncs README, links the Windhawk DLL, runs repository regressions and the
   full C++/DLL-unload suites, then moves all root version sources to
   `previous-versions/` and publishes an identical `latest.cpp`.

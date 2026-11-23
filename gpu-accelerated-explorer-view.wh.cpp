@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.5
+// @version         1.1.6
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -310,6 +310,8 @@ struct SurfaceStyle {
     Color borderColor;
     float borderWidth = 0.f;
     float borderRadius = 4.f;
+    bool borderRadiusPercent = false;
+    float shadowOpacity = 1.f;
     BorderStyle borderStyle = BorderStyle::Solid;
     std::optional<float> height;
     std::optional<Shadow> shadow; // Absence keeps the native tooltip shadow.
@@ -340,6 +342,7 @@ struct Document {
     std::array<bool, 2> highlightEnabled{};
     std::array<SurfaceStyle, 2> tooltips;
     std::array<SurfaceStyle, 2> marquees;
+    std::array<std::optional<SurfaceStyle>, 2> thumbnails;
     std::array<std::array<SurfaceStyle,6>,2> checkboxes;
     std::array<bool,2> checkboxEnabled{};
     std::array<std::array<SurfaceStyle,1>,2> groupBadges, swipeIndicators;
@@ -865,11 +868,12 @@ void CompileStyles(Document& document) {
     const Binding bindings[] = {{L"background-color", &SurfaceStyle::background},
         {L"background", &SurfaceStyle::background}, {L"border-color", &SurfaceStyle::borderColor},
         {L"border-width", &SurfaceStyle::borderWidth}, {L"border-radius", &SurfaceStyle::borderRadius},
-        {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}, {L"height", &SurfaceStyle::height}};
+        {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}, {L"height", &SurfaceStyle::height},
+        {L"shadow-opacity", &SurfaceStyle::shadowOpacity}};
     constexpr std::wstring_view names[] = {L"FillSelectionRect:selected", L"FillSelectionRect:hover", L"FillSelectionRect:selected:hover"};
     for (size_t mode = 0; mode < document.highlights.size(); ++mode) {
         auto& styles = document.highlights[mode];
-        const auto apply = [&](SurfaceStyle& style, std::wstring_view element) {
+        const auto apply = [&](SurfaceStyle& style, std::wstring_view element, bool allowPercentageRadius = true) {
             const auto found = document.elements.find(element);
             if (found == document.elements.end()) return;
             // Apply scopes before aliases, so a dark background-color beats a
@@ -884,13 +888,28 @@ void CompileStyles(Document& document) {
                         using Field = std::remove_cvref_t<decltype(style.*member)>;
                         if constexpr (std::is_same_v<Field, float> || std::is_same_v<Field, std::optional<float>>) {
                             auto text = Parser::Trim(*value);
+                            if constexpr (std::is_same_v<Field, float>) {
+                                if (member == &SurfaceStyle::shadowOpacity) {
+                                    const bool percent = text.ends_with(L"%");
+                                    if (percent) text.remove_suffix(1);
+                                    const float opacity = !percent && text == L"none" ? 0.f :
+                                        Number(text)/(percent ? 100.f : 1.f);
+                                    if (opacity < 0.f || opacity > 1.f) throw std::invalid_argument("shadow opacity");
+                                    style.shadowOpacity = opacity;
+                                    return;
+                                }
+                            }
                             if constexpr (std::is_same_v<Field, std::optional<float>>) {
                                 if(text==L"auto") {(style.*member).reset(); return;}
                             }
-                            if (text.ends_with(L"px")) text.remove_suffix(2);
+                            const bool corner = binding.name == L"border-radius";
+                            const bool percent = corner && allowPercentageRadius && text.ends_with(L"%");
+                            if (percent) text.remove_suffix(1);
+                            else if (text.ends_with(L"px")) text.remove_suffix(2);
                             const float width = Number(text);
                             if (!std::isfinite(width) || width < 0.f) throw std::invalid_argument("nonnegative length");
                             style.*member = width;
+                            if (corner) style.borderRadiusPercent = percent;
                         } else if constexpr (std::is_same_v<Field, BorderStyle>) {
                             constexpr std::pair<std::wstring_view, BorderStyle> choices[] = {
                                 {L"solid",BorderStyle::Solid},{L"dashed",BorderStyle::Dashed},
@@ -919,10 +938,15 @@ void CompileStyles(Document& document) {
             }
         };
         SurfaceStyle common;
-        apply(common, L"FillSelectionRect");
+        if (document.elements.contains(L"DrawThumbnail")) {
+            auto& thumbnail = document.thumbnails[mode].emplace();
+            thumbnail.borderRadius = -1.f; // Omitted: keep size-dependent default rounding.
+            apply(thumbnail, L"DrawThumbnail");
+        }
+        apply(common, L"FillSelectionRect", false);
         for (size_t i = 0; i < styles.size(); ++i) {
             styles[i] = i == 2 ? styles[0] : common;
-            apply(styles[i], names[i]);
+            apply(styles[i], names[i], false);
         }
         document.highlightEnabled[mode] = std::any_of(styles.begin(), styles.end(), [](const auto& style) {
             return style.background.kind != Paint::Kind::Default || style.borderWidth > 0.f;
@@ -943,7 +967,7 @@ void CompileStyles(Document& document) {
         document.groupBadges[mode][0].borderWidth=1.f;
         document.groupBadges[mode][0].borderRadius=std::numeric_limits<float>::max();
         apply(document.groupBadges[mode][0],L"PaintGroupBadge");
-        apply(document.swipeIndicators[mode][0],L"DrawSwipeIndicator");
+        apply(document.swipeIndicators[mode][0],L"DrawSwipeIndicator",false);
         constexpr std::wstring_view parts[] = {L"DrawScrollbar:thumb", L"DrawScrollbar:track"};
         for (size_t part = 0; part < std::size(parts); ++part) {
             auto& bar = document.scrollbars[mode][part];
@@ -1381,6 +1405,29 @@ float g_thumbnailCornerRadius96 = 8.f;
 float ThumbnailCornerRadius(float width, float height, int dpi) {
     return std::min(std::max(0.f, g_thumbnailCornerRadius96) * static_cast<float>(dpi) / 96.f,
         std::min(width, height) * .2f);
+}
+float ThumbnailCornerRadius(D2D1_RECT_F bounds, int dpi, float radius96) {
+    const float width = bounds.right-bounds.left, height = bounds.bottom-bounds.top;
+    if (radius96 < 0.f) return ThumbnailCornerRadius(width, height, dpi);
+    const float scale = dpi/96.f;
+    const float maximum = std::min(width, height)*.5f;
+    return std::min(radius96, maximum/scale)*scale;
+}
+float PercentRadius(float percent, float basis, float maximum) {
+    return static_cast<float>(std::min(double(percent)/100.0*basis, double(maximum)));
+}
+float ThemeBorderRadius(const Theme::SurfaceStyle& style, float maximum, int dpi, float percentBasis) {
+    if (style.borderRadiusPercent) return PercentRadius(style.borderRadius,percentBasis,maximum);
+    const float scale = dpi/96.f;
+    return std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
+}
+float ThemeBorderRadius(const Theme::SurfaceStyle& style, D2D1_RECT_F bounds, int dpi) {
+    const float shorter = std::max(0.f,std::min(bounds.right-bounds.left,bounds.bottom-bounds.top));
+    return ThemeBorderRadius(style,shorter*.5f,dpi,shorter);
+}
+float ThumbnailRadius96(const Theme::SurfaceStyle& style, float itemHeight96) {
+    return style.borderRadiusPercent ?
+        PercentRadius(style.borderRadius,itemHeight96,std::numeric_limits<float>::max()) : style.borderRadius;
 }
 std::atomic<unsigned long long> g_shellAssociationEpoch{1};
 std::atomic<bool> g_scrollbar{true};
@@ -2259,6 +2306,7 @@ struct DragPreviewImage {
     std::wstring imageKey;
     bool folder=false,association=true;
     float tilt=0.f;
+    float itemHeight96=0.f;
 };
 struct DragPreview : DragPreviewImage {
     HWND window=nullptr;
@@ -2283,6 +2331,7 @@ struct DragPreview : DragPreviewImage {
     DWORD effect=DROPEFFECT_NONE;
     COLORREF background=0,foreground=0,accent=0;
     unsigned long long badgePalette=g_swipePalette.load(std::memory_order_relaxed);
+    std::shared_ptr<const Theme::SurfaceStyle> thumbnailTheme;
     float dragBadgeScaling=0.75f; // Item-count diameter, padding and font scale together.
     bool rtl=false,animate=true;
     std::shared_ptr<std::atomic<bool>> rendered=std::make_shared<std::atomic<bool>>(false);
@@ -2299,6 +2348,12 @@ struct DragShadow {
     const void* identity=nullptr;
     float side=0.f;
     int dpi=0; // Thumbnail corners follow the pile's DPI.
+    float thumbnailRadius96=-1.f;
+    struct Border {
+        float width=0.f, opacity=0.f;
+        Theme::BorderStyle style=Theme::BorderStyle::None;
+        bool operator==(const Border&) const = default;
+    } border;
 };
 // Same policy calculation as list text, with an independent monitor cache so
 // a drag on another display never invalidates the tab's existing glyph masks.
@@ -5353,6 +5408,15 @@ int DpiOf(HWND hwnd);
 int ViewDpi(const ViewState& state) {
     const int dpi = state.presentationOnly ? state.presentationDpi : DpiOf(state.hwnd);
     return std::clamp(dpi,72,768);
+}
+const Theme::SurfaceStyle* ThumbnailTheme(const ViewState& state) {
+    if (!state.themeSnapshot || state.themeHighContrast) return nullptr;
+    const auto& style = state.themeSnapshot->thumbnails[static_cast<size_t>(state.themeMode)];
+    return style ? &*style : nullptr;
+}
+std::shared_ptr<const Theme::SurfaceStyle> CaptureThumbnailTheme(const ViewState& state) {
+    if (const auto* style=ThumbnailTheme(state)) return {state.themeSnapshot,style};
+    return {};
 }
 BOOL ViewClientRect(const ViewState& state,RECT* rect) {
     if(state.presentationOnly) { *rect=state.presentationClient; return TRUE; }
@@ -18808,6 +18872,17 @@ ID2D1StrokeStyle* ThemeBorderStroke(ID2D1RenderTarget* target, ThemeBorderStroke
     }
     return cache.styles[slot].Get();
 }
+D2D1_COLOR_F HighlightColor(const Theme::Color& color);
+bool PushRoundedClip(ID2D1DeviceContext* target, D2D1_RECT_F bounds, float radius,
+    ComPtr<ID2D1RoundedRectangleGeometry>& geometry) {
+    ComPtr<ID2D1Factory> factory;
+    target->GetFactory(&factory);
+    if (!factory || FAILED(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(bounds,radius,radius),&geometry)))
+        return false;
+    target->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),geometry.Get(),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE),nullptr);
+    return true;
+}
 void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColorBrush* brush,float width=1.f,
                 ID2D1StrokeStyle* style=nullptr) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
@@ -18830,15 +18905,47 @@ void StrokeChevron(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F tip,D2D1_POINT
     target->DrawLine(corner,SnapDrawPoint(target,b,phase),brush,width);
     target->FillEllipse(D2D1::Ellipse(corner,width*.5f,width*.5f),brush);
 }
-void StrokeRoundedRect(ViewState& state,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBrush* brush,float width=1.f,
-                       ID2D1StrokeStyle* style=nullptr) {
+void StrokeRoundedRect(ID2D1RenderTarget* target,D2D1_ROUNDED_RECT rect,ID2D1SolidColorBrush* brush,float width=1.f,
+                       ID2D1StrokeStyle* style=nullptr,bool snap=true) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
-    rect.rect=SnapDrawRect(state.target.Get(),rect.rect);
+    if(snap) rect.rect=SnapDrawRect(target,rect.rect);
     width=std::max(1.f,roundf(width));
     const float inset=width*.5f;
     rect.rect.left+=inset; rect.rect.top+=inset; rect.rect.right-=inset; rect.rect.bottom-=inset;
     if(rect.rect.right<=rect.rect.left || rect.rect.bottom<=rect.rect.top) return;
-    static_cast<ID2D1RenderTarget*>(state.target.Get())->DrawRoundedRectangle(rect,brush,width,style);
+    if(rect.radiusX>0.f || rect.radiusY>0.f) target->DrawRoundedRectangle(rect,brush,width,style);
+    else target->DrawRectangle(rect.rect,brush,width,style);
+}
+float ThemeBorderWidth(D2D1_RECT_F bounds, float alpha, int dpi, const Theme::SurfaceStyle& style) {
+    if (style.borderWidth <= 0.f || style.borderStyle == Theme::BorderStyle::None ||
+        !VisibleOpacity(alpha * style.borderColor.alpha)) return 0.f;
+    const float maximum = floorf(std::min(bounds.right-bounds.left, bounds.bottom-bounds.top)*.5f);
+    if (maximum < 1.f) return 0.f;
+    // The bounds are in physical pixels. Clamp before scaling to avoid overflow.
+    const float scale = dpi/96.f;
+    return std::clamp(roundf(std::min(style.borderWidth, maximum/scale)*scale), 1.f, maximum);
+}
+D2D1_ROUNDED_RECT ThumbnailFrame(D2D1_RECT_F artwork, float radius, float width) {
+    if (width > 0.f) {
+        artwork.left-=width; artwork.top-=width; artwork.right+=width; artwork.bottom+=width;
+        if (radius > 0.f) radius+=width;
+    }
+    return D2D1::RoundedRect(artwork,radius,radius);
+}
+void StrokeRoundedRect(ID2D1DeviceContext* target, ID2D1SolidColorBrush* brush, ThemeBorderStrokes& strokes,
+    D2D1_ROUNDED_RECT shape, float alpha, float width, const Theme::SurfaceStyle& style, bool snap=false) {
+    if (!brush || width <= 0.f) return;
+    const float innerRadius = std::max(0.f, shape.radiusX-width*.5f);
+    auto color = HighlightColor(style.borderColor);
+    color.a *= std::clamp(alpha, 0.f, 1.f);
+    brush->SetColor(color);
+    // Clip a square centerline corner to the outer curve when the stroke is thick.
+    ComPtr<ID2D1RoundedRectangleGeometry> corners;
+    const bool clipped = shape.radiusX > 0.f && innerRadius == 0.f &&
+        PushRoundedClip(target,shape.rect,shape.radiusX,corners);
+    StrokeRoundedRect(target,D2D1::RoundedRect(shape.rect,innerRadius,innerRadius),brush,width,
+        ThemeBorderStroke(target,strokes,style.borderStyle),snap);
+    if (clipped) target->PopLayer();
 }
 template<class Style>
 void RefreshTextRenderingForWindow(Style& state,HWND window,bool checkMonitor=false) {
@@ -19410,7 +19517,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
                     state.brush->SetColor(Packed(0xE7C84E, .18f*opacity));
                     state.target->FillRoundedRectangle(rc, state.brush.Get());
                     state.brush->SetColor(Packed(0xFFD95A, .95f*opacity));
-                    StrokeRoundedRect(state,rc, state.brush.Get(), 1.f);
+                    StrokeRoundedRect(state.target.Get(),rc, state.brush.Get(), 1.f);
                 }
             }
             state.target->PopAxisAlignedClip();
@@ -20122,7 +20229,7 @@ D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
 
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
                     float opacity = 1.f, float angle = 0.f, D2D1_RECT_F* drawn = nullptr,
-                    IconRecord* overlay = nullptr) {
+                    IconRecord* overlay = nullptr, float itemHeight = 0.f) {
     if(!VisibleOpacity(opacity)) return true;
     if (!icon.bitmap) return false;
     if (state.iconDemandStartedAt && (!state.iconFirstDrawLogged ||
@@ -20151,7 +20258,8 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
     if (drawn) *drawn = rect;
     // Corner adornments follow Explorer's measured sizes (see the overlay and
     // badge below). They may extend past small artwork; damage includes them.
-    const float smallestAdornment = static_cast<float>(GetSystemMetricsForDpi(SM_CXSMICON, ViewDpi(state)));
+    const int viewDpi = ViewDpi(state);
+    const float smallestAdornment = static_cast<float>(GetSystemMetricsForDpi(SM_CXSMICON, viewDpi));
     const auto adorn = [&](const D2D1_RECT_F& area) {
         if (!drawn) return;
         drawn->left=std::min(drawn->left,area.left); drawn->top=std::min(drawn->top,area.top);
@@ -20168,8 +20276,16 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
             .b=reinterpret_cast<ULONG_PTR>(icon.bitmap.Get()),
             .v={rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top}},true);
     if (thumbnail) {
-        const float dpi = std::max(96,state.textFormatDpi)/96.f;
-        const float radius = ThumbnailCornerRadius(width, height, std::max(96,state.textFormatDpi));
+        const auto* style = ThumbnailTheme(state);
+        const int defaultDpi = std::max(96,state.textFormatDpi);
+        const float dpi = defaultDpi/96.f;
+        const float radius96 = style ? ThumbnailRadius96(*style,
+            (itemHeight > 0.f ? itemHeight : state.rowPx)*96.f/viewDpi) : -1.f;
+        const float radius = radius96 >= 0.f ? ThumbnailCornerRadius(rect,viewDpi,radius96) :
+            ThumbnailCornerRadius(width,height,defaultDpi);
+        const float border = style ? ThemeBorderWidth(rect,opacity,viewDpi,*style) : 0.f;
+        const auto frame = ThumbnailFrame(rect,radius,border);
+        if (border > 0.f) adorn(frame.rect);
         // Three small translucent fills approximate a soft shadow. No blur
         // effect, offscreen surface, extra texture or per-item geometry exists.
         // Whole-pixel spreads keep each band's straight edges on the grid.
@@ -20177,15 +20293,20 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         // short side, smaller (and fainter) below, so small or wide images
         // are not swamped. Shaped previews with transparent margins have no
         // rectangle to shadow.
-        const float unit = dpi * std::min(1.f, std::min(width, height) / (48.f * dpi));
-        const float drop = roundf(2*unit);
-        if (artwork.thumbnailOpaque) for (int spread=3; spread>=1; --spread) {
-            const float out = roundf(spread*unit);
-            if (out < 1.f) continue;
-            state.brush->SetColor(D2D1::ColorF(0.f,0.f,0.f,opacity*.055f*std::min(1.f,unit/dpi*2.f)));
-            state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(
-                rect.left-out,rect.top-out+drop,rect.right+out,rect.bottom+out+drop),
-                radius+out,radius+out),state.brush.Get());
+        const float shadowOpacity = opacity * (style ? style->shadowOpacity : 1.f);
+        if (artwork.thumbnailOpaque && VisibleOpacity(shadowOpacity)) {
+            const float unit = dpi * std::min(1.f, std::min(width, height) / (48.f * dpi));
+            if (roundf(3*unit) >= 1.f) {
+                const float drop = roundf(2*unit);
+                state.brush->SetColor(D2D1::ColorF(0.f,0.f,0.f,shadowOpacity*.055f*std::min(1.f,unit/dpi*2.f)));
+                for (int spread=3; spread>=1; --spread) {
+                    const float out = roundf(spread*unit);
+                    if (out < 1.f) break;
+                    state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(
+                        frame.rect.left-out,frame.rect.top-out+drop,frame.rect.right+out,frame.rect.bottom+out+drop),
+                        frame.radiusX+out,frame.radiusY+out),state.brush.Get());
+                }
+            }
         }
         state.thumbnailBrush->SetBitmap(icon.bitmap.Get());
         state.thumbnailBrush->SetOpacity(opacity);
@@ -20195,10 +20316,12 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         state.thumbnailBrush->SetTransform(D2D1::Matrix3x2F::Scale(
             (rect.right-rect.left)/sourceWidth,(rect.bottom-rect.top)/sourceHeight) *
             D2D1::Matrix3x2F::Translation(rect.left,rect.top));
-        state.target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius,radius),
-            state.thumbnailBrush.Get());
+        if (radius96 == 0.f) state.target->FillRectangle(rect, state.thumbnailBrush.Get());
+        else state.target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius,radius), state.thumbnailBrush.Get());
         // The reusable brush must not pin an evicted bitmap or obsolete device.
         state.thumbnailBrush->SetBitmap(nullptr);
+        if (border > 0.f) StrokeRoundedRect(state.target.Get(), state.brush.Get(), state.themeBorderStrokes,
+            frame, opacity, border, *style);
         if (artwork.badgeSize) {
             // Explorer's app badge, measured on its own view at 96 and 120 DPI:
             // 6.2 DIP + 0.2 of the thumbnail height, so it grows slower than
@@ -20286,7 +20409,7 @@ void RecordClipboardDamage(ViewState& state, const D2D1_RECT_F& icon) {
 }
 
 void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
-                    float opacity = 1.f) {
+                    float opacity = 1.f, float itemHeight = 0.f) {
     if(!VisibleOpacity(opacity)) return;
     const bool pending = state.clipboardPaths.contains(e.path);
     const float angle = pending && !state.startupAnimationsSuppressed ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
@@ -20294,7 +20417,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     auto* overlay = OverlayArtwork(state, e, true);
     const auto draw = [&](IconRecord& icon, bool association) {
         D2D1_RECT_F drawn{};
-        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay);
+        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay,itemHeight);
         if (ready && pending && drawn.right>drawn.left && drawn.bottom>drawn.top) RecordClipboardDamage(state,drawn);
         if (ready) icon.painted=state.graphicsPaintSerial;
         if (state.uiTraceDrawItem)
@@ -21100,23 +21223,11 @@ void DrawThemeSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
         if (radius > 0.f) state.target->FillRoundedRectangle(D2D1::RoundedRect(part, radius, radius), brush);
         else state.target->FillRectangle(part, brush);
     }
-    if (style.borderWidth > 0.f && style.borderStyle != Theme::BorderStyle::None) {
-        const float scale = ViewDpi(state)/96.f;
-        const float maximum = floorf(std::min(part.right-part.left, part.bottom-part.top)*.5f);
-        if (maximum < 1.f) return;
-        // Targets use physical-pixel coordinates at 96 DPI. Scale the theme's
-        // logical width once, then use the same whole-pixel stroke for its inset
-        // and corner geometry. Clamp before multiplying to avoid float overflow.
-        const float width = std::clamp(roundf(std::min(style.borderWidth, maximum/scale)*scale), 1.f, maximum);
-        auto color = HighlightColor(style.borderColor); color.a *= std::clamp(borderAlpha < 0.f ? alpha : borderAlpha, 0.f, 1.f);
-        state.brush->SetColor(color);
-        auto shape=D2D1::RoundedRect(part,std::max(0.f,radius-width*.5f),std::max(0.f,radius-width*.5f));
-        auto* stroke=ThemeBorderStroke(state.target.Get(),state.themeBorderStrokes,style.borderStyle);
-        if(physicalBounds) {
-            shape.rect.left+=width*.5f; shape.rect.top+=width*.5f;
-            shape.rect.right-=width*.5f; shape.rect.bottom-=width*.5f;
-            state.target->DrawRoundedRectangle(shape,state.brush.Get(),width,stroke);
-        } else StrokeRoundedRect(state,shape,state.brush.Get(),width,stroke);
+    if (style.borderWidth > 0.f) {
+        const float opacity = borderAlpha < 0.f ? alpha : borderAlpha;
+        StrokeRoundedRect(state.target.Get(), state.brush.Get(), state.themeBorderStrokes,
+            D2D1::RoundedRect(part,radius,radius), opacity,
+            ThemeBorderWidth(part,opacity,ViewDpi(state),style), style, !physicalBounds);
     }
 }
 void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds,
@@ -21144,12 +21255,11 @@ bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
     }
     if (!snapshot) return false;
     const auto& style = snapshot->scrollbars[static_cast<size_t>(state.themeMode)][part][interaction];
-    if (style.background.kind == Theme::Paint::Kind::Default && style.borderWidth <= 0.f &&
-        style.borderRadius == std::numeric_limits<float>::max()) return false;
+    const bool customRadius = style.borderRadiusPercent || style.borderRadius != std::numeric_limits<float>::max();
+    if (style.background.kind == Theme::Paint::Kind::Default && style.borderWidth <= 0.f && !customRadius) return false;
     const float maximum = std::max(0.f, std::min(bounds.right-bounds.left, bounds.bottom-bounds.top)*.5f);
-    const float scale = ViewDpi(state)/96.f;
-    if (style.borderRadius != std::numeric_limits<float>::max())
-        radius = std::min(maximum, roundf(std::min(style.borderRadius, maximum/scale)*scale));
+    // The native radius is half the part's cross-axis thickness.
+    if (customRadius) radius = ThemeBorderRadius(style,maximum,ViewDpi(state),radius*2.f);
     // Custom fills/borders use their own alpha. An omitted background keeps
     // the native animated fill independently of a themed border or radius.
     const size_t slot = part*3+interaction;
@@ -21175,11 +21285,9 @@ bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
     }
     if (!snapshot || !snapshot->elements.contains(L"DrawMarquee")) return false;
     const auto& style = snapshot->marquees[static_cast<size_t>(state.themeMode)];
-    const float scale = ViewDpi(state)/96.f;
-    const float maximum = std::max(0.f,std::min(physical.right-physical.left,physical.bottom-physical.top)*.5f);
-    const float radius = std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
     if (physical.right == physical.left || physical.bottom == physical.top) {
         if (style.borderWidth > 0.f && style.borderStyle != Theme::BorderStyle::None) {
+            const float scale = ViewDpi(state)/96.f;
             auto color = HighlightColor(style.borderColor); color.a *= std::min(1.f,opacity*2.3f);
             state.brush->SetColor(color);
             const float length = std::max(1.f,std::max(physical.right-physical.left,physical.bottom-physical.top));
@@ -21189,6 +21297,7 @@ bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
         }
         return true;
     }
+    const float radius = ThemeBorderRadius(style,physical,ViewDpi(state));
     if (state.rtlLayout) {
         const float left = physical.left;
         physical.left = state.paintWidth-physical.right; physical.right = state.paintWidth-left;
@@ -21224,10 +21333,9 @@ bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fracti
     auto bounds=track;
     if(part==0) bounds.right=bounds.left+(bounds.right-bounds.left)*fraction;
     const float maximum=std::max(0.f,std::min(bounds.right-bounds.left,bounds.bottom-bounds.top)*.5f);
-    const float scale=ViewDpi(state)/96.f;
     const auto& style=drive.surface;
-    const float radius=style.borderRadius==std::numeric_limits<float>::max() ? maximum:
-        std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
+    const float radius=!style.borderRadiusPercent && style.borderRadius==std::numeric_limits<float>::max() ? maximum:
+        ThemeBorderRadius(style,maximum,ViewDpi(state),track.bottom-track.top);
     const float alpha=paint.kind==Theme::Paint::Kind::Default ? contentOpacity*(part==0 ? .82f:.18f):contentOpacity;
     const auto origin=originTrack && originTrack->bottom>originTrack->top ? *originTrack:track;
     DrawThemeSurface(state,bounds,drive.trackOrigin ? origin:bounds,radius,alpha,style,
@@ -21268,7 +21376,7 @@ void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                 part.left=state.paintWidth-part.right; part.right=state.paintWidth-left;
             }
             state.brush->SetColor(Packed(rgb,alpha));
-            StrokeRoundedRect(state,D2D1::RoundedRect(part,radius,radius),
+            StrokeRoundedRect(state.target.Get(),D2D1::RoundedRect(part,radius,radius),
                 state.brush.Get(),static_cast<float>(Scale96(1,ViewDpi(state))));
         }
     }
@@ -21792,8 +21900,7 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
     if(themed) {
         const auto& styles=snapshot->groupBadges[static_cast<size_t>(state.themeMode)];
         auto& cache=state.groupBadgeResources; PrepareContrastSurfaces(state,cache,styles);
-        const float scale=ViewDpi(state)/96.f;
-        radius=std::min(radius,roundf(std::min(styles[0].borderRadius,radius/scale)*scale));
+        radius=ThemeBorderRadius(styles[0],pill,ViewDpi(state));
         DrawThemeSurface(state,pill,pill,radius,alpha,styles[0],cache.gradients[0],cache.ramps[0],
             1.f,ThemeRgb(COLORREF(palette&0xffffff)),alpha,256,nullptr,true);
         ink=cache.marks[0];
@@ -22116,9 +22223,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
         const auto& styles=snapshot->checkboxes[mode];
         const size_t index=(checked ? 3:0)+(pressed ? 2:hot ? 1:0);
         const auto& style=styles[index];
-        const float scale=ViewDpi(state)/96.f;
-        const float maximum=std::max(0.f,std::min(rect.right-rect.left,rect.bottom-rect.top)*.5f);
-        const float radius=std::min(maximum,roundf(std::min(style.borderRadius,maximum/scale)*scale));
+        const float radius=ThemeBorderRadius(style,rect,ViewDpi(state));
         const float fillAlpha=style.background.kind==Theme::Paint::Kind::Default && !checked ? .08f:1.f;
         DrawThemeSurface(state,rect,rect,radius,opacity*fillAlpha,style,cache.gradients[index],cache.ramps[index],
             fillAlpha,ThemeRgb(checked ? cache.accent:cache.foreground),opacity,64);
@@ -22848,6 +22953,12 @@ D2D1_RECT_F DragArtworkRect(const IconPixels& pixels,float side,float center,flo
     const float width=pixels.Ready() ? w*fit:side,height=pixels.Ready() ? h*fit:side;
     return D2D1::RectF(center-width*.5f,bottom-height,center+width*.5f,bottom);
 }
+DragShadow::Border DragThumbnailBorder(const DragPreview& preview, const IconPixels& pixels) {
+    if (!preview.thumbnailTheme || !pixels.thumbnailWidth || !pixels.thumbnailHeight) return {};
+    const auto& style=*preview.thumbnailTheme;
+    const float width=ThemeBorderWidth(DragArtworkRect(pixels,preview.side,0.f,0.f),1.f,preview.dpi,style);
+    return width>0.f ? DragShadow::Border{width,style.borderColor.alpha,style.borderStyle} : DragShadow::Border{};
+}
 float DragStackTilt(const std::wstring& path,size_t index) {
     return index ? (SelectionPathHash(path)&1 ? -1.f:1.f)*std::min(12.f,3.f*float(index)):0.f;
 }
@@ -22870,18 +22981,23 @@ DragPreviewGeometry LayoutDragPreview(const DragPreview& preview) {
     auto bounds=D2D1::RectF(0,0,2*edge+side+2*outset,2*edge+side+outset);
     // Bound rotated squares and their soft shadows, independent of artwork
     // aspect ratios or whether the native target currently supplies a caption.
-    const float padding=DragShadowPadding(side),offset=DragShadowOffset(side);
+    const float border=preview.thumbnailTheme ?
+        ThemeBorderWidth(square,1.f,preview.dpi,*preview.thumbnailTheme):0.f;
+    const auto outerSquare=ThumbnailFrame(square,0.f,border).rect;
+    const float padding=DragShadowPadding(side)+border,offset=DragShadowOffset(side);
     float pileTop=square.top;
     const auto shadow=D2D1::RectF(square.left-padding,square.top-padding+offset,
         square.right+padding,square.bottom+padding+offset);
     geometry.pile=D2D1::RectF(FLT_MAX,FLT_MAX,-FLT_MAX,-FLT_MAX);
     for(size_t i=0;i<std::min(preview.imageCount,kDragPreviewImages);++i) {
         const auto transform=DragStackTransform(preview,i,square);
-        for(auto point:{D2D1::Point2F(square.left,square.top),D2D1::Point2F(square.right,square.top),
-            D2D1::Point2F(square.left,square.bottom),D2D1::Point2F(square.right,square.bottom)})
+        for(auto point:{D2D1::Point2F(outerSquare.left,outerSquare.top),D2D1::Point2F(outerSquare.right,outerSquare.top),
+            D2D1::Point2F(outerSquare.left,outerSquare.bottom),D2D1::Point2F(outerSquare.right,outerSquare.bottom)})
             pileTop=std::min(pileTop,transform.TransformPoint(point).y);
         // Each layer's own artwork, as DrawDragPreview places and tilts it.
-        const auto art=DragArtworkRect(preview.Image(i).pixels,side,(square.left+square.right)*.5f,square.bottom);
+        const auto& pixels=preview.Image(i).pixels;
+        const auto art=ThumbnailFrame(DragArtworkRect(pixels,side,(square.left+square.right)*.5f,square.bottom),
+            0.f,DragThumbnailBorder(preview,pixels).width).rect;
         for(auto point:{D2D1::Point2F(art.left,art.top),D2D1::Point2F(art.right,art.top),
             D2D1::Point2F(art.left,art.bottom),D2D1::Point2F(art.right,art.bottom)}) {
             point=transform.TransformPoint(point);
@@ -23097,30 +23213,23 @@ void DrawCenteredDragLabel(ID2D1DeviceContext* target,ID2D1SolidColorBrush* brus
     target->DrawTextLayout(D2D1::Point2F(),layout.Get(),brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     target->SetTransform(previous);
 }
-// A pile thumbnail is rounded by the thumbnail rule at the pile's own drawn
-// size and DPI, whatever the grid item shows; icons keep their silhouettes.
 void DrawDragArtwork(ID2D1DeviceContext* target,ID2D1Bitmap* bitmap,const IconPixels& pixels,
-    const D2D1_RECT_F& destination,int dpi) {
+    const D2D1_RECT_F& destination,float radius) {
     const auto source=D2D1::RectF(0,0,float(pixels.thumbnailWidth ? pixels.thumbnailWidth:pixels.width),
         float(pixels.thumbnailHeight ? pixels.thumbnailHeight:pixels.height));
     ComPtr<ID2D1RoundedRectangleGeometry> corners;
-    if(pixels.thumbnailWidth && pixels.thumbnailHeight) {
-        const float radius=ThumbnailCornerRadius(destination.right-destination.left,destination.bottom-destination.top,dpi);
-        ComPtr<ID2D1Factory> factory; target->GetFactory(&factory);
-        if(radius>0.f && factory &&
-            FAILED(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(destination,radius,radius),&corners)))
-            corners.Reset();
-    }
-    if(corners) target->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),corners.Get(),
-        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE),nullptr);
+    const bool clipped=radius>0.f && PushRoundedClip(target,destination,radius,corners);
     target->DrawBitmap(bitmap,&destination,1.f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,&source,nullptr);
-    if(corners) target->PopLayer();
+    if(clipped) target->PopLayer();
 }
 
-DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,float side,int dpi) {
+DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,const DragPreviewImage& image,
+    float side,int dpi,float thumbnailRadius96,DragShadow::Border border,ThemeBorderStrokes& strokes) {
     DragShadow result;
     result.identity=image.pixels.data.Identity(); result.side=side; result.dpi=dpi;
-    const float pad=DragShadowPadding(side);
+    result.thumbnailRadius96=thumbnailRadius96;
+    result.border=border;
+    const float pad=DragShadowPadding(side)+border.width;
     const auto rect=DragArtworkRect(image.pixels,side,0.f,0.f);
     const float width=rect.right-rect.left,height=rect.bottom-rect.top;
     const auto size=D2D1::SizeU(UINT(std::ceil(width+2*pad)),UINT(std::ceil(height+2*pad)));
@@ -23142,7 +23251,19 @@ DragShadow CreateDragShadow(ID2D1DeviceContext* target,ID2D1Bitmap* artwork,cons
     const auto destination=D2D1::RectF(pad,pad,pad+width,pad+height);
     const auto& pixels=image.pixels;
     if(artwork && pixels.Ready()) {
-        DrawDragArtwork(target,artwork,pixels,destination,dpi); // The shadow follows rounded corners.
+        const float radius=pixels.thumbnailWidth && pixels.thumbnailHeight ?
+            ThumbnailCornerRadius(destination,dpi,thumbnailRadius96):0.f;
+        DrawDragArtwork(target,artwork,pixels,destination,radius); // The shadow follows the artwork's silhouette.
+        if (border.width>0.f) {
+            ComPtr<ID2D1SolidColorBrush> silhouette;
+            if (SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0),&silhouette))) {
+                Theme::SurfaceStyle style;
+                style.borderColor={0,border.opacity,false};
+                style.borderStyle=border.style;
+                StrokeRoundedRect(target,silhouette.Get(),strokes,ThumbnailFrame(destination,radius,border.width),
+                    1.f,border.width,style);
+            }
+        }
     } else {
         ComPtr<ID2D1SolidColorBrush> silhouette;
         if(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White,.8f),&silhouette))) {
@@ -23173,11 +23294,15 @@ std::wstring FormatDragCount(int count,bool rtl,LPCWSTR locale=LOCALE_NAME_USER_
 
 void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
     const std::array<ComPtr<ID2D1Bitmap>,kDragPreviewImages>* existingArtwork=nullptr,DragGlyph* glyph=nullptr,
-    const DragTextStyle* textStyle=nullptr,const std::array<DragShadow,kDragPreviewImages>* shadows=nullptr) {
+    const DragTextStyle* textStyle=nullptr,const std::array<DragShadow,kDragPreviewImages>* shadows=nullptr,
+    ThemeBorderStrokes* cachedStrokes=nullptr) {
     const float side=preview.side;
     const auto geometry=LayoutDragPreview(preview);
     ComPtr<ID2D1SolidColorBrush> brush;
     if(FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0,0.f),&brush))) return;
+    ThemeBorderStrokes localStrokes;
+    auto& strokes=cachedStrokes ? *cachedStrokes:localStrokes;
+    const auto* thumbnailStyle=preview.thumbnailTheme.get();
     const auto color=[&](COLORREF value,float alpha=1.f) {
         brush->SetColor(D2D1::ColorF(GetRValue(value)/255.f,GetGValue(value)/255.f,GetBValue(value)/255.f,alpha));
     };
@@ -23198,7 +23323,7 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
         // rotated and left continuous (SnapDrawRect ignores rotations).
         const auto destination=SnapDrawRect(target,DragArtworkRect(pixels,side,center,bottom));
         if(shadows && (*shadows)[layer].bitmap) {
-            const float pad=DragShadowPadding(side),offset=DragShadowOffset(side);
+            const float pad=DragShadowPadding(side)+(*shadows)[layer].border.width,offset=DragShadowOffset(side);
             const auto& shadow=(*shadows)[layer].bitmap;
             const auto size=shadow->GetSize();
             const auto bounds=SnapDrawRect(target,D2D1::RectF(destination.left-pad,destination.top-pad+offset,
@@ -23211,7 +23336,13 @@ void DrawDragPreview(ID2D1DeviceContext* target,const DragPreview& preview,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&bitmap)))) {
             // Thumbnail decoration has a separate atlas band. Never squeeze that
             // band into the image, stretch its aspect ratio, or crop it to a square.
-            DrawDragArtwork(target,bitmap.Get(),pixels,destination,preview.dpi);
+            const bool thumbnail=pixels.thumbnailWidth && pixels.thumbnailHeight;
+            const float radius=thumbnail ? ThumbnailCornerRadius(destination,preview.dpi,
+                thumbnailStyle ? ThumbnailRadius96(*thumbnailStyle,image.itemHeight96):-1.f):0.f;
+            DrawDragArtwork(target,bitmap.Get(),pixels,destination,radius);
+            const float border=DragThumbnailBorder(preview,pixels).width;
+            if(border>0.f) StrokeRoundedRect(target,brush.Get(),strokes,ThumbnailFrame(destination,radius,border),
+                1.f,border,*thumbnailStyle);
         } else {
             // Only used when even the currently displayed association is missing.
             // A recognizable, antialiased silhouette replaces the old blank box.
@@ -23302,20 +23433,27 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
                 D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),&layer.artwork[i]);
         }
     }
-    // Blur only on new artwork or DPI/size changes, and share the result for
-    // identical icons. Pointer motion and operation/caption updates reuse it.
+    // Cache the silhouette blur by artwork, size, DPI, rounding and border.
+    // Pointer motion and operation/caption updates reuse it.
     for(size_t i=0;i<kDragPreviewImages;++i) {
         const auto identity=layer.artworkIdentity[i];
         auto& shadow=layer.shadows[i];
         if(i>=preview->imageCount) {shadow={}; continue;}
-        if(shadow.identity==identity && shadow.side==preview->side && shadow.dpi==preview->dpi) continue;
-        shadow={}; shadow.identity=identity; shadow.side=preview->side; shadow.dpi=preview->dpi;
+        const auto& image=preview->Image(i);
+        const float radius96=preview->thumbnailTheme && image.pixels.thumbnailWidth && image.pixels.thumbnailHeight ?
+            ThumbnailRadius96(*preview->thumbnailTheme,image.itemHeight96):-1.f;
+        const auto border=DragThumbnailBorder(*preview,image.pixels);
+        const auto matches=[&](const DragShadow& candidate) {
+            return candidate.identity==identity && candidate.side==preview->side && candidate.dpi==preview->dpi &&
+                candidate.thumbnailRadius96==radius96 && candidate.border==border;
+        };
+        if(matches(shadow)) continue;
         bool shared=false;
-        for(size_t j=0;j<i;++j) if(layer.shadows[j].identity==identity && layer.shadows[j].side==preview->side &&
-            layer.shadows[j].dpi==preview->dpi) {
+        for(size_t j=0;j<i;++j) if(matches(layer.shadows[j])) {
             shadow=layer.shadows[j]; shared=true; break;
         }
-        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),preview->Image(i),preview->side,preview->dpi);
+        if(!shared) shadow=CreateDragShadow(state.target.Get(),layer.artwork[i].Get(),image,
+            preview->side,preview->dpi,radius96,border,state.themeBorderStrokes);
     }
     ComPtr<ID2D1Image> previous; state.target->GetTarget(&previous);
     ComPtr<IDWriteRenderingParams> previousTextParams; state.target->GetTextRenderingParams(&previousTextParams);
@@ -23323,7 +23461,7 @@ bool RenderDragPreview(ViewState& state,const std::shared_ptr<const DragPreview>
     D2D1_MATRIX_3X2_F transform{}; state.target->GetTransform(&transform);
     state.target->SetTarget(layer.plane.bitmap.Get()); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
     state.target->BeginDraw(); state.target->Clear(D2D1::ColorF(0,0.f));
-    DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle,&layer.shadows);
+    DrawDragPreview(state.target.Get(),*preview,&layer.artwork,&layer.glyph,&layer.textStyle,&layer.shadows,&state.themeBorderStrokes);
     const HRESULT draw=state.target->EndDraw();
     state.target->SetTarget(previous.Get()); state.target->SetTransform(transform);
     SetCompatibleTextRendering(state.target.Get(),previousTextParams.Get(),previousTextMode);
@@ -24367,7 +24505,7 @@ void Paint(ViewState& state) {
                 w, top + height), D2D1_ANTIALIAS_MODE_ALIASED);
             const auto geometry = LayoutItem(state, {top, height, opacity, old.oldLeft, old.oldWidth});
             const float contentOpacity = opacity * ItemContentOpacity(state, old.entry);
-            DrawActualIcon(state, old.entry, geometry.icon.left, geometry.icon.top, contentOpacity);
+            DrawActualIcon(state, old.entry, geometry.icon.left, geometry.icon.top, contentOpacity, height);
             state.target->PopAxisAlignedClip();
         }
     }
@@ -24424,9 +24562,9 @@ void Paint(ViewState& state) {
             // A morphing icon is drawn at its travelling size.
             const float side = state.iconPx;
             state.iconPx = geometry.icon.right - geometry.icon.left;
-            DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
+            DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity, v.height);
             state.iconPx = side;
-        } else DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity);
+        } else DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity, v.height);
         const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
         const float checkboxReveal = SelectionCheckboxReveal(state);
         if (checkboxReveal > 0.f && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
@@ -24739,7 +24877,7 @@ void Paint(ViewState& state) {
                     StrokeLine(state,D2D1::Point2F(left,top),D2D1::Point2F(right,bottom),state.brush.Get());
                 else {
                     const float radius = static_cast<float>(Scale96(4, ViewDpi(state)));
-                    StrokeRoundedRect(state,D2D1::RoundedRect(rc, radius, radius),state.brush.Get(),1.f);
+                    StrokeRoundedRect(state.target.Get(),D2D1::RoundedRect(rc, radius, radius),state.brush.Get(),1.f);
                 }
             }
         }
@@ -31127,11 +31265,37 @@ void ShutdownShellDragDrop(ViewState& state) {
 }
 
 void PublishDragPreview(ViewState& state) {
-    if(!state.presenter || state.presenter->stopping.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(state.presenter->mutex);
-    state.presenter->dragPreview=state.dragPreview ?
-        std::make_shared<const DragPreview>(*state.dragPreview):std::shared_ptr<const DragPreview>{};
-    SetEvent(state.presenter->wake);
+    const auto presenter=state.presenter;
+    if(!presenter || presenter->stopping.load(std::memory_order_acquire)) return;
+    const auto owned=state.dragPreview;
+    D2D1_SIZE_U resized{};
+    POINT origin{};
+    if(owned) {
+        auto theme=CaptureThumbnailTheme(state);
+        if(owned->thumbnailTheme!=theme) {
+            const bool touch=state.touch.dragPromoted;
+            const auto oldExtent=DragPreviewExtent(*owned);
+            const auto oldAnchor=PositionDragPreview(*owned,{},touch);
+            owned->thumbnailTheme=std::move(theme);
+            const auto extent=DragPreviewExtent(*owned);
+            const auto anchor=PositionDragPreview(*owned,{},touch);
+            RECT window{};
+            if((oldExtent.width!=extent.width || oldExtent.height!=extent.height ||
+                oldAnchor.x!=anchor.x || oldAnchor.y!=anchor.y) && GetWindowRect(owned->window,&window)) {
+                resized=extent;
+                origin={window.left+anchor.x-oldAnchor.x,window.top+anchor.y-oldAnchor.y};
+            }
+        }
+    }
+    auto preview=owned ? std::make_shared<const DragPreview>(*owned):nullptr;
+    {
+        std::lock_guard lock(presenter->mutex);
+        presenter->dragPreview=std::move(preview);
+        SetEvent(presenter->wake);
+    }
+    if(resized.width && resized.height)
+        SetWindowPos(owned->window,nullptr,origin.x,origin.y,int(resized.width),int(resized.height),
+            SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER);
 }
 
 void RefreshDragPreview(ViewState& state) {
@@ -31373,6 +31537,7 @@ public:
         if(!lane_ || lane_->stopping.load(std::memory_order_acquire)) return;
         const int dpi=ViewDpi(state),systemIcon=GetSystemMetricsForDpi(SM_CXICON,dpi);
         auto preview=std::make_shared<DragPreview>();
+        preview->thumbnailTheme=CaptureThumbnailTheme(state);
         preview->side=std::clamp(state.iconPx,float(systemIcon*4),float(systemIcon*8));
         preview->dpi=dpi; preview->count=count;
         preview->countLabel=FormatDragCount(count,state.rtlLayout);
@@ -31406,6 +31571,8 @@ public:
         for(size_t i=0;i<rows.size();++i) {
             const auto& entry=state.entries[size_t(rows[i])]; state.dragPreviewEntries[i]=entry;
             auto& image=state.dragPreview->Image(i); image.folder=entry.folder;
+            const float itemHeight=DisplayRowHeight(state,rows[i]);
+            image.itemHeight96=(itemHeight>0.f ? itemHeight : state.rowPx)*96.f/dpi;
             image.tilt=DragStackTilt(entry.path,i);
             std::wstring path; bool attrs=false;
             auto* shown=FindIconRecord(state,IconKey(state,entry,path,attrs),true,false,&image.imageKey);
@@ -32119,6 +32286,12 @@ void ShowItemTip(ViewState& state, POINT client) {
     SetEvent(work.columns.wake);
 }
 
+void HandlePointerHover(ViewState& state, POINT at, WPARAM buttons) {
+    if (buttons & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2)) return;
+    const int row = InsideListX(state,at.x) ? RowFromPoint(state,at.y,at.x) : -1;
+    if (row >= 0 && row == state.hovered && SelectionCheckboxAt(state,at)==-1) ShowItemTip(state,at);
+}
+
 void ConsumeItemTip(ViewState& state) {
     auto& work = *state.background;
     std::optional<ItemTipJob> result;
@@ -32222,13 +32395,13 @@ bool OpaqueItemTipText(const ItemTip& tip,float radius) {
 }
 
 // One layered popup: body placement/layout stays fixed while its outer shadow
-// extends the window around it. All theme lengths use logical 96-DPI pixels.
+// extends the window around it. Fixed theme lengths use logical 96-DPI pixels.
 void RenderItemTip(ItemTip& tip) {
     if (!IsWindow(tip.hwnd) || !tip.nameLayout || tip.size.cx <= 0 || tip.size.cy <= 0) return;
     const int dpi = DpiOf(tip.hwnd);
     const float scale = dpi/96.f;
-    const float maximumRadius = std::min(tip.size.cx,tip.size.cy)*.5f;
-    const float radius = std::min(maximumRadius,roundf(std::min(tip.style.borderRadius,maximumRadius/scale)*scale));
+    const float shorter = float(std::min(tip.size.cx,tip.size.cy));
+    const float radius = ThemeBorderRadius(tip.style,shorter*.5f,dpi,shorter);
     float sigma = float(Scale96(2,dpi)), spread = 0.f;
     auto offset = D2D1::Point2F(0,float(Scale96(2,dpi)));
     D2D1_COLOR_F shadowColor = D2D1::ColorF(0.f,0.f,0.f,ColorLuminance(tip.background) < .5 ? .45f:.2f);
@@ -32296,20 +32469,15 @@ void RenderItemTip(ItemTip& tip) {
                 } else { fill->SetColor(HighlightColor(paint.stops.front().color)); background = fill.Get(); }
             }
         }
-        if (background) tip.target->FillRoundedRectangle(body,background);
-        if (fill && tip.style.borderWidth > 0.f && tip.style.borderStyle != Theme::BorderStyle::None) {
-            const float maximum = floorf(std::min(tip.size.cx,tip.size.cy)*.5f);
-            if (maximum >= 1.f) {
-                const float width = std::clamp(roundf(std::min(tip.style.borderWidth,maximum/scale)*scale),1.f,maximum);
-                const float inset = width*.5f;
-                auto edge = body;
-                edge.rect = D2D1::RectF(body.rect.left+inset,body.rect.top+inset,body.rect.right-inset,body.rect.bottom-inset);
-                edge.radiusX = edge.radiusY = std::max(0.f,radius-inset);
-                fill->SetColor(HighlightColor(tip.style.borderColor));
-                if (edge.rect.right > edge.rect.left && edge.rect.bottom > edge.rect.top)
-                    tip.target->DrawRoundedRectangle(edge,fill.Get(),width,
-                        ThemeBorderStroke(tip.target.Get(),tip.borderStrokes,tip.style.borderStyle));
-            }
+        if (background) {
+            if (radius > 0.f) tip.target->FillRoundedRectangle(body,background);
+            else tip.target->FillRectangle(body.rect,background);
+        }
+        if (const float width = ThemeBorderWidth(body.rect,1.f,dpi,tip.style); fill && width > 0.f) {
+            const float centerlineRadius = std::max(0.f,radius-width*.5f);
+            fill->SetColor(HighlightColor(tip.style.borderColor));
+            StrokeRoundedRect(tip.target.Get(),D2D1::RoundedRect(body.rect,centerlineRadius,centerlineRadius),
+                fill.Get(),width,ThemeBorderStroke(tip.target.Get(),tip.borderStrokes,tip.style.borderStyle),false);
         }
         if (text && label) {
             auto antialias = background && OpaqueItemTipText(tip,radius) ?
@@ -36198,6 +36366,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 RefreshThemeColor(false);
                 s->viewTogglePaletteDirty=true;
                 RefreshNativePalette(*s,true);
+                if (s->dragPreview) PublishDragPreview(*s);
             }
             if (changes & kStyleFontCollection) {
                 AcquireSRWLockExclusive(&g_resolvedFontLock);
@@ -37571,11 +37740,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     case WM_MOUSEHOVER:
-        if (s && !(wParam & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2))) {
-            const POINT at{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
-            const int row = InsideListX(*s,at.x) ? RowFromPoint(*s,at.y,at.x) : -1;
-            if (row >= 0 && row == s->hovered && SelectionCheckboxAt(*s,at)==-1) ShowItemTip(*s,at);
-        }
+        if (s) HandlePointerHover(*s,POINT{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)},wParam);
         return 0;
     case WM_MOUSELEAVE:
         if (s) {
@@ -38216,6 +38381,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 s->clipboardStaticBuffers = 0; s->clipboardWiggleOnly = false;
                 s->itemTip.paletteDirty = true;
                 if (IsWindow(s->itemTip.hwnd) && IsWindowVisible(s->itemTip.hwnd)) ResolveItemTipPalette(*s);
+                if (s->dragPreview) PublishDragPreview(*s);
                 Redraw(*s);
             }
         }

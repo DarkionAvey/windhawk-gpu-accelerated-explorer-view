@@ -227,14 +227,15 @@ static void TestGridFilenameSelection(ViewState& state) {
     const auto flags=state.selectedFlags;
     const int selected=state.selected,hovered=state.hovered;
     const auto search=std::move(state.typeSearch); state.typeSearch.clear();
-    // Stay long enough to wrap at the smaller grid font default. A wrapping
-    // layout can legitimately contain one line when its entire label fits.
-    state.entries[0].name=L"Install macOS 27 release Beta - Developer Preview"; state.entries[0].path=L"grid-label-fixture:0";
+    const auto geometry=LayoutItem(state,{0,state.rowPx,1,DocumentRowLeft(state,0)});
+    // Use a Unicode line separator to get visibly unequal lines regardless
+    // of the selected font's word advances or automatic wrap point.
+    state.entries[0].name=geometry.wrapped ? L"Explorer\u2028i" : L"Install macOS 27 release Beta - Developer Preview";
+    state.entries[0].path=L"grid-label-fixture:0";
     state.entries[1].name=L"Short"; state.entries[1].path=L"grid-label-fixture:1";
     state.selectedFlags.assign(state.total,0); state.selectedFlags[0]=1;
     state.selected=0; state.hovered=-1;
     SelectionShape shape;
-    const auto geometry=LayoutItem(state,{0,state.rowPx,1,DocumentRowLeft(state,0)});
     const auto bounds=SelectionRect(state,0,0,state.rowPx,0,0,ListEndX(state),
         DocumentRowLeft(state,0),0,&shape);
     const float padding=2.f*DpiOf(state.hwnd)/96.f+.5f;
@@ -296,6 +297,13 @@ static void TestGridFilenameSelection(ViewState& state) {
     if(shape.count>1) {
         const auto shortest=std::min_element(shape.lines.begin(),shape.lines.begin()+shape.count,
             [](const auto& a,const auto& b) {return a.right-a.left<b.right-b.left;});
+        if (!(shortest->left>bounds.left+2.f || shortest->right<bounds.right-2.f)) {
+            std::cerr<<"LABEL equal widths dpi="<<ViewDpi(state)<<" rtl="<<state.rtlLayout
+                <<" font="<<state.textFormat->GetFontSize()<<" text width="<<geometry.text.right-geometry.text.left
+                <<" bounds="<<bounds.left<<","<<bounds.right<<" lines=";
+            for(unsigned i=0;i<shape.count;++i) std::cerr<<" "<<shape.lines[i].left<<","<<shape.lines[i].right;
+            std::cerr<<std::endl;
+        }
         Check(shortest->left>bounds.left+2.f || shortest->right<bounds.right-2.f,
             "wrapped filename selection used the whole label block width");
         const float outside=shortest->left>bounds.left+2.f ? bounds.left+1 : bounds.right-1;

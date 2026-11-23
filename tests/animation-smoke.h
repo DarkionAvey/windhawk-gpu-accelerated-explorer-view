@@ -566,6 +566,9 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
                   "paced frame waited for queue-idle WM_PAINT instead of completing its paint");
             UpdateWindow(state.hwnd);
             Check(paints+1 == state.paintCalls, "paced paint left a duplicate WM_PAINT invalidation");
+            // Observe the held wake's latch directly. A later compositor tick
+            // is independent of this input completion and may rearm the latch.
+            FrameInputFixture::HoldFramePosts heldPosts(state.hwnd,kMsgFrame);
             auto markQueued=[&] {
                 RegisterAnimationWindow(state.hwnd);
                 {
@@ -617,22 +620,16 @@ static void TestBatchedDeletion(State& state, const std::wstring& fixture) {
                 for(int n=0;n<128;++n) Check(PostMessageW(state.hwnd,restorePost,n,0),"restore post fixture");
                 ResumeInputDeferredFrame(state.hwnd,state.lifetimeToken,state.token,WM_KEYDOWN);
                 const bool queued=stillQueued();
-                MSG nextFrame{};
-                const bool nextWake=PeekMessageW(&nextFrame,state.hwnd,kMsgFrame,kMsgFrame,
-                    PM_NOREMOVE|PM_QS_POSTMESSAGE) && nextFrame.message==kMsgFrame && nextFrame.hwnd==state.hwnd;
-                // A new real clock post is also evidence that the held wake
-                // was acknowledged: its queued latch blocked further posts.
-                const bool acknowledged=!queued || nextWake;
-                if(state.framePaintPending || !acknowledged || state.paintCalls!=before+1)
+                if(state.framePaintPending || queued || state.paintCalls!=before+1)
                     std::cout<<"INPUT FRAME paints-delivered="<<DeletionPaintProbe::paints.load()
                         <<" client="<<[&]{RECT c{}; GetClientRect(state.hwnd,&c); return std::to_string(c.right)+"x"+std::to_string(c.bottom);}()
                         <<" window="<<[&]{RECT w{}; GetWindowRect(state.hwnd,&w); return std::to_string(w.left)+","+std::to_string(w.top)+" "+
                             std::to_string(w.right-w.left)+"x"+std::to_string(w.bottom-w.top);}()
                         <<" bits="<<bits<<" pending="<<state.framePaintPending
-                        <<" queued="<<queued<<" next="<<nextWake<<" paints="<<before<<"->"<<state.paintCalls
+                        <<" queued="<<queued<<" paints="<<before<<"->"<<state.paintCalls
                         <<" deferred="<<state.frameInputDeferred<<" graphics="<<state.graphicsOperations
                         <<" update="<<GetUpdateRect(state.hwnd,nullptr,FALSE)<<std::endl;
-                Check(!state.framePaintPending && acknowledged && state.paintCalls==before+1,
+                Check(!state.framePaintPending && !queued && state.paintCalls==before+1,
                     "input completion did not present/ack exactly one frame before queue idle");
                 MSG posted{}; unsigned remaining=0;
                 while(PeekMessageW(&posted,state.hwnd,restorePost,restorePost,PM_REMOVE)) ++remaining;

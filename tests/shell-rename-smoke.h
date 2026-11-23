@@ -40,6 +40,18 @@ void Pump(ProviderSelectionFixture::Browser& host) {
     }
     ReceiveDirectoryResults(state);
 }
+void WaitForFolderRelease(const std::filesystem::path& root) {
+    // A destroyed Shell view can still release its handles on this STA.
+    std::vector<std::wstring> held;
+    const bool released=Eventually([&] {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+        held=ProcessHandlesUnder(root);
+        return held.empty();
+    }, 30000);
+    for (const auto& path : held) std::wcout << L"RENAME folder handle still open: " << path << std::endl;
+    Check(released, "the renamed folder stayed open after its view closed");
+}
 bool HostHidden(const ViewState& state) {
     const HWND host = FolderContentHost(state.nativeHwnd);
     return host && !(GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE);
@@ -153,13 +165,7 @@ void RenameSet(const std::filesystem::path& root, const std::vector<Item>& renam
         }, 30000), "the empty-space click did not clear Explorer's selection after the rename");
     Check(!state.rename.editor && !NativeRenameEditor(state, ::GetFocus()), "an editor was left open after the rename");
     }
-    // Shell objects of the destroyed view release their folder handles from
-    // this thread's queue; the renamed set must not stay open.
-    Check(Eventually([&] {
-        MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
-        return ProcessHandlesUnder(root).empty();
-    }, 30000), "the renamed folder stayed open after its view closed");
+    WaitForFolderRelease(root);
 }
 }
 
@@ -1172,41 +1178,42 @@ static void TestRenameClickEnd(const std::wstring& fixture) {
 // The field draws into the Explorer frame's surface beneath the GPU visual,
 // which paints no GDI. Closing or hiding the field puts back what that
 // surface held, so no field text or border shows through the list afterwards.
-static void TestRenameVacatedSurface(const std::wstring& fixture) {
+static void CheckRenameVacatedPixels(const std::filesystem::path& root) {
     using namespace ShellRenameFixture;
-    // A window surface exists only on screen: place the frame there on a
-    // private desktop.
-    wchar_t desktop[256]{}; DWORD length = 0;
-    Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop, sizeof(desktop), &length),
-        "vacated surface desktop identity");
-    if (!std::wstring_view(desktop).starts_with(L"gpu-overlay-vacated-surface-")) {
-        PrivateDesktopFixture::Run(L"vacated-surface", L"--test rename-vacated-surface", 600000);
-        return;
-    }
-    const auto root = std::filesystem::path(fixture) / L"rename-vacated";
-    CreateFiles(root, {L"Quarterly report draft for the regional board meeting.txt"});
-    ProviderSelectionFixture::Browser host(true);
-    SetWindowPos(host.frame, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    constexpr wchar_t filename[]=L"Quarterly report draft for the regional board meeting.txt";
+    CreateFiles(root, {filename});
+    // Keep the real frame and EDIT while isolating the GDI surface from
+    // ExplorerBrowser travel history, directory watches, and Shell repainting.
+    PresentationFixture::Tab host(L"rename vacated surface",1,false,false,false,1000,700);
+    Check(SetWindowPos(host.frame, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE),
+        "put the private frame on screen");
     auto& state = host.state;
+    SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
     FocusFixture::Session focus(host.frame, state.hwnd);
-    host.Navigate(root.wstring(), 1);
-    // Explorer's frame clips its children; the overlay draws only through
-    // DirectComposition and the native view is suppressed.
+    state.folderPath=root.wstring();
+    auto& entry=state.entries.front();
+    entry.name=filename; entry.path=(root/filename).wstring(); entry.folder=false;
+    ComPtr<IShellItem> item;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(root.c_str(),nullptr,IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&state.folder))),
+        "vacated surface private Shell folder");
+    auto* selection=new SelectionFolderView;
+    selection->folder=state.folder; selection->state=&state; selection->reenterCapture=false;
+    state.folderView.Attach(selection);
+    // The real frame clips its children. The overlay has no GDI pixels of
+    // its own, as in the composited view with native contents suppressed.
     SetWindowLongPtrW(host.frame, GWL_STYLE, GetWindowLongPtrW(host.frame, GWL_STYLE) | WS_CLIPCHILDREN);
     Check(SetWindowSubclass(state.hwnd, +[](HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR)->LRESULT {
         if (message == WM_ERASEBKGND) return 1;
         if (message == WM_PAINT) { ValidateRect(hwnd, nullptr); return 0; }
         return DefSubclassProc(hwnd, message, wp, lp);
     }, 2, 0), "GPU overlay paint stand-in");
-    Check(SuppressNativeContent(state), "vacated surface native suppression");
     const auto factoryBefore = g_writeFactory;
     struct RestoreFactory { ComPtr<IDWriteFactory> value; ~RestoreFactory() { g_writeFactory = value; } } restoreFactory{factoryBefore};
     if (!g_writeFactory) Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_writeFactory.GetAddressOf()))), "vacated surface fonts");
     Check(MakeTextFormats(state) && state.textFormat, "vacated surface list format");
-    // A known surface under the view, read back through the frame's DC. The
-    // fixture's own Shell windows may repaint it after a close, so each field
-    // starts from it again.
+    // Each editor starts from the same known frame surface under the view.
     const COLORREF ground = RGB(23, 117, 61);
     const RECT view = RenameViewport(state, true);
     const auto paintGround = [&] {
@@ -1237,7 +1244,7 @@ static void TestRenameVacatedSurface(const std::wstring& fixture) {
         state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;
         Check(SyncNativeSelection(state), "vacated surface selection");
         BeginRename(state, 0);
-        Check(state.rename.editor != nullptr, "vacated surface editor");
+        Check(IsWindowVisible(state.rename.editor), "vacated surface editor");
         RedrawWindow(state.rename.editor, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
         const RECT field = state.rename.frameRect;
         const size_t drawn = foreign(field);
@@ -1246,12 +1253,17 @@ static void TestRenameVacatedSurface(const std::wstring& fixture) {
     };
     // Closing.
     auto [closed, drawn] = open();
+    const HWND closedEditor=state.rename.editor;
     CancelRename(state);
+    Check(!IsWindow(closedEditor),"closing left the rename EDIT alive");
     const size_t afterClose = foreign(closed);
     // Hiding while the view zooms.
     auto [hidden, drawnAgain] = open();
+    const HWND hiddenEditor=state.rename.editor;
     state.zoomAnimating = true;
     RepositionRenameEdit(state);
+    Check(state.rename.editor==hiddenEditor && IsWindow(hiddenEditor) && !IsWindowVisible(hiddenEditor),
+        "zoom did not hide the live rename EDIT");
     const size_t afterHide = foreign(hidden);
     state.zoomAnimating = false;
     CancelRename(state);
@@ -1260,4 +1272,19 @@ static void TestRenameVacatedSurface(const std::wstring& fixture) {
     Check(afterClose == 0, "the closed field's pixels stayed in the frame surface");
     Check(afterHide == 0, "the hidden field's pixels stayed in the frame surface");
     std::cout << "PASS: closing or hiding the rename field restores the frame surface beneath the GPU view\n";
+}
+
+static void TestRenameVacatedSurface(const std::wstring& fixture) {
+    // A window surface exists only on screen: place the frame there on a
+    // private desktop.
+    wchar_t desktop[256]{}; DWORD length = 0;
+    Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desktop, sizeof(desktop), &length),
+        "vacated surface desktop identity");
+    if (!std::wstring_view(desktop).starts_with(L"gpu-overlay-vacated-surface-")) {
+        PrivateDesktopFixture::Run(L"vacated-surface", L"--test rename-vacated-surface", 600000);
+        return;
+    }
+    const auto root = std::filesystem::path(fixture) / L"rename-vacated";
+    CheckRenameVacatedPixels(root);
+    ShellRenameFixture::WaitForFolderRelease(root);
 }

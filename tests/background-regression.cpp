@@ -55,6 +55,7 @@
 #undef TrackPopupMenuEx
 #undef SendMessageW
 #undef QueryPerformanceCounter
+#undef PostMessageW
 #undef Wh_Log
 #undef CoCreateInstance
 #undef SetWinEventHook
