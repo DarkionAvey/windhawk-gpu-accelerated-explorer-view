@@ -83,7 +83,7 @@ struct Browser {
     DWORD cookie = 0;
     unsigned shellHints = 0;
     bool registered = false;
-    explicit Browser(bool travelLog = false) {
+    explicit Browser(bool travelLog = false, bool listViewGroups = false) {
         if (travelLog) {
             WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
             cls.lpszClassName=L"CabinetWClass"; RegisterClassW(&cls);
@@ -108,6 +108,12 @@ struct Browser {
         }, 1, reinterpret_cast<DWORD_PTR>(this)), "provider Shell notification receiver");
         Check(SUCCEEDED(CoCreateInstance(CLSID_ExplorerBrowser, nullptr, CLSCTX_INPROC_SERVER,
             IID_PPV_ARGS(&browser))), "provider ExplorerBrowser");
+        if (listViewGroups) {
+            ComPtr<IFolderViewOptions> options;
+            Check(SUCCEEDED(browser.As(&options)) &&
+                SUCCEEDED(options->SetFolderViewOptions(FVO_VISTALAYOUT, FVO_VISTALAYOUT)),
+                "request native list-view group inspection");
+        }
         RECT bounds{0, 0, 1000, 700}; FOLDERSETTINGS settings{FVM_DETAILS, FWF_NOBROWSERVIEWSTATE};
         Check(SUCCEEDED(browser->Initialize(frame, &bounds, &settings)), "provider browser initialization");
         browser->SetOptions(EBO_NOBORDER | (travelLog ? EBO_NONE : EBO_NOTRAVELLOG));

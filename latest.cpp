@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.8
+// @version         1.1.9
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -9771,11 +9771,82 @@ void SortEntriesByIndex(std::vector<Entry>& entries, Less&& less) {
 enum class FolderSizeSource { Off, Recorded, Fresh };
 void ResolveFolderContentSizes(std::vector<Entry>& entries, TabBackground& work,
                                unsigned long long token, FolderSizeSource source);
+// A local day number stays consistent across daylight-saving transitions.
+struct RelativeCalendarDate {
+    SYSTEMTIME local{};
+    long long day = 0;
+    bool Read(const FILETIME& stamp, const DYNAMIC_TIME_ZONE_INFORMATION* zone = nullptr) {
+        SYSTEMTIME utc{};
+        if ((!stamp.dwHighDateTime && !stamp.dwLowDateTime) ||
+            !FileTimeToSystemTime(&stamp, &utc) ||
+            !SystemTimeToTzSpecificLocalTimeEx(zone, &utc, &local)) return false;
+        SYSTEMTIME midnight = local;
+        midnight.wHour = midnight.wMinute = midnight.wSecond = midnight.wMilliseconds = 0;
+        FILETIME ft{};
+        if (!SystemTimeToFileTime(&midnight, &ft)) return false;
+        day = ((ULONGLONG(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) / 864000000000ULL;
+        return true;
+    }
+};
+
+struct RelativeDateGroups {
+    RelativeCalendarDate today;
+    long long weekStart;
+    bool valid;
+    std::wstring titles[13];
+    RelativeDateGroups() {
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        valid = today.Read(now);
+        wchar_t first[4]{};
+        GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IFIRSTDAYOFWEEK, first, ARRAYSIZE(first));
+        weekStart = today.day - (today.local.wDayOfWeek + 13 - _wtoi(first)) % 7;
+    }
+    void Assign(Entry& entry, const FILETIME& stamp) {
+        RelativeCalendarDate date;
+        entry.groupKey.clear();
+        entry.groupTitle.clear();
+        if (!valid || !date.Read(stamp)) return;
+        const auto days = date.day - today.day;
+        const bool sameYear = date.local.wYear == today.local.wYear;
+        const bool sameMonth = sameYear && date.local.wMonth == today.local.wMonth;
+        int rank;
+        if (days < -1) {
+            if (date.day >= weekStart) rank = 4;
+            else if (date.day >= weekStart - 7) rank = 3;
+            else if (sameMonth) rank = 2;
+            else rank = sameYear ? 1 : 0;
+        } else if (days <= 1) rank = 6 + static_cast<int>(days);
+        else if (date.day < weekStart + 7) rank = 8;
+        else if (date.day < weekStart + 14) rank = 9;
+        else if (sameMonth) rank = 10;
+        else rank = sameYear ? 11 : 12;
+
+        // Property System date group strings in chronological order.
+        static constexpr UINT resources[] = {100,101,102,104,103,105,106,107,108,109,110,111,112};
+        static constexpr const wchar_t* fallback[] = {L"A long time ago", L"Earlier this year",
+            L"Earlier this month", L"Last week", L"Earlier this week", L"Yesterday", L"Today",
+            L"Tomorrow", L"Later this week", L"Next week", L"Later this month",
+            L"Later this year", L"Sometime in the future"};
+        auto& title = titles[rank];
+        if (title.empty()) {
+            wchar_t label[128]{};
+            const auto module = GetModuleHandleW(L"propsys.dll");
+            title = module && LoadStringW(module, resources[rank], label, ARRAYSIZE(label))
+                ? label : fallback[rank];
+        }
+        entry.groupTitle = title;
+        entry.groupKey = std::to_wstring(rank);
+    }
+};
 void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& group,
                             std::map<std::wstring, std::wstring>& typeCache,
                             TabBackground& work, unsigned long long token) {
     if (!group.enabled) return;
     const SortKind kind = ClassifySort(group.key);
+    std::optional<RelativeDateGroups> dates;
+    if (kind == SortKind::Modified || kind == SortKind::Created || kind == SortKind::Accessed)
+        dates.emplace();
     if (kind == SortKind::Size) ResolveFolderContentSizes(entries, work, token, FolderSizeSource::Fresh);
     for (size_t i = 0; i < entries.size(); ++i) {
         if (!DirectoryJobCurrent(work, token)) return;
@@ -9826,19 +9897,7 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
         case SortKind::Accessed: {
             const FILETIME& stamp = kind == SortKind::Modified ? e.lastWrite :
                 kind == SortKind::Created ? e.created : e.accessed;
-            if (!stamp.dwLowDateTime && !stamp.dwHighDateTime) break;
-            FILETIME local{}; SYSTEMTIME date{};
-            if (FileTimeToLocalFileTime(&stamp, &local) &&
-                FileTimeToSystemTime(&local, &date) && date.wYear) {
-                wchar_t key[32]{};
-                swprintf_s(key, ARRAYSIZE(key), L"%04u-%02u",
-                           date.wYear, date.wMonth);
-                e.groupKey = key;
-                wchar_t title[100]{};
-                if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &date,
-                    L"MMMM yyyy", title, ARRAYSIZE(title), nullptr))
-                    e.groupTitle = title;
-            }
+            dates->Assign(e, stamp);
             break;
         }
         case SortKind::ShellProperty: {
@@ -10690,22 +10749,13 @@ constinit SystemRelativeTime g_systemRelativeTime;
 struct ItemTipRelativeOffset {double value=0; SystemRelativeTime::Unit unit=SystemRelativeTime::Second;};
 std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,const FILETIME& now,
     const DYNAMIC_TIME_ZONE_INFORMATION* zone=nullptr) {
-    if(!time.dwLowDateTime && !time.dwHighDateTime) return {};
-    SYSTEMTIME utc{},utcNow{},local{},localNow{};
-    if(!FileTimeToSystemTime(&time,&utc) || !FileTimeToSystemTime(&now,&utcNow) ||
-        !SystemTimeToTzSpecificLocalTimeEx(zone,&utc,&local) ||
-        !SystemTimeToTzSpecificLocalTimeEx(zone,&utcNow,&localNow)) return {};
+    RelativeCalendarDate date, current;
+    if (!date.Read(time, zone) || !current.Read(now, zone)) return {};
+    const auto& local = date.local;
+    const auto& localNow = current.local;
     const auto ticks=[](const FILETIME& value) {return (ULONGLONG(value.dwHighDateTime)<<32)|value.dwLowDateTime;};
     const double seconds=(double(ticks(time))-double(ticks(now)))/10000000.;
-    // Local calendar dates, represented at fictitious UTC midnight: a day
-    // remains a calendar day through 23/25-hour daylight-saving transitions.
-    const auto midnight=[](SYSTEMTIME value,FILETIME& result) {
-        value.wHour=value.wMinute=value.wSecond=value.wMilliseconds=0;
-        return SystemTimeToFileTime(&value,&result)!=FALSE;
-    };
-    FILETIME day{},dayNow{};
-    if(!midnight(local,day) || !midnight(localNow,dayNow)) return {};
-    const double days=std::round((double(ticks(day))-double(ticks(dayNow)))/864000000000.);
+    const double days = static_cast<double>(date.day - current.day);
     if(days==0) {
         if(std::abs(seconds)<60.) return ItemTipRelativeOffset{std::trunc(seconds),SystemRelativeTime::Second};
         if(std::abs(seconds)<3600.) return ItemTipRelativeOffset{std::trunc(seconds/60.),SystemRelativeTime::Minute};

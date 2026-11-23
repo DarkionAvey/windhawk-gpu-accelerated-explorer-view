@@ -2030,6 +2030,7 @@ static void TestPreviewInput() {
 #include "rename-vertical-alignment-smoke.h"
 #include "swipe-compositor-smoke.h"
 #include "native-menu-smoke.h"
+#include "date-group-parity.h"
 #include "column-menu-smoke.h"
 #include "item-tip-smoke.h"
 #include "pixel-snap-smoke.h"

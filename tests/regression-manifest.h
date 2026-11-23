@@ -222,6 +222,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("provider-selection", PARALLEL, TestProviderSelection(fixture)),
     REGRESSION("initial-sorting", PARALLEL, TestInitialSorting(fixture)),
     REGRESSION("empty-sort-key", PARALLEL, TestEmptyShellSortKey(fixture)),
+    REGRESSION("native-date-group-parity", PARALLEL, TestDateGroupParity(fixture)),
     REGRESSION("native-menu-interaction", PARALLEL, TestNativeMenuInteraction(L"filesystem")),
     REGRESSION("explorer-column-menu", PARALLEL, TestExplorerColumnMenu(fixture)),
     REGRESSION("native-menu-archive", PARALLEL, TestNativeMenuInteraction(L"archive")),

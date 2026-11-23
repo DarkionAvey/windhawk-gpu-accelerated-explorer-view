@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.9
+- **ADDED** Date grouping now shows relative time just like native explorer behavior.
+
 ## 1.1.8
 - **IMPROVED** The default scrollbar thumbs have distinct idle, hover, and pressed shades in light and dark mode. Pressing or dragging a thumb shows the native Explorer gray.
 
