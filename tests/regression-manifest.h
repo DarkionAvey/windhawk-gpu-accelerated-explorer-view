@@ -83,6 +83,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("theme-parser-values", PARALLEL, TestThemeParserValues()),
     REGRESSION("theme-parser-settings", PARALLEL, TestThemeParserSettings()),
     REGRESSION("theme-parser-recovery", PARALLEL, TestThemeParserRecovery()),
+    REGRESSION("theme-column-header", PARALLEL, TestThemedColumnHeader()),
     REGRESSION("theme-thumbnail", PARALLEL, TestThemedThumbnail()),
     REGRESSION("theme-drag-thumbnail", PARALLEL, TestThemedDragThumbnail()),
     REGRESSION("theme-highlight-base", PARALLEL,

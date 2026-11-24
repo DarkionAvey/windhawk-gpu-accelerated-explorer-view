@@ -1,5 +1,10 @@
  # Changelog
 
+## 1.1.11
+- **ADDED** Theme XML can set Details header height, text size and color, and style vertical dividers and the bottom rule independently. Headers and their text can follow the list as you zoom.
+
+- **IMPROVED** Details column headers keep their text size and trim vertical padding as Compact view animates.
+
 ## 1.1.9
 - **ADDED** Date grouping now shows relative time just like native explorer behavior.
 

@@ -206,13 +206,22 @@ static void TestCompactRows(const std::wstring&) {
         auto& state = tab.state; state.compactRows = false; const int dpi = ViewDpi(state);
         ApplyViewLayout(state, {FVM_DETAILS, 16}, false); UpdateMetrics(state);
         const float row = state.rowPx, font = state.fontPx;
+        const float normalHeader=float(MulDiv(38,dpi,96)), compactHeader=float(MulDiv(28,dpi,96));
+        Check(state.headerPx==normalHeader,"regular Details header departed from its default height");
         Check(row == float(MulDiv(g_row96.load(), dpi, 96)), "fixture row is not the DPI-scaled setting");
         struct Reset { ~Reset() { ExplorerSettingsFixture::compact = false; } } reset;
+        AnimationClockFixture::Freeze clock;
         ExplorerSettingsFixture::compact = true;
         ReconcileCompactRows(state);
         Check(state.zoomAnimating && std::fabs(state.rowPx - row) < .01f, "Compact view did not zoom from the presented row");
+        Check(state.headerPx==normalHeader,"Compact view jumped to the new header height");
+        AnimationClockFixture::instant.QuadPart+=std::llround(state.qpcFrequency*.090);
+        AdvanceRowHeight(state);
+        Check(std::abs(state.headerPx-(normalHeader+(compactHeader-normalHeader)*.875f))<.1f,
+            "header height did not share Compact view's eased animation");
         AdvanceRowHeight(state, true);
         Check(state.rowPx == std::round(row * 27.f / 37.f), "Compact rows differ from Explorer's measured 27/37 fraction");
+        Check(state.headerPx==compactHeader,"Compact Details header did not settle at 28 logical pixels");
         Check(state.fontPx == font, "Compact view changed the text size");
         // Compact highlights touch. Center the native-sized checkbox within the available height.
         const float top = LayoutRowVisual(state, 0, 1.f).top;

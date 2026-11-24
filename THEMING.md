@@ -107,6 +107,57 @@ The same theme on one line, ready to paste into the setting:
 <theme><element name="FillSelectionRect:selected" background="transparent" border-color="#3b82f6" border-width="1px" /><element name="FillSelectionRect:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /><element name="FillSelectionRect:selected:hover" background="linear-gradient(to right, #3b82f6, #1e3a8a)" border-width="0" /></theme>
 ```
 
+## Details column headers
+
+Use `DrawColumnHeader` to style the Details header row. Shared, light, and
+dark values work as usual. Bare lengths and values ending in `px` use
+logical pixels at 96 DPI.
+
+| Property | Value |
+|---|---|
+| `height` | A fixed length, or `auto` to follow the list item height during zoom and Compact view. |
+| `font-size` | A positive fixed length, a percentage of the current item height, or `auto` to match the list text size. |
+| `text-color` | A color for captions and sort arrows. The default follows Windows. |
+| `border-width` | Thickness of the column dividers and header rules. Omit it to keep the usual one-screen-pixel lines. |
+| `border-color` | A color for the dividers and rules. The default follows Windows. |
+| `border-opacity` | A number from `0` to `1`, a percentage, or `none`. Omit it to keep the usual subtle lines. |
+
+```xml
+<theme>
+  <element name="DrawColumnHeader" height="auto" font-size="42%" border-opacity="35%">
+    <dark text-color="#dbeafe" />
+    <element name="vertical-divider" border-width="2px" border-color="accent" />
+    <element name="horizontal-divider" border-width="1px" border-color="#808080">
+      <dark border-opacity="none" />
+    </element>
+  </element>
+</theme>
+```
+
+Omit `height` to keep the `38px` regular default and the `28px` Compact view
+target. An explicit height applies in either mode. The header grows when
+needed to fit the font, selection checkbox, and vertical padding. Percentage
+and automatic font sizes follow Ctrl+wheel and pinch zoom. The automatic
+values fall back to the defaults when drawing a header during a grid-view
+transition.
+
+Set shared border properties on `DrawColumnHeader`. Its `vertical-divider` subelement
+overrides them for column dividers and the rule next to the scrollbar. Its
+`horizontal-divider` subelement overrides them for the bottom rule. Each subelement
+accepts its own light and dark values. The flat names
+`DrawColumnHeader:vertical-divider` and `DrawColumnHeader:horizontal-divider`
+address the same targets.
+Zero border width, zero opacity, a fully transparent color, or
+`border-style="none"` hides the affected rules. Windows high contrast uses
+the default appearance and sizing.
+
+This example tracks the list item height and text size during zoom. It uses
+the accent color for the text and bottom divider and hides the vertical lines.
+
+```xml
+<element name="DrawColumnHeader" border-opacity="35%" height="auto" font-size="auto" text-color="accent">   <element name="horizontal-divider" border-width="1.5px" border-color="accent" />   <element name="vertical-divider" border-width="0px" /> </element>
+```
+
 ## Storage bars
 
 Use `DrawDriveBar:fill` for the used portion and `DrawDriveBar:track` for the
@@ -117,6 +168,17 @@ elements. Omitted corners keep the usual capsule shape; borders default to off.
 An omitted background keeps the usual fill. Custom colors use their own
 transparency and follow the item's visibility fade. Borders stay inside the
 shape and scale to whole screen pixels. High contrast keeps the usual bars.
+
+You can also write the parts as subelements of `DrawDriveBar`:
+
+```xml
+<theme>
+  <element name="DrawDriveBar">
+    <element name="track" background="#80808030" />
+    <element name="fill" background="accent" />
+  </element>
+</theme>
+```
 
 Set `height` separately on `DrawDriveBar:track` and `DrawDriveBar:fill`, for
 example a `5px` track with a `30px` fill. Both share the same vertical center.

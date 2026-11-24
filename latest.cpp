@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.10
+// @version         1.1.11
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -312,6 +312,10 @@ struct SurfaceStyle {
     float borderRadius = 4.f;
     bool borderRadiusPercent = false;
     float shadowOpacity = 1.f;
+    bool borderColorDefined = false;
+    std::optional<float> borderOpacity, fontSize;
+    bool fontSizePercent = false;
+    std::optional<Color> textColor;
     BorderStyle borderStyle = BorderStyle::Solid;
     std::optional<float> height;
     std::optional<Shadow> shadow; // Absence keeps the native tooltip shadow.
@@ -342,6 +346,10 @@ struct Document {
     std::array<bool, 2> highlightEnabled{};
     std::array<SurfaceStyle, 2> tooltips;
     std::array<SurfaceStyle, 2> marquees;
+    struct ColumnHeaderStyle {
+        SurfaceStyle header, vertical, horizontal;
+    };
+    std::array<ColumnHeaderStyle, 2> columnHeaders;
     std::array<std::optional<SurfaceStyle>, 2> thumbnails;
     std::array<std::array<SurfaceStyle,6>,2> checkboxes;
     std::array<bool,2> checkboxEnabled{};
@@ -454,7 +462,7 @@ struct Parser {
         // Track semantic scope independently of XML depth: optional theme
         // wrappers never change which element owns its appearance properties.
         struct Scope { Element* element = nullptr; bool appearance = false, scale = false;
-            int mode = -1; ScaleStop* stop = nullptr; };
+            int mode = -1; ScaleStop* stop = nullptr; const std::wstring* elementName = nullptr; };
         Scope scope;
         std::vector<Scope> parents;
         parents.reserve(16);
@@ -495,7 +503,8 @@ struct Parser {
                     scope.mode = int(index);
                     scope.appearance = true;
                 } else {
-                    if (scope.element) Fail(L"Keep styled elements beside one another, not inside one another");
+                    if (scope.element && (tag != L"element" || scope.appearance || scope.scale))
+                        Fail(L"Put named subelements directly inside their styled element");
                     std::wstring name = tag;
                     if (tag == L"element") {
                         const auto attribute = attributes.find(L"name");
@@ -503,10 +512,12 @@ struct Parser {
                         name = std::move(attribute->second); attributes.erase(attribute);
                     }
                     if (Trim(name).empty()) Fail(L"Each element needs a name");
+                    if (scope.elementName) name = *scope.elementName + L":" + name;
                     if (name.size() > 256 ||
                         std::any_of(name.begin(), name.end(), [](wchar_t c) { return c < 32 || c == 127; }))
                         Fail(L"Each element needs a name of between 1 and 256 characters",E_INVALIDARG,false);
-                    scope = {&document->elements.try_emplace(std::move(name)).first->second, false};
+                    const auto entry = document->elements.try_emplace(std::move(name)).first;
+                    scope = {.element=&entry->second,.elementName=&entry->first};
                     merge(scope.element->universal, std::move(attributes));
                 }
                 if (reader->IsEmptyElement()) scope = parent;
@@ -863,13 +874,14 @@ void CompileDriveScale(DriveStyle& style, const Element& element, size_t mode) {
 }
 void CompileStyles(Document& document) {
     // Property metadata binds names to members; no per-element assignment chain.
-    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*, std::optional<float> SurfaceStyle::*>;
+    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*, std::optional<float> SurfaceStyle::*, std::optional<Color> SurfaceStyle::*>;
     struct Binding { std::wstring_view name; Member member; };
     const Binding bindings[] = {{L"background-color", &SurfaceStyle::background},
         {L"background", &SurfaceStyle::background}, {L"border-color", &SurfaceStyle::borderColor},
         {L"border-width", &SurfaceStyle::borderWidth}, {L"border-radius", &SurfaceStyle::borderRadius},
         {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}, {L"height", &SurfaceStyle::height},
-        {L"shadow-opacity", &SurfaceStyle::shadowOpacity}};
+        {L"shadow-opacity", &SurfaceStyle::shadowOpacity}, {L"border-opacity", &SurfaceStyle::borderOpacity},
+        {L"font-size", &SurfaceStyle::fontSize}, {L"text-color", &SurfaceStyle::textColor}};
     constexpr std::wstring_view names[] = {L"FillSelectionRect:selected", L"FillSelectionRect:hover", L"FillSelectionRect:selected:hover"};
     for (size_t mode = 0; mode < document.highlights.size(); ++mode) {
         auto& styles = document.highlights[mode];
@@ -888,28 +900,34 @@ void CompileStyles(Document& document) {
                         using Field = std::remove_cvref_t<decltype(style.*member)>;
                         if constexpr (std::is_same_v<Field, float> || std::is_same_v<Field, std::optional<float>>) {
                             auto text = Parser::Trim(*value);
-                            if constexpr (std::is_same_v<Field, float>) {
-                                if (member == &SurfaceStyle::shadowOpacity) {
-                                    const bool percent = text.ends_with(L"%");
-                                    if (percent) text.remove_suffix(1);
-                                    const float opacity = !percent && text == L"none" ? 0.f :
-                                        Number(text)/(percent ? 100.f : 1.f);
-                                    if (opacity < 0.f || opacity > 1.f) throw std::invalid_argument("shadow opacity");
-                                    style.shadowOpacity = opacity;
+                            if (binding.name == L"shadow-opacity" || binding.name == L"border-opacity") {
+                                const bool percent = text.ends_with(L"%");
+                                if (percent) text.remove_suffix(1);
+                                const float opacity = !percent && text == L"none" ? 0.f :
+                                    Number(text)/(percent ? 100.f : 1.f);
+                                if (opacity < 0.f || opacity > 1.f) throw std::invalid_argument("opacity");
+                                style.*member = opacity;
+                                return;
+                            }
+                            if constexpr (std::is_same_v<Field, std::optional<float>>) {
+                                if(text==L"auto") {
+                                    if (element==L"DrawColumnHeader") style.*member = -1.f;
+                                    else (style.*member).reset();
+                                    if (binding.name==L"font-size") style.fontSizePercent=false;
                                     return;
                                 }
                             }
-                            if constexpr (std::is_same_v<Field, std::optional<float>>) {
-                                if(text==L"auto") {(style.*member).reset(); return;}
-                            }
                             const bool corner = binding.name == L"border-radius";
-                            const bool percent = corner && allowPercentageRadius && text.ends_with(L"%");
+                            const bool font = binding.name == L"font-size";
+                            const bool percent = (font || (corner && allowPercentageRadius)) && text.ends_with(L"%");
                             if (percent) text.remove_suffix(1);
                             else if (text.ends_with(L"px")) text.remove_suffix(2);
                             const float width = Number(text);
-                            if (!std::isfinite(width) || width < 0.f) throw std::invalid_argument("nonnegative length");
+                            if (!std::isfinite(width) || width < 0.f || (font && width == 0.f))
+                                throw std::invalid_argument("length");
                             style.*member = width;
                             if (corner) style.borderRadiusPercent = percent;
+                            if (font) style.fontSizePercent = percent;
                         } else if constexpr (std::is_same_v<Field, BorderStyle>) {
                             constexpr std::pair<std::wstring_view, BorderStyle> choices[] = {
                                 {L"solid",BorderStyle::Solid},{L"dashed",BorderStyle::Dashed},
@@ -928,7 +946,10 @@ void CompileStyles(Document& document) {
                                     paint.kind = Paint::Kind::Solid; paint.color = ReadColor(text);
                                 } else paint = ReadPaint(text);
                                 style.*member = std::move(paint);
-                            } else style.*member = ReadColor(text);
+                            } else {
+                                style.*member = ReadColor(text);
+                                if (binding.name == L"border-color") style.borderColorDefined = true;
+                            }
                         }
                     }, binding.member);
                 } catch (const std::exception&) {
@@ -954,6 +975,14 @@ void CompileStyles(Document& document) {
         apply(document.tooltips[mode],L"RenderItemTip");
         document.marquees[mode].borderWidth = 1.f;
         apply(document.marquees[mode], L"DrawMarquee");
+        auto& columnHeader=document.columnHeaders[mode];
+        columnHeader.header.borderWidth=-1.f; // Omitted: keep the native one-pixel rules.
+        apply(columnHeader.header, L"DrawColumnHeader");
+        columnHeader.vertical=columnHeader.horizontal=columnHeader.header;
+        apply(columnHeader.vertical, L"DrawColumnHeader:vertical");
+        apply(columnHeader.horizontal, L"DrawColumnHeader:horizontal");
+        apply(columnHeader.vertical, L"DrawColumnHeader:vertical-divider");
+        apply(columnHeader.horizontal, L"DrawColumnHeader:horizontal-divider");
         constexpr std::wstring_view checkboxNames[]={L"DrawSelectionCheckbox",L"DrawSelectionCheckbox:hover",
             L"DrawSelectionCheckbox:pressed",L"DrawSelectionCheckbox:checked",L"DrawSelectionCheckbox:checked:hover",
             L"DrawSelectionCheckbox:checked:pressed"};
@@ -1300,6 +1329,7 @@ constexpr int kScrollbarHitTolerance96 = 3;
 constexpr int kScrollbarContentGap96 = 5;
 constexpr int kHorizontalScrollbarHeight96 = 13;
 constexpr int kHeader96 = 38;
+constexpr int kCompactHeader96 = 28;
 // Internal animation debugging control. Edit and recompile: 2.0 doubles
 // durations (half speed), 0.5 halves durations (double speed).
 constexpr double kAnimationDurationScale = 1.0;
@@ -5011,6 +5041,8 @@ struct ViewState {
     int scroll = 0;
     float rowPx = 32.f;
     float headerPx = 38.f;
+    float headerTextHeight96 = 0.f;
+    float headerFontSize96 = 0.f;
     float fontPx = 17.f;
     float iconPx = 19.f;
     float listIconPx = 19.f; // Retain the header's Name inset while a grid is active.
@@ -5289,7 +5321,7 @@ struct SwipeFeedbackSnapshot {
     X(zoomAnimating) X(zoomFromHeight96) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
     X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(zoomFromCompact) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
-    X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
+    X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(headerTextHeight96) X(headerFontSize96) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
     X(nativeTextColor) X(nativeHeaderTextColor) X(themeSnapshot) X(themeMode) X(themeHighContrast) \
     X(cachedNativeMode) X(folderPath) X(selectedFlags) \
     X(presentationStyleRevision) X(presentationGroupIntents) X(lastInteractionTick) X(pipelineInputTime) X(uiTraceUntil)
@@ -15191,6 +15223,64 @@ float ContentTextHeight(float font, int dpi) {
     return ItemTextLinePitch(font) * 2.f + float(Scale96(2, dpi));
 }
 
+float SelectionCheckboxSize(const ViewState& state);
+
+const Theme::Document::ColumnHeaderStyle* ColumnHeaderTheme(const ViewState& state) {
+    return state.themeSnapshot && !state.themeHighContrast ?
+        &state.themeSnapshot->columnHeaders[static_cast<size_t>(state.themeMode)] : nullptr;
+}
+
+std::optional<float> ColumnHeaderFontSize(const ViewState& state, int dpi) {
+    const auto* style = ColumnHeaderTheme(state);
+    if (!style || !style->header.fontSize) return std::nullopt;
+    const float size = *style->header.fontSize;
+    if (size < 0.f) return state.gridView ? std::nullopt : std::optional<float>(state.fontPx);
+    const double scale = style->header.fontSizePercent ? state.rowPx/100.0 : dpi/96.0;
+    return static_cast<float>(std::clamp(size*scale,1.0,double(kPlatformImageDimension)));
+}
+
+float ColumnHeaderDividerWidth(const Theme::SurfaceStyle* style, int dpi) {
+    if (!style) return 1.f;
+    if (style->borderStyle==Theme::BorderStyle::None || style->borderOpacity==0.f ||
+        (style->borderColorDefined && style->borderColor.alpha==0.f)) return 0.f;
+    if (style->borderWidth < 0.f) return 1.f;
+    return static_cast<float>(std::round(std::min(style->borderWidth*(dpi/96.0),
+        double(kPlatformImageDimension))));
+}
+
+float ColumnHeaderTargetHeight(const ViewState& state, int dpi, float compact) {
+    const float normal = static_cast<float>(Scale96(kHeader96,dpi));
+    const auto* style = ColumnHeaderTheme(state);
+    const auto height = style ? style->header.height : std::nullopt;
+    const auto fontSize = ColumnHeaderFontSize(state,dpi);
+    const bool autoHeight = height && *height < 0.f && !state.gridView;
+    const bool fixedHeight = height && *height >= 0.f;
+    if (!fixedHeight && !autoHeight && !fontSize && compact <= 0.f) return normal;
+
+    const float lineHeight = fontSize ?
+        *fontSize * std::max(1.f,state.headerTextHeight96/std::max(1.f,state.headerFontSize96)) :
+        state.headerTextHeight96*dpi/96.f;
+    const float content = std::max(SelectionCheckboxSize(state),lineHeight);
+    const float minimum = std::ceil(content)+2.f*Scale96(2,dpi);
+    if (autoHeight) return std::max(minimum,state.rowPx);
+    if (fixedHeight) {
+        RECT client{};
+        ViewClientRect(state,&client);
+        const float maximum = std::max({normal,minimum,static_cast<float>(client.bottom)});
+        return std::clamp(std::round(std::min(*height,maximum*96.f/dpi)*dpi/96.f),minimum,maximum);
+    }
+    const float trimmed = std::clamp(static_cast<float>(Scale96(kCompactHeader96,dpi)),
+        std::min(normal,minimum),normal);
+    const float requested = std::lerp(normal,trimmed,compact);
+    return fontSize ? std::max(minimum,requested) : requested;
+}
+
+void UpdateColumnHeaderHeight(ViewState& state, float compact) {
+    const float height = state.columnsView ? ColumnHeaderTargetHeight(state,ViewDpi(state),compact) : 0.f;
+    if (state.columnModeTransition) state.columnHeaderTo = height;
+    else state.headerPx = height;
+}
+
 void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     state.zebraExtentAnimating = false;
     int dpi = ViewDpi(state);
@@ -15250,9 +15340,8 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     state.iconPx = state.zoomAnimating ? state.zoomFromIconPx +
         (icon - state.zoomFromIconPx) * zoomProgress : static_cast<float>(icon);
     if (!state.gridView) state.listIconPx = state.iconPx;
-    const float header = state.columnsView ? static_cast<float>(Scale96(kHeader96, dpi)) : 0.f;
-    if (state.columnModeTransition) state.columnHeaderTo = header;
-    else state.headerPx = header;
+    const float compact = state.compactRows && !state.gridView ? 1.f : 0.f;
+    UpdateColumnHeaderHeight(state,state.zoomAnimating ? std::lerp(state.zoomFromCompact,compact,zoomProgress) : compact);
     LayoutGroupSections(state);
     // An ordinary metrics refresh (DPI, settings, resize, activation) settles
     // the pending zoom instead of leaving an old anchor/timestamp alive.
@@ -15275,11 +15364,15 @@ bool ColumnsPresented(const ViewState& state) {
 }
 
 float ColumnModeVisibility(const ViewState& state, int dpi = 0) {
-    const float full = static_cast<float>(Scale96(kHeader96, dpi ? dpi : ViewDpi(state)));
-    return state.columnModeTransition ?
-        std::clamp((state.modeComposition.painting ? state.modeComposition.logicalHeader : state.headerPx) /
-            std::max(1.f, full), 0.f, 1.f) :
-        (state.columnsView ? 1.f : 0.f);
+    if (!state.columnModeTransition) return state.columnsView ? 1.f : 0.f;
+    const float full = ColumnHeaderTargetHeight(state,dpi ? dpi : ViewDpi(state),CompactReveal(state));
+    return std::clamp((state.modeComposition.painting ? state.modeComposition.logicalHeader : state.headerPx) /
+        std::max(1.f,full),0.f,1.f);
+}
+
+float ColumnHeaderPaintHeight(const ViewState& state, int dpi) {
+    return state.columnModeTransition && !state.modeComposition.painting ?
+        ColumnHeaderTargetHeight(state,dpi,CompactReveal(state)) : state.headerPx;
 }
 
 float ColumnHeaderOffset(const ViewState& state, int dpi) {
@@ -15543,7 +15636,7 @@ D2D1_RECT_F HeaderSelectionCheckbox(ViewState& state) {
     const float left = NameColumnStart(state) + CheckboxMetric(18,ViewDpi(state)) -
         SelectionCheckboxBand(state)*(1.f-SelectionCheckboxReveal(state));
     const float top = ColumnHeaderOffset(state,ViewDpi(state)) +
-        (Scale96(kHeader96,ViewDpi(state))-size)*.5f;
+        (ColumnHeaderPaintHeight(state,ViewDpi(state))-size)*.5f;
     return D2D1::RectF(left,top,left+size,top+size);
 }
 
@@ -16424,7 +16517,7 @@ void StartColumnTransition(ViewState& state,
         (!state.columnsView && !viewMode) ||
         (!viewMode && (previous.empty() || state.columns.empty()))) return;
     const float headerTo = state.columnsView ?
-        static_cast<float>(Scale96(kHeader96, ViewDpi(state))) : 0.f;
+        ColumnHeaderTargetHeight(state,ViewDpi(state),CompactReveal(state)) : 0.f;
     state.columnMotion.reserve(state.columns.size());
     // The same short, DPI-scaled displacement applies to every column width.
     // Logical reading order automatically mirrors it for RTL.
@@ -16584,7 +16677,7 @@ void SetColumnViewMode(ViewState& state, bool details, bool animate = true) {
     StopRowTransition(state);
     state.columnsView = details;
     state.columnModeEntrancePending = animate && details;
-    state.headerPx = details ? static_cast<float>(Scale96(kHeader96, ViewDpi(state))) : 0.f;
+    UpdateColumnHeaderHeight(state,CompactReveal(state));
     UpdateColumns(state);
     if (animate && state.visible && state.detailsViewActive) {
         if (!details) state.columnContentWidth = previousExtent;
@@ -17008,10 +17101,12 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         cache.alignment = alignment;
     }
     const bool middleTrim = filename && ViewOptionEnabled(state,g_middleEllipsis);
+    const float fontSize = header ? ColumnHeaderFontSize(state,ViewDpi(state)).value_or(format->GetFontSize()) :
+        format->GetFontSize();
     auto it = cache.layouts.find(text);
     float previousSize=0.f;
     const bool fontChanged=it==cache.layouts.end() ||
-        FAILED(it->second.text->GetFontSize(0,&previousSize)) || previousSize!=format->GetFontSize();
+        FAILED(it->second.text->GetFontSize(0,&previousSize)) || previousSize!=fontSize;
     bool geometryChanged = false;
     if (it == cache.layouts.end() || it->second.generation != cache.generation ||
         fontChanged || (!naturalWidth && it->second.middleTrim != middleTrim)) {
@@ -17026,13 +17121,15 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
             DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
             if(SUCCEEDED(format->GetTrimming(&trimming,&sign)) &&
                 SUCCEEDED(textLayout->SetInlineObject(nullptr,{0,static_cast<UINT32>(text.size())})) &&
-                SUCCEEDED(textLayout->SetFontSize(format->GetFontSize(),{0,static_cast<UINT32>(text.size())})) &&
+                SUCCEEDED(textLayout->SetFontSize(fontSize,{0,static_cast<UINT32>(text.size())})) &&
                 SUCCEEDED(textLayout->SetMaxWidth(width)) && SUCCEEDED(textLayout->SetMaxHeight(height)) &&
                 SUCCEEDED(textLayout->SetTrimming(&trimming,sign.Get()))) layout=it->second.text;
         }
-        if (!layout && FAILED(g_writeFactory->CreateTextLayout(text.c_str(),
-            static_cast<UINT32>(text.size()), format, width, height,
-            layout.GetAddressOf()))) return nullptr;
+        if (!layout) {
+            const auto length=static_cast<UINT32>(text.size());
+            if (FAILED(g_writeFactory->CreateTextLayout(text.c_str(),length,format,width,height,&layout)) ||
+                (fontSize!=format->GetFontSize() && FAILED(layout->SetFontSize(fontSize,{0,length})))) return nullptr;
+        }
         if (wrapped) {
             layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
             layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -17220,7 +17317,7 @@ D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
     return D2D1::RectF(from + leading,
         headerOffset,
         to - trailing,
-        header ? headerOffset + Scale96(kHeader96,dpi) : state.rowPx);
+        header ? headerOffset + ColumnHeaderPaintHeight(state,dpi) : state.rowPx);
 }
 
 // Both the initial width fit and its deferred metadata completion use the
@@ -18392,6 +18489,17 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         if (SUCCEEDED(g_writeFactory->CreateTextFormat(family, nullptr, sortedWeight, style, stretch,
                 uiFontSize, L"", &sorted))) ConfigureTextFormat(sorted.Get(), state.rtlLayout, false);
         else sorted = header;
+        // Measure the actual normal and sorted faces once when they change.
+        float lineHeight=uiFontSize;
+        for (auto* format : {header.Get(),sorted.Get()}) {
+            ComPtr<IDWriteTextLayout> sample;
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(g_writeFactory->CreateTextLayout(L"Ag",2,format,uiFontSize*4.f,uiFontSize*4.f,&sample)) &&
+                SUCCEEDED(sample->GetMetrics(&metrics))) lineHeight=std::max(lineHeight,metrics.height);
+        }
+        state.headerTextHeight96=lineHeight*96.f/dpi;
+        state.headerFontSize96=uiFontSize*96.f/dpi;
+        UpdateColumnHeaderHeight(state,CompactReveal(state));
         // Commit a complete set only. Failed refreshes retain usable formats.
         state.textFormat = std::move(body);
         state.headerFormat = std::move(header);
@@ -19617,7 +19725,7 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
     float cx = logicalColumnEnd - static_cast<float>(Scale96(17, dpi));
     if (state.rtlLayout) cx = state.paintWidth - cx;
     const float cy = ColumnHeaderOffset(state,dpi) +
-        static_cast<float>(Scale96(kHeader96, dpi)) * .5f;
+        ColumnHeaderPaintHeight(state,dpi) * .5f;
     // Match the expanded section chevron's 2:1 width/height, retaining the bold sort stroke.
     const float halfWidth = static_cast<float>(Scale96(4, dpi));
     // A reversal folds the chevron through flat about its own center.
@@ -22454,7 +22562,8 @@ bool PrepareRowComposition(ViewState& state) {
     if (mode.rows && mode.root && mode.rowRevision==state.rowSceneRevision &&
         mode.started.QuadPart==state.rowTransitionStartedQpc.QuadPart &&
         mode.scroll==state.scrollNow && mode.horizontal==state.horizontalScroll &&
-        mode.size.cx==client.right && mode.size.cy==client.bottom && mode.rtl==state.rtlLayout) return true;
+        mode.size.cx==client.right && mode.size.cy==client.bottom && mode.rtl==state.rtlLayout &&
+        mode.header==state.headerPx) return true;
     // Reuse packed storage across commits/scrolling. Updating the surfaces and
     // replacing their visuals is one DComp transaction; no stale source is
     // exposed, and streamed filesystem results do not churn GPU allocations.
@@ -22572,9 +22681,11 @@ bool PrepareRowComposition(ViewState& state) {
 bool PrepareModeComposition(ViewState& state) {
     if (state.rowTransitionActive) return PrepareRowComposition(state);
     auto& mode = state.modeComposition;
+    const auto* headerStyle=ColumnHeaderTheme(state);
     const bool widths=state.columnTransitionActive && !state.columnModeTransition && !state.columnTransitionSpring &&
         state.columnsView && !state.gridView && !state.thisPcGpu &&
-        !ViewOptionEnabled(state,g_filenameOnly) && state.disappearingColumns.empty();
+        !ViewOptionEnabled(state,g_filenameOnly) && state.disappearingColumns.empty() &&
+        ColumnHeaderDividerWidth(headerStyle ? &headerStyle->vertical : nullptr,ViewDpi(state))<=1.f;
     if ((!state.columnModeTransition && !widths) || !state.composition || !state.compTarget ||
         !state.backbuffer || !state.swapChain || state.rename.editor || state.rowTransitionActive ||
         state.horizontalAnimating || state.zoomAnimating || PointerDragActive(state) || state.manipulationFrameActive) return false;
@@ -22582,7 +22693,8 @@ bool PrepareModeComposition(ViewState& state) {
     if (state.rejectedColumnComposition==state.columnTransitionStartedQpc.QuadPart &&
         state.rejectedColumnCompositionSize.cx==client.right && state.rejectedColumnCompositionSize.cy==client.bottom)
         return false;
-    if (!mode.rows && mode.started.QuadPart == state.columnTransitionStartedQpc.QuadPart &&
+    const float headerHeight=ColumnHeaderPaintHeight(state,ViewDpi(state));
+    if (!mode.rows && mode.started.QuadPart == state.columnTransitionStartedQpc.QuadPart && mode.header==headerHeight &&
         mode.size.cx==client.right && mode.size.cy==client.bottom &&
         mode.columns.size()==state.columns.size() && mode.grid==state.gridView &&
         mode.rtl==state.rtlLayout && mode.horizontal==state.horizontalScroll) return mode.root != nullptr;
@@ -22597,7 +22709,7 @@ bool PrepareModeComposition(ViewState& state) {
         state.columns.size() != state.columnMotion.size()) return false;
     size.width = clientWidth;
     mode.started = state.columnTransitionStartedQpc;
-    mode.header = static_cast<float>(Scale96(kHeader96,ViewDpi(state)));
+    mode.header = headerHeight;
     mode.size = {client.right,client.bottom};
     mode.horizontal=state.horizontalScroll; mode.grid=state.gridView; mode.rtl=state.rtlLayout; mode.widths=widths;
     // Only temporary planes need overscan. The ordinary swap chain stays
@@ -24046,7 +24158,7 @@ void Paint(ViewState& state) {
     const float header = static_cast<float>(state.headerPx);
     const float columnHeader = static_cast<float>(ColumnHeaderHeight(state));
     const float headerOffset = ColumnHeaderOffset(state,dpi);
-    const float headerBottom = headerOffset + Scale96(kHeader96,dpi);
+    const float headerBottom = headerOffset + ColumnHeaderPaintHeight(state,dpi);
     const float modeOpacity = compositionFrame.active ? 1.f : ColumnModeVisibility(state,dpi);
     const float row = static_cast<float>(state.rowPx);
     const float xName = static_cast<float>(NameTextOrigin(state));
@@ -24072,9 +24184,22 @@ void Paint(ViewState& state) {
         ? state.nativeTextColor : GetSysColor(COLOR_WINDOWTEXT));
     const unsigned headerColor = ThemeRgb(state.nativeHeaderTextColor != CLR_INVALID
         ? state.nativeHeaderTextColor : GetSysColor(COLOR_WINDOWTEXT));
-    // Keep divider contrast near the native navigation-pane separator while
-    // compositing the active theme foreground over Explorer's real surface.
-    constexpr float headerDividerOpacity = 1.f / 15.f;
+    const auto* headerStyle=ColumnHeaderTheme(state);
+    const auto resolveHeaderColor=[&](const Theme::Color* color) {
+        if (!color) return std::pair{headerColor,1.f};
+        const auto ink=HighlightColor(*color);
+        return std::pair{ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),
+            std::lround(ink.b*255))),ink.a};
+    };
+    const auto [captionColor,captionOpacity]=resolveHeaderColor(
+        headerStyle && headerStyle->header.textColor ? &*headerStyle->header.textColor : nullptr);
+    const auto rule=[&](const Theme::SurfaceStyle* style, float defaultOpacity) {
+        const auto [color,alpha]=resolveHeaderColor(style && style->borderColorDefined ? &style->borderColor : nullptr);
+        const float opacity=style ? style->borderOpacity.value_or(defaultOpacity) : defaultOpacity;
+        return std::tuple{ColumnHeaderDividerWidth(style,dpi),color,alpha*opacity};
+    };
+    const auto [dividerWidth,dividerColor,dividerAlpha]=rule(headerStyle ? &headerStyle->vertical : nullptr,1.f/15.f);
+    const auto [bottomWidth,bottomColor,bottomAlpha]=rule(headerStyle ? &headerStyle->horizontal : nullptr,.12f);
     // Secondary columns are simply the same native text color with the
     // configured opacity: never invent a second dark/light RGB value.
     state.target->BeginDraw();
@@ -24153,14 +24278,14 @@ void Paint(ViewState& state) {
                 }
                 if (caption.right > caption.left)
                     Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
-                         headerColor, true, fade, sorted);
+                         captionColor, true, fade*captionOpacity, sorted);
                 if (compositionFrame.Widths()) compositionFrame.Column(columnIndex,true);
                 if (sorted && to - from >= arrowRoom)
                     DrawHeaderSortChevron(state, to,
-                        state.sort.direction == SORT_DESCENDING, headerColor, fade);
-                if (compositionFrame.Widths() || to <= listEnd)
-                    Fill(state, to - .5f, headerOffset, to + .5f, headerBottom, headerColor,
-                         headerDividerOpacity * fade);
+                        state.sort.direction == SORT_DESCENDING, captionColor, fade*captionOpacity);
+                if (dividerWidth>0.f && (compositionFrame.Widths() || to <= listEnd))
+                    Fill(state, to-dividerWidth*.5f, headerOffset, to+dividerWidth*.5f, headerBottom,
+                        dividerColor,dividerAlpha*fade);
             }
             if (compositionFrame.Widths()) compositionFrame.Background();
             // The grabbed header is painted LAST, above the moving neighbors.
@@ -24177,28 +24302,31 @@ void Paint(ViewState& state) {
                     const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, dpi);
                     if (caption.right > caption.left)
                         Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
-                             headerColor, true, 1.f, sorted);
+                             captionColor, true, captionOpacity, sorted);
                     if (sorted && right - left >= arrowRoom)
                         DrawHeaderSortChevron(state, right,
-                            state.sort.direction == SORT_DESCENDING, headerColor, 1.f);
+                            state.sort.direction == SORT_DESCENDING, captionColor, captionOpacity);
                 }
             }
             // Hover-only button: occupies the unused Name icon gutter, not the
             // trailing end of the header; nothing is painted when not hovered.
         }
         state.target->PopAxisAlignedClip(); // header captions / column hit zone
-        if (details && columnHeader > 0.f) {
+        const bool outerDivider=dividerWidth>0.f && bar.usable && w>=1.f;
+        if (details && columnHeader > 0.f && (bottomWidth>0.f || outerDivider)) {
             state.target->PushAxisAlignedClip(D2D1::RectF(0.f,0.f,w,columnHeader),D2D1_ANTIALIAS_MODE_ALIASED);
             // Full-width header rules, including the left/right edgeMargin areas.
             // These are paint-only and never expand file/header hit targets.
-            Fill(state, 0.f, headerBottom - 1.f, w, headerBottom,
-                 headerColor, .12f * modeOpacity);
+            if (bottomWidth>0.f)
+                Fill(state, 0.f, std::max(headerOffset,headerBottom-bottomWidth), w, headerBottom,
+                    bottomColor,bottomAlpha*modeOpacity);
             // The scrollbar gap separates this outer rule from the last column
             // divider. Without a vertical scrollbar the two can overlap and form
             // an unnaturally bright double line, so only paint the outer rule
             // when the scrollbar is actually present.
-            if (bar.usable && w >= 1.f)
-                Fill(state, w - 1.f, headerOffset, w, headerBottom, headerColor, headerDividerOpacity * modeOpacity);
+            if (outerDivider)
+                Fill(state, std::max(0.f,w-dividerWidth), headerOffset, w, headerBottom,
+                    dividerColor, dividerAlpha * modeOpacity);
             state.target->PopAxisAlignedClip();
         }
         state.textRasterBuildTicks+=bodyRasterTicks;
@@ -29986,7 +30114,8 @@ void QueueInputFocusUpdate(HWND overlay, HWND viewControl) {
     if (!state->inputFocusMessageQueued) state->viewControlFocusReturn=nullptr;
 }
 
-void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested = nullptr);
+void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested = nullptr,
+    std::optional<bool> compactRows = std::nullopt);
 
 // One GPU layout transaction for cached navigation, initial native mode and
 // explicit user changes. It never interrogates the Shell or publishes rows.
@@ -30549,7 +30678,8 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
 // one zoom. The destination packs once for hit testing; metrics and cells
 // interpolate from the presented image on the zoom clock. A negative height
 // keeps the zoom preference: the caller already chose a new native layout.
-void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested) {
+void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested,
+    std::optional<bool> compactRows) {
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     AdvanceRowHeight(state);
@@ -30574,6 +30704,7 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     state.zoomFromHeight96 = height;
     // Only now adopt the destination. All source geometry above belongs to
     // the applied layout, independently of an earlier Shell observation.
+    if (compactRows) state.compactRows = *compactRows;
     if (requested) {
         state.layoutNativeMode=requested->mode;
         if (state.gridView) state.nativeIconSize=requested->iconSize;
@@ -30615,14 +30746,12 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
 void ReconcileCompactRows(ViewState& state) {
     const bool compact = ReadCompactMode();
     if (compact == state.compactRows) return;
-    const float presented = CompactReveal(state);
-    state.compactRows = compact;
     if (!state.gridView && state.visible && state.inScope && state.detailsViewActive && state.loaded &&
         !state.startupAnimationsSuppressed && g_smooth.load(std::memory_order_relaxed)) {
         RenameZoomUpdate renameZoom(state);
-        BeginAnimatedZoom(state, -1);
-        state.zoomFromCompact = presented; // The flag changed before the zoom sampled it.
+        BeginAnimatedZoom(state, -1, nullptr, compact);
     } else {
+        state.compactRows = compact;
         UpdateMetrics(state); ClampScroll(state); RepositionRenameEdit(state);
     }
     QueueVisibleDataFrame(state);
@@ -36399,6 +36528,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 RefreshThemeColor(false);
                 s->viewTogglePaletteDirty=true;
                 RefreshNativePalette(*s,true);
+                UpdateColumnHeaderHeight(*s,CompactReveal(*s));
+                ClampScroll(*s);
                 if (s->dragPreview) PublishDragPreview(*s);
             }
             if (changes & kStyleFontCollection) {
@@ -38411,6 +38542,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const auto snapshot = Theme::Snapshot();
             if (snapshot != s->themeSnapshot) {
                 s->themeSnapshot = snapshot;
+                UpdateColumnHeaderHeight(*s,CompactReveal(*s));
+                ClampScroll(*s);
+                RepositionRenameEdit(*s);
                 s->clipboardStaticBuffers = 0; s->clipboardWiggleOnly = false;
                 s->itemTip.paletteDirty = true;
                 if (IsWindow(s->itemTip.hwnd) && IsWindowVisible(s->itemTip.hwnd)) ResolveItemTipPalette(*s);

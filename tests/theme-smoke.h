@@ -134,6 +134,109 @@ struct Tooltip {
 };
 }
 
+static void TestThemedColumnHeader() {
+    using namespace ThemeRegression;
+    StyleFixture::Session style;
+    OptionEffects::Settings settings;
+    Fonts();
+    const auto drive=Parse(LR"(<theme><element name="DrawDriveBar">
+        <element name="fill" height="7px" />
+        <element name="track" height="3px"><dark height="4px" /></element>
+    </element></theme>)");
+    Check(drive->driveBars[0][0].surface.height==7.f && drive->driveBars[0][1].surface.height==3.f &&
+        drive->driveBars[1][1].surface.height==4.f,"nested storage bar names or their appearance scopes changed");
+    for(int dpi:{96,144,192}) {
+        Regression::Scope scope("column header dpi="+std::to_string(dpi));
+        StyleFixture::dpi=dpi;
+        PresentationFixture::Tab tab(L"themed column header",1,false,false,false,640,380);
+        auto& state=tab.state;
+        state.selectedFlags.Fill(0); state.selected=state.hovered=-1;
+        ApplyViewLayout(state,{FVM_DETAILS,16},false);
+        state.columns[0].width=MulDiv(220,dpi,96);
+        ExplorerColumn type;
+        type.key=PKEY_ItemTypeText; type.title=L"Type"; type.width=MulDiv(70,dpi,96);
+        state.columns.push_back(std::move(type));
+        UpdateColumns(state);
+        Check(MakeTextFormats(state),"column header fonts");
+        TouchInputTest::RenderedTouch output;
+        const auto load=[&](const wchar_t* xml) {
+            Load(settings,xml);
+            state.themeSnapshot=Theme::Snapshot();
+            UpdateMetrics(state);
+        };
+        const auto checkFont=[&](float expected) {
+            auto* caption=ResolveTextLayout(state,L"Name",120.f,state.headerPx,true);
+            float actual=0.f;
+            Check(caption && SUCCEEDED(caption->GetFontSize(0,&actual)),"themed header caption layout");
+            Near(actual,expected,.01f,"the header caption did not use the expected font size");
+            return caption;
+        };
+        load(LR"(<theme><element name="DrawColumnHeader" border-opacity="35%" height="auto" font-size="auto" text-color="accent">
+            <element name="horizontal-divider" border-width="1.5px" border-color="accent"><dark border-opacity="none" /></element>
+            <element name="vertical-divider" border-width="0px"><dark border-width="2px" border-color="#00ff00" border-opacity="50%" /></element>
+        </element></theme>)");
+        g_swipePalette=RGB(255,0,0);
+        const float initialRow=state.rowPx;
+        Check(state.headerPx==initialRow,"auto header height did not match its row");
+        checkFont(state.fontPx);
+        BeginAnimatedZoom(state,56);
+        AdvanceRowHeight(state,true);
+        Check(state.rowPx==float(MulDiv(56,dpi,96)) && state.headerPx==state.rowPx &&
+            state.rowPx!=initialRow,"auto header height did not follow zoom");
+        checkFont(state.fontPx);
+        const int bottom=int(state.headerPx), thickness=int(std::round(1.5*dpi/96.0));
+        const auto light=output.Capture(state);
+        const auto pixels=[&](const auto& frame,int x,int y) {
+            const auto width=output.renderer.backbuffer->GetPixelSize().width;
+            const auto offset=(size_t(y)*width+x)*4;
+            return std::array<unsigned,4>{frame.at(offset+2),frame.at(offset+1),frame.at(offset),frame.at(offset+3)};
+        };
+        for(int y=bottom-thickness-1;y<bottom;++y) {
+            const auto pixel=pixels(light,4,y);
+            const unsigned expected=y>=bottom-thickness ? 89u:0u;
+            Check(pixel==std::array<unsigned,4>{expected,0,0,expected},
+                "nested horizontal rule did not inherit opacity, resolve accent or scale its thickness");
+        }
+        size_t captionPixels=0;
+        for(int y=0;y<bottom-thickness;++y) for(int x=0;x<200;++x) {
+            const auto pixel=pixels(light,x,y);
+            if(pixel[0]>0 && pixel[1]==0 && pixel[2]==0) ++captionPixels;
+        }
+        Check(captionPixels>0,"accent header caption was not drawn");
+        const auto checkVertical=[&](const auto& frame,bool enabled) {
+            const int center=int(std::round(ListStartX(state)+state.columns[0].end));
+            const int width=MulDiv(2,dpi,96);
+            // The right edge of the Name column is clear of its caption.
+            const int start=int(std::floor(center-width*.5f+.5f));
+            for(int x=start-1;x<=start+width;++x) {
+                const unsigned expected=enabled && x>=start && x<start+width ? 128u:0u;
+                Check(pixels(frame,x,bottom/2)==std::array<unsigned,4>{0,expected,0,expected},
+                    "vertical divider width, opacity or independent appearance override is wrong");
+            }
+        };
+        checkVertical(light,false);
+        state.themeMode=Theme::Mode::Dark;
+        const auto dark=output.Capture(state);
+        checkVertical(dark,true);
+        Check(pixels(dark,4,bottom-1)==std::array<unsigned,4>{},
+            "disabling the horizontal subelement affected only part of its rule");
+        state.themeMode=Theme::Mode::Light;
+
+        load(LR"(<theme><element name="DrawColumnHeader" font-size="42%" height="12px" /></theme>)");
+        const float expected=.42f*MulDiv(56,dpi,96);
+        auto* caption=checkFont(expected);
+        DWRITE_TEXT_METRICS metrics{};
+        Check(SUCCEEDED(caption->GetMetrics(&metrics)) && state.headerPx>=metrics.height+2*MulDiv(2,dpi,96),
+            "a fixed header height clipped the percentage-sized caption or its padding");
+        load(LR"(<theme><element name="DrawColumnHeader" font-size="20px" /></theme>)");
+        checkFont(20.f*dpi/96.f);
+        Check(state.headerPx==float(MulDiv(38,dpi,96)),"omitting height lost the regular Details default");
+        state.themeHighContrast=true;
+        UpdateMetrics(state);
+        checkFont(state.headerFormat->GetFontSize());
+    }
+}
+
 static void TestThemedThumbnail() {
     using namespace ThemeRegression;
     StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;
