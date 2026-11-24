@@ -152,10 +152,13 @@ Zero border width, zero opacity, a fully transparent color, or
 the default appearance and sizing.
 
 This example tracks the list item height and text size during zoom. It uses
-the accent color for the text and bottom divider and hides the vertical lines.
+the accent color for the text and hides both dividers.
 
 ```xml
-<element name="DrawColumnHeader" border-opacity="35%" height="auto" font-size="auto" text-color="accent">   <element name="horizontal-divider" border-width="1.5px" border-color="accent" />   <element name="vertical-divider" border-width="0px" /> </element>
+<element name="DrawColumnHeader" border-opacity="35%" height="auto" font-size="auto" text-color="accent">
+  <element name="horizontal-divider" border-width="0px" />
+  <element name="vertical-divider" border-width="0px" />
+</element>
 ```
 
 ## Storage bars
@@ -562,6 +565,29 @@ or the first color of a gradient. Its shape and derived colors are cached.
            background="linear-gradient(to bottom, #9274e0, #7552d2)" border-color="#a68ce8" />
   <element name="DrawSelectionCheckbox:checked:pressed"
            background="#53339b" border-color="#7552d2" />
+</theme>
+```
+
+## Group by section headers
+
+Use `PaintGroupHeading` for the section titles shown when Explorer is grouped.
+Light and dark blocks work as usual.
+
+- `height` takes a pixel value, or `auto` to follow the list item height
+  as you zoom. In grid views, `auto` uses the default section height.
+- `font-size` takes a pixel value, a percentage of the current item height,
+  or `auto` to follow the list text size. In grid views, `auto` uses the
+  default section text size.
+- `text-color` sets the title color and supports `accent`.
+
+Omitted properties use the view defaults. A taller font expands the heading
+as needed to leave vertical padding.
+
+### Accented section headers
+
+```xml
+<theme>
+  <element name="PaintGroupHeading" height="auto" font-size="auto" text-color="accent" />
 </theme>
 ```
 

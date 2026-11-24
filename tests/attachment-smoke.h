@@ -182,6 +182,82 @@ static void TestColdAttachWake() {
     std::cout << "PASS: startup wake survives message filtering without DispatchMessage or input, including minimized enable and repeated observer shutdown/restart\n";
 }
 
+static void TestColdAttachFirstPaint(const std::wstring& directory) {
+    Check(SUCCEEDED(OleInitialize(nullptr)) && PrepareTextRuntime(),"cold paint runtime");
+    WNDCLASSW cls{};
+    cls.hInstance=GetModuleHandleW(nullptr);
+    cls.lpfnWndProc=DefWindowProcW;
+    for(const auto* name:{L"CabinetWClass",L"CtrlNotifySink"}) {
+        cls.lpszClassName=name;
+        RegisterClassW(&cls);
+    }
+    cls.lpszClassName=L"SHELLDLL_DefView"; RegisterClassW(&cls);
+    cls.lpfnWndProc=OverlayProc; cls.lpszClassName=kOverlayClass; RegisterClassW(&cls);
+    struct {
+        HWND frame=nullptr, home=nullptr, destination=nullptr;
+        ComPtr<IFolderView2> folderView;
+        ComPtr<IShellFolder> folder;
+        ComPtr<IShellBrowser> browser;
+        int scans=0;
+    } fixture;
+    fixture.frame=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"CabinetWClass",L"cold paint fixture",
+        WS_POPUP|WS_VISIBLE,-32000,-32000,640,480,nullptr,nullptr,cls.hInstance,nullptr);
+    Check(fixture.frame!=nullptr,"cold paint fixture frame");
+    FocusFixture::Session focus(fixture.frame,nullptr);
+    FocusFixture::foreground=nullptr;
+    const auto focusSets=FocusFixture::sets;
+    const auto createView=[&] {
+        const HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,
+            0,0,640,480,fixture.frame,nullptr,cls.hInstance,nullptr);
+        const HWND view=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,
+            0,0,640,480,host,nullptr,cls.hInstance,nullptr);
+        Check(host && view,"cold paint native hierarchy");
+        return view;
+    };
+    ComPtr<IShellItem> item;
+    Check(SUCCEEDED(SHCreateItemFromParsingName(directory.c_str(),nullptr,IID_PPV_ARGS(&item))) &&
+        SUCCEEDED(item->BindToHandler(nullptr,BHID_SFObject,IID_PPV_ARGS(&fixture.folder))),
+        "cold paint fixture filesystem binding");
+    auto* response=new AttachmentFolderView;
+    fixture.folderView.Attach(response);
+    response->folder=fixture.folder;
+    const auto paint=[&](HWND view) {
+        Check(IsWindowVisible(view),"native fixture was hidden before the pre-paint check");
+        ::InvalidateRect(view,nullptr,FALSE);
+        MSG msg{};
+        Check(PeekMessageW(&msg,view,WM_PAINT,WM_PAINT,PM_REMOVE) &&
+            msg.hwnd==view,"USER did not queue paint for the native view");
+        AttachBeforeFirstNativePaint(msg.hwnd,[&](HWND frame,HWND tab,HWND candidate) {
+            Check(frame==fixture.frame && tab==frame && candidate==view,
+                "first paint scan escaped its owning tab or native view");
+            ++fixture.scans;
+            const std::wstring path=candidate==fixture.home ? L"shell:HomeFolder" : directory;
+            AttachView(candidate,fixture.folderView,fixture.folder,fixture.browser,path);
+        });
+        Check(bool(IsWindowVisible(view))==(view==fixture.home),
+            "native visibility at the first paint dispatch boundary was wrong");
+        DispatchMessageW(&msg);
+    };
+    fixture.home=createView();
+    paint(fixture.home);
+    paint(fixture.home);
+    Check(fixture.scans==1,"unsupported view had zero or repeated first paint scans");
+    Check(IsWindowVisible(fixture.home) && !OverlayForTab(fixture.frame),
+        "unsupported view was suppressed or acquired an overlay");
+    ShowWindow(GetParent(fixture.home),SW_HIDE);
+    fixture.destination=createView();
+    paint(fixture.destination);
+    auto* state=State(OverlayForTab(fixture.frame));
+    Check(fixture.scans==2 && state && state->nativeHwnd==fixture.destination &&
+        !IsWindowVisible(fixture.destination),
+        "supported destination reached native paint before suppression");
+    Check(FocusFixture::sets==focusSets,"cold paint attachment changed focus");
+    DestroyWindow(fixture.frame);
+    StopTabVisibilityObserver();
+    fixture.folderView.Reset(); fixture.folder.Reset(); item.Reset();
+    OleUninitialize();
+}
+
 template<class State>
 static void CheckNestedGraphicsMessages(State& state) {
     if constexpr(requires {state.presenter;}) if(state.presenter) {

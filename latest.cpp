@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.11
+// @version         1.1.14
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -350,6 +350,7 @@ struct Document {
         SurfaceStyle header, vertical, horizontal;
     };
     std::array<ColumnHeaderStyle, 2> columnHeaders;
+    std::array<SurfaceStyle, 2> groupHeadings;
     std::array<std::optional<SurfaceStyle>, 2> thumbnails;
     std::array<std::array<SurfaceStyle,6>,2> checkboxes;
     std::array<bool,2> checkboxEnabled{};
@@ -911,7 +912,7 @@ void CompileStyles(Document& document) {
                             }
                             if constexpr (std::is_same_v<Field, std::optional<float>>) {
                                 if(text==L"auto") {
-                                    if (element==L"DrawColumnHeader") style.*member = -1.f;
+                                    if (element==L"DrawColumnHeader" || element==L"PaintGroupHeading") style.*member = -1.f;
                                     else (style.*member).reset();
                                     if (binding.name==L"font-size") style.fontSizePercent=false;
                                     return;
@@ -975,6 +976,7 @@ void CompileStyles(Document& document) {
         apply(document.tooltips[mode],L"RenderItemTip");
         document.marquees[mode].borderWidth = 1.f;
         apply(document.marquees[mode], L"DrawMarquee");
+        apply(document.groupHeadings[mode], L"PaintGroupHeading");
         auto& columnHeader=document.columnHeaders[mode];
         columnHeader.header.borderWidth=-1.f; // Omitted: keep the native one-pixel rules.
         apply(columnHeader.header, L"DrawColumnHeader");
@@ -1281,6 +1283,7 @@ bool RegisterFrameHookReleaseMessage() {
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
+constexpr wchar_t kColdAttachPaintCheckedProperty[] = L"WindhawkGpuColdAttachPaintChecked";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
 // One navigation-rebind policy regardless of whether the signal came from
@@ -1641,6 +1644,25 @@ struct ColumnMotion {
     float fromOpacity = 1.f, toOpacity = 1.f;
     bool entering = false;
 };
+enum class ScrollAxis { Vertical, Horizontal };
+// Inventory of independently checked view morph surfaces. New animated
+// surfaces must have corresponding assertions in the scene regression.
+enum class ViewMorphPart {
+    RowFeedback, Icon, Text, GroupHeading, ColumnHeader,
+    VerticalTrack, VerticalThumb, HorizontalTrack, HorizontalThumb, Count
+};
+struct ScrollbarGeometry {
+    float left = 0.f, right = 0.f, top = 0.f, bottom = 0.f;
+    float thumbStart = 0.f, thumbLength = 0.f, travel = 0.f;
+    float scrollRange = 0.f;
+    ScrollAxis axis = ScrollAxis::Vertical;
+    bool usable = false;
+};
+struct ScrollbarLayoutMotion {
+    std::array<ScrollbarGeometry,2> from;
+    std::optional<unsigned long long> rowRevision;
+    bool columnMode = false;
+};
 struct ScrollbarMotion {
     float activeFrom = 0.f, activeTo = 0.f;
     float pressedFrom = 0.f, pressedTo = 0.f;
@@ -1819,6 +1841,7 @@ struct CapturedGroupHeader {
     std::wstring key, title;
     float oldTop = 0.f; // Window coordinates at capture time.
     bool collapsed = false;
+    float oldHeight = -1.f, oldOpacity = 1.f;
 };
 struct SelectionShape {
     D2D1_RECT_F bounds{};
@@ -4228,6 +4251,8 @@ struct ViewState {
     unsigned long long detailsRefreshEpoch = 0;
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
+    ScrollbarLayoutMotion scrollbarLayoutMotion;
+    bool presentationScrollbarGeometryPending = false;
     bool horizontalScrollbarAdmitted = false; // Optional chrome waits for settled column geometry.
     unsigned long long horizontalScrollbarDeferrals = 0; // Overflow held back while columns settled.
     bool horizontalScrollbarPublished = false; // A presented frame has shown the admitted bar.
@@ -4766,7 +4791,7 @@ struct ViewState {
         bool middleTrim=false;
     };
     std::unordered_map<int, WidthEntry> widthCache;
-    TextLayoutCache textLayouts[4]; // Body, header, sorted header, wrapped icon labels.
+    TextLayoutCache textLayouts[5]; // Body, header, sorted header, wrapped icon labels, themed group titles.
     struct {
         ComPtr<IDWriteTextFormat> format;
         std::vector<std::wstring> labels;
@@ -4975,6 +5000,10 @@ struct ViewState {
     float swipeEdgeX = 0.f; // Only displacement left over after column scrolling.
     double touchpadPinchHeight96 = 0.;
     int pinchRevealRow = -1; // Selection fully visible when a direct pinch began.
+    int pinchAnchorRow = -1;
+    float pinchAnchorFraction = 0.f;
+    std::wstring pinchAnchorPath;
+    unsigned long long pinchAnchorToken = 0;
     // An intentional horizontal gesture is locked separately from vertical pan.
     // The preview uses compositor redraws only while it is visible or fading.
     bool swipeHorizontal = false;
@@ -5078,6 +5107,7 @@ struct ViewState {
     bool graphicsReleaseQueued = false, graphicsSuspended = false, gpuDeviceCounted = false;
     bool graphicsStandby = false, graphicsStandbyPending = false, graphicsStandbyTrimmed = false;
     unsigned long long graphicsPaintSerial = 0, lastAcceptedPaint = 0;
+    unsigned long long lastAcceptedPresentationModel = 0;
     unsigned graphicsOperations = 0; // Native/COM dispatch can reenter any graphics scope.
     ULONGLONG lastGpuMemoryLog = 0;
     bool resizeDeferred = false;
@@ -5297,7 +5327,7 @@ struct SwipeFeedbackSnapshot {
     X(startupAnimationsSuppressed) \
     X(itemsPerRow) X(itemWidth) X(columns) X(columnEpoch) X(propertyEpoch) X(columnContentWidth) \
     X(imageMemoryAllowance) X(imageCacheFloor) \
-    X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
+    X(scrollbarLayoutMotion) X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
     X(columnTransitionActive) X(columnTransitionSpring) \
     X(columnModeTransition) X(columnPresentationPending) X(columnHeaderFrom) X(columnHeaderTo) \
     X(columnTransitionStartedQpc) X(columnMotion) X(disappearingColumns) X(columnDragArmed) X(columnDragActive) \
@@ -5334,6 +5364,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     LARGE_INTEGER columnIntentOrigin{};
     RECT client{}; int dpi=96; LOGFONTW font{};
     bool frameSizing=false; // The frame is between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE.
+    bool scrollbarGeometryPending=false;
     bool active=false,inputFocus=false,selectionFeedback=false;
     HWND renameEditor=nullptr; int renameIndex=-1;
     float documentHeight=0.f;
@@ -5630,9 +5661,43 @@ bool FileThumbnails(const ViewState& state) {
 bool UsesThumbnails(const ViewState& state, const Entry& entry) {
     return !entry.folder && FileThumbnails(state);
 }
-float GroupHeadingHeight(const ViewState& state) {
+float ItemTextLinePitch(float font);
+
+std::optional<float> ThemedHeadingFontSize(const Theme::SurfaceStyle* style, int dpi, bool gridView, float row, float font) {
+    if (!style || !style->fontSize) return std::nullopt;
+    const float size = *style->fontSize;
+    if (size < 0.f) return gridView ? std::nullopt : std::optional<float>(font);
+    const double scale = style->fontSizePercent ? row/100.0 : dpi/96.0;
+    return static_cast<float>(std::clamp(size*scale,1.0,double(kPlatformImageDimension)));
+}
+
+const Theme::SurfaceStyle* GroupHeadingTheme(const ViewState& state) {
+    return state.themeSnapshot && !state.themeHighContrast ?
+        &state.themeSnapshot->groupHeadings[static_cast<size_t>(state.themeMode)] : nullptr;
+}
+
+float DefaultGroupHeadingHeight(bool gridView, int dpi, float row, float font) {
+    return gridView ?
+        std::max(float(Scale96(24, dpi)), ItemTextLinePitch(font) + Scale96(8, dpi)) : row;
+}
+
+float GroupHeadingHeight(const ViewState& state, float row, float font) {
     const int dpi = ViewDpi(state);
-    return state.gridView ? std::max(float(Scale96(24, dpi)), state.fontPx * 1.5f + Scale96(8, dpi)) : state.rowPx;
+    const float normal = DefaultGroupHeadingHeight(state.gridView,dpi,row,font);
+    const auto* style = GroupHeadingTheme(state);
+    if (!style) return normal;
+    const auto fontSize = ThemedHeadingFontSize(style,dpi,state.gridView,row,font);
+    const auto height = style->height;
+    const bool fixedHeight = height && *height >= 0.f;
+    const bool autoHeight = height && *height < 0.f && !state.gridView;
+    if (!fixedHeight && !autoHeight && !fontSize) return normal;
+    const float requested = fixedHeight ? static_cast<float>(std::round(std::min(
+        *height*(dpi/96.0),double(kPlatformImageDimension)))) : normal;
+    const float minimum = std::ceil(ItemTextLinePitch(fontSize.value_or(font))) + 2.f*Scale96(2,dpi);
+    return std::max(requested,minimum);
+}
+float GroupHeadingHeight(const ViewState& state) {
+    return GroupHeadingHeight(state,state.rowPx,state.fontPx);
 }
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
@@ -5664,13 +5729,12 @@ void LayoutGroupSections(ViewState& state) {
         auto extent = [&](int columns) {
             const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
             const float row = state.zoomAnimating ? state.zoomToRowPx : state.rowPx;
-            const float heading = state.zoomAnimating ?
-                std::max(float(Scale96(24, ViewDpi(state))), font*1.5f+Scale96(8, ViewDpi(state))) :
-                GroupHeadingHeight(state);
+            const float heading = GroupHeadingHeight(state,row,font);
+            const float gap = DefaultGroupHeadingHeight(true,dpi,row,font);
             if (state.sections.empty()) return lines(state.total) * row;
             float height = 0.f;
             for (const auto& s : state.sections)
-                height += heading + (lines(s.end-s.first) * row + heading) * s.fraction;
+                height += heading + (lines(s.end-s.first) * row + gap) * s.fraction;
             return height;
         };
         state.itemsPerRow = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
@@ -5682,13 +5746,15 @@ void LayoutGroupSections(ViewState& state) {
         state.itemWidth = small ? std::min(width,minimum) : width / state.itemsPerRow;
     }
     float y = state.presentationOnly && !state.presentationEntries && !state.sections.empty() ? state.sections.front().documentTop : 0.f;
+    const float heading = GroupHeadingHeight(state);
+    const float gap = DefaultGroupHeadingHeight(state.gridView,ViewDpi(state),state.rowPx,state.fontPx);
     for (auto& section : state.sections) {
         section.documentTop = y;
         // An empty list row separates sections. Grid headings use their
         // compact height, so large thumbnails do not create enormous gaps.
         // The spacing belongs to the body and collapses with its items.
-        y += GroupHeadingHeight(state) + (state.rowPx *
-            ItemLineCount(state, section.end-section.first) + GroupHeadingHeight(state)) * section.fraction;
+        y += heading + (state.rowPx *
+            ItemLineCount(state, section.end-section.first) + gap) * section.fraction;
         section.documentEnd = y;
     }
 }
@@ -5961,6 +6027,12 @@ float LayoutTransitionProgress(const ViewState& state, bool active, LARGE_INTEGE
         kUiTransitionDurationMs,sampled)) : 0.f;
 }
 
+float RowTransitionScrollDelta(const ViewState& state) {
+    // Animated zoom already moves the viewport and the destination together.
+    // Its captured source poses are in window coordinates.
+    return state.zoomLayoutTransition ? 0.f : state.scrollNow-state.rowTransitionOldScroll;
+}
+
 float CurrentRowProgress(const ViewState& state) {
     if (!state.rowTransitionActive) return 1.f;
     return (state.presenter || (state.modeComposition.rows && state.modeComposition.published)) && state.rowTransitionStartedQpc.QuadPart ?
@@ -5977,7 +6049,7 @@ RowVisual LayoutGroupHeader(const ViewState& state, size_t section, float progre
             state.groupHeaderMotion.end(), static_cast<int>(section),
             [](const GroupHeaderMotion& motion, int id) { return motion.sectionIndex < id; });
         if (it != state.groupHeaderMotion.end() && it->sectionIndex == static_cast<int>(section)) {
-            const float from = it->oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float from = it->oldTop - RowTransitionScrollDelta(state);
             visual.top = from + (visual.top - from) * progress;
             if(it->oldHeight>=0.f) {
                 visual.height=it->oldHeight+(visual.height-it->oldHeight)*progress;
@@ -6017,8 +6089,8 @@ std::vector<CapturedGroupHeader> CaptureVisibleGroupHeaders(const ViewState& sta
         const auto& section = state.sections[i];
         if (section.documentTop > to) break;
         if (section.documentTop + GroupHeadingHeight(state) < from && static_cast<int>(i) != pinned) continue;
-        headers.push_back({section.key, section.title,
-            LayoutGroupHeader(state, i, progress, false).top, section.collapsed});
+        const auto visual=LayoutGroupHeader(state,i,progress,false);
+        headers.push_back({section.key,section.title,visual.top,section.collapsed,visual.height,visual.opacity});
     }
     return headers;
 }
@@ -14647,7 +14719,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         // Keep still-visible ghosts from the preceding batch. They already
         // have no logical row; retaining them cannot resurrect selection.
         for (auto& old : state.disappearingRows) {
-            old.oldTop -= state.scrollNow - state.rowTransitionOldScroll;
+            old.oldTop -= RowTransitionScrollDelta(state);
             old.oldHeight *= 1.f - capturedProgress;
             old.oldOpacity *= 1.f - capturedProgress;
             old.oldIndex = -1;
@@ -15232,11 +15304,7 @@ const Theme::Document::ColumnHeaderStyle* ColumnHeaderTheme(const ViewState& sta
 
 std::optional<float> ColumnHeaderFontSize(const ViewState& state, int dpi) {
     const auto* style = ColumnHeaderTheme(state);
-    if (!style || !style->header.fontSize) return std::nullopt;
-    const float size = *style->header.fontSize;
-    if (size < 0.f) return state.gridView ? std::nullopt : std::optional<float>(state.fontPx);
-    const double scale = style->header.fontSizePercent ? state.rowPx/100.0 : dpi/96.0;
-    return static_cast<float>(std::clamp(size*scale,1.0,double(kPlatformImageDimension)));
+    return ThemedHeadingFontSize(style ? &style->header : nullptr,dpi,state.gridView,state.rowPx,state.fontPx);
 }
 
 float ColumnHeaderDividerWidth(const Theme::SurfaceStyle* style, int dpi) {
@@ -16000,6 +16068,10 @@ void StartGroupingTransition(ViewState& state,
                     g.title == section.title; });
             if (old != oldHeaders.end()) {
                 motion.oldTop = old->oldTop;
+                if (reflow) {
+                    motion.oldHeight = old->oldHeight;
+                    motion.oldOpacity = old->oldOpacity;
+                }
             } else {
                 motion.entering = true;
                 motion.oldTop = h + section.documentTop - state.scrollNow + row * .35f;
@@ -16056,7 +16128,7 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
     const RowMotion& motion = *motionPtr;
     // Movement belongs to document space. Scroll translates BOTH endpoints
     // by the full viewport delta, independently of the collapse's progress.
-    const float fromTop = motion.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+    const float fromTop = motion.oldTop - RowTransitionScrollDelta(state);
     const float top = fromTop + (targetTop - fromTop) * progress;
     const float oldHeight = motion.entering ? 0.f : motion.oldHeight;
     const float opacity = state.groupingLayoutTransition ?
@@ -16086,7 +16158,8 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
 // so a retargeted layout always starts from the image on screen.
 // A list/grid switch (shapes) also captures list rows, as wide as the list,
 // with each item's presented icon and name for the morph to start from.
-std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes = false) {
+std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes = false,
+                                                  float sampledProgress = -1.f) {
     // Retargeting zoom/resize must retain a travelling icon/name, even when
     // the caller only requested cell geometry for an ordinary reflow.
     shapes |= state.rowTransitionActive && std::any_of(state.rowMotion.begin(),state.rowMotion.end(),
@@ -16099,7 +16172,7 @@ std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes
         for (const auto& motion : state.rowMotion) rows.push_back(motion.newIndex);
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-    const float progress = LayoutTransitionProgress(state,
+    const float progress = sampledProgress>=0.f ? sampledProgress : LayoutTransitionProgress(state,
         state.rowTransitionActive, state.rowTransitionStartedQpc);
     const float pad = kRowTransitionOverscan * state.rowPx;
     for (int index : rows) {
@@ -16513,6 +16586,7 @@ void StartColumnTransition(ViewState& state,
     PipelineScope pipeline(state.background,L"columns.transition",previous.size(),state.columns.size());
     const float headerFrom = state.headerPx;
     StopColumnTransition(state);
+    state.scrollbarLayoutMotion.columnMode = false;
     if (state.startupAnimationsSuppressed || !state.visible || !state.detailsViewActive ||
         (!state.columnsView && !viewMode) ||
         (!viewMode && (previous.empty() || state.columns.empty()))) return;
@@ -17077,9 +17151,18 @@ size_t GlyphCacheBytes(const ViewState& state) {
     return bytes;
 }
 
+TextLayoutCache& TextCache(ViewState& state, bool header, bool sorted, bool wrapped,
+                           std::optional<float> groupFontSize) {
+    if (groupFontSize) return state.textLayouts[4];
+    if (wrapped) return state.textLayouts[3];
+    if (!header) return state.textLayouts[0];
+    return state.textLayouts[sorted ? 2 : 1];
+}
+
 IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     float width, float height, bool header = false, bool sortedHeader = false,
-    float* naturalWidth = nullptr, bool wrapped = false, bool filename = false) {
+    float* naturalWidth = nullptr, bool wrapped = false, bool filename = false,
+    std::optional<float> groupFontSize = std::nullopt) {
     auto format = !header ? state.textFormat.Get() :
         (sortedHeader && state.sortedHeaderFormat ?
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
@@ -17088,7 +17171,7 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     // made wrapped labels alternate sizes while scrolling or crossing columns.
     width = roundf(width); height = roundf(height);
     if (!format || !g_writeFactory || width <= 0.f || height <= 0.f) return nullptr;
-    auto& cache = state.textLayouts[wrapped ? 3 : !header ? 0 : sortedHeader ? 2 : 1];
+    auto& cache = TextCache(state,header,sortedHeader,wrapped,groupFontSize);
     const auto alignment = format->GetTextAlignment();
     if (cache.format.Get() != format || cache.alignment != alignment) {
         // Readiness belongs to the value, not a particular font. Keep the
@@ -17102,7 +17185,7 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     }
     const bool middleTrim = filename && ViewOptionEnabled(state,g_middleEllipsis);
     const float fontSize = header ? ColumnHeaderFontSize(state,ViewDpi(state)).value_or(format->GetFontSize()) :
-        format->GetFontSize();
+        groupFontSize.value_or(format->GetFontSize());
     auto it = cache.layouts.find(text);
     float previousSize=0.f;
     const bool fontChanged=it==cache.layouts.end() ||
@@ -18681,6 +18764,7 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.graphicsStandbyTrimmed=false;
     state.graphicsPaintSerial=0;
     state.lastAcceptedPaint=0;
+    state.lastAcceptedPresentationModel=0;
     state.presentationContentAccepted=false;
     ClearModeComposition(state);
     state.dragComposition={};
@@ -19222,14 +19306,15 @@ HRESULT ReserveGlyphSlot(ViewState& state, UINT width, UINT height,
 // Wrapped/trimmed text keeps exact bounds. Direct drawing uses the same box,
 // so right-aligned/centered values never shift when their mask takes over.
 bool IntrinsicTextBox(ViewState& state, const std::wstring& text, IDWriteTextLayout* layout,
-                      float& x, float& width, float height, bool header, bool sorted, bool wrapped, bool filename) {
+                      float& x, float& width, float height, bool header, bool sorted, bool wrapped, bool filename,
+                      std::optional<float> groupFontSize) {
     if (wrapped) return false;
-    auto& shaped = state.textLayouts[!header ? 0 : sorted ? 2 : 1].layouts.at(text);
+    auto& shaped = TextCache(state,header,sorted,wrapped,groupFontSize).layouts.at(text);
     const float cellWidth=width;
     if (shaped.naturalWidth < 0.f) {
         float natural=0.f;
-        ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename);
-        ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename);
+        ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename,groupFontSize);
+        ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename,groupFontSize);
     }
     const float glyphWidth=ceilf(shaped.naturalWidth)+1.f;
     if (shaped.naturalWidth < 0.f || glyphWidth > cellWidth) return false;
@@ -19247,10 +19332,10 @@ bool IntrinsicTextBox(ViewState& state, const std::wstring& text, IDWriteTextLay
 // precolored BGRA bitmap changes translucent glyph coverage on composition.
 bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayout* layout,
                     float x, float y, float width, float height, unsigned color,
-                    float opacity, bool header, bool sorted, bool wrapped, bool deferCold = false,
-                    bool filename = false) {
+                    float opacity, bool header, bool sorted, bool wrapped, bool deferCold,
+                    bool filename, std::optional<float> groupFontSize) {
     if(!VisibleOpacity(opacity)) return true;
-    auto& cache = state.textLayouts[wrapped ? 3 : !header ? 0 : sorted ? 2 : 1];
+    auto& cache = TextCache(state,header,sorted,wrapped,groupFontSize);
     auto& shaped = cache.layouts.at(text);
     BOOL underline = FALSE; layout->GetUnderline(0,&underline);
     // Deferral is for newly exposed values. A mask miss at different bounds
@@ -19258,7 +19343,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     deferCold = deferCold && !shaped.displayed;
     auto& p = state.frameProfile;
     const float cellWidth=width;
-    const bool intrinsic=IntrinsicTextBox(state,text,layout,x,width,height,header,sorted,wrapped,filename);
+    const bool intrinsic=IntrinsicTextBox(state,text,layout,x,width,height,header,sorted,wrapped,filename,groupFontSize);
     const auto draw = [&](const TextLayoutCache::Raster& raster) {
         shaped.displayed = true;
         ID2D1Bitmap1* bitmap=raster.bitmap.Get();
@@ -19571,7 +19656,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
           float r, float b, unsigned hex, bool header=false, float opacity=1.f,
           bool sortedHeader=false, bool wrapped=false,
           const std::vector<DWRITE_TEXT_RANGE>* highlight=nullptr, bool deferCold=false,
-          bool filename=false, bool underline=false, float textCenter=-1.f, float textVertical=.5f) {
+          bool filename=false, bool underline=false, float textCenter=-1.f, float textVertical=.5f,
+          std::optional<float> groupFontSize=std::nullopt) {
     if (highlight && highlight->empty()) highlight = nullptr;
     if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
@@ -19594,7 +19680,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         (sortedHeader && state.sortedHeaderFormat ?
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
     if (!fmt) return;
-    if (!header && !highlight && state.zoomAnimating &&
+    if (!header && !groupFontSize && !highlight && state.zoomAnimating &&
         DrawScaledTextRaster(state,text,l,t,r,b,hex,opacity,wrapped,filename,underline,textCenter,textVertical)) return;
     // Changes to font/trimming geometry retain immediate drawing during their
     // animation. With stable geometry, don't even shape a new deferred value
@@ -19602,7 +19688,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
     deferCold = deferCold && state.textRasterPainting && !state.textRasterUnavailable &&
         !state.zoomAnimating && (!state.columnTransitionActive || state.modeComposition.painting) && state.dragDivider < 0 &&
         !state.horizontalAnimating && !state.draggingHorizontal && !state.columnDragActive;
-    auto& cache=state.textLayouts[wrapped ? 3 : !header ? 0 : sortedHeader ? 2 : 1];
+    auto& cache=TextCache(state,header,sortedHeader,wrapped,groupFontSize);
     if (deferCold && state.qpcFrequency > 0. && state.textRasterBuildTicks >= state.qpcFrequency*.001) {
         const auto found=cache.layouts.find(text);
         if (found==cache.layouts.end() || !found->second.displayed) {
@@ -19611,7 +19697,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             return;
         }
     }
-    if (auto layout = ResolveTextLayout(state, text, r-l, b-t, header, sortedHeader, nullptr, wrapped,filename)) {
+    if (auto layout = ResolveTextLayout(state, text, r-l, b-t, header, sortedHeader, nullptr, wrapped,filename,groupFontSize)) {
         auto& shaped = cache.layouts.at(text);
         const auto offset = TextAlignmentOffset(shaped,r-l,b-t,textCenter,textVertical);
         l+=offset.x; r+=offset.x; t+=offset.y; b+=offset.y;
@@ -19653,10 +19739,10 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             state.target->PopAxisAlignedClip();
             state.brush->SetColor(Packed(hex, opacity));
         }
-        if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename)) {
+        if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename,groupFontSize)) {
             // Same canonical box and whole-pixel origin as the cached mask.
             float boxLeft=l, boxWidth=r-l;
-            const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename);
+            const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename,groupFontSize);
             const auto origin=SnapDrawPoint(state.target.Get(),D2D1::Point2F(boxLeft,t));
             if (intrinsic) layout->SetMaxWidth(boxWidth);
             // A translucent brush changes Direct2D's grayscale text alpha
@@ -20359,7 +20445,8 @@ D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
 
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
                     float opacity = 1.f, float angle = 0.f, D2D1_RECT_F* drawn = nullptr,
-                    IconRecord* overlay = nullptr, float itemHeight = 0.f) {
+                    IconRecord* overlay = nullptr, float itemHeight = 0.f,
+                    std::optional<float> drawnSide = std::nullopt) {
     if(!VisibleOpacity(opacity)) return true;
     if (!icon.bitmap) return false;
     if (state.iconDemandStartedAt && (!state.iconFirstDrawLogged ||
@@ -20370,7 +20457,7 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         state.iconFirstDrawLogged = true;
         if (!icon.association) state.iconFirstSpecificDrawLogged = true;
     }
-    const float side = static_cast<float>(IconPixelSize(state));
+    const float side = drawnSide.value_or(IconPixelSize(state));
     const auto pixels = icon.bitmap->GetSize();
     const auto& artwork=icon.bitmapPixels.Ready() && icon.bitmapPixels.data.Identity()!=icon.pixels.data.Identity() ?
         icon.bitmapPixels : icon.pixels;
@@ -20539,7 +20626,8 @@ void RecordClipboardDamage(ViewState& state, const D2D1_RECT_F& icon) {
 }
 
 void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
-                    float opacity = 1.f, float itemHeight = 0.f) {
+                    float opacity = 1.f, float itemHeight = 0.f,
+                    std::optional<float> drawnSide = std::nullopt) {
     if(!VisibleOpacity(opacity)) return;
     const bool pending = state.clipboardPaths.contains(e.path);
     const float angle = pending && !state.startupAnimationsSuppressed ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
@@ -20547,7 +20635,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     auto* overlay = OverlayArtwork(state, e, true);
     const auto draw = [&](IconRecord& icon, bool association) {
         D2D1_RECT_F drawn{};
-        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay,itemHeight);
+        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay,itemHeight,drawnSide);
         if (ready && pending && drawn.right>drawn.left && drawn.bottom>drawn.top) RecordClipboardDamage(state,drawn);
         if (ready) icon.painted=state.graphicsPaintSerial;
         if (state.uiTraceDrawItem)
@@ -20555,7 +20643,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
                 .a=state.uiTraceItem,.b=reinterpret_cast<ULONG_PTR>(icon.bitmap.Get()),
                 .v={opacity,double(icon.requestedSize),double(icon.pixels.width),double(association)}},true);
         const auto& clip = state.clipboardIconViewport;
-        const float side = IconPixelSize(state);
+        const float side = drawnSide.value_or(IconPixelSize(state));
         if (ready && pending && opacity > 0.f && x+side > clip.left && x < clip.right &&
             y+side > clip.top && y < clip.bottom) state.clipboardIconsVisible = true;
         return ready;
@@ -20579,20 +20667,11 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     if (state.uiTraceDrawItem)
         PipelineEvent(*state.background,{.operation=L"ui.icon.missing[opacity,side,grid,thumbs]",
             .a=state.uiTraceItem,.b=state.token,
-            .v={opacity,double(IconPixelSize(state)),double(state.gridView),double(g_listThumbnails.load())}},true);
+            .v={opacity,double(drawnSide.value_or(IconPixelSize(state))),double(state.gridView),double(g_listThumbnails.load())}},true);
 }
 
 // One scrollbar model for both axes. Placement is axis-specific; thumb
 // sizing, mapping, hit testing and painting are not duplicated.
-enum class ScrollAxis { Vertical, Horizontal };
-struct ScrollbarGeometry {
-    float left = 0.f, right = 0.f, top = 0.f, bottom = 0.f;
-    float thumbStart = 0.f, thumbLength = 0.f, travel = 0.f;
-    float scrollRange = 0.f;
-    ScrollAxis axis = ScrollAxis::Vertical;
-    bool usable = false;
-};
-
 ScrollbarGeometry MakeScrollbarGeometry(ScrollAxis axis, float left, float right,
                                        float top, float bottom, float content,
                                        float viewport, float offset,
@@ -20695,16 +20774,20 @@ ScrollbarGeometry Scrollbar(ViewState& state, bool touchTarget = false) {
         std::max(static_cast<float>(Scale96(24, dpi)), barWidth));
 }
 
+bool HorizontalScrollbarGeometryPending(const ViewState& state) {
+    if (state.presentationOnly) return state.presentationScrollbarGeometryPending;
+    return state.zoomAnimating || state.autoRefitPending || state.columnFitPendingEpoch ||
+        (state.folderView && (state.initialModePending || state.nativeColumnsDirty ||
+            state.deferColumnProviders || state.directoryPending || state.namesPreview));
+}
+
 bool UpdateHorizontalScrollbarVisibility(ViewState& state) {
     if (state.presentationOnly) return false;
     // Column discovery, fitting and the accepted final animation image already
     // provide readiness events. Do not turn provisional overflow into chrome,
     // add a settling timer, or withhold content/vertical scrolling for it.
     const bool settling = state.columnTransitionActive || state.columnModeTransition ||
-        state.columnPresentationPending || state.zoomAnimating || state.autoRefitPending ||
-        state.columnFitPendingEpoch || (state.folderView &&
-            (state.initialModePending || state.nativeColumnsDirty || state.deferColumnProviders ||
-             state.directoryPending || state.namesPreview));
+        state.columnPresentationPending || HorizontalScrollbarGeometryPending(state);
     const bool needed = state.horizontalScroll > 0.f || state.horizontalAnimating || state.draggingHorizontal;
     const bool previous = state.horizontalScrollbarAdmitted;
     if (!settling || needed)
@@ -20733,12 +20816,8 @@ void PublishHorizontalScrollbar(ViewState& state) {
     state.horizontalScrollbarPublished |= state.horizontalScrollbarAdmitted;
 }
 
-ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
-    // An absent bar still owns its axis: painting it must never reset the
-    // visible vertical bar's hover/press animation.
-    UpdateHorizontalScrollbarVisibility(state);
-    if (!state.horizontalScrollbarAdmitted || !ColumnsPresented(state) || !HorizontalHeight(state))
-        return {.axis = ScrollAxis::Horizontal};
+ScrollbarGeometry HorizontalBarGeometry(ViewState& state, bool touchTarget) {
+    if (!HorizontalHeight(state)) return {.axis = ScrollAxis::Horizontal};
     RECT rect{}; ViewClientRect(state, &rect);
     const int dpi = ViewDpi(state);
     const float margin = static_cast<float>(Scale96(kScrollbarInset96, dpi));
@@ -20752,6 +20831,68 @@ ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
         HorizontalScrollbarTop(state, touchTarget), bottom,
         state.columnContentWidth, ListViewportWidth(state), state.horizontalScroll,
         std::max(static_cast<float>(Scale96(24, dpi)), ScrollbarBreadth(state, true, touchTarget)), 1.f);
+}
+
+ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
+    UpdateHorizontalScrollbarVisibility(state);
+    // Keep the axis even when absent so paint resets only its own hover state.
+    return state.horizontalScrollbarAdmitted ? HorizontalBarGeometry(state,touchTarget) :
+        ScrollbarGeometry{.axis = ScrollAxis::Horizontal};
+}
+
+std::array<ScrollbarGeometry,2> PresentedScrollbars(ViewState& state) {
+    std::array<ScrollbarGeometry,2> bars{Scrollbar(state), HorizontalBar(state)};
+    const auto& motion=state.scrollbarLayoutMotion;
+    const bool rows=state.rowTransitionActive && motion.rowRevision==state.rowSceneRevision;
+    const bool columns=state.columnModeTransition && motion.columnMode;
+    const bool awaitingAdmission=motion.columnMode && state.columnPresentationPending &&
+        state.columnsView && !HorizontalScrollbarGeometryPending(state);
+    if ((!rows && !columns && !awaitingAdmission) || !g_scrollbar.load(std::memory_order_relaxed)) return bars;
+
+    const float progress = rows ?
+        LayoutTransitionProgress(state,true,state.rowTransitionStartedQpc) :
+        columns && !motion.rowRevision ?
+            EaseOutCubic(UiTransitionProgress(state,state.columnTransitionStartedQpc)) : 1.f;
+
+    // Use the settled viewport for the destination, even while the column
+    // header is still sliding. Reuse the live scroll offsets and touch widths.
+    auto destination=bars;
+    if (state.columnModeTransition) {
+        const float header=state.headerPx;
+        state.headerPx=state.columnHeaderTo;
+        {
+            const ScopedFlag settled(state.columnModeTransition,false);
+            destination[0]=Scrollbar(state);
+            destination[1]=(state.horizontalScrollbarAdmitted || !HorizontalScrollbarGeometryPending(state)) ?
+                HorizontalBarGeometry(state,false) : ScrollbarGeometry{.axis=ScrollAxis::Horizontal};
+        }
+        state.headerPx=header;
+    } else if (awaitingAdmission || (rows && !HorizontalScrollbarGeometryPending(state))) {
+        destination[1]=HorizontalBarGeometry(state,false);
+    }
+    for (size_t i=0;i<bars.size();++i) {
+        if (i==0 ? state.draggingScrollbar : state.draggingHorizontal) continue;
+        auto from=motion.from[i];
+        auto to=destination[i];
+        if (!from.usable && !to.usable) { bars[i]=to; continue; }
+        const auto collapsed=[](ScrollbarGeometry bar) {
+            if (bar.axis==ScrollAxis::Horizontal) bar.top=bar.bottom;
+            else bar.left=bar.right;
+            return bar;
+        };
+        if (!from.usable) from=collapsed(to);
+        if (!to.usable) to=collapsed(from);
+        auto& bar=bars[i];
+        bar=to;
+        bar.left=std::lerp(from.left,to.left,progress);
+        bar.right=std::lerp(from.right,to.right,progress);
+        bar.top=std::lerp(from.top,to.top,progress);
+        bar.bottom=std::lerp(from.bottom,to.bottom,progress);
+        bar.thumbStart=std::lerp(from.thumbStart,to.thumbStart,progress);
+        bar.thumbLength=std::lerp(from.thumbLength,to.thumbLength,progress);
+        bar.usable=bar.right>bar.left && bar.bottom>bar.top;
+    }
+    return bars;
 }
 
 bool HitScrollbar(const ScrollbarGeometry& bar, float x, float y, float tolerance) {
@@ -21712,7 +21853,8 @@ D2D1_RECT_F GroupHoverRect(ViewState& state, int section, const RowVisual& visua
         const float available = std::max(0.f, text.right-text.left);
         float width = 0.f;
         if (auto* layout = ResolveTextLayout(state,state.sections[size_t(section)].title,
-                available,visual.height)) {
+                available,visual.height,false,false,nullptr,false,false,
+                ThemedHeadingFontSize(GroupHeadingTheme(state),ViewDpi(state),state.gridView,state.rowPx,state.fontPx))) {
             DWRITE_TEXT_METRICS metrics{};
             if (SUCCEEDED(layout->GetMetrics(&metrics))) width = std::clamp(metrics.width,0.f,available);
         }
@@ -22075,9 +22217,12 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
         badge.textLeft+badge.textWidth+1.f, badge.pill.bottom, foreground, false, foregroundAlpha);
 }
 
-// Group headings use the SAME body text format as file rows, so pinch and
-// Ctrl+wheel zoom affect their glyph size as well as their row geometry.
-// The themed group-heading color and standard Fill/Text path are unchanged.
+std::pair<unsigned,float> ResolveHeadingColor(unsigned fallback, const Theme::Color* color) {
+    if (!color) return {fallback,1.f};
+    const auto ink=HighlightColor(*color);
+    return {ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),
+        std::lround(ink.b*255))),ink.a};
+}
 void PaintGroupHeading(ViewState& state, const std::wstring& title,
                        bool collapsed, float top, float height,
                        float opacity, float listEnd, float windowWidth,
@@ -22115,8 +22260,12 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         state.sectionBadgeAnimating = true;
     PaintGroupBadge(state,badge,opacity);
     text.left += badge.shift;
+    const auto* style = GroupHeadingTheme(state);
+    const auto [color,alpha] = ResolveHeadingColor(headerColor,
+        style && style->textColor ? &*style->textColor : nullptr);
     Text(state, title, text.left, text.top, text.right, text.bottom,
-        headerColor, false, .9f * opacity);
+        color, false, .9f * opacity * alpha, false, false, nullptr, false,
+        false, false, -1.f, .5f, ThemedHeadingFontSize(style,dpi,state.gridView,state.rowPx,state.fontPx));
 }
 
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
@@ -22621,7 +22770,7 @@ bool PrepareRowComposition(ViewState& state) {
         add(mode.items,i,LayoutRowVisual(state,i,0.f),LayoutRowVisual(state,i,1.f));
     for (size_t i=0;i<state.disappearingRows.size();++i) {
         const auto& old=state.disappearingRows[i];
-        RowVisual from{old.oldTop-(state.scrollNow-state.rowTransitionOldScroll),old.oldHeight,
+        RowVisual from{old.oldTop-RowTransitionScrollDelta(state),old.oldHeight,
             old.oldOpacity,old.oldLeft,old.oldWidth};
         auto to=from; to.height=to.opacity=0.f;
         add(mode.items,-int(i)-1,from,to);
@@ -22633,7 +22782,7 @@ bool PrepareRowComposition(ViewState& state) {
     }
     for(size_t i=0;i<state.disappearingHeaders.size();++i) {
         const auto& old=state.disappearingHeaders[i];
-        RowVisual from{old.oldTop-(state.scrollNow-state.rowTransitionOldScroll),GroupHeadingHeight(state),1.f};
+        RowVisual from{old.oldTop-RowTransitionScrollDelta(state),GroupHeadingHeight(state),1.f};
         auto to=from; to.height=to.opacity=0.f;
         add(mode.headings,-int(i)-1,from,to,true);
     }
@@ -22936,7 +23085,7 @@ bool PublishRowScene(ViewState& state) {
                 item.from={from.top+(to.top-from.top)*p-(mode.scroll-mode.previousScroll),
                     from.height+(to.height-from.height)*p,from.opacity+(to.opacity-from.opacity)*p,
                     from.left+(to.left-from.left)*p,from.width+(to.width-from.width)*p};
-                const float ownerTop=item.from.top+state.scrollNow-state.rowTransitionOldScroll;
+                const float ownerTop=item.from.top+RowTransitionScrollDelta(state);
                 if(headings) {
                     if(item.key>=0) {
                         auto motion=std::lower_bound(state.groupHeaderMotion.begin(),state.groupHeaderMotion.end(),item.key,
@@ -24185,16 +24334,10 @@ void Paint(ViewState& state) {
     const unsigned headerColor = ThemeRgb(state.nativeHeaderTextColor != CLR_INVALID
         ? state.nativeHeaderTextColor : GetSysColor(COLOR_WINDOWTEXT));
     const auto* headerStyle=ColumnHeaderTheme(state);
-    const auto resolveHeaderColor=[&](const Theme::Color* color) {
-        if (!color) return std::pair{headerColor,1.f};
-        const auto ink=HighlightColor(*color);
-        return std::pair{ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),
-            std::lround(ink.b*255))),ink.a};
-    };
-    const auto [captionColor,captionOpacity]=resolveHeaderColor(
+    const auto [captionColor,captionOpacity]=ResolveHeadingColor(headerColor,
         headerStyle && headerStyle->header.textColor ? &*headerStyle->header.textColor : nullptr);
     const auto rule=[&](const Theme::SurfaceStyle* style, float defaultOpacity) {
-        const auto [color,alpha]=resolveHeaderColor(style && style->borderColorDefined ? &style->borderColor : nullptr);
+        const auto [color,alpha]=ResolveHeadingColor(headerColor,style && style->borderColorDefined ? &style->borderColor : nullptr);
         const float opacity=style ? style->borderOpacity.value_or(defaultOpacity) : defaultOpacity;
         return std::tuple{ColumnHeaderDividerWidth(style,dpi),color,alpha*opacity};
     };
@@ -24476,7 +24619,7 @@ void Paint(ViewState& state) {
             blank.emplace_back(top,top+visual.height);
         }
         if(state.groupingLayoutTransition) for(const auto& old:state.disappearingHeaders) {
-            const float top=old.oldTop+state.rowTransitionOldScroll-header;
+            const float top=old.oldTop-RowTransitionScrollDelta(state)+state.scrollNow-header;
             blank.emplace_back(top,top+heading*(1.f-headerProgress));
         }
         std::sort(blank.begin(),blank.end());
@@ -24545,7 +24688,7 @@ void Paint(ViewState& state) {
     // Shell state. Their shrinking height and opacity close the old gaps.
     if (state.selectionFeedbackVisible && state.rowTransitionActive) {
         for (const auto& old : state.disappearingRows) {
-            const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
             const float opacity = compositionFrame.Rows() ? 1.f : old.oldOpacity * (1.f - layoutProgress);
             if (height <= 0.f || (!compositionFrame.Rows() && (top >= contentBottom || top + height <= header)))
@@ -24656,7 +24799,7 @@ void Paint(ViewState& state) {
     // collapsing row; there is no stale hit target or resurrected selection.
     if (state.rowTransitionActive) {
         for (const auto& old : state.disappearingRows) {
-            const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
             const float opacity = compositionFrame.Rows() ? 1.f : old.oldOpacity * (1.f - layoutProgress);
             if (height <= 0.f || (!compositionFrame.Rows() && (top >= contentBottom || top + height <= header)))
@@ -24719,13 +24862,11 @@ void Paint(ViewState& state) {
         paintedItems.push_back({i,v,geometry,usage,contentOpacity});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
-        if (v.morph < 1.f) {
-            // A morphing icon is drawn at its travelling size.
-            const float side = state.iconPx;
-            state.iconPx = geometry.icon.right - geometry.icon.left;
-            DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity, v.height);
-            state.iconPx = side;
-        } else DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity, v.height);
+        // A travelling icon changes its draw bounds, while cache lookups use
+        // the same tier as the published artwork and upload working set.
+        const auto drawnSide=v.morph<1.f ?
+            std::optional<float>(geometry.icon.right-geometry.icon.left) : std::nullopt;
+        DrawActualIcon(state,e,geometry.icon.left,geometry.icon.top,contentOpacity,v.height,drawnSide);
         const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
         const float checkboxReveal = SelectionCheckboxReveal(state);
         if (checkboxReveal > 0.f && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
@@ -24766,7 +24907,7 @@ void Paint(ViewState& state) {
     // collapsing row; there is no stale hit target or resurrected selection.
     if (state.rowTransitionActive) {
         for (const auto& old : state.disappearingRows) {
-            const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
             const float opacity = compositionFrame.Rows() ? 1.f : old.oldOpacity * (1.f - layoutProgress);
             if (height <= 0.f || (!compositionFrame.Rows() && (top >= contentBottom || top + height <= header)))
@@ -24930,7 +25071,7 @@ void Paint(ViewState& state) {
     if (state.groupingLayoutTransition) for (const auto& old:state.disappearingHeaders) {
         const float opacity=1.f-headerProgress;
         const float height=GroupHeadingHeight(state)*opacity;
-        const float top=old.oldTop-(state.scrollNow-state.rowTransitionOldScroll);
+        const float top=old.oldTop-RowTransitionScrollDelta(state);
         if (height>.01f && top<contentBottom && top+height>header)
             headings.push_back({&old.title,old.collapsed,{top,height,opacity},-int(&old-state.disappearingHeaders.data())-1});
     }
@@ -25045,9 +25186,10 @@ void Paint(ViewState& state) {
         state.target->PopAxisAlignedClip();
     }
     // Scrollbars and persistent navigation feedback remain above the marquee.
-    DrawScrollbar(state, compositionFrame.active ? Scrollbar(state) : bar, nameColor,
+    const auto scrollbars=PresentedScrollbars(state);
+    DrawScrollbar(state, scrollbars[0], nameColor,
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
-    DrawScrollbar(state, HorizontalBar(state), nameColor,
+    DrawScrollbar(state, scrollbars[1], nameColor,
         state.horizontalScrollbarHot || state.draggingHorizontal, state.draggingHorizontal);
     // Foreground visuals belong to the persistent composition root, never to
     // this repaint or to a temporary row/column transition's chrome plane.
@@ -25131,6 +25273,10 @@ void Paint(ViewState& state) {
         }
         PipelineEvent(*state.background,{.operation=L"render.present[pos,target]",.a=static_cast<unsigned>(present),
             .b=PipelineFlags(state),.v={state.scrollNow,state.scrollTarget}});
+        if (LiveLayoutTransition(state))
+            PipelineEvent(*state.background,{.operation=L"grid.reflow.present[progress,columns,poses,scrollDelta]",
+                .a=state.rowSceneRevision,.b=static_cast<unsigned>(present),
+                .v={presentedLayoutProgress,double(state.itemsPerRow),double(state.rowMotion.size()),RowTransitionScrollDelta(state)}});
         state.presentPending = present == DXGI_ERROR_WAS_STILL_DRAWING;
         if (state.presentPending) QueryPerformanceCounter(&state.rejectedPresentQpc);
         else state.rejectedPresentQpc = {};
@@ -25191,6 +25337,7 @@ void Paint(ViewState& state) {
     }
     if (submitted) {
         state.lastAcceptedPaint=state.graphicsPaintSerial;
+        state.lastAcceptedPresentationModel=state.presentationSequence;
         if (state.presentObserverId) {
             LARGE_INTEGER at{}, frequency{};
             QueryPerformanceCounter(&at); QueryPerformanceFrequency(&frequency);
@@ -30084,7 +30231,7 @@ void UpdateDirectory(ViewState& state) {
     }
 }
 
-void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr);
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr, HWND expectedNative = nullptr);
 
 ViewState* State(HWND hwnd) {
     // A process-wide foreground/WinEvent can name another Explorer UI thread.
@@ -30150,6 +30297,10 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         state.detailsViewActive && state.visible && state.inScope && state.loaded &&
         !state.optimisticStartedAt && !state.pendingNavigationPaint &&
         g_smooth.load(std::memory_order_relaxed);
+    std::optional<std::array<ScrollbarGeometry,2>> previousScrollbars;
+    if (!zoom && animate && state.visible && state.detailsViewActive &&
+        ((changed && reflow && state.gridView!=grid) || state.columnsView!=columns))
+        previousScrollbars=PresentedScrollbars(state);
     std::vector<CapturedRow> morphCells; std::vector<CapturedGroupHeader> morphHeadings; float morphRow=0.f;
     if (zoom) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
@@ -30166,7 +30317,9 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
             !state.optimisticStartedAt && !state.pendingNavigationPaint;
         AdvanceRowHeight(state);
         auto cells=morph ? CapturePresentedGridCells(state,true) : std::vector<CapturedRow>{};
-        auto headings=cells.empty() ? std::vector<CapturedGroupHeader>{} : CaptureVisibleGroupHeaders(state);
+        auto headings=cells.empty() ? std::vector<CapturedGroupHeader>{} :
+            CaptureVisibleGroupHeaders(state,LayoutTransitionProgress(state,
+                state.rowTransitionActive,state.rowTransitionStartedQpc));
         const float oldRow=state.rowPx;
         // The first item fully inside the old viewport keeps its screen top.
         const auto anchor=std::find_if(cells.begin(),cells.end(),
@@ -30201,7 +30354,15 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         SetColumnViewMode(state,columns,animate && supported && state.detailsViewActive && state.graphicsReady);
     }
     // After the column change: entering or leaving Details stops row motion.
-    if (!morphCells.empty()) StartGroupingTransition(state,std::move(morphCells),std::move(morphHeadings),morphRow,false,true);
+    const bool morphing=!morphCells.empty();
+    if (morphing) StartGroupingTransition(state,std::move(morphCells),std::move(morphHeadings),morphRow,false,true);
+    if (previousScrollbars) {
+        auto& motion=state.scrollbarLayoutMotion;
+        motion.from=*previousScrollbars;
+        motion.rowRevision=morphing && state.rowTransitionActive ?
+            std::optional<unsigned long long>(state.rowSceneRevision) : std::nullopt;
+        motion.columnMode=state.columnModeTransition;
+    }
     state.detailsViewActive=supported;
     if (enteringColumns) ArmAutoRefit(state);
     if (changed) TraceUiState(state,L"ui.layout.after[layout,native,header,selected]");
@@ -30548,10 +30709,10 @@ bool AdvanceRowHeight(ViewState& state, bool finish) {
     UpdateMetrics(state, progress);
     ReconcileColumnViewportAfterRowCount(state);
     const float anchored = ZoomScrollTarget(state);
-    // Grid cell positions and heights interpolate between the same endpoints.
-    // Interpolating their revealed viewports keeps a visible selection inside
-    // the viewport throughout reflow, rather than correcting it after zoom.
-    state.scrollNow = state.scrollTarget = state.gridView ?
+    // A grid morph already interpolates screen positions. Its destination
+    // uses the current packing and anchor; interpolating a document offset
+    // across two packings pulls those poses away from the visible viewport.
+    state.scrollNow = state.scrollTarget = state.gridView && !state.zoomLayoutTransition ?
         state.zoomFromScroll + (anchored-state.zoomFromScroll)*progress : anchored;
     ClampScroll(state);
     if (state.fontPx != beforeFont) {
@@ -30590,6 +30751,31 @@ public:
     }
 };
 
+void CapturePinchAnchor(ViewState& state, POINT contact) {
+    state.pinchAnchorRow=-1;
+    state.pinchAnchorPath.clear();
+    state.pinchAnchorToken=state.token;
+    const RECT viewport=ContentViewport(state,true);
+    const float x=float(LogicalX(state,contact.x))-ListStartX(state), y=float(contact.y);
+    const float progress=LayoutTransitionProgress(state,state.rowTransitionActive,state.rowTransitionStartedQpc);
+    float nearest=std::numeric_limits<float>::infinity();
+    for(int index:VisibleDemandRows(state,0.f)) {
+        if (!DisplayedRow(state,index)) continue;
+        const auto cell=LayoutRowVisual(state,index,progress);
+        if (cell.opacity<=0.f || cell.height<=0.f || cell.top>=viewport.bottom ||
+            cell.top+cell.height<=viewport.top) continue;
+        const float dx=state.gridView ? std::max({0.f,cell.left-x,x-cell.left-cell.width}) : 0.f;
+        const float dy=std::max({0.f,cell.top-y,y-cell.top-cell.height});
+        const float distance=dx*dx+dy*dy;
+        if (distance>=nearest) continue;
+        nearest=distance;
+        state.pinchAnchorRow=index;
+        state.pinchAnchorFraction=(y-cell.top)/cell.height;
+    }
+    if (state.pinchAnchorRow>=0)
+        state.pinchAnchorPath=state.entries[size_t(state.pinchAnchorRow)].path;
+}
+
 double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact = nullptr) {
     const int current = ZoomHeight96(state);
     if (!std::isfinite(requested96)) return current;
@@ -30626,23 +30812,31 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         // and fractional row under the midpoint through grid/group reflow,
         // except that a selection visible when the pinch began stays in
         // view; a distant selection must not pull the viewport from the hand.
-        const int oldColumns = state.itemsPerRow;
         const bool zoomLayout = state.zoomLayoutTransition;
         AdvanceRowHeight(state);
-        auto cells = CapturePresentedGridCells(state);
+        const int oldColumns = state.itemsPerRow;
+        const float oldScroll=state.scrollNow;
+        const int anchor=state.pinchAnchorRow;
+        if (state.pinchAnchorToken!=state.token || !DisplayedRow(state,anchor) ||
+            size_t(anchor)>=state.entries.size() || state.entries[size_t(anchor)].path!=state.pinchAnchorPath)
+            CapturePinchAnchor(state,*contact);
+        const float sampledProgress=state.presenter && state.rowTransitionActive ?
+            state.rowTransitionPresentedProgress : -1.f;
+        auto cells = CapturePresentedGridCells(state,false,sampledProgress);
         auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
-            CaptureVisibleGroupHeaders(state);
+            CaptureVisibleGroupHeaders(state,sampledProgress);
         // Take over the current pose rather than finishing a wheel/trackpad
         // zoom at its endpoint before following the fingers.
         state.zoomAnimating = false;
         // A grid reflow already in flight keeps moving under later samples;
         // only a column change (or a finished wheel zoom) retargets it.
-        if (cells.empty() || zoomLayout) StopRowTransition(state);
-        const int index = RowFromPoint(state, contact->y, contact->x);
+        if (zoomLayout) StopRowTransition(state);
+        // Repacking can move the destination cell across the pinch point.
+        // Keep the same item and its fractional position for the whole gesture.
+        const int index = state.pinchAnchorRow;
         const float documentY = contact->y - state.headerPx + state.scrollNow;
-        const float fraction = index >= 0 ?
-            (documentY - DocumentRowTop(state, index)) / std::max(1.f, DisplayRowHeight(state, index)) :
-            documentY / std::max(1.f, state.rowPx);
+        const float fraction = index>=0 ? state.pinchAnchorFraction :
+            documentY/std::max(1.f,state.rowPx);
         StopScrollAnimation(state);
         StopHoverAnimation(state);
         StopKeyboardSelectionAnimation(state);
@@ -30657,8 +30851,18 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         state.scrollNow = state.scrollTarget = anchored - (contact->y - state.headerPx);
         ClampScroll(state);
         KeepSelectionRevealed(state, state.pinchRevealRow);
-        if (state.itemsPerRow != oldColumns || zoomLayout)
-            BeginGridReflow(state, std::move(cells), std::move(headers));
+        if (state.rowTransitionActive && state.reflowLayoutTransition) {
+            // Only a genuine scroll translates the old poses. Zooming on a
+            // deep row can change its document Y by several viewports.
+            state.rowTransitionOldScroll+=state.scrollNow-oldScroll;
+        }
+        if (state.itemsPerRow != oldColumns || zoomLayout) {
+            const auto sourceCount=cells.size();
+            BeginGridReflow(state,std::move(cells),std::move(headers));
+            PipelineEvent(*state.background,{.operation=L"grid.pinch.reflow[oldColumns,newColumns,sourceCells,scrollDelta]",
+                .a=state.rowSceneRevision,.b=PipelineFlags(state),
+                .v={double(oldColumns),double(state.itemsPerRow),double(sourceCount),state.scrollNow-oldScroll}});
+        }
         state.measuredNameIndex = -1;
         state.widthCache.clear();
         if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
@@ -30734,6 +30938,10 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     state.zoomAnimating = true;
     if (state.zoomLayoutTransition) state.rowTransitionStartedQpc = state.zoomStartedQpc;
     UpdateMetrics(state, 0.f);
+    if (state.zoomLayoutTransition) {
+        state.scrollNow=state.scrollTarget=ZoomScrollTarget(state);
+        ClampScroll(state);
+    }
     if (state.gridView) QueueVisibleDataFrame(state);
     if (state.visible && g_smooth.load(std::memory_order_relaxed))
         RegisterViewAnimation(state);
@@ -30980,6 +31188,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
         // Decided once per gesture: a cell outgrowing the viewport must not
         // lose its protection partway through the same pinch.
         state.pinchRevealRow = contact ? FullyVisibleSelection(state) : -1;
+        if (contact) CapturePinchAnchor(state,*contact);
         state.touchpadPinching = true;
         state.swipeHorizontal = state.swipeVertical = false;
         if (state.touch.panningFeedback) {
@@ -33139,8 +33348,10 @@ struct BootstrapPendingFrame {
 };
 struct BootstrapThreadHook {
     HHOOK hook = nullptr;
+    HHOOK paint = nullptr;
     HANDLE thread = nullptr;
     ~BootstrapThreadHook() {
+        if (paint) UnhookWindowsHookEx(paint);
         if (hook) UnhookWindowsHookEx(hook);
         if (thread) CloseHandle(thread);
     }
@@ -33169,6 +33380,41 @@ void HandleColdAttach(HWND frame, HWND requestedTab = nullptr) {
         if(target==ActiveExplorerTab(frame)) CheckOverlaySize(frame);
     }
     RemovePropW(key, kBootstrapQueuedProperty);
+}
+
+template<class Scan = decltype(&ScanShellWindow)>
+void AttachBeforeFirstNativePaint(HWND child, Scan scan = ScanShellWindow) {
+    if (!child || g_unloading.load(std::memory_order_relaxed) ||
+        !g_textRuntimeReady.load(std::memory_order_acquire)) return;
+    wchar_t cls[64]{};
+    if (!GetClassNameW(child,cls,ARRAYSIZE(cls))) return;
+    HWND native=child;
+    if (!_wcsicmp(cls,L"DirectUIHWND") || !_wcsicmp(cls,L"SysListView32")) {
+        native=GetParent(child);
+        if (!GetClassNameW(native,cls,ARRAYSIZE(cls))) return;
+    }
+    if (_wcsicmp(cls,L"SHELLDLL_DefView") || GetPropW(native,kColdAttachPaintCheckedProperty) ||
+        !IsWindowVisible(native) || GetWindowThreadProcessId(native,nullptr)!=GetCurrentThreadId()) return;
+    const HWND frame=GetAncestor(native,GA_ROOT);
+    if (!IsExplorerFrame(frame) || IsIconic(frame) || GetPropW(frame,kShellScanProperty)) return;
+    const HWND tab=ActiveExplorerTab(frame);
+    if (!IsWindow(tab) || OverlayForTab(tab)) return;
+    // Claim one attempt per view HWND before entering the guarded Shell scan.
+    // Discovery can be reentrant, and unsupported views keep painting normally.
+    if (!SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1))) return;
+    scan(frame,tab,native);
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU startup] COLD_PREPAINT frame=%p tab=%p native=%p attached=%d",
+            frame,tab,native,OverlayForTab(tab)!=nullptr);
+}
+
+LRESULT CALLBACK ColdAttachPaintHook(int code, WPARAM wp, LPARAM lp) {
+    WindowCallbackGuard callback;
+    if (code>=0 && lp) {
+        const auto& msg=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        if (msg.message==WM_PAINT) AttachBeforeFirstNativePaint(msg.hwnd);
+    }
+    return CallNextHookEx(nullptr,code,wp,lp);
 }
 
 // Explorer may consume a registered message before DispatchMessageW. Claim
@@ -33227,6 +33473,7 @@ bool QueueColdAttach(HWND frame, HWND source, HWND requestedTab = nullptr) {
                 thread, GetLastError());
             return false;
         }
+        subscription->paint=SetWindowsHookExW(WH_CALLWNDPROC,ColdAttachPaintHook,nullptr,thread);
         threads.emplace(thread, std::move(subscription));
     }
     auto& pending = t_bootstrapPending->pending;
@@ -33358,7 +33605,9 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
         if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
             RemovePropW(frame,kColdAttachResolvedProperty);
             EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
-                RemovePropW(child,kColdAttachResolvedProperty); return TRUE;
+                RemovePropW(child,kColdAttachResolvedProperty);
+                RemovePropW(child,kColdAttachPaintCheckedProperty);
+                return TRUE;
             },0);
         }
         return TRUE;
@@ -34186,6 +34435,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     // drew it (ConsumePresentation). A superseded capture never counts.
     UpdateHorizontalScrollbarVisibility(state);
     auto model=std::make_shared<PresentationModel>();
+    model->scrollbarGeometryPending=HorizontalScrollbarGeometryPending(state);
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
 #undef CAPTURE_PRESENTATION
@@ -34396,6 +34646,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     auto oldColumns=std::move(state.columns); auto oldDisappearingColumns=std::move(state.disappearingColumns);
     const float oldFont=state.fontPx,oldRow=state.rowPx; const bool oldRtl=state.rtlLayout,oldGrid=state.gridView;
     const int oldItemsPerRow=state.itemsPerRow;
+    const float oldGroupHeight=GroupHeadingHeight(state);
     const auto oldGroupingSpec=state.grouping;
     if(!sameFolder || !SameShellGroup(oldGroupingSpec,model.grouping)) state.sectionBadges.reset();
     const int oldDpi=state.presentationDpi;
@@ -34408,6 +34659,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     state.presentationRowRevision=model.rowSceneRevision; state.presentationColumnOrigin=model.columnIntentOrigin;
     state.presentationClient=model.client; state.presentationDpi=model.dpi; state.presentationFont=model.font;
     state.presentationFrameSizing=model.frameSizing;
+    state.presentationScrollbarGeometryPending=model.scrollbarGeometryPending;
     state.presentationActive=model.active; state.inputFocusIndicators=model.inputFocus;
     state.selectionFeedbackVisible=model.selectionFeedback;
     state.rename.editor=model.renameEditor; state.rename.index=model.renameIndex;
@@ -34444,7 +34696,8 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
         const bool rebuild=oldDirectory!=model.directory || !SameShellGroup(oldGroupingSpec,state.grouping) ||
             (state.grouping.enabled && !state.namesPreview && state.rowGroup.size()!=size_t(state.total));
         badgeTopologyChanged=rebuild;
-        bool geometry=rebuild || oldRow!=state.rowPx || oldGrid!=state.gridView || oldItemsPerRow!=state.itemsPerRow;
+        bool geometry=rebuild || oldRow!=state.rowPx || oldGrid!=state.gridView ||
+            oldItemsPerRow!=state.itemsPerRow || oldGroupHeight!=GroupHeadingHeight(state);
         if(rebuild) {
             std::map<std::wstring,ViewState::GroupSection> previous;
             for(auto& section:state.sections) if(sameFolder && (section.collapsed || section.started.QuadPart))
@@ -34590,6 +34843,7 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
         if(SUCCEEDED(state.composition->GetFrameStatistics(&statistics))) receipt->compositionTime=statistics.currentTime;
     }
     receipt->ready=state.graphicsReady; receipt->accepted=!state.presentPending &&
+        state.lastAcceptedPresentationModel==state.presentationSequence &&
         state.lastAcceptedPaint==state.graphicsPaintSerial && state.lastAcceptedPaint;
     receipt->content=receipt->accepted && state.presentationContentAccepted;
     receipt->failed=failed; receipt->standby=state.graphicsStandby && !state.graphicsStandbyPending;
@@ -34836,10 +35090,12 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
         state.clipboardWiggleOnly=!model && !validated && !foregroundChanged && !handoff && state.graphicsReady &&
             state.clipboardIconsVisible && !NeedsAnimationPaint(state,true,true,false);
+        const bool zoomWasAnimating=state.zoomAnimating;
         AdvanceAnimationFrame(state,false);
         const auto previousPaint=state.graphicsPaintSerial;
         const auto previousForeground=state.swipeCompositionSerial;
-        const bool repaint=model || !state.graphicsReady || NeedsAnimationPaint(state,true,false) || handoff;
+        const bool repaint=model || !state.graphicsReady || zoomWasAnimating ||
+            NeedsAnimationPaint(state,true,false) || handoff;
         if(repaint) Paint(state);
         else if(!RenderSwipeFeedback(state) && state.d3d) {
             const HRESULT device=state.d3d->GetDeviceRemovedReason();
@@ -36527,9 +36783,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 // refresh below reads a changed accent and reapplies it.
                 RefreshThemeColor(false);
                 s->viewTogglePaletteDirty=true;
+                const float groupHeight = GroupHeadingHeight(*s);
                 RefreshNativePalette(*s,true);
                 UpdateColumnHeaderHeight(*s,CompactReveal(*s));
+                const bool groupResized = groupHeight != GroupHeadingHeight(*s);
+                if (groupResized) LayoutGroupSections(*s);
                 ClampScroll(*s);
+                if (groupResized) RepositionRenameEdit(*s);
                 if (s->dragPreview) PublishDragPreview(*s);
             }
             if (changes & kStyleFontCollection) {
@@ -38541,8 +38801,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             const auto snapshot = Theme::Snapshot();
             if (snapshot != s->themeSnapshot) {
+                const float groupHeight = GroupHeadingHeight(*s);
                 s->themeSnapshot = snapshot;
                 UpdateColumnHeaderHeight(*s,CompactReveal(*s));
+                if (groupHeight != GroupHeadingHeight(*s)) LayoutGroupSections(*s);
                 ClampScroll(*s);
                 RepositionRenameEdit(*s);
                 s->clipboardStaticBuffers = 0; s->clipboardWiggleOnly = false;
@@ -41148,7 +41410,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     SetTimer(overlay, kTimerId, 250, nullptr);
 }
 
-void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab, HWND expectedNative) {
     if (g_unloading.load() || !g_textRuntimeReady.load(std::memory_order_acquire) || !IsWindow(explorerFrame) ||
         GetPropW(explorerFrame, kShellScanProperty)) return;
     struct ScanGuard {
@@ -41334,7 +41596,7 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
         HWND native = nullptr;
         const HRESULT nativeResult = shellView->GetWindow(&native);
         stage.Mark(L"discovered IShellView GetWindow");
-        if (FAILED(nativeResult) || !native ||
+        if (FAILED(nativeResult) || !native || (expectedNative && native!=expectedNative) ||
             GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native,preparing ? targetTab : nullptr) ||
             BrowserTabHost(shellBrowser.Get(), native, explorerFrame) !=
                 targetTab)
@@ -41344,6 +41606,7 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
         if (FAILED(viewResult) || !view) {
             if (viewResult!=E_NOINTERFACE) break; // Still unresolved, not proof of unsupported content.
             SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1));
             if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     DeactivateOutsideScope(*state);
@@ -41360,8 +41623,10 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
         if (!pathResolved) {
             break;
         }
-        if (!IsSupportedLocation(path))
+        if (!IsSupportedLocation(path)) {
             SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1));
+        }
         if (IsSupportedLocation(path)) {
             AttachView(native,view,folder,shellBrowser,path,preparing);
             stage.Mark(L"AttachView discovered tab");
@@ -42110,6 +42375,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
         selectAllOverlay=state->hwnd; selectAllNative=state->nativeHwnd; selectAllToken=state->token;
         BeginNativeSelectAll(*state,true);
     }
+    if (msg && msg->message==WM_PAINT) AttachBeforeFirstNativePaint(msg->hwnd);
     if (msg && msg->message >= WM_USER) SuppressDispatchedNativeViewport(msg->hwnd);
     NativeStructureBatch structureBatch(msg ? msg->hwnd : nullptr);
     NativeViewInput viewInput(NativeViewInput::Owner(msg));

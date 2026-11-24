@@ -596,13 +596,16 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
         const int oldColumns=state.itemsPerRow;
         const int moving=VisibleItemRows(state,0.f).front()+oldColumns-1;
         const auto from=LayoutRowVisual(state,moving,1.f);
-        const float fromScroll=state.scrollNow;
+        std::optional<AnimationClockFixture::Freeze> zoomClock(std::in_place);
         ApplyRowHeight(state,80);
         const auto captured=LayoutRowVisual(state,moving,0.f);
         Check(state.zoomLayoutTransition && state.itemsPerRow<oldColumns &&
             fabsf(captured.top-from.top)<.1f && fabsf(captured.left-from.left)<.1f &&
-            fabsf(captured.width-from.width)<.1f && state.scrollNow==fromScroll,
-            "zoom repacking snapped cells/width/viewport instead of capturing the displayed layout");
+            fabsf(captured.width-from.width)<.1f,
+            "zoom repacking snapped cell position or width at the start of the morph");
+        const float initialAnchor=(state.scrollNow+ViewHeight(state)*.5f)/state.rowPx*state.itemsPerRow;
+        Check(fabsf(initialAnchor-anchor)<.05f,
+            "repacked viewport lost its document item anchor before the first morph frame");
         QueryPerformanceCounter(&state.zoomStartedQpc);
         state.zoomStartedQpc.QuadPart-=static_cast<LONGLONG>(state.qpcFrequency*.09);
         state.rowTransitionStartedQpc=state.zoomStartedQpc;
@@ -624,6 +627,7 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                 "continuous zoom restarted cell motion at a stale layout");
         }
         AdvanceRowHeight(state,true);
+        zoomClock.reset();
         const float after=(state.scrollNow+ViewHeight(state)*.5f)/state.rowPx*state.itemsPerRow;
         Check(!state.zoomAnimating && fabsf(after-anchor)<.05f,
             "grid zoom did not preserve its document item anchor through repacking");
@@ -644,11 +648,13 @@ static void TestIconGrid(HWND frame, const std::wstring& fixture) {
                 SetScrollImmediate(state, DocumentRowTop(state,state.selected) +
                     (growing ? state.rowPx-ViewHeight(state)+2.f : -2.f));
                 const auto start = LayoutRowVisual(state,state.selected,1.f);
-                const float oldScroll = state.scrollNow;
                 ApplyRowHeight(state,destination);
-                Check(state.zoomAnimating && state.scrollNow == oldScroll &&
-                    fabsf(LayoutRowVisual(state,state.selected,0.f).top-start.top)<.1f,
-                    "selection-aware grid zoom snapped its starting viewport");
+                const auto capturedSelection=LayoutRowVisual(state,state.selected,0.f);
+                Check(state.zoomAnimating && fabsf(capturedSelection.top-start.top)<.1f &&
+                    fabsf(capturedSelection.left-start.left)<.1f &&
+                    fabsf(capturedSelection.height-start.height)<.1f &&
+                    fabsf(capturedSelection.width-start.width)<.1f,
+                    "selection-aware grid zoom snapped the selected cell at the start of the morph");
                 const auto began = state.zoomStartedQpc;
                 for (double ms : {18.,54.,90.,135.,179.,181.}) {
                     AnimationClockFixture::Freeze frameInstant;

@@ -237,6 +237,62 @@ static void TestThemedColumnHeader() {
     }
 }
 
+static void TestThemedGroupHeading() {
+    using namespace ThemeRegression;
+    StyleFixture::Session style;
+    OptionEffects::Settings settings;
+    Fonts();
+    Surface surface;
+    auto& state=surface.state;
+    constexpr int dpi=144;
+    StyleFixture::dpi=dpi;
+    state.presentationDpi=dpi;
+    state.themeMode=Theme::Mode::Light;
+    state.rowPx=80.f;
+    state.fontPx=18.f;
+    Check(MakeTextFormats(state),"group heading fonts");
+    const std::wstring title=L"MMMMMMMM";
+    const auto verify=[&](const wchar_t* attributes,float expectedFont,float requestedHeight) {
+        Load(settings,Element(L"PaintGroupHeading",attributes));
+        state.themeSnapshot=Theme::Snapshot();
+        const float height=GroupHeadingHeight(state);
+        ComPtr<IDWriteTextLayout> reference;
+        Check(SUCCEEDED(g_writeFactory->CreateTextLayout(title.data(),UINT32(title.size()),
+            state.textFormat.Get(),400.f,200.f,&reference)) &&
+            SUCCEEDED(reference->SetFontSize(expectedFont,{0,UINT32(title.size())})),
+            "independent group title layout");
+        DWRITE_TEXT_METRICS metrics{};
+        Check(SUCCEEDED(reference->GetMetrics(&metrics)) &&
+            height>=metrics.height+2*MulDiv(2,dpi,96),"group heading clipped the themed title or padding");
+        if(requestedHeight>0.f) Near(height,requestedHeight,.01f,"group heading height");
+        for(bool raster : {false,true}) {
+            state.textRasterUnavailable=!raster;
+            const auto pixels=surface.Render([&](ViewState& view) {
+                PaintGroupHeading(view,title,false,0.f,height,1.f,Surface::width,Surface::width,0xffffff);
+            });
+            int left=Surface::width,right=-1;
+            for(int y=0;y<int(height);++y) for(int x=0;x<int(Surface::width);++x) {
+                const DWORD pixel=At(pixels,x,y);
+                if(Channel(pixel,16)>0 && (pixel&0xffff)==0) {
+                    left=std::min(left,x);
+                    right=std::max(right,x);
+                }
+            }
+            // M has ink near both edges of its advance. An ellipsis or a
+            // body-sized raster cannot cover the independently measured span.
+            Check(right-left+1>=metrics.width-expectedFont*.5f &&
+                right-left+1<=metrics.width+1.f,"painted group title was truncated or used the wrong font size");
+        }
+    };
+    verify(LR"(height="auto" font-size="auto" text-color="#ff0000")",18.f,80.f);
+    state.rowPx=100.f;
+    state.fontPx=22.f;
+    Check(MakeTextFormats(state),"group heading zoom fonts");
+    verify(LR"(height="auto" font-size="auto" text-color="#ff0000")",22.f,100.f);
+    verify(LR"(height="8px" font-size="40%" text-color="#ff0000")",40.f,0.f);
+    verify(LR"(height="50px" font-size="20px" text-color="#ff0000")",30.f,75.f);
+}
+
 static void TestThemedThumbnail() {
     using namespace ThemeRegression;
     StyleFixture::Session style; OptionEffects::Settings settings; Fonts(); Surface surface;

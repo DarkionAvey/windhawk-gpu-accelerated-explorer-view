@@ -16,6 +16,32 @@ inline D2D1_RECT_F Between(D2D1_RECT_F a,D2D1_RECT_F b,float p) {
     return {a.left*(1-p)+b.left*p,a.top*(1-p)+b.top*p,
         a.right*(1-p)+b.right*p,a.bottom*(1-p)+b.bottom*p};
 }
+constexpr std::array kItemMorphAssertions{ViewMorphPart::Icon,ViewMorphPart::Text};
+constexpr std::array kChromeMorphAssertions{
+    ViewMorphPart::RowFeedback,ViewMorphPart::GroupHeading,ViewMorphPart::ColumnHeader,
+    ViewMorphPart::VerticalTrack,ViewMorphPart::VerticalThumb,
+    ViewMorphPart::HorizontalTrack,ViewMorphPart::HorizontalThumb};
+static_assert([] {
+    std::array<unsigned,size_t(ViewMorphPart::Count)> counts{};
+    for(auto part:kItemMorphAssertions) ++counts[size_t(part)];
+    for(auto part:kChromeMorphAssertions) ++counts[size_t(part)];
+    return std::ranges::all_of(counts,[](unsigned count) {return count==1;});
+}(),"Each view morph surface needs exactly one scene coverage entry");
+
+struct SceneMorphCoverage {
+    std::array<bool,size_t(ViewMorphPart::Count)> checked{};
+    void Record(ViewMorphPart part) { checked[size_t(part)]=true; }
+    template<size_t N> void Require(const std::array<ViewMorphPart,N>& expected) const {
+        for(auto part:expected) Check(checked[size_t(part)],"registered scene surface was not asserted");
+    }
+};
+
+struct SceneMorphPath {
+    D2D1_RECT_F from,to;
+    void CheckAt(D2D1_RECT_F actual,float progress,const char* component) const {
+        Rect(actual,Between(from,to,progress),component);
+    }
+};
 inline void TextAnchorPath(const ItemGeometry& item,const ItemGeometry& before,const ItemGeometry& after,float p) {
     const float x0=before.wrapped ? .5f : 0.f, x1=after.wrapped ? .5f : 0.f;
     const float y0=before.wrapped ? 0.f : .5f, y1=after.wrapped ? 0.f : .5f;
@@ -53,6 +79,7 @@ inline LRESULT CALLBACK Receive(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,
 static void TestViewMorphGeometry(UINT dpi) {
     using namespace ViewTransitionRegression;
     StyleFixture::Session style; StyleFixture::dpi=dpi; Fonts();
+    SceneMorphCoverage coverage;
     for(bool rtl : {false,true}) for(const auto pair : {
             std::pair{FVM_DETAILS,FVM_ICON},std::pair{FVM_ICON,FVM_DETAILS},
             std::pair{FVM_TILE,FVM_CONTENT},std::pair{FVM_CONTENT,FVM_TILE},
@@ -72,9 +99,11 @@ static void TestViewMorphGeometry(UINT dpi) {
         for(int row=0;row<6;++row) destination[size_t(row)]=LayoutItem(state,LayoutRowVisual(state,row,1));
         for(float p : {0.f,.125f,.25f,.5f,.75f,1.f}) for(int row=0;row<6;++row) {
             const auto item=LayoutItem(state,LayoutRowVisual(state,row,p));
-            Rect(item.icon,Between(before[size_t(row)].icon,destination[size_t(row)].icon,p),
+            SceneMorphPath{before[size_t(row)].icon,destination[size_t(row)].icon}.CheckAt(item.icon,p,
                 "icon departed from the direct path between settled endpoints");
+            coverage.Record(ViewMorphPart::Icon);
             TextAnchorPath(item,before[size_t(row)],destination[size_t(row)],p);
+            coverage.Record(ViewMorphPart::Text);
         }
         // Reverse while mid-flight: the next snapshot starts at the current
         // pose, including component geometry, not either settled endpoint.
@@ -92,8 +121,152 @@ static void TestViewMorphGeometry(UINT dpi) {
         Check(!snapshot.oldViewport.empty() && snapshot.oldViewport.front().shaped,
             "directory snapshot discarded an interrupted component morph");
     }
+    coverage.Require(kItemMorphAssertions);
     g_writeFactory.Reset();
     std::cout<<"PASS: bidirectional icon/name paths, wide list to grid, multi-column identities and reversal snapshots\n";
+}
+
+static void TestViewMorphScrollbars() {
+    using namespace ViewTransitionRegression;
+    StyleFixture::Session style; StyleFixture::dpi=96; Fonts();
+    OptionEffects::Settings settings;
+    ThemeRegression::Load(settings,LR"(<theme>
+        <element name="DrawScrollbar:thumb" background="#ff0000" />
+        <element name="DrawScrollbar:track" background="#00ff00" />
+    </theme>)");
+    g_autoRefitColumns=false;
+    g_scrollbar=true;
+    SceneMorphCoverage coverage;
+    for(bool rtl : {false,true}) {
+        Regression::Scope scope(rtl ? "scrollbar morph RTL" : "scrollbar morph LTR");
+        PresentationFixture::Tab tab(L"scrollbar morph",64,rtl,false,false,640,420);
+        auto& state=tab.state;
+        FocusFixture::Session focus(tab.frame,state.hwnd);
+        AnimationClockFixture::Freeze clock;
+        state.selectedFlags.Fill(0);
+        state.columns[0].width=950;
+        state.graphicsReady=true;
+        UpdateColumns(state);
+        const auto before=PresentedScrollbars(state);
+        Check(before[0].usable && before[1].usable,"Details fixture must overflow on both axes");
+        ApplyViewLayout(state,{FVM_ICON,96},true,true);
+        Check(state.rowTransitionActive && state.columnModeTransition,"fixture failed to start both scene transitions");
+
+        PresentationFixture::Tab settled(L"settled grid",64,rtl,true,false,640,420);
+        ApplyViewLayout(settled.state,{FVM_ICON,96},false);
+        const auto after=PresentedScrollbars(settled.state);
+        Check(after[0].usable && !after[1].usable &&
+            fabs(before[0].thumbLength-after[0].thumbLength)>5.f,"grid fixture must resize the vertical thumb");
+        const auto track=[](const ScrollbarGeometry& bar) {
+            return D2D1::RectF(bar.left,bar.top,bar.right,bar.bottom);
+        };
+        const auto thumb=[](const ScrollbarGeometry& bar) {
+            return bar.axis==ScrollAxis::Horizontal ?
+                D2D1::RectF(bar.thumbStart,bar.top,bar.thumbStart+bar.thumbLength,bar.bottom) :
+                D2D1::RectF(bar.left,bar.thumbStart,bar.right,bar.thumbStart+bar.thumbLength);
+        };
+        auto horizontalEnd=before[1];
+        horizontalEnd.top=horizontalEnd.bottom;
+        const std::array paths{
+            SceneMorphPath{track(before[0]),track(after[0])}, SceneMorphPath{thumb(before[0]),thumb(after[0])},
+            SceneMorphPath{track(before[1]),track(horizontalEnd)}, SceneMorphPath{thumb(before[1]),thumb(horizontalEnd)}};
+        const auto check=[&](const std::array<ScrollbarGeometry,2>& bars,float progress) {
+            paths[0].CheckAt(track(bars[0]),progress,"vertical track scene path");
+            paths[1].CheckAt(thumb(bars[0]),progress,"vertical thumb scene path");
+            paths[2].CheckAt(track(bars[1]),progress,"horizontal track scene path");
+            paths[3].CheckAt(thumb(bars[1]),progress,"horizontal thumb scene path");
+            coverage.Record(ViewMorphPart::VerticalTrack);
+            coverage.Record(ViewMorphPart::VerticalThumb);
+            coverage.Record(ViewMorphPart::HorizontalTrack);
+            coverage.Record(ViewMorphPart::HorizontalThumb);
+        };
+        state.rowTransitionStartedQpc=AnimationClockFixture::instant;
+        for(double time : {0.,.1,.2,.4}) {
+            AdvanceClock(state.rowTransitionStartedQpc,time);
+            check(PresentedScrollbars(state),float(1.-std::pow(1.-time,3.)));
+        }
+        // Check the complete paint path on the presentation replica. The
+        // themed track is green and the thumb red, so a handoff that paints
+        // the settled bar instead of the sampled one cannot pass on geometry alone.
+        AdvanceClock(state.rowTransitionStartedQpc,.1);
+        TouchInputTest::RenderedTouch output;
+        const auto pixels=output.Capture(state);
+        const auto size=output.renderer.backbuffer->GetPixelSize();
+        const float progress=float(1.-std::pow(.9,3.));
+        const auto pixel=[&](D2D1_POINT_2F point,unsigned channel) {
+            const int x=int(rtl ? float(size.width)-point.x : point.x),y=int(point.y);
+            const size_t index=(size_t(y)*size.width+x)*4;
+            Check(pixels.at(index+channel)>128 &&
+                pixels.at(index+(channel==2 ? 1 : 2))<32 && pixels.at(index)<32,
+                "paint did not use the sampled scrollbar track or thumb");
+        };
+        for(int axis : {0,1}) {
+            const auto t=Between(paths[axis*2].from,paths[axis*2].to,progress);
+            const auto b=Between(paths[axis*2+1].from,paths[axis*2+1].to,progress);
+            pixel(D2D1::Point2F((b.left+b.right)*.5f,(b.top+b.bottom)*.5f),2);
+            pixel(axis==0 ? D2D1::Point2F((t.left+t.right)*.5f,(b.bottom+t.bottom)*.5f) :
+                D2D1::Point2F((b.right+t.right)*.5f,(t.top+t.bottom)*.5f),1);
+        }
+
+        AdvanceClock(state.rowTransitionStartedQpc,.4);
+        const auto interrupted=PresentedScrollbars(state);
+        ApplyViewLayout(state,{FVM_DETAILS,96},true,true);
+        const auto resumed=PresentedScrollbars(state);
+        for(int axis : {0,1}) {
+            Check(resumed[axis].usable,"reversal dropped a visible scrollbar");
+            Rect(track(resumed[axis]),track(interrupted[axis]),"reversed scrollbar track jumped");
+            Rect(thumb(resumed[axis]),thumb(interrupted[axis]),"reversed scrollbar thumb jumped");
+        }
+        FinishColumnTransition(state);
+        StopRowTransition(state);
+        const auto finalBars=PresentedScrollbars(state);
+        for(int axis : {0,1}) {
+            Check(finalBars[axis].usable,"reversed scene did not restore the Details scrollbar");
+            Rect(track(finalBars[axis]),track(before[axis]),"reversed scene track endpoint");
+            Rect(thumb(finalBars[axis]),thumb(before[axis]),"reversed scene thumb endpoint");
+        }
+    }
+    // Sample the shared row pose used by selection/hover and the separate
+    // group-heading pose against settled layouts. The group title is not
+    // part of the item's atlas.
+    {
+        PresentationFixture::Tab grouped(L"grouped scene source",64,false,false,true,640,420);
+        PresentationFixture::Tab settled(L"grouped scene destination",64,false,true,true,640,420);
+        auto& state=grouped.state;
+        AnimationClockFixture::Freeze clock;
+        ApplyViewLayout(settled.state,{FVM_ICON,96},false);
+        const auto band=[](const RowVisual& visual) {
+            return D2D1::RectF(visual.left,visual.top,visual.left+visual.width,visual.top+visual.height);
+        };
+        auto feedbackFrom=LayoutRowVisual(state,1,1.f);
+        feedbackFrom.width=640.f; // List feedback spans the source client.
+        const auto headingFrom=LayoutGroupHeader(state,0,1.f,false);
+        state.graphicsReady=true;
+        const float headerFrom=state.headerPx;
+        ApplyViewLayout(state,{FVM_ICON,96},true,true);
+        Check(state.rowTransitionActive && state.columnModeTransition,
+            "grouped fixture did not start a view morph");
+        constexpr double time=.25;
+        const float p=float(1.-std::pow(1.-time,3.));
+        AdvanceClock(state.columnTransitionStartedQpc,time);
+        AdvanceColumnTransition(state);
+        Near(state.headerPx,headerFrom*(1.f-p),"column header snapped instead of following the shared curve");
+        coverage.Record(ViewMorphPart::ColumnHeader);
+        FinishColumnTransition(state);
+        const auto feedbackTo=LayoutRowVisual(settled.state,1,1.f);
+        const auto headingTo=LayoutGroupHeader(settled.state,0,1.f,false);
+        Check(feedbackFrom.top!=feedbackTo.top && headingFrom.height!=headingTo.height,
+            "grouped fixture did not move its feedback and heading");
+        const auto feedback=LayoutRowVisual(state,1,p);
+        const auto heading=LayoutGroupHeader(state,0,p,false);
+        SceneMorphPath{band(feedbackFrom),band(feedbackTo)}.CheckAt(band(feedback),p,"row feedback scene path");
+        Near(feedback.opacity,1.f,"surviving row feedback changed opacity");
+        coverage.Record(ViewMorphPart::RowFeedback);
+        SceneMorphPath{band(headingFrom),band(headingTo)}.CheckAt(band(heading),p,"group heading scene path");
+        Near(heading.opacity,1.f,"surviving group heading changed opacity");
+        coverage.Record(ViewMorphPart::GroupHeading);
+    }
+    coverage.Require(kChromeMorphAssertions);
 }
 
 // No device, pixel readback, queued input or real-time deadline is involved.
@@ -161,6 +334,67 @@ static void TestViewMorphTextAnchors() {
     }
     g_writeFactory.Reset();
     std::cout<<"PASS: deterministic text anchors, frozen local ink metrics, RTL, DPI and interrupted view morphs\n";
+}
+
+static void TestDeepGridPinchMorph() {
+    using namespace ViewTransitionRegression;
+    StyleFixture::Session style; StyleFixture::dpi=96; Fonts();
+    for(bool selected : {false,true}) {
+        Regression::Scope scope(selected ? "selected deep pinch anchor" : "deep pinch anchor");
+        PresentationFixture::Tab tab(L"deep pinch",17045,false,true,false,760,640);
+        auto& state=tab.state;
+        FocusFixture::Session focus(tab.frame,state.hwnd);
+        AnimationClockFixture::Freeze clock;
+        constexpr int index=5001;
+        state.selectedFlags.Fill(0);
+        state.selected=-1;
+        ApplyRowHeight(state,210.);
+        AdvanceRowHeight(state,true);
+        Check(state.itemsPerRow==3,"deep grid fixture did not start with three columns");
+        state.scrollNow=state.scrollTarget=DocumentRowTop(state,index)-24.f;
+        ClampScroll(state);
+        if(selected) {state.selected=index; state.selectedFlags[index]=1;}
+        const auto original=LayoutRowVisual(state,index,1.f);
+        const POINT contact{
+            LONG(ListStartX(state)+original.left+original.width*.5f),
+            LONG(original.top+original.height*.5f)};
+        const auto icon=[&](float progress) {return LayoutItem(state,LayoutRowVisual(state,index,progress)).icon;};
+        const auto source=icon(1.f);
+        ApplyManipulationPinch(state,0.f,&contact);
+        const auto pinchTo=[&](double height) {
+            ApplyManipulationPinch(state,float(std::log(height/state.touchpadPinchHeight96)),&contact);
+        };
+        pinchTo(300.);
+        Check(state.itemsPerRow==2 && state.rowTransitionActive && state.reflowLayoutTransition,
+            "deep pinch snapped from three columns to two");
+        const auto revision=state.rowSceneRevision;
+        state.rowTransitionStartedQpc=AnimationClockFixture::instant;
+        const auto start=icon(0.f);
+        Near(start.top,source.top,
+            "first morph frame lost the original icon top");
+        const float before=state.scrollNow;
+        pinchTo(309.);
+        Check(state.itemsPerRow==2 && state.rowSceneRevision==revision &&
+            fabsf(state.scrollNow-before)>640.f,
+            "fixture did not move document coordinates by more than a viewport without repacking");
+        const auto retained=icon(0.f);
+        Near(retained.top,start.top,
+            "resizing a deep grid translated the previous morph pose out of the viewport");
+        AdvanceClock(state.rowTransitionStartedQpc,.15);
+        constexpr float progress=1.f-.85f*.85f*.85f;
+        const auto midway=icon(progress);
+        Check(midway.top<640.f && midway.bottom>0.f && midway.left>=0.f &&
+            LayoutRowVisual(state,index,progress).opacity==1.f,
+            "anchor icon disappeared during the live grid morph");
+        const auto beforeReverse=LayoutRowVisual(state,index,progress);
+        pinchTo(210.);
+        Check(state.itemsPerRow==3 && state.rowTransitionActive && state.rowSceneRevision!=revision,
+            "deep pinch snapped during reversal");
+        const auto reversed=LayoutRowVisual(state,index,0.f);
+        Near(reversed.top,beforeReverse.top,"grid reversal discarded its visible starting pose");
+        Near(reversed.left,beforeReverse.left,"grid reversal discarded its visible column position");
+    }
+    g_writeFactory.Reset();
 }
 
 static void TestFractionalTouchZoom(UINT dpi) {
