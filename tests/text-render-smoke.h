@@ -187,7 +187,7 @@ static void TestTextRaster(State& state) {
                 Check(layout!=nullptr,"filename trimming layout");
                 DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
                 Check(SUCCEEDED(layout->GetTrimming(&trimming,&sign)) &&
-                    (trimming.delimiterCount>0)==(expected && !gridMode) &&
+                    trimming.delimiterCount==0 &&
                     state.textLayouts[gridMode ? 3 : 0].layouts.at(name).middleTrim==expected,
                     "middle ellipsis dropdown did not follow its view scope");
                 DWRITE_HIT_TEST_METRICS runs[64]{}; UINT32 count=0;
@@ -200,6 +200,41 @@ static void TestTextRaster(State& state) {
                 if(suffixVisible!=expected) std::wcerr<<L"TRIM suffix grid="<<gridMode<<L" rtl="<<rtlMode
                     <<L" policy="<<static_cast<int>(policy)<<L" name="<<name<<L"\n";
                 Check(suffixVisible==expected,"filename ellipsis did not preserve the trailing text in the visible layout");
+                if (expected) {
+                    // The plain ASCII fixture has one cluster per letter. On
+                    // the last visible line, both ends must survive in pairs.
+                    const std::wstring probe=std::wstring(64,L'W')+std::wstring(40,L'i')+L".txt";
+                    auto* paired=ResolveTextLayout(state,probe,width,height,false,false,nullptr,gridMode,true);
+                    Check(paired!=nullptr,"paired filename layout");
+                    DWRITE_TEXT_RANGE range{};
+                    ComPtr<IDWriteInlineObject> mark;
+                    Check(SUCCEEDED(paired->GetInlineObject(64,&mark,&range)) && mark,
+                        "expected an inline ellipsis in the omitted middle");
+                    UINT32 start=0;
+                    if (gridMode) {
+                        ComPtr<IDWriteTextLayout> original;
+                        Check(SUCCEEDED(g_writeFactory->CreateTextLayout(probe.c_str(),UINT32(probe.size()),
+                            state.textLayouts[3].format.Get(),paired->GetMaxWidth(),100000.f,&original)) &&
+                            SUCCEEDED(original->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)),
+                            "unclipped reference for wrapped filename");
+                        DWRITE_TRIMMING none{DWRITE_TRIMMING_GRANULARITY_NONE,0,0};
+                        Check(SUCCEEDED(original->SetTrimming(&none,nullptr)), "reference trimming disabled");
+                        DWRITE_LINE_METRICS lines[64]{}; UINT32 count=0;
+                        Check(SUCCEEDED(original->GetLineMetrics(lines,ARRAYSIZE(lines),&count)) && count,
+                            "unclipped filename line metrics");
+                        float bottom=lines[0].height;
+                        for (UINT32 i=1;i<count && bottom+lines[i].height<=paired->GetMaxHeight()+.1f;++i) {
+                            start+=lines[i-1].length;
+                            bottom+=lines[i].height;
+                        }
+                    }
+                    const auto tail=probe.size()-range.startPosition-range.length;
+                    if (!(tail>4 && range.startPosition==start+tail))
+                        std::cout<<"PAIR grid="<<gridMode<<" rtl="<<rtlMode<<" lineStart="<<start
+                            <<" cut="<<range.startPosition<<" tail="<<tail<<std::endl;
+                    Check(tail>4 && range.startPosition-start==tail,
+                        "middle trimming must keep paired clusters including the basename suffix");
+                }
                 Check(layout==ResolveTextLayout(state,name,130,40,false,false,nullptr,gridMode,true),
                     "unchanged filename trimming rebuilt its shaped text");
                 const auto first=capture(name,true,gridMode,130,0xFFFFFF,1,false,true);

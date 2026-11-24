@@ -822,12 +822,31 @@ static void TestCreatedItemRename(const std::wstring& fixture) {
         }
         if (opened && route == Route::Grouped) {
             // Toggling the item's section is input outside the field: it commits.
-            SetWindowTextW(state.rename.editor, L"toggled");
-            ToggleGroupSection(state, state.rowGroup[size_t(state.rename.index)]);
-            const bool committed = !state.rename.editor &&
-                Eventually([&] { Pump(host); return std::filesystem::exists(root / L"toggled"); }, 15000);
-            if (!committed) std::wcout << L"  section toggle did not commit the field" << std::endl;
-            failed |= !committed;
+            // Creation can expose the editor before the grouped directory result
+            // publishes its heading. A real click needs a heading for this item.
+            const auto createdPath=(root/createdName).wstring();
+            int group=-1;
+            Check(Eventually([&] {
+                Pump(host);
+                const int index=state.rename.index;
+                if (!RenameSessionValid(state) || state.rename.path!=createdPath ||
+                    size_t(index)>=state.rowGroup.size()) return false;
+                group=state.rowGroup[size_t(index)];
+                if (group<0 || size_t(group)>=state.sections.size()) return false;
+                const auto& section=state.sections[size_t(group)];
+                return section.first<=index && index<section.end;
+            },15000),"created folder did not acquire a group heading while its rename field was open");
+            Check(SetWindowTextW(state.rename.editor,L"toggled"),"set grouped rename field text");
+            ToggleGroupSection(state,group);
+            Check(!state.rename.editor,"section toggle left the created folder's rename field open");
+            const bool committed=Eventually([&] {
+                Pump(host); return std::filesystem::is_directory(root/L"toggled") &&
+                    !std::filesystem::exists(root/createdName);
+            },15000);
+            if (!committed) std::wcout << L"  grouped rename missing on disk: original=" << createdPath
+                << L" originalExists=" << std::filesystem::exists(createdPath)
+                << L" directoryPending=" << state.directoryPending << std::endl;
+            Check(committed,"group heading closed the rename field but the folder rename did not reach disk");
         }
         CancelRename(state);
         for (int i = 0; i < 4; ++i) Pump(host);
@@ -1219,7 +1238,7 @@ static void CheckRenameVacatedPixels(const std::filesystem::path& root) {
     const auto paintGround = [&] {
         const HDC dc = GetDCEx(host.frame, nullptr, DCX_CACHE);
         const HBRUSH brush = CreateSolidBrush(ground);
-        FillRect(dc, &view, brush);
+        Check(dc && brush && FillRect(dc, &view, brush) && GdiFlush(), "paint rename fixture background");
         DeleteObject(brush); ReleaseDC(host.frame, dc);
     };
     const auto foreign = [&](const RECT& area) {
@@ -1230,8 +1249,9 @@ static void CheckRenameVacatedPixels(const std::filesystem::path& root) {
         const HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
         const HDC memory = CreateCompatibleDC(dc);
         const HGDIOBJ previous = SelectObject(memory, bitmap);
-        BitBlt(memory, 0, 0, w, h, dc, area.left, area.top, SRCCOPY);
-        GdiFlush();
+        Check(dc && bitmap && bits && memory && previous &&
+            BitBlt(memory, 0, 0, w, h, dc, area.left, area.top, SRCCOPY) && GdiFlush(),
+            "capture rename fixture background");
         const DWORD expected = (DWORD(GetRValue(ground)) << 16) | (DWORD(GetGValue(ground)) << 8) | GetBValue(ground);
         size_t count = 0;
         for (int i = 0; bits && i < w * h; ++i) count += (static_cast<const DWORD*>(bits)[i] & 0xFFFFFF) != expected;
@@ -1239,6 +1259,7 @@ static void CheckRenameVacatedPixels(const std::filesystem::path& root) {
         return count;
     };
     const auto open = [&] {
+        RedrawWindow(host.frame,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW);
         paintGround();
         Check(foreign(view) == 0, "the frame surface under the view could not be read back");
         state.selectedFlags.Fill(0); state.selectedFlags[0] = 1; state.selected = state.anchor = 0;

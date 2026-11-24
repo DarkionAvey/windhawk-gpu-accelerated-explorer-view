@@ -55,13 +55,8 @@ void Selection(const std::wstring& fixture) {
         return selected;
     };
     const auto pump=[&] {
-        MSG message{};
-        // The real overlay receives every selection notification; dropping
-        // these left a native selection change unimported whenever the
-        // faster path lost a race under load.
-        for(UINT selectionMessage:{kMsgAdoptNativeSelectAll,kMsgNativeSelectionChanged,kMsgShellSelectionEvent})
-            while(PeekMessageW(&message,state.hwnd,selectionMessage,selectionMessage,PM_REMOVE))
-                OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
+        // The subclass above handles selection notifications. Dispatch in queue order
+        // so a selection echo cannot jump ahead of directory or worker completion.
         browser.Pump();
         ReceiveDirectoryResults(state);
         ConsumePresentation(state);
@@ -209,6 +204,10 @@ void Selection(const std::wstring& fixture) {
             std::cout<<"CHECKBOX membership timeout expected="<<total<<","<<check<<" actual="<<state.total<<","<<HeaderSelectionCheckboxState(state)
                 <<" native="<<nativeTotal<<" selected="<<count()<<" gpu-selected="<<std::count(state.selectedFlags.begin(),state.selectedFlags.end(),1)
                 <<" pending="<<state.checkboxHeaderActionPending<<" directory="<<state.directoryPending<<" watch="<<state.watchedChangePending
+                <<" prepared="<<state.pendingNativeSelection<<" unsafe="<<state.nativeSelectionUnsafe
+                <<" import="<<state.nativeSelectionImportPending<<" queued="<<state.nativeSelectionMessageQueued
+                <<" recovery="<<state.nativeSelectionRecoveryPending<<" summary="<<state.checkboxSummaryTotal
+                <<" shares="<<state.checkboxSelection.SharesStorage(state.selectedFlags)
                 <<" policy="<<state.clickPolicy.checkSelect<<" visible="<<state.visible<<std::endl;
             for(const auto& line:selectionLog) std::wcout<<L"CHECKBOX LOG "<<line<<L'\n';
         }

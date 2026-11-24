@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.9
+// @version         1.1.10
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -83,7 +83,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $description: Dim the names of files that begin with a dot.
     - middleEllipsis: gridOnly
       $name: Ellipsis in the middle of filenames
-      $description: Preserve the end of a shortened filename, including its extension.
+      $description: Show the beginning and end of a shortened filename.
       $options:
         - gridOnly: Only in grid view
         - alwaysOn: Always on
@@ -17038,32 +17038,6 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
             layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         }
-        if (middleTrim && !wrapped && text.size() > 1) {
-            // Native trimming retains the suffix without rewriting the name,
-            // so search hit tests, selection and shaping keep original indices.
-            // Preserve an extension; extensionless/leading-dot names retain
-            // up to eight trailing characters instead. Work runs once per shape.
-            size_t suffix = text.find_last_of(L'.');
-            if (suffix == std::wstring::npos || !suffix || suffix+1 == text.size())
-                suffix = text.size()-std::min<size_t>(8,std::max<size_t>(1,text.size()/3));
-            if ((text[suffix] & 0xFC00) == 0xDC00 && suffix) --suffix;
-            const auto scalar = [&](size_t position) -> UINT32 {
-                const UINT32 first = text[position];
-                return (first & 0xFC00) == 0xD800 && position+1 < text.size() &&
-                    (text[position+1] & 0xFC00) == 0xDC00 ?
-                    0x10000+((first-0xD800)<<10)+(text[position+1]-0xDC00) : first;
-            };
-            DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
-            if (SUCCEEDED(layout->GetTrimming(&trimming,&sign))) {
-                trimming.delimiter = scalar(suffix); trimming.delimiterCount = 0;
-                for (size_t i=suffix;i<text.size();) {
-                    const UINT32 codepoint = scalar(i);
-                    if (codepoint == trimming.delimiter) ++trimming.delimiterCount;
-                    i += codepoint > 0xFFFF ? 2 : 1;
-                }
-                layout->SetTrimming(&trimming,sign.Get());
-            }
-        }
         if (it == cache.layouts.end()) {
             TrimShapedLayouts(state);
             cache.recent.push_front(nullptr);
@@ -17109,57 +17083,53 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         layout.filenameSelectionReady = false;
         geometryChanged = true;
     }
-    if (wrapped && middleTrim && geometryChanged && text.size() > 1) {
-        // DirectWrite's delimiter trimming is single-line. For wrapped labels,
-        // replace the omitted range with its standard inline ellipsis instead.
-        // Original UTF-16 indices survive; fit once per geometry, using shaped
-        // clusters/line breaks rather than repeated substring measurements.
+    if (middleTrim && geometryChanged && text.size() > 1) {
+        // Dolphin's middle mode delegates to Qt::ElideMiddle: consume one unit
+        // from each end per step. Use DirectWrite shaped clusters and retain
+        // original indices for selection, search highlighting and hit testing.
         DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
         layout.text->GetTrimming(&trimming,&sign);
         layout.text->SetInlineObject(nullptr,{0,static_cast<UINT32>(text.size())});
         DWRITE_TRIMMING untrimmed{DWRITE_TRIMMING_GRANULARITY_NONE,0,0};
         layout.text->SetTrimming(&untrimmed,nullptr);
-        UINT32 count=0;
-        layout.text->GetLineMetrics(nullptr,0,&count);
-        std::vector<DWRITE_LINE_METRICS> lines(count);
-        if (count && SUCCEEDED(layout.text->GetLineMetrics(lines.data(),count,&count))) {
-            float bottom=0; UINT32 start=0; size_t visible=0;
-            while (visible<lines.size() && bottom+lines[visible].height<=height+.1f) {
-                bottom+=lines[visible].height; start+=lines[visible++].length;
+        UINT32 lineStart=0;
+        bool fit=!wrapped;
+        if (wrapped) {
+            UINT32 count=0;
+            layout.text->GetLineMetrics(nullptr,0,&count);
+            std::vector<DWRITE_LINE_METRICS> lines(count);
+            if (count && SUCCEEDED(layout.text->GetLineMetrics(lines.data(),count,&count))) {
+                float bottom=0;
+                UINT32 start=0;
+                for (UINT32 i=0;i<count && bottom+lines[i].height<=height+.1f;++i) {
+                    lineStart=start;
+                    start+=lines[i].length;
+                    bottom+=lines[i].height;
+                    fit=i+1<count;
+                }
             }
-            if (visible && visible<lines.size() && sign) {
-                const UINT32 lineStart=start-lines[visible-1].length;
-                size_t suffix=text.find_last_of(L'.');
-                if (suffix==std::wstring::npos || !suffix || suffix+1==text.size())
-                    suffix=text.size()-std::min<size_t>(8,std::max<size_t>(1,text.size()/3));
-                UINT32 clustersCount=0;
-                layout.text->GetClusterMetrics(nullptr,0,&clustersCount);
-                std::vector<DWRITE_CLUSTER_METRICS> clusters(clustersCount);
-                DWRITE_INLINE_OBJECT_METRICS ellipsis{};
-                if (clustersCount && SUCCEEDED(sign->GetMetrics(&ellipsis)) &&
-                    SUCCEEDED(layout.text->GetClusterMetrics(clusters.data(),clustersCount,&clustersCount))) {
-                    size_t first=0,tail=0; UINT32 position=0;
-                    for(size_t i=0;i<clusters.size();++i) {
-                        if(position<lineStart) first=i+1;
-                        if(position<suffix) tail=i+1;
-                        position+=clusters[i].length;
+        }
+        if (fit && sign) {
+            UINT32 count=0;
+            layout.text->GetClusterMetrics(nullptr,0,&count);
+            std::vector<DWRITE_CLUSTER_METRICS> clusters(count);
+            DWRITE_INLINE_OBJECT_METRICS mark{};
+            if (count && SUCCEEDED(sign->GetMetrics(&mark)) &&
+                SUCCEEDED(layout.text->GetClusterMetrics(clusters.data(),count,&count))) {
+                UINT32 left=0, right=count, begin=0, end=static_cast<UINT32>(text.size());
+                while (left<right && begin<lineStart) begin+=clusters[left++].length;
+                float total=0;
+                for (UINT32 i=left;i<right;++i) total+=clusters[i].width;
+                if (total>width || wrapped) {
+                    float used=mark.width;
+                    while (right-left>2) {
+                        used+=clusters[left].width+clusters[right-1].width;
+                        if (used>=width) break;
+                        begin+=clusters[left++].length;
+                        end-=clusters[--right].length;
                     }
-                    tail=std::min(tail,clusters.size()-1);
-                    float tailWidth=0;
-                    for(size_t i=tail;i<clusters.size();++i) tailWidth+=clusters[i].width;
-                    while(tail+1<clusters.size() && tailWidth+ellipsis.width>width)
-                        tailWidth-=clusters[tail++].width;
-                    UINT32 cut=0,tailPosition=0; float used=0;
-                    for(size_t i=0;i<tail;++i) {
-                        if(i<first || used+clusters[i].width+ellipsis.width+tailWidth<=width) {
-                            cut+=clusters[i].length;
-                            if(i>=first) used+=clusters[i].width;
-                        } else break;
-                    }
-                    // Compute suffix identity independently of the fitted prefix.
-                    for(size_t i=0;i<tail;++i) tailPosition+=clusters[i].length;
-                    if(cut<tailPosition && tailWidth+ellipsis.width<=width)
-                        layout.text->SetInlineObject(sign.Get(),{cut,tailPosition-cut});
+                    if (begin<end && mark.width<=width)
+                        layout.text->SetInlineObject(sign.Get(),{begin,end-begin});
                 }
             }
         }

@@ -183,9 +183,14 @@ static void ItemTipScenario(const std::wstring& directory) {
     Check(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
         reinterpret_cast<IUnknown**>(g_writeFactory.ReleaseAndGetAddressOf()))), "item tip fonts");
     Check(RegisterItemTipClass(OverlayModuleInstance()), "item tip window class");
-    // An on-monitor view, so placement below the cursor is not clamped.
+    // Keep the hover anchor away from both horizontal edges (LTR and RTL)
+    // and near the top so the below-cursor assertion exercises that branch.
+    MONITORINFO placementMonitor{sizeof(placementMonitor)};
+    Check(GetMonitorInfoW(MonitorFromPoint(POINT{},MONITOR_DEFAULTTOPRIMARY), &placementMonitor),
+        "tooltip fixture monitor");
+    const RECT work=placementMonitor.rcWork;
     const HWND view = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"private item tip view",
-        WS_POPUP | WS_VISIBLE, 700, 200, 600, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        WS_POPUP | WS_VISIBLE, work.left+(work.right-work.left)/2-40, work.top, 600, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     Check(view != nullptr, "item tip view");
     {
     ViewState state;
