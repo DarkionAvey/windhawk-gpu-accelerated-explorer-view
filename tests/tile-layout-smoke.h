@@ -129,12 +129,15 @@ static void TestContentLayout(const std::wstring& directory) {
         const auto list = LayoutItem(state, LayoutRowVisual(state, 0, 1.f));
         const float listRow = state.rowPx;
         // Entering Content zooms from the presented list row: no jump.
-        ApplyViewLayout(state, {FVM_CONTENT, 32}, true, true);
-        Check(state.zoomAnimating && !state.gridView && !state.columnsView, "List to Content did not animate");
-        const auto start = LayoutItem(state, LayoutRowVisual(state, 0, 1.f));
-        Check(std::fabs(state.rowPx - listRow) < .5f && std::fabs(start.text.top - list.text.top) < .5f &&
-            std::fabs(start.icon.top - list.icon.top) < .5f && ContentReveal(state) < .05f,
-            "List to Content jumped instead of starting from the list layout");
+        {
+            AnimationClockFixture::Freeze clock;
+            ApplyViewLayout(state, {FVM_CONTENT, 32}, true, true);
+            Check(state.zoomAnimating && !state.gridView && !state.columnsView, "List to Content did not animate");
+            const auto start = LayoutItem(state, LayoutRowVisual(state, 0, 1.f));
+            Check(std::fabs(state.rowPx - listRow) < .5f && std::fabs(start.text.top - list.text.top) < .5f &&
+                std::fabs(start.icon.top - list.icon.top) < .5f && ContentReveal(state) < .05f,
+                "List to Content jumped instead of starting from the list layout");
+        }
         AdvanceRowHeight(state, true);
         Check(!state.zoomAnimating && ContentReveal(state) == 1.f && state.rowPx > listRow,
             "List to Content did not settle on taller Content rows");
@@ -164,9 +167,12 @@ static void TestContentLayout(const std::wstring& directory) {
         // Leaving for Details zooms back from Content and requests columns.
         const float contentRow = state.rowPx;
         const auto epoch = state.columnEpoch;
-        ApplyViewLayout(state, {FVM_DETAILS, 16}, true, true);
-        Check(state.zoomAnimating && state.columnsView && std::fabs(state.rowPx - contentRow) < .5f &&
-            ContentReveal(state) > .95f, "Content to Details did not start from the Content layout");
+        {
+            AnimationClockFixture::Freeze clock;
+            ApplyViewLayout(state, {FVM_DETAILS, 16}, true, true);
+            Check(state.zoomAnimating && state.columnsView && std::fabs(state.rowPx - contentRow) < .5f &&
+                ContentReveal(state) > .95f, "Content to Details did not start from the Content layout");
+        }
         Check(state.columnEpoch != epoch, "leaving Content kept content-complete rows for Details columns");
         AdvanceRowHeight(state, true); FinishColumnTransition(state);
         Check(!state.zoomAnimating && ContentReveal(state) == 0.f && state.rowPx < contentRow,

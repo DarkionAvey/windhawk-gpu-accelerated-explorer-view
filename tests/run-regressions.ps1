@@ -42,6 +42,7 @@ try {
     if ($ProgressAction) { & $ProgressAction 'Checking execution environment and Windhawk injection...' }
     Assert-RegressionExecutionContext
     Assert-NoModuleInjection # Before compiling: an injected engine invalidates every result.
+    Assert-ShellHookRegistration # Explorer rename needs DLL-backed hooks; a broken session invalidates rename results.
     if ($ProgressAction) { & $ProgressAction 'Locating the compiler and preparing binaries...' }
     $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
     $compilerDirectory = Join-Path $WindhawkDirectory 'Compiler'

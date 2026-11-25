@@ -209,6 +209,8 @@ static void TestThemedColumnHeader() {
             state.rowPx!=initialRow,"auto header height did not follow zoom");
         checkFont(state.fontPx);
         const int bottom=int(state.headerPx), thickness=int(std::round(1.5*dpi/96.0));
+        OffscreenPalette palette;
+        palette.Resolve(state);
         const auto light=output.Capture(state);
         const auto pixels=[&](const auto& frame,int x,int y) {
             const auto width=output.renderer.backbuffer->GetPixelSize().width;
@@ -240,6 +242,7 @@ static void TestThemedColumnHeader() {
         };
         checkVertical(light,false);
         state.themeMode=Theme::Mode::Dark;
+        palette.Resolve(state);
         const auto dark=output.Capture(state);
         checkVertical(dark,true);
         Check(pixels(dark,4,bottom-1)==std::array<unsigned,4>{},

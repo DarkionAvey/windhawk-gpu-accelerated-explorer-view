@@ -2206,3 +2206,96 @@ static void TestTouchInput(const std::wstring& fixture) {
     g_touchpadSwipeNavigation=swipe; g_smooth=smooth; g_scrollbar=bars; g_writeFactory=savedWrite;
     std::cout<<"PASS: real Windows recognizer -> marquee GPU pixels before list focus and straight drags; no metric/pixel jump at pinch recognition, proportional post-threshold span scaling; six double-tap cycles, held native promotion waits for mouse delivery and cancels safely (OLE handoff requires hardware), 1/2/3/5-finger vertical pan, staggered swipes, contact replacement, fitting-directory marquee, capture/contact changes, two-finger column/history edges, grouped LTR/RTL pinch at 3 DPIs, coalesced frames, inertia and animated scrollbars; independent contexts\n";
 }
+
+// The adaptive contact smoothing ahead of every touch consumer
+// (SmoothTouchContacts). Real numbers through the production filter: no
+// window, no recognizer, no synthesized messages.
+static void TestTouchSmoothing() {
+    constexpr double kQpc = 10'000'000.;  // 100 ns ticks
+    constexpr UINT64 kStep = 70'000;      // 7 ms between reports (~144 Hz)
+    TouchContactFilters filters;
+    UINT64 clock = 1'000'000;
+    auto contact = [&](UINT32 id, POINTER_FLAGS flags, LONG x, LONG y) {
+        POINTER_INFO p{};
+        p.pointerType = PT_TOUCH; p.pointerId = id; p.pointerFlags = flags;
+        p.ptPixelLocation = {x, y}; p.ptHimetricLocation = {x * 26, y * 26};
+        p.PerformanceCount = clock;
+        return p;
+    };
+    const POINTER_FLAGS move = POINTER_FLAG_UPDATE | POINTER_FLAG_INCONTACT | POINTER_FLAG_INRANGE;
+    {
+        Regression::Scope scope("first contact");
+        // The crash this guards: the first DOWN must create its filter, and stays raw.
+        auto down = contact(1, POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT | POINTER_FLAG_INRANGE, 100, 100);
+        SmoothTouchContacts(filters, &down, 1, kQpc, 96);
+        Check(filters.size() == 1 && filters[0].id == 1, "touch DOWN did not create its contact filter");
+        Check(down.ptPixelLocation.x == 100 && down.ptPixelLocation.y == 100, "touch DOWN point was altered");
+    }
+    {
+        Regression::Scope scope("resting wobble");
+        LONG worst = 0;
+        for (int i = 0; i < 60; ++i) {
+            clock += kStep;
+            auto p = contact(1, move, 100 + (i % 2 ? 3 : -3), 100 + (i % 3 ? 2 : -2));
+            const LONG himetricBefore = p.ptHimetricLocation.x;
+            SmoothTouchContacts(filters, &p, 1, kQpc, 96);
+            worst = std::max({worst, std::abs(p.ptPixelLocation.x - 100), std::abs(p.ptPixelLocation.y - 100)});
+            Check(p.ptHimetricLocation.x == himetricBefore, "himetric moved without a known device mapping");
+        }
+        std::cout << "PROFILE: resting wobble +-3 px -> worst " << worst << " px\n";
+        Check(worst <= 1, "a resting finger's wobble reached the consumers");
+    }
+    {
+        Regression::Scope scope("coalesced sample");
+        auto p = contact(1, move, 140, 100);  // same timestamp as the last report
+        SmoothTouchContacts(filters, &p, 1, kQpc, 96);
+        Check(p.ptPixelLocation.x >= 100 && p.ptPixelLocation.x < 140,
+              "a zero-interval sample was taken as a flick (no smoothing) or overshot");
+    }
+    {
+        Regression::Scope scope("fast pan");
+        LONG raw = 100, shown = 100;
+        for (int i = 0; i < 30; ++i) {
+            clock += kStep; raw += 15;  // ~2 px/ms
+            auto p = contact(1, move, raw, 100);
+            SmoothTouchContacts(filters, &p, 1, kQpc, 96);
+            shown = p.ptPixelLocation.x;
+        }
+        std::cout << "PROFILE: fast pan lag " << (raw - shown) << " px\n";
+        Check(raw - shown <= 12 && shown <= raw, "a moving finger was held back (lag) or overshot");
+    }
+    {
+        Regression::Scope scope("lost UP and new contact");
+        clock += kStep;
+        auto down = contact(2, POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT | POINTER_FLAG_INRANGE, 300, 300);
+        SmoothTouchContacts(filters, &down, 1, kQpc, 96);
+        Check(filters.size() == 1 && filters[0].id == 2, "a contact whose UP never came kept its filter");
+        clock += kStep;
+        auto up = contact(2, POINTER_FLAG_UP, 300, 300);
+        SmoothTouchContacts(filters, &up, 1, kQpc, 96);
+        Check(filters.empty(), "UP did not release its contact filter");
+        clock += kStep;
+        auto tap = contact(3, POINTER_FLAG_DOWN | POINTER_FLAG_UP, 50, 50);
+        SmoothTouchContacts(filters, &tap, 1, kQpc, 96);
+        Check(filters.empty() && tap.ptPixelLocation.x == 50, "a DOWN+UP frame left a filter or moved the tap");
+    }
+    {
+        Regression::Scope scope("two contacts");
+        clock += kStep;
+        POINTER_INFO pair[2]{contact(4, POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT, 200, 200),
+                             contact(5, POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT, 400, 200)};
+        SmoothTouchContacts(filters, pair, 2, kQpc, 96);
+        for (int i = 0; i < 20; ++i) {
+            clock += kStep;
+            POINTER_INFO next[2]{contact(4, move, 200 - 10 * i, 200), contact(5, move, 400 + 10 * i, 200)};
+            SmoothTouchContacts(filters, next, 2, kQpc, 96);
+            Check(next[0].ptPixelLocation.x <= 200 && next[1].ptPixelLocation.x >= 400,
+                  "pinch contacts were mixed up");
+            Check(std::abs((200 - next[0].ptPixelLocation.x) - (next[1].ptPixelLocation.x - 400)) <= 1,
+                  "symmetric pinch contacts were smoothed differently");
+        }
+        Check(filters.size() == 2, "two contacts did not keep two filters");
+    }
+    std::cout << "PASS: touch smoothing: first contact, resting wobble, coalesced sample, fast pan lag, "
+                 "lost UP, DOWN+UP tap, symmetric pinch\n";
+}

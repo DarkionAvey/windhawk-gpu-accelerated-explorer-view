@@ -265,12 +265,21 @@ static void TestNativeMultipleRename(const std::wstring& fixture) {
             SUCCEEDED(SHParseDisplayName(probe.c_str(), nullptr, &folder, 0, nullptr)) &&
             SUCCEEDED(browser->BrowseToIDList(folder, SBSP_ABSOLUTE));
         CoTaskMemFree(folder);
-        renamed = renamed && Eventually([&] {
+        Check(renamed,"native rename control could not navigate to its private folder");
+        Check(Eventually([&] {
             pump(); int count = 0;
             return SUCCEEDED(browser->GetCurrentView(IID_PPV_ARGS(&view))) && view &&
                 SUCCEEDED(view->ItemCount(SVGIO_ALLVIEW, &count)) && count == 2;
-        }) && SUCCEEDED(view->SelectItem(0, SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_FOCUSED)) &&
-            SUCCEEDED(view->SelectItem(1, SVSI_SELECT)) && SUCCEEDED(view->DoRename());
+        }),"native rename control did not populate both items");
+        ComPtr<IShellView> shellView;
+        SetActiveWindow(frame);
+        Check(SUCCEEDED(view.As(&shellView)) && SUCCEEDED(shellView->UIActivate(SVUIA_ACTIVATE_FOCUS)),
+            "native rename control could not activate its Shell view");
+        Check(SUCCEEDED(view->SelectItem(0, SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_FOCUSED)) &&
+            SUCCEEDED(view->SelectItem(1, SVSI_SELECT)), "native rename control could not select the pair");
+        Check(Eventually([&] { pump(); int selected=0; return SUCCEEDED(view->ItemCount(SVGIO_SELECTION,&selected)) && selected==2; }),
+            "native rename control did not settle on both selected items");
+        Check(SUCCEEDED(view->DoRename()),"native rename control rejected DoRename");
         HWND editor = nullptr;
         renamed = renamed && Eventually([&] {
             pump();
@@ -283,7 +292,10 @@ static void TestNativeMultipleRename(const std::wstring& fixture) {
             }, reinterpret_cast<LPARAM>(&editor));
             return editor != nullptr;
         });
-        if (renamed) { SetWindowTextW(editor, L"x"); SetFocus(frame); }
+        Check(renamed,"native rename control did not show its edit window");
+        SetFocus(editor);
+        Check(GetFocus()==editor && SetWindowTextW(editor,L"x"),"native rename control could not edit the focused field");
+        SetFocus(frame);
         renamed = renamed && Eventually([&] {
             pump();
             const auto listing = Listing(probe);
@@ -294,8 +306,7 @@ static void TestNativeMultipleRename(const std::wstring& fixture) {
         if (browser) browser->Destroy();
         browser.Reset();
         if (frame) DestroyWindow(frame);
-        Check(renamed, "Explorer is stale: Windows' own multi-item rename also failed. Restart Explorer (or sign out), "
-            "check that renaming several files works in native Explorer, then rerun");
+        Check(renamed,"native rename control did not commit both files to disk");
     }
     const auto label = [](Commit commit) {
         return commit == Commit::Enter ? std::wstring(L"enter") : commit == Commit::Row ? L"row" : L"empty";
@@ -735,6 +746,13 @@ static void TestRenameTextMetrics(const std::wstring& fixture) {
 // production hook on it, the creation notification and the overlay do the rest.
 static void TestCreatedItemRename(const std::wstring& fixture) {
     using namespace ShellRenameFixture;
+    wchar_t desktop[256]{}; DWORD length=0;
+    Check(GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),UOI_NAME,desktop,sizeof(desktop),&length),
+        "created item rename desktop identity");
+    if (!std::wstring_view(desktop).starts_with(L"gpu-overlay-created-rename-")) {
+        PrivateDesktopFixture::Run(L"created-rename",L"--test created-item-rename",120000);
+        return;
+    }
     enum class Route { Menu, Shortcut, CommandBar, Grouped };
     const auto label = [](Route route) {
         return route == Route::Menu ? std::wstring(L"menu") : route == Route::Shortcut ? L"shortcut" :
@@ -826,7 +844,7 @@ static void TestCreatedItemRename(const std::wstring& fixture) {
             // publishes its heading. A real click needs a heading for this item.
             const auto createdPath=(root/createdName).wstring();
             int group=-1;
-            Check(Eventually([&] {
+            const bool headingReady=Eventually([&] {
                 Pump(host);
                 const int index=state.rename.index;
                 if (!RenameSessionValid(state) || state.rename.path!=createdPath ||
@@ -835,7 +853,13 @@ static void TestCreatedItemRename(const std::wstring& fixture) {
                 if (group<0 || size_t(group)>=state.sections.size()) return false;
                 const auto& section=state.sections[size_t(group)];
                 return section.first<=index && index<section.end;
-            },15000),"created folder did not acquire a group heading while its rename field was open");
+            },15000);
+            if (!headingReady) std::wcerr << L"Grouped creation: editor=" << bool(state.rename.editor)
+                << L" valid=" << RenameSessionValid(state) << L" pathMatch=" << (state.rename.path==createdPath)
+                << L" index=" << state.rename.index << L" grouping=" << state.grouping.enabled
+                << L" displayedGrouping=" << state.displayedGrouping.enabled << L" rowGroups=" << state.rowGroup.size()
+                << L" sections=" << state.sections.size() << L" group=" << group << std::endl;
+            Check(headingReady,"created folder did not acquire a group heading while its rename field was open");
             Check(SetWindowTextW(state.rename.editor,L"toggled"),"set grouped rename field text");
             ToggleGroupSection(state,group);
             Check(!state.rename.editor,"section toggle left the created folder's rename field open");

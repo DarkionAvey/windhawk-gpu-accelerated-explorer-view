@@ -98,7 +98,11 @@ static void TestOptionConsumers(Set set) {
         set(L"Selection.selectionOpacity",L"60");
         for(int opacity:{10,60,100}) {
             set(L"Hover.hoverSelectedOpacity",std::to_wstring(opacity));
-            Check(std::abs(SelectionBaseOpacity(state,{0,0,100,1},0,0,100)-std::min(.6f,opacity/100.f))<.001f,
+            state.selectedFlags[0]=1;
+            const HoverVisual hover{0,0,100,1};
+            const float base=SelectionBaseOpacity(state,hover,0,0,100);
+            const float overlay=HoverOverlayOpacity(state,hover,{0});
+            Check(std::abs(overlay+(1.f-overlay)*base-opacity/100.f)<.001f,
                 "combined hover opacity did not reach selection blending");
         }
     }

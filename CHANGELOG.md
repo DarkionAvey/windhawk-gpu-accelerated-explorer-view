@@ -1,5 +1,15 @@
  # Changelog
 
+## 1.1.16
+- **IMPROVED** Pinch zoom skips capturing a new animation when the grid keeps its columns. Painting multiple selected items reuses the tab's memory.
+
+- **FIXED** Short, centered grid filenames follow the selection or hover color as the highlight reaches the text.
+- **FIXED** Hovering a selected item uses the combined highlight opacity when choosing its text color, including with an empty theme.
+- **FIXED** Both scrollbars respond to the thumb shown during a view change.
+- **FIXED** Explorer can retry first-paint attachment when a folder becomes ready after the initial check.
+- **FIXED** Themed text and marks keep their matching colors while a new palette loads. Tabs share the last accent successfully read from Windows.
+- **FIXED** Relative date groups refresh across midnight and system calendar changes. Missing relative labels use the Windows date format.
+
 ## 1.1.15
 - **ADDED** Selected and hovered file labels automatically choose a contrasting, softly blended text color. Theme XML can override it for each highlight state and for light or dark mode.
 - **ADDED** Section headers automatically adjust their text and chevron colors to the highlight. Column headers can opt in with `text-color="auto"`.

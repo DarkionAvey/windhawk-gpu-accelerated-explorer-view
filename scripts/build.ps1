@@ -24,6 +24,7 @@ $published = $false
 try {
     Assert-RegressionExecutionContext
     Assert-NoModuleInjection # Before the repository checks, compilers and tests.
+    Assert-ShellHookRegistration # Explorer rename needs DLL-backed hooks; a broken session invalidates rename results.
     # Check the toolchain before creating or changing a working release.
     $WindhawkDirectory = Resolve-WindhawkDirectory $WindhawkDirectory
     if (!$SourceFile) {

@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.15
+// @version         1.1.16
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1298,6 +1298,7 @@ bool RegisterFrameHookReleaseMessage() {
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
+constexpr wchar_t kColdAttachPaintPendingProperty[] = L"WindhawkGpuColdAttachPaintPending";
 constexpr wchar_t kColdAttachPaintCheckedProperty[] = L"WindhawkGpuColdAttachPaintChecked";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
@@ -2249,6 +2250,7 @@ struct FolderChangeStamp {
     }
 };
 struct CachedFolderSnapshot {
+    unsigned long long calendarStamp=0;
     std::shared_ptr<const std::vector<Entry>> presentationEntries;
     SharedPidl folderIdentity;
     std::wstring path;
@@ -3091,6 +3093,14 @@ struct TouchRecognizer {
     unsigned outputCount = 0;
     bool overflow = false, stopping = false;
     std::vector<POINTER_INFO> packets, contacts, normalized;
+    // Adaptive contact smoothing (SmoothTouchFrame), one entry per contact.
+    struct ContactFilter {
+        UINT32 id = 0;
+        UINT64 qpc = 0;
+        double x = 0., y = 0., vx = 0., vy = 0.; // pixels; pixels/ms
+        double himetricPerPixelX = 0., himetricPerPixelY = 0.; // 0: unknown device mapping
+    };
+    std::vector<ContactFilter> filters;
     LARGE_INTEGER packetClock{};
     ULONGLONG packetClockTick = 0;
     UINT32 frame = 0;
@@ -3127,7 +3137,7 @@ struct TouchRecognizer {
         if (context) StopInteractionContext(context);
         if (tapContext) StopInteractionContext(tapContext);
         stopping = false;
-        contacts.clear(); outputCount = 0; overflow = false;
+        contacts.clear(); filters.clear(); outputCount = 0; overflow = false;
     }
 };
 
@@ -3365,6 +3375,7 @@ struct ContrastPalette {
         const auto found=foregrounds.find(surface);
         return found!=foregrounds.end() ? found->second : fallback;
     }
+    COLORREF background=CLR_INVALID, foreground=CLR_INVALID;
     COLORREF tipBackground=CLR_INVALID, selection=RGB(0,120,215);
     unsigned long long revision=0, surfaceRevision=0, accent=0;
     std::array<float,3> opacity{};
@@ -4149,6 +4160,22 @@ struct ItemTip {
 };
 void RenderItemTip(ItemTip& tip);
 
+struct PaintedFeedback {
+    struct Part {D2D1_RECT_F bounds; float radius;};
+    std::array<Part,8> parts{};
+    unsigned count=0;
+    float base=0.f, combined=0.f;
+    bool Covers(float x,float y) const {
+        for(unsigned i=0;i<count;++i) {
+            const auto& [r,radius]=parts[i];
+            if(x<r.left || x>=r.right || y<r.top || y>=r.bottom) continue;
+            const float dx=std::max({r.left+radius-x,x-(r.right-radius),0.f});
+            const float dy=std::max({r.top+radius-y,y-(r.bottom-radius),0.f});
+            if(dx*dx+dy*dy<=radius*radius) return true;
+        }
+        return false;
+    }
+};
 struct ViewState {
     ItemTip itemTip;
     // The bridge state is owner-STA-only. A presentation instance contains
@@ -4302,6 +4329,8 @@ struct ViewState {
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
     ScrollbarLayoutMotion scrollbarLayoutMotion;
+    std::array<ScrollbarGeometry,2> acceptedScrollbars{};
+    std::optional<unsigned long long> acceptedScrollbarToken;
     bool presentationScrollbarGeometryPending = false;
     bool horizontalScrollbarAdmitted = false; // Optional chrome waits for settled column geometry.
     unsigned long long horizontalScrollbarDeferrals = 0; // Overflow held back while columns settled.
@@ -4449,6 +4478,8 @@ struct ViewState {
     ShellGroupSpec grouping;
     ShellGroupSpec queuedDirectoryGrouping; // Captured for provisional worker reconciliation.
     ShellGroupSpec displayedGrouping;
+    unsigned calendarRevision=0;
+    unsigned long long calendarStamp=0, requestedCalendarStamp=0;
     // Group headings are layout items, not Shell items. Physical item indices
     // remain unchanged for QuickLook, PIDL selection and file operations.
     struct GroupSection {
@@ -4526,6 +4557,8 @@ struct ViewState {
     std::vector<ZebraBand> zebraBands, zebraFromBands, zebraTargetBands;
     // Paint-only working sets, reused every frame for their capacity.
     struct ZebraBody { const std::wstring* key; float top, bottom; };
+    std::vector<std::pair<size_t,PaintedFeedback>> selectionPaintScratch;
+    std::vector<PaintedFeedback> ghostPaintScratch;
     std::vector<ZebraBand> zebraNextScratch, zebraPresentedScratch;
     std::vector<std::pair<float,float>> zebraBlankScratch, zebraFillScratch;
     std::vector<ZebraBody> zebraBodyScratch;
@@ -5258,11 +5291,8 @@ struct ViewState {
         ComPtr<IDCompositionEffectGroup> opacity;
         ComPtr<IDCompositionAnimation> fade;
         unsigned long long revision=0,traceRevision=0;
-        std::shared_ptr<const Theme::Document> theme;
-        Theme::Mode themeMode=Theme::Mode::Light;
         bool highContrast=false;
         unsigned long long palette=0, contrastRevision=0;
-        COLORREF background=CLR_INVALID,foreground=CLR_INVALID;
         LARGE_INTEGER origin{},fadeStarted{};
         double frequency=0.;
         D2D1_RECT_F bounds{};
@@ -5433,6 +5463,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     ClipboardPaths clipboard;
 };
 struct PresentationReceipt {
+    std::array<ScrollbarGeometry,2> scrollbars{};
     unsigned long long sequence=0,lifetime=0,token=0,directoryToken=0,rowRevision=0;
     unsigned long long frames=0;
     unsigned long long swipeFeedbackRevision=0;
@@ -5759,45 +5790,49 @@ int ItemLineCount(const ViewState& state, int count) {
 float SelectionCheckboxSpace(const ViewState& state, bool settled = false);
 bool SelectionCheckboxRevealMoving(const ViewState& state);
 bool SortChevronFlipping(const ViewState& state);
-void LayoutGroupSections(ViewState& state) {
-    state.itemsPerRow = 1;
+struct GridPacking { int columns; float width; };
+GridPacking PackGrid(const ViewState& state,float row,float font,float icon,float header) {
+    RECT client{}; ViewClientRect(state, &client);
+    const int dpi = ViewDpi(state);
+    // Pack the destination once, then move existing cells to it using
+    // the zoom clock. Packing interpolated icon sizes snaps at each
+    // integer column boundary partway through an otherwise smooth zoom.
+    const float checkboxSpace = (TileLayout(state) || state.layoutNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
+    // ExplorerFrame collection.smallicons: ItemGridLayout columnwidth
+    // 308rp and itemspacing 1rp. The checkbox lives inside that column.
+    const bool small = state.layoutNativeMode == FVM_SMALLICON;
+    const float smallPitch = float(Scale96(308,dpi) + Scale96(1,dpi));
+    const float minimum = (small ? 0.f : checkboxSpace) + (TileLayout(state) ?
+        std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
+            icon + font * 12.f + Scale96(24, dpi)) :
+        small ? std::max(smallPitch, checkboxSpace + icon + font * 6.f) :
+        std::max(static_cast<float>(GetSystemMetricsForDpi(SM_CXICONSPACING,dpi)), icon + Scale96(16, dpi)));
+    float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
+    auto extent = [&](int columns) {
+        const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
+        const float heading = GroupHeadingHeight(state,row,font);
+        const float gap = DefaultGroupHeadingHeight(true,dpi,row,font);
+        if (state.sections.empty()) return lines(state.total) * row;
+        float height = 0.f;
+        for (const auto& s : state.sections)
+            height += heading + (lines(s.end-s.first) * row + gap) * s.fraction;
+        return height;
+    };
+    int columns = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
+    if (g_scrollbar.load(std::memory_order_relaxed) &&
+        extent(columns) > std::max(0.f, client.bottom - header)) {
+        width = std::max(1.f, width - VerticalScrollbarClearance(dpi));
+        columns = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
+    }
+    return {columns,small ? std::min(width,minimum) : width/columns};
+}
+void LayoutGroupSections(ViewState& state,std::optional<GridPacking> packing=std::nullopt) {
+    state.itemsPerRow=1;
     if (state.gridView) {
-        RECT client{}; ViewClientRect(state, &client);
-        const int dpi = ViewDpi(state);
-        // Pack the destination once, then move existing cells to it using
-        // the zoom clock. Packing interpolated icon sizes snaps at each
-        // integer column boundary partway through an otherwise smooth zoom.
-        const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
-        const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float checkboxSpace = (TileLayout(state) || state.layoutNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
-        // ExplorerFrame collection.smallicons: ItemGridLayout columnwidth
-        // 308rp and itemspacing 1rp. The checkbox lives inside that column.
-        const bool small = state.layoutNativeMode == FVM_SMALLICON;
-        const float smallPitch = float(Scale96(308,dpi) + Scale96(1,dpi));
-        const float minimum = (small ? 0.f : checkboxSpace) + (TileLayout(state) ?
-            std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
-                icon + font * 12.f + Scale96(24, dpi)) :
-            small ? std::max(smallPitch, checkboxSpace + icon + font * 6.f) :
-            std::max(static_cast<float>(GetSystemMetricsForDpi(SM_CXICONSPACING,dpi)), icon + Scale96(16, dpi)));
-        float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
-        auto extent = [&](int columns) {
-            const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
-            const float row = state.zoomAnimating ? state.zoomToRowPx : state.rowPx;
-            const float heading = GroupHeadingHeight(state,row,font);
-            const float gap = DefaultGroupHeadingHeight(true,dpi,row,font);
-            if (state.sections.empty()) return lines(state.total) * row;
-            float height = 0.f;
-            for (const auto& s : state.sections)
-                height += heading + (lines(s.end-s.first) * row + gap) * s.fraction;
-            return height;
-        };
-        state.itemsPerRow = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
-        if (g_scrollbar.load(std::memory_order_relaxed) &&
-            extent(state.itemsPerRow) > std::max(0.f, client.bottom - state.headerPx)) {
-            width = std::max(1.f, width - VerticalScrollbarClearance(dpi));
-            state.itemsPerRow = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
-        }
-        state.itemWidth = small ? std::min(width,minimum) : width / state.itemsPerRow;
+        if (!packing) packing=PackGrid(state,state.zoomAnimating ? state.zoomToRowPx : state.rowPx,
+            state.zoomAnimating ? state.zoomToFontPx : state.fontPx,state.zoomAnimating ? state.zoomToIconPx : state.iconPx,state.headerPx);
+        state.itemsPerRow=packing->columns;
+        state.itemWidth=packing->width;
     }
     float y = state.presentationOnly && !state.presentationEntries && !state.sections.empty() ? state.sections.front().documentTop : 0.f;
     const float heading = GroupHeadingHeight(state);
@@ -7904,9 +7939,9 @@ D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
 // the title-bar glass color: with an automatic accent it is a darkened, blended
 // variant (and it lags manual changes), so it is only a last resort. The last
 // accent read on a WinRT-capable thread is kept for threads that cannot
-// activate UISettings (settings load), never replaced by a guess.
+// activate UISettings, including workers serving newly opened tabs.
 std::atomic<COLORREF> g_systemAccent{CLR_INVALID};
-bool ReadSystemAccent(COLORREF& accent,bool remember) {
+bool ReadSystemAccent(COLORREF& accent) {
     using namespace ABI::Windows::UI::ViewManagement;
     constexpr wchar_t name[] = L"Windows.UI.ViewManagement.UISettings";
     HSTRING_HEADER header{}; HSTRING className = nullptr;
@@ -7916,7 +7951,7 @@ bool ReadSystemAccent(COLORREF& accent,bool remember) {
         FAILED(RoActivateInstance(className, &instance)) || FAILED(instance.As(&colors)) ||
         FAILED(colors->GetColorValue(UIColorType_Accent, &value)) || value.A != 255) return false;
     accent = RGB(value.R, value.G, value.B);
-    if(remember) g_systemAccent.store(accent,std::memory_order_relaxed);
+    g_systemAccent.store(accent,std::memory_order_relaxed);
     return true;
 }
 
@@ -7935,23 +7970,21 @@ ContrastPalette::Ink ContrastInk(COLORREF surface,double ratio=4.5,unsigned step
     // If the target is unreachable, the search saturates at full opacity.
     return {ink,float(high)/steps};
 }
-unsigned long long ReadAccentPalette(bool highContrast,unsigned long long previous,bool remember=false) {
-    constexpr auto systemAccentBit=1ull<<61;
+unsigned long long ReadAccentPalette(bool highContrast,unsigned long long previous) {
     DWORD dwm = 0; BOOL opaque = FALSE;
     COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     if (!ValidRgb(accent)) accent = RGB(0,120,215);
     COLORREF system = CLR_INVALID;
-    const bool haveSystem=ReadSystemAccent(system,remember) ||
-        ValidRgb(system = !remember && (previous&systemAccentBit) ? COLORREF(previous&0xffffff) :
-            g_systemAccent.load(std::memory_order_relaxed));
+    const bool haveSystem=ReadSystemAccent(system) ||
+        ValidRgb(system = g_systemAccent.load(std::memory_order_relaxed));
     if (haveSystem)
         accent = system;
     else if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
         accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
     if(highContrast) accent=GetSysColor(COLOR_HIGHLIGHT);
     COLORREF foreground=highContrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : 0;
-    const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : haveSystem ? systemAccentBit : 0) | accent;
-    if((previous & ((7ull<<61)|0xFFFFFF))==key &&
+    const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : 0) | accent;
+    if((previous & ((3ull<<62)|0xFFFFFF))==key &&
         (!highContrast || COLORREF((previous>>24)&0xFFFFFF)==foreground)) return previous;
     unsigned alpha=255;
     if(!highContrast) {
@@ -7968,7 +8001,7 @@ unsigned long long ReadAccentPalette(bool highContrast,unsigned long long previo
     HIGHCONTRASTW contrast{sizeof(contrast)};
     const bool highContrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
         (contrast.dwFlags&HCF_HIGHCONTRASTON);
-    const auto palette=ReadAccentPalette(highContrast,g_swipePalette.load(),true);
+    const auto palette=ReadAccentPalette(highContrast,g_swipePalette.load());
     g_swipePalette.store(palette,std::memory_order_relaxed);
     if(g_dynamicAccent.load()) g_selectionRgb.store(COLORREF(palette&0xffffff));
 }
@@ -8170,6 +8203,8 @@ std::shared_ptr<const ContrastPalette> ResolveContrastPalette(const PaletteReque
         return palette;
     }
     palette->mode=job.mode;
+    palette->background=job.background;
+    palette->foreground=job.foreground;
     palette->accent=accentPalette;
     palette->selection=job.dynamicAccent ? accent : job.selection;
     palette->opacity=job.opacity;
@@ -10121,6 +10156,7 @@ struct RelativeDateGroups {
     long long weekStart;
     bool valid;
     std::wstring titles[13];
+    bool missing[13]{};
     RelativeDateGroups() {
         FILETIME now{};
         GetSystemTimeAsFileTime(&now);
@@ -10151,16 +10187,22 @@ struct RelativeDateGroups {
 
         // Property System date group strings in chronological order.
         static constexpr UINT resources[] = {100,101,102,104,103,105,106,107,108,109,110,111,112};
-        static constexpr const wchar_t* fallback[] = {L"A long time ago", L"Earlier this year",
-            L"Earlier this month", L"Last week", L"Earlier this week", L"Yesterday", L"Today",
-            L"Tomorrow", L"Later this week", L"Next week", L"Later this month",
-            L"Later this year", L"Sometime in the future"};
         auto& title = titles[rank];
-        if (title.empty()) {
+        if (title.empty() && !missing[rank]) {
             wchar_t label[128]{};
             const auto module = GetModuleHandleW(L"propsys.dll");
-            title = module && LoadStringW(module, resources[rank], label, ARRAYSIZE(label))
-                ? label : fallback[rank];
+            if (module && LoadStringW(module,resources[rank],label,ARRAYSIZE(label))) title=label;
+            else {
+                missing[rank]=true;
+                if (DiagnosticsEnabled()) Wh_Log(L"[GPU groups] missing propsys date label %u",resources[rank]);
+            }
+        }
+        if (missing[rank]) {
+            wchar_t dateLabel[128]{};
+            GetDateFormatEx(LOCALE_NAME_USER_DEFAULT,DATE_SHORTDATE,&date.local,nullptr,dateLabel,ARRAYSIZE(dateLabel),nullptr);
+            entry.groupTitle=dateLabel;
+            entry.groupKey=std::to_wstring(rank)+L"/"+std::to_wstring(date.day);
+            return;
         }
         entry.groupTitle = title;
         entry.groupKey = std::to_wstring(rank);
@@ -13404,6 +13446,7 @@ void CacheDepartingFolder(ViewState& state) {
     snapshot.folderIdentity = state.directoryFolderIdentity;
     snapshot.sort = state.displayedSort;
     snapshot.grouping = state.displayedGrouping;
+    snapshot.calendarStamp=state.calendarStamp;
     snapshot.visibility = state.visibility;
     snapshot.viewMode = {state.layoutNativeMode,state.layoutIconSize};
     snapshot.entries = std::move(state.entries);
@@ -13552,6 +13595,7 @@ bool RestoreCachedFolder(ViewState& state) {
     state.displayedMetadataHash = snapshot.metadataHash;
     const SortSpec restoredSort = snapshot.sort;
     state.grouping = snapshot.grouping;
+    state.requestedCalendarStamp=state.calendarStamp=snapshot.calendarStamp;
     cache.usedBytes -= snapshot.estimatedBytes;
     --cache.snapshotCount;
     cache.folders.erase(it);
@@ -13697,6 +13741,15 @@ bool SortReadDefersNames(const ViewState& state) {
         state.sortReadUnavailableToken!=state.token;
 }
 
+unsigned long long DateGroupingStamp(const ViewState& state) {
+    if (!state.grouping.enabled || state.thisPcGpu) return 0;
+    const auto kind=ClassifySort(state.grouping.key);
+    if (kind!=SortKind::Modified && kind!=SortKind::Created && kind!=SortKind::Accessed) return 0;
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    return (static_cast<unsigned long long>(state.calendarRevision)<<32) |
+        (unsigned(now.wYear)<<9) | (unsigned(now.wMonth)<<5) | now.wDay;
+}
+
 void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
                            bool preserveViewport = false, bool verifyNamespace = false) {
     PipelineScope pipeline(state.background,L"directory.request",replacePending,verifyNamespace);
@@ -13802,6 +13855,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // Keep the previous list visible during same-folder refreshes. During
     // navigation, the new view starts with an empty names-only surface.
     state.directoryPending = true;
+    state.requestedCalendarStamp=DateGroupingStamp(state);
     state.directoryRequestedAt = GetTickCount64();
     CancelNativeCatalog(state);
     state.directoryToken = g_nextToken.fetch_add(1);
@@ -15402,6 +15456,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 state.namespaceIdentities = std::move(result.namespaceIdentities);
             }
             if (result.kind == DirectoryResult::Complete && result.error == ERROR_SUCCESS) {
+                state.calendarStamp=state.requestedCalendarStamp;
                 state.validatedFolderStamp = result.changeStamp;
                 state.validatedFolderRevision = result.changeRevision;
                 if (result.observerId) {
@@ -15587,11 +15642,10 @@ void UpdateColumnHeaderHeight(ViewState& state, float compact) {
     else state.headerPx = height;
 }
 
-void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
-    state.zebraExtentAnimating = false;
+struct ItemMetrics { float row,font,icon; };
+ItemMetrics TargetItemMetrics(const ViewState& state,int height96,double precise) {
     int dpi = ViewDpi(state);
-    const int height96 = ZoomHeight96(state);
-    const double precise = state.preciseRowHeight96[state.gridView];
+
     const bool direct = precise > 0. && std::llround(precise) == height96;
     const double size96 = direct ? precise : height96;
     // Grid zoom grows the image independently of its caption. Bound font
@@ -15636,6 +15690,11 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
         state.layoutNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
             icon + 2.f * ItemTextLinePitch(font) + 3.f * GridCaptionInset(dpi);
+    return {row,font,icon};
+}
+void ApplyItemMetrics(ViewState& state,ItemMetrics metrics,float zoomProgress,std::optional<GridPacking> packing={}) {
+    const auto [row,font,icon]=metrics;
+    state.zebraExtentAnimating=false;
     state.zoomToIconPx = static_cast<float>(icon);
     state.zoomToFontPx = static_cast<float>(font);
     state.zoomToRowPx = row;
@@ -15648,13 +15707,17 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     if (!state.gridView) state.listIconPx = state.iconPx;
     const float compact = state.compactRows && !state.gridView ? 1.f : 0.f;
     UpdateColumnHeaderHeight(state,state.zoomAnimating ? std::lerp(state.zoomFromCompact,compact,zoomProgress) : compact);
-    LayoutGroupSections(state);
+    LayoutGroupSections(state,packing);
     // An ordinary metrics refresh (DPI, settings, resize, activation) settles
     // the pending zoom instead of leaving an old anchor/timestamp alive.
     if (state.zoomAnimating && zoomProgress >= 1.f) {
         state.zoomAnimating = false;
         UnregisterAnimationWhenIdle(state);
     }
+}
+
+void UpdateMetrics(ViewState& state,float zoomProgress=1.f) {
+    ApplyItemMetrics(state,TargetItemMetrics(state,ZoomHeight96(state),state.preciseRowHeight96[state.gridView]),zoomProgress);
 }
 
 // Icon and text geometry scale together when Ctrl+wheel adjusts row height.
@@ -19001,6 +19064,7 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.graphicsStandby=state.graphicsStandbyPending=false;
     state.graphicsStandbyTrimmed=false;
     state.graphicsPaintSerial=0;
+    state.acceptedScrollbarToken.reset();
     state.lastAcceptedPaint=0;
     state.lastAcceptedPresentationModel=0;
     state.presentationContentAccepted=false;
@@ -19898,8 +19962,8 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
           std::optional<float> groupFontSize=std::nullopt) {
     if (highlight && highlight->empty()) highlight = nullptr;
     if (header && !sortedHeader) {
-        const auto* style=ColumnHeaderTheme(state);
-        if(!style || !style->header.autoTextColor) opacity*=kMutedHeaderOpacity;
+        const auto* theme=PaintedHighlightTheme(state);
+        if(!theme || !theme->columnHeaders[size_t(PaintedHighlightMode(state))].header.autoTextColor) opacity*=kMutedHeaderOpacity;
     }
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
     RefreshTextRendering(state);
@@ -21131,6 +21195,7 @@ std::array<ScrollbarGeometry,2> PresentedScrollbars(ViewState& state) {
         bar.bottom=std::lerp(from.bottom,to.bottom,progress);
         bar.thumbStart=std::lerp(from.thumbStart,to.thumbStart,progress);
         bar.thumbLength=std::lerp(from.thumbLength,to.thumbLength,progress);
+        bar.travel=std::max(0.f,(i ? bar.right-bar.left : bar.bottom-bar.top)-bar.thumbLength);
         bar.usable=bar.right>bar.left && bar.bottom>bar.top;
     }
     return bars;
@@ -21149,8 +21214,27 @@ bool HitScrollbarThumb(const ScrollbarGeometry& bar, float pointer) {
     return bar.usable && pointer >= bar.thumbStart && pointer <= bar.thumbStart + bar.thumbLength;
 }
 
+ScrollbarGeometry InputScrollbar(ViewState& state,bool horizontal,bool touch) {
+    const auto& motion=state.scrollbarLayoutMotion;
+    const bool morph=(state.rowTransitionActive && motion.rowRevision==state.rowSceneRevision) ||
+        (motion.columnMode && (state.columnModeTransition || state.columnPresentationPending));
+    if (!morph || !g_scrollbar.load()) return horizontal ? HorizontalBar(state,touch) : Scrollbar(state,touch);
+    auto bar=state.acceptedScrollbarToken==state.token ? state.acceptedScrollbars[horizontal] : motion.from[horizontal];
+    if (!bar.usable || !touch) return bar;
+    const float breadth=ScrollbarBreadth(state,horizontal,true);
+    if (horizontal) bar.top=std::min(bar.top,bar.bottom-breadth);
+    else bar.left=std::min(bar.left,bar.right-breadth);
+    const float span=horizontal ? bar.right-bar.left : bar.bottom-bar.top;
+    const float origin=horizontal ? bar.left : bar.top;
+    const float fraction=bar.travel>0.f ? std::clamp((bar.thumbStart-origin)/bar.travel,0.f,1.f) : 0.f;
+    bar.thumbLength=std::min(span,std::max(breadth,bar.thumbLength));
+    bar.travel=span-bar.thumbLength;
+    bar.thumbStart=origin+fraction*bar.travel;
+    return bar;
+}
+
 bool OnHorizontalBar(ViewState& state, int x, int y) {
-    return HitScrollbar(HorizontalBar(state, state.pointingDevice == PointingDevice::Touch),
+    return HitScrollbar(InputScrollbar(state,true,state.pointingDevice==PointingDevice::Touch),
         static_cast<float>(LogicalX(state, x)), static_cast<float>(y),
         static_cast<float>(Scale96(kScrollbarHitTolerance96, ViewDpi(state))));
 }
@@ -21165,7 +21249,7 @@ float ScrollFractionAt(const ScrollbarGeometry& bar, float pointer, float grab) 
 }
 
 bool OnScrollbar(ViewState& state, int x, int y) {
-    return HitScrollbar(Scrollbar(state, state.pointingDevice == PointingDevice::Touch),
+    return HitScrollbar(InputScrollbar(state,false,state.pointingDevice==PointingDevice::Touch),
         static_cast<float>(LogicalX(state, x)), static_cast<float>(y),
         static_cast<float>(Scale96(kScrollbarHitTolerance96, ViewDpi(state))));
 }
@@ -21375,12 +21459,18 @@ void ScrubScrollbar(ViewState& state, float mouseY) {
 // instantScrollbarScrub; horizontal dragging is always direct. Track clicks
 // animate to a centered target (or jump if smooth scrolling is off).
 bool BeginScrollbarInteraction(ViewState& state, int x, int y) {
-    const bool horizontal = OnHorizontalBar(state, x, y);
-    const bool vertical = !horizontal && OnScrollbar(state, x, y);
-    if (!horizontal && !vertical) return false;
-    AdvanceRowHeight(state, true);
-    const bool touch = state.touch.control && state.pointingDevice == PointingDevice::Touch;
-    const ScrollbarGeometry bar = horizontal ? HorizontalBar(state, touch) : Scrollbar(state, touch);
+    const bool touch=state.pointingDevice==PointingDevice::Touch;
+    const float logicalX=float(LogicalX(state,x)), tolerance=float(Scale96(kScrollbarHitTolerance96,ViewDpi(state)));
+    auto bar=InputScrollbar(state,true,touch);
+    const bool horizontal=HitScrollbar(bar,logicalX,float(y),tolerance);
+    if (!horizontal) {
+        bar=InputScrollbar(state,false,touch);
+        if (!HitScrollbar(bar,logicalX,float(y),tolerance)) return false;
+    }
+    const bool vertical=!horizontal;
+    AdvanceRowHeight(state,true);
+    const auto live=horizontal ? HorizontalBar(state) : Scrollbar(state);
+    if (!live.usable) return true; // An outgoing bar has no destination range to scrub.
     const float pointer = horizontal ? static_cast<float>(LogicalX(state, x)) :
                                        static_cast<float>(y);
     const bool thumb = HitScrollbarThumb(bar, pointer);
@@ -21389,21 +21479,17 @@ bool BeginScrollbarInteraction(ViewState& state, int x, int y) {
     state.draggingHorizontal = horizontal;
     state.draggingScrollbar = vertical;
     if (thumb) {
-        // The hit target can already be enlarged while the drawn thumb is
-        // still small. Anchor the grab to the drawn pose so DOWN cannot scroll
-        // the list just because the touch minimum thumb length is larger.
-        const auto visual = horizontal ? HorizontalBar(state) : Scrollbar(state);
-        state.capturedPointer.reset();
-        state.scrollbarGrabLength[horizontal ? 1 : 0] = visual.thumbLength;
-        const float grab = pointer - visual.thumbStart;
+        // Preserve the offset at DOWN. Subsequent pointer deltas map to the live
+        // track even if the thumb was moving or enlarged for touch at contact.
+        state.capturedPointer=POINT{x,y};
+        state.scrollbarGrabLength[horizontal ? 1 : 0]=live.thumbLength;
+        const float grab=pointer-live.thumbStart;
         if (horizontal) {
-            state.horizontalAnimating = false;
-            state.horizontalGrabOffset = grab;
-            ScrubHorizontal(state, x);
+            state.horizontalAnimating=false;
+            state.horizontalGrabOffset=grab;
         } else {
             StopScrollAnimation(state);
-            state.scrollbarGrabY = grab;
-            ScrubScrollbar(state, pointer);
+            state.scrollbarGrabY=grab;
         }
     } else {
         state.capturedPointer = POINT{x, y};
@@ -21476,6 +21562,90 @@ float FilenameSelectionPadding(const ViewState& state) {
 }
 
 // All normal and moving selection backgrounds use the SAME bounds and fill.
+SelectionShape GridFilenameShape(ViewState& state,const ItemGeometry& geometry,const std::wstring& label) {
+    const auto& text = geometry.text;
+    auto* layout = ResolveTextLayout(state,label,text.right-text.left,
+        text.bottom-text.top,false,false,nullptr,geometry.wrapped,true);
+    if (!layout) return {};
+    auto& cached = state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(label);
+    if (!cached.filenameSelectionReady) {
+        cached.filenameSelection = {};
+        cached.filenameSelectionReady = true;
+        DWRITE_LINE_METRICS lines[512]{};
+        UINT32 count = 0, position = 0;
+        const float pad = static_cast<float>(Scale96(3,ViewDpi(state)));
+        if (SUCCEEDED(layout->GetLineMetrics(lines,ARRAYSIZE(lines),&count))) {
+            for (UINT32 i=0; i<count && cached.filenameSelection.count <
+                    cached.filenameSelection.lines.size(); ++i) {
+                const auto& line = lines[i];
+                const UINT32 length = line.length-line.trailingWhitespaceLength;
+                DWRITE_HIT_TEST_METRICS runs[256]{};
+                UINT32 runCount = 0;
+                D2D1_RECT_F rc{cached.width,cached.height,0,0};
+                if (length && SUCCEEDED(layout->HitTestTextRange(position,length,0,0,
+                    runs,ARRAYSIZE(runs),&runCount))) {
+                    for (UINT32 j=0;j<runCount;++j) {
+                        const auto& m=runs[j];
+                        if (m.width<=0 || m.height<=0 || m.top>=cached.height ||
+                            m.top+m.height<=0) continue;
+                        rc.left=std::min(rc.left,m.left); rc.top=std::min(rc.top,m.top);
+                        rc.right=std::max(rc.right,m.left+m.width);
+                        rc.bottom=std::max(rc.bottom,m.top+m.height);
+                    }
+                }
+                position += line.length;
+                if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
+                // Pad symmetrically within the layout box (a rename EDIT
+                // covers exactly that box). Clamping each side separately
+                // removed only the leading inset when the caption starts
+                // at the box edge (Small icons), leaving a lopsided pill.
+                const float inset=std::clamp(std::min(rc.left,cached.width-rc.right),0.f,pad);
+                rc.left-=inset; rc.right+=inset;
+                rc.top=std::max(0.f,rc.top); rc.bottom=std::min(cached.height,rc.bottom);
+                // DirectWrite describes physical glyph positions. Fill
+                // mirrors logical rectangles, so convert the shaped run.
+                if (state.rtlLayout) {
+                    const float left=rc.left;
+                    rc.left=cached.width-rc.right; rc.right=cached.width-left;
+                }
+                cached.filenameSelection.lines[cached.filenameSelection.count++]=rc;
+            }
+        }
+    }
+    SelectionShape result;
+    // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
+    const float origin = state.rtlLayout ? state.paintWidth-
+        roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
+    const float padding = FilenameSelectionPadding(state);
+    for (unsigned i=0;i<cached.filenameSelection.count;++i) {
+        auto rc=cached.filenameSelection.lines[i];
+        rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
+        rc.right=std::min(geometry.cell.right,rc.right+origin+padding);
+        rc.top=std::max(geometry.cell.top,rc.top+roundf(text.top)-padding);
+        rc.bottom=std::min(geometry.cell.bottom,rc.bottom+roundf(text.top)+padding);
+        if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
+        // Wrapped lines overlap in their interior padding. Give the overlap
+        // to the wider line (its descenders/ascenders extend past the
+        // narrower line), so the union is unchanged but translucent fills
+        // never double up. Meet on a whole pixel: two antialiased edges at
+        // a fractional row would leave a faint line through the highlight.
+        if (result.count && rc.top<result.lines[result.count-1].bottom) {
+            auto& previous=result.lines[result.count-1];
+            const bool previousWider=previous.right-previous.left>=rc.right-rc.left;
+            previous.bottom=rc.top=roundf(previousWider ? previous.bottom : rc.top);
+        }
+        if (!result.count) result.bounds=rc;
+        else {
+            result.bounds.left=std::min(result.bounds.left,rc.left);
+            result.bounds.right=std::max(result.bounds.right,rc.right);
+            result.bounds.top=std::min(result.bounds.top,rc.top);
+            result.bounds.bottom=std::max(result.bounds.bottom,rc.bottom);
+        }
+        result.lines[result.count++]=rc;
+    }
+    return result;
+}
+
 // Interpolating this rectangle also handles filename-only pills with different
 // text widths, rather than jumping to the next filename's width.
 // `filenameText` requests the filename-only shape regardless of the option
@@ -21494,86 +21664,7 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         if (!entry && index >= 0 && index < state.total)
             entry = &ModelEntry(state,index);
         if (!entry || EntryLabel(*entry).empty()) return {};
-        const auto& text = geometry.text;
-        auto* layout = ResolveTextLayout(state,EntryLabel(*entry),text.right-text.left,
-            text.bottom-text.top,false,false,nullptr,geometry.wrapped,true);
-        if (!layout) return {};
-        auto& cached = state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(EntryLabel(*entry));
-        if (!cached.filenameSelectionReady) {
-            cached.filenameSelection = {};
-            cached.filenameSelectionReady = true;
-            DWRITE_LINE_METRICS lines[512]{};
-            UINT32 count = 0, position = 0;
-            const float pad = static_cast<float>(Scale96(3,ViewDpi(state)));
-            if (SUCCEEDED(layout->GetLineMetrics(lines,ARRAYSIZE(lines),&count))) {
-                for (UINT32 i=0; i<count && cached.filenameSelection.count <
-                        cached.filenameSelection.lines.size(); ++i) {
-                    const auto& line = lines[i];
-                    const UINT32 length = line.length-line.trailingWhitespaceLength;
-                    DWRITE_HIT_TEST_METRICS runs[256]{};
-                    UINT32 runCount = 0;
-                    D2D1_RECT_F rc{cached.width,cached.height,0,0};
-                    if (length && SUCCEEDED(layout->HitTestTextRange(position,length,0,0,
-                        runs,ARRAYSIZE(runs),&runCount))) {
-                        for (UINT32 j=0;j<runCount;++j) {
-                            const auto& m=runs[j];
-                            if (m.width<=0 || m.height<=0 || m.top>=cached.height ||
-                                m.top+m.height<=0) continue;
-                            rc.left=std::min(rc.left,m.left); rc.top=std::min(rc.top,m.top);
-                            rc.right=std::max(rc.right,m.left+m.width);
-                            rc.bottom=std::max(rc.bottom,m.top+m.height);
-                        }
-                    }
-                    position += line.length;
-                    if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-                    // Pad symmetrically within the layout box (a rename EDIT
-                    // covers exactly that box). Clamping each side separately
-                    // removed only the leading inset when the caption starts
-                    // at the box edge (Small icons), leaving a lopsided pill.
-                    const float inset=std::clamp(std::min(rc.left,cached.width-rc.right),0.f,pad);
-                    rc.left-=inset; rc.right+=inset;
-                    rc.top=std::max(0.f,rc.top); rc.bottom=std::min(cached.height,rc.bottom);
-                    // DirectWrite describes physical glyph positions. Fill
-                    // mirrors logical rectangles, so convert the shaped run.
-                    if (state.rtlLayout) {
-                        const float left=rc.left;
-                        rc.left=cached.width-rc.right; rc.right=cached.width-left;
-                    }
-                    cached.filenameSelection.lines[cached.filenameSelection.count++]=rc;
-                }
-            }
-        }
-        SelectionShape result;
-        // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
-        const float origin = state.rtlLayout ? state.paintWidth-
-            roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
-        const float padding = FilenameSelectionPadding(state);
-        for (unsigned i=0;i<cached.filenameSelection.count;++i) {
-            auto rc=cached.filenameSelection.lines[i];
-            rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
-            rc.right=std::min(geometry.cell.right,rc.right+origin+padding);
-            rc.top=std::max(geometry.cell.top,rc.top+roundf(text.top)-padding);
-            rc.bottom=std::min(geometry.cell.bottom,rc.bottom+roundf(text.top)+padding);
-            if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-            // Wrapped lines overlap in their interior padding. Give the overlap
-            // to the wider line (its descenders/ascenders extend past the
-            // narrower line), so the union is unchanged but translucent fills
-            // never double up. Meet on a whole pixel: two antialiased edges at
-            // a fractional row would leave a faint line through the highlight.
-            if (result.count && rc.top<result.lines[result.count-1].bottom) {
-                auto& previous=result.lines[result.count-1];
-                const bool previousWider=previous.right-previous.left>=rc.right-rc.left;
-                previous.bottom=rc.top=roundf(previousWider ? previous.bottom : rc.top);
-            }
-            if (!result.count) result.bounds=rc;
-            else {
-                result.bounds.left=std::min(result.bounds.left,rc.left);
-                result.bounds.right=std::max(result.bounds.right,rc.right);
-                result.bounds.top=std::min(result.bounds.top,rc.top);
-                result.bounds.bottom=std::max(result.bounds.bottom,rc.bottom);
-            }
-            result.lines[result.count++]=rc;
-        }
+        const auto result=GridFilenameShape(state,geometry,EntryLabel(*entry));
         if (shape) *shape=result;
         return result.bounds;
     }
@@ -21867,22 +21958,6 @@ bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fracti
         resources.gradient,resources.ramps,1.f,fallbackColor,contentOpacity,512,&paint);
     return true;
 }
-struct PaintedFeedback {
-    struct Part {D2D1_RECT_F bounds; float radius;};
-    std::array<Part,8> parts{};
-    unsigned count=0;
-    float base=0.f, combined=0.f;
-    bool Covers(float x,float y) const {
-        for(unsigned i=0;i<count;++i) {
-            const auto& [r,radius]=parts[i];
-            if(x<r.left || x>=r.right || y<r.top || y>=r.bottom) continue;
-            const float dx=std::max({r.left+radius-x,x-(r.right-radius),0.f});
-            const float dy=std::max({r.top+radius-y,y-(r.bottom-radius),0.f});
-            if(dx*dx+dy*dy<=radius*radius) return true;
-        }
-        return false;
-    }
-};
 float FeedbackAlpha(const ViewState& state,Theme::Highlight kind,float opacity) {
     if(!ThemedHighlights(state)) return opacity;
     const auto& paint=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state))[static_cast<size_t>(kind)].background;
@@ -21912,20 +21987,19 @@ void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
         const float radius=SelectionRadius(state,part.right-part.left,part.bottom-part.top);
         if(feedback && !outline && feedback->count<feedback->parts.size())
             feedback->parts[feedback->count++]={part,radius};
-        if (!outline && ThemedHighlights(state)) {
-            // Crossfade paint contributions without an offscreen layer. At rest
-            // this is one brush/fill; an in-flight hover can mix two styles.
+        if (!outline) {
+            // Keep the state contributions even when both styles use the same
+            // accent brush and can be painted with one fill.
             const float top = std::clamp(combinedWeight, 0.f, 1.f)*alpha;
             const float bottom = (alpha-top)/std::max(.000001f, 1.f-top);
             if(feedback) {
                 feedback->base=FeedbackAlpha(state,kind,bottom);
                 feedback->combined=FeedbackAlpha(state,Theme::Highlight::SelectedHover,top);
             }
-            DrawHighlightSurface(state, part, rc, radius, bottom, kind);
-            if (top > 0.f) DrawHighlightSurface(state, part, rc, radius, top, Theme::Highlight::SelectedHover);
-        } else if (!outline) {
-            if(feedback) feedback->base=alpha;
-            Fill(state,part.left,part.top,part.right,part.bottom,rgb,alpha,radius);
+            if (ThemedHighlights(state)) {
+                if (bottom > 0.f) DrawHighlightSurface(state, part, rc, radius, bottom, kind);
+                if (top > 0.f) DrawHighlightSurface(state, part, rc, radius, top, Theme::Highlight::SelectedHover);
+            } else Fill(state,part.left,part.top,part.right,part.bottom,rgb,alpha,radius);
         }
         else {
             if (state.rtlLayout) {
@@ -22235,14 +22309,9 @@ float SelectionBaseOpacity(const ViewState& state, const HoverVisual& hover,
         std::max(1.f, std::min(right-left, hover.right-hover.left)), 0.f, 1.f);
     const float overlap = std::clamp(1.f - fabsf(hover.row - visualRow), 0.f, 1.f) *
         hover.strength * horizontal;
-    if (ThemedHighlights(state)) {
-        if (state.rename.editor && state.hovered == state.rename.index) return base;
-        // The combined state is a complete surface, not an accent overpaint.
-        // Retire the selected contribution as that surface arrives, including
-        // when combined opacity is lower than selection opacity.
-        return base*(1.f-overlap)/std::max(.000001f, 1.f-combined*overlap);
-    }
-    return base + std::min(0.f, combined - base) * overlap;
+    if (state.rename.editor && state.hovered == state.rename.index) return base;
+    // Retire the selected contribution as the combined surface arrives.
+    return base*(1.f-overlap)/std::max(.000001f, 1.f-combined*overlap);
 }
 
 // Overpainting the base selection should yield the configured combined
@@ -22295,15 +22364,11 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
         }
     }
     selectedWeight = std::clamp(selectedWeight, 0.f, 1.f);
-    const auto [base,hoverAlpha,combined]=HighlightOpacities(state);
-    if (ThemedHighlights(state)) {
-        const float alpha = hoverAlpha*(1.f-selectedWeight)+combined*selectedWeight;
-        if (combinedWeight) *combinedWeight = alpha > 0.f ? combined*selectedWeight/alpha : 0.f;
-        return alpha;
-    }
-    const float selectedExtra = std::clamp(
-        (combined - base) / std::max(0.001f, 1.f - base), 0.f, 1.f);
-    return hoverAlpha + (selectedExtra - hoverAlpha) * selectedWeight;
+    const auto opacity=HighlightOpacities(state);
+    const float combined=opacity[size_t(Theme::Highlight::SelectedHover)]*selectedWeight;
+    const float alpha=opacity[size_t(Theme::Highlight::Hover)]*(1.f-selectedWeight)+combined;
+    if (combinedWeight) *combinedWeight=alpha>0.f ? combined/alpha : 0.f;
+    return alpha;
 }
 
 // The highlight's visual motion is isolated from logical selection. Native
@@ -22383,21 +22448,21 @@ template<size_t N> void ReleaseContrastSurfaces(ThemeContrastResources<N>& cache
 // The same cached, translucent contrasting ink serves checks, chip counts and swipe chevrons.
 template<size_t N> void PrepareContrastSurfaces(ViewState& state,ThemeContrastResources<N>& cache,
     const std::array<Theme::SurfaceStyle,N>& styles) {
-    const auto snapshot=state.themeSnapshot;
+    const auto& snapshot=state.contrastPalette->theme;
     const COLORREF accent=COLORREF(DrawingAccent()&0xffffff);
-    const COLORREF bg=state.nativeEditBackground;
-    const COLORREF fg=state.nativeTextColor==CLR_INVALID ? RGB(128,128,128):state.nativeTextColor;
-    if(cache.snapshot!=snapshot || cache.mode!=state.themeMode || cache.accent!=accent ||
+    const COLORREF bg=state.contrastPalette->background;
+    const COLORREF fg=state.contrastPalette->foreground==CLR_INVALID ? RGB(128,128,128):state.contrastPalette->foreground;
+    if(cache.snapshot!=snapshot || cache.mode!=PaintedHighlightMode(state) || cache.accent!=accent ||
        cache.background!=bg || cache.foreground!=fg) {
-        cache={}; cache.snapshot=snapshot; cache.mode=state.themeMode; cache.accent=accent;
+        cache={}; cache.snapshot=snapshot; cache.mode=PaintedHighlightMode(state); cache.accent=accent;
         cache.background=bg; cache.foreground=fg;
         for(size_t i=0;i<styles.size();++i) {
             const auto& paint=styles[i].background;
             if(paint.kind==Theme::Paint::Kind::Linear)
                 cache.gradients[i]=NativeThemeGradient(state.target.Get(),paint);
         }
-    } else if(cache.markRevision==(state.contrastPalette ? state.contrastPalette->surfaceRevision : 0)) return;
-    cache.markRevision=state.contrastPalette ? state.contrastPalette->surfaceRevision : 0;
+    } else if(cache.markRevision==state.contrastPalette->surfaceRevision) return;
+    cache.markRevision=state.contrastPalette->surfaceRevision;
     for(size_t i=0;i<N;++i) {
         const auto ink=ResolveForeground(HighlightPalette(state),&styles[i],ThemeRgb(fg));
         cache.marks[i]=Packed(ink.rgb,ink.alpha);
@@ -22442,11 +22507,11 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
     const auto palette = DrawingAccent();
     const auto pill = mirror(badge.pill);
     float radius = (pill.bottom-pill.top)*.5f;
-    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const auto snapshot=PaintedHighlightTheme(state);
     const bool themed=snapshot && snapshot->elements.contains(L"PaintGroupBadge");
     D2D1_COLOR_F ink{};
     if(themed) {
-        const auto& styles=snapshot->groupBadges[static_cast<size_t>(state.themeMode)];
+        const auto& styles=snapshot->groupBadges[static_cast<size_t>(PaintedHighlightMode(state))];
         auto& cache=state.groupBadgeResources; PrepareContrastSurfaces(state,cache,styles);
         radius=ThemeBorderRadius(styles[0],pill,ViewDpi(state));
         DrawThemeSurface(state,pill,pill,radius,alpha,styles[0],cache.gradients[0],cache.ramps[0],
@@ -22482,12 +22547,6 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
         badge.textLeft+badge.textWidth+1.f, badge.pill.bottom, foreground, false, foregroundAlpha);
 }
 
-std::pair<unsigned,float> ResolveHeadingColor(unsigned fallback, const Theme::Color* color) {
-    if (!color) return {fallback,1.f};
-    const auto ink=HighlightColor(*color);
-    return {ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),
-        std::lround(ink.b*255))),ink.a};
-}
 ContrastPalette::Ink TextForeground(const ViewState& state,const Theme::SurfaceStyle* style,
     const Theme::SurfaceStyle* backdrop,unsigned fallback,bool defaultAuto=false) {
     const bool useAuto=defaultAuto || (style && style->autoTextColor);
@@ -22510,6 +22569,28 @@ struct ForegroundFeedback {
         }
         return selected ? std::optional{Theme::Highlight::Selected} : std::nullopt;
     }
+    std::optional<Theme::Highlight> CaptionState(ViewState& state,const ItemGeometry& geometry,const std::wstring& label) const {
+        const auto& box=geometry.text;
+        if (!geometry.wrapped) return StateAt(box.left+.5f,(box.top+box.bottom)*.5f);
+        const auto overlaps=[&](const PaintedFeedback* paint) {
+            if (!paint || (paint->base<=0.f && paint->combined<=0.f)) return false;
+            for (unsigned i=0;i<paint->count;++i) {
+                const auto& r=paint->parts[i].bounds;
+                if (r.left<box.right && r.right>box.left && r.top<box.bottom && r.bottom>box.top) return true;
+            }
+            return false;
+        };
+        if (!overlaps(selectedRow) && !overlaps(moving) && !overlaps(hover)) return {};
+        const auto glyphs=GridFilenameShape(state,geometry,label);
+        std::array<float,4> coverage{};
+        for (unsigned i=0;i<glyphs.count;++i) {
+            const auto& line=glyphs.lines[i];
+            const auto kind=StateAt((line.left+line.right)*.5f,(line.top+line.bottom)*.5f);
+            coverage[kind ? size_t(*kind) : 3]+=line.right-line.left;
+        }
+        const size_t best=std::max_element(coverage.begin(),coverage.end())-coverage.begin();
+        return best<3 && coverage[best]>0.f ? std::optional{static_cast<Theme::Highlight>(best)} : std::nullopt;
+    }
     const Theme::SurfaceStyle* At(const std::array<Theme::SurfaceStyle,3>& styles,float x,float y) const {
         const auto kind=StateAt(x,y);
         return kind ? &styles[static_cast<size_t>(*kind)] : nullptr;
@@ -22530,7 +22611,8 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
     const float centerY = top + height * .5f;
     const float unit = static_cast<float>(Scale96(4, dpi)) *
         std::clamp(height / std::max(1.f, GroupHeadingHeight(state)), 0.f, 1.f);
-    const auto* style=GroupHeadingTheme(state);
+    const auto* theme=PaintedHighlightTheme(state);
+    const auto* style=state.themeHighContrast ? nullptr : theme ? &theme->groupHeadings[size_t(PaintedHighlightMode(state))] : &Theme::defaultGroupHeading;
     const auto& highlights=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state));
     if(style && style->autoTextColor) {
         const auto arrow=TextForeground(state,style,feedback.At(highlights,centerXLogical,centerY),headerColor);
@@ -22563,7 +22645,7 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
 
     Text(state, title, text.left, text.top, text.right, text.bottom,
         ink.rgb, false, ink.Opacity(opacity,.9f*opacity), false, false, nullptr, false,
-        false, false, -1.f, .5f, ThemedHeadingFontSize(style,dpi,state.gridView,state.rowPx,state.fontPx));
+        false, false, -1.f, .5f, ThemedHeadingFontSize(GroupHeadingTheme(state),dpi,state.gridView,state.rowPx,state.fontPx));
 }
 
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
@@ -22801,8 +22883,8 @@ bool CheckboxVisualPressed(const ViewState& state,int id) {
 void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, float opacity,
                            bool hot=false,bool pressed=false) {
     if (!VisibleOpacity(opacity) || rect.right <= rect.left || rect.bottom <= rect.top) return;
-    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
-    const size_t mode=static_cast<size_t>(state.themeMode);
+    const auto snapshot=PaintedHighlightTheme(state);
+    const size_t mode=static_cast<size_t>(PaintedHighlightMode(state));
     const bool themed=snapshot && snapshot->checkboxEnabled[mode];
     D2D1_COLOR_F mark{};
     if(themed) {
@@ -24331,9 +24413,9 @@ void DrawSwipeIndicator(ViewState& state,const SwipeIndicator& motion,LARGE_INTE
         LayoutSwipeIndicator(state,motion,now,width,top,bottom,compositorOpacity);
     if(alpha<=0.f || w<=0.f || h<=0.f) return;
     const auto colors=DrawingAccent();
-    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const auto snapshot=PaintedHighlightTheme(state);
     const bool themed=snapshot && snapshot->elements.contains(L"DrawSwipeIndicator");
-    if(themed) PrepareContrastSurfaces(state,state.swipeResources,snapshot->swipeIndicators[static_cast<size_t>(state.themeMode)]);
+    if(themed) PrepareContrastSurfaces(state,state.swipeResources,snapshot->swipeIndicators[static_cast<size_t>(PaintedHighlightMode(state))]);
     else ReleaseContrastSurfaces(state.swipeResources);
     state.brush->SetColor(Packed(ThemeRgb(COLORREF(colors&0xFFFFFF)),alpha));
     // Clip each half of the rounded surface to retain independent edge/far
@@ -24344,7 +24426,7 @@ void DrawSwipeIndicator(ViewState& state,const SwipeIndicator& motion,LARGE_INTE
         if(themed) {
             auto& cache=state.swipeResources;
             const auto bounds=D2D1::RectF(l,cy-h*.5f,r,cy+h*.5f);
-            DrawThemeSurface(state,bounds,bounds,radius,alpha,snapshot->swipeIndicators[static_cast<size_t>(state.themeMode)][0],
+            DrawThemeSurface(state,bounds,bounds,radius,alpha,snapshot->swipeIndicators[static_cast<size_t>(PaintedHighlightMode(state))][0],
                 cache.gradients[0],cache.ramps[0],1.f,ThemeRgb(COLORREF(colors&0xffffff)),alpha,256,nullptr,true);
         } else state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(l,cy-h*.5f,r,cy+h*.5f),radius,radius),state.brush.Get());
         state.target->PopAxisAlignedClip();
@@ -24414,9 +24496,10 @@ bool RenderSwipeFeedback(ViewState& state) {
         const bool sameIntent=layer.visual && layer.revision==state.swipeFeedbackRevision && layer.origin.QuadPart==motion.origin.QuadPart;
         const bool sameViewport=layer.viewport.width==UINT(client.right) && layer.viewport.height==UINT(client.bottom) &&
             layer.dpi==dpi && layer.rtl==state.rtlLayout;
-        const bool sameAppearance=layer.contrastRevision==(state.contrastPalette ? state.contrastPalette->surfaceRevision : 0) && layer.theme==state.themeSnapshot && layer.themeMode==state.themeMode &&
-            layer.highContrast==state.themeHighContrast && layer.palette==DrawingAccent() &&
-            layer.background==state.nativeEditBackground && layer.foreground==state.nativeTextColor;
+        const auto* palette=HighlightPalette(state);
+        const auto surfaceRevision=palette ? palette->surfaceRevision : 0;
+        const bool sameAppearance=layer.contrastRevision==surfaceRevision &&
+            layer.highContrast==state.themeHighContrast && layer.palette==DrawingAccent();
         if(sameIntent && sameViewport && sameAppearance &&
             ((motion.committed && layer.fade) || (!motion.moving && !layer.moving))) continue;
         const float top=sameIntent ? layer.top*float(dpi)/layer.dpi:state.headerPx;
@@ -24483,10 +24566,9 @@ bool RenderSwipeFeedback(ViewState& state) {
                 if(!checked(layer.visual->SetEffect(nullptr),L"swipe.failure.setEffect",i)) return false;
             }
         }
-        layer.theme=state.themeSnapshot; layer.themeMode=state.themeMode; layer.highContrast=state.themeHighContrast;
-        layer.contrastRevision=state.contrastPalette ? state.contrastPalette->surfaceRevision : 0;
-        layer.palette=DrawingAccent(); layer.background=state.nativeEditBackground;
-        layer.foreground=state.nativeTextColor;
+        layer.highContrast=state.themeHighContrast;
+        layer.contrastRevision=surfaceRevision;
+        layer.palette=DrawingAccent();
         layer.revision=state.swipeFeedbackRevision; layer.origin=motion.origin;
         layer.viewport={UINT(client.right),UINT(client.bottom)}; layer.dpi=dpi; layer.rtl=state.rtlLayout; layer.top=top;
         layer.bounds=bounds; layer.moving=motion.moving; layer.visible=true;
@@ -24635,13 +24717,15 @@ void Paint(ViewState& state) {
     const unsigned headerColor = ThemeRgb(state.nativeHeaderTextColor != CLR_INVALID
         ? state.nativeHeaderTextColor : GetSysColor(COLOR_WINDOWTEXT));
     const auto* headerStyle=ColumnHeaderTheme(state);
-    const auto captionInk=TextForeground(state,headerStyle ? &headerStyle->header : nullptr,nullptr,headerColor);
+    const auto* paintedTheme=PaintedHighlightTheme(state);
+    const auto* captionStyle=paintedTheme ? &paintedTheme->columnHeaders[size_t(PaintedHighlightMode(state))].header : nullptr;
+    const auto captionInk=TextForeground(state,captionStyle,nullptr,headerColor);
     const auto captionColor=captionInk.rgb;
     const auto captionOpacity=captionInk.alpha;
     const auto rule=[&](const Theme::SurfaceStyle* style, float defaultOpacity) {
-        const auto [color,alpha]=ResolveHeadingColor(headerColor,style && style->borderColorDefined ? &style->borderColor : nullptr);
+        const auto ink=ResolveForeground(nullptr,nullptr,headerColor,style && style->borderColorDefined ? &style->borderColor : nullptr);
         const float opacity=style ? style->borderOpacity.value_or(defaultOpacity) : defaultOpacity;
-        return std::tuple{ColumnHeaderDividerWidth(style,dpi),color,alpha*opacity};
+        return std::tuple{ColumnHeaderDividerWidth(style,dpi),ink.rgb,ink.alpha*opacity};
     };
     const auto [dividerWidth,dividerColor,dividerAlpha]=rule(headerStyle ? &headerStyle->vertical : nullptr,1.f/15.f);
     const auto [bottomWidth,bottomColor,bottomAlpha]=rule(headerStyle ? &headerStyle->horizontal : nullptr,.12f);
@@ -24967,8 +25051,12 @@ void Paint(ViewState& state) {
         typeSearchNow - state.lastTyped <= kTypeSearchTimeoutMs;
     // One shared visual geometry for backgrounds, selection, icons, and text.
     // Actual row indices and Shell selection have already been committed.
-    std::unordered_map<int,PaintedFeedback> rowFeedback;
-    if (state.selectionFeedbackVisible) for (int i : visibleItems) {
+    auto& selectedPaint=state.selectionPaintScratch;
+    selectedPaint.clear();
+    auto& ghostPaint=state.ghostPaintScratch;
+    ghostPaint.clear();
+    if (state.selectionFeedbackVisible) for (size_t slot=0;slot<visibleItems.size();++slot) {
+        const int i=visibleItems[slot];
         RowVisual v = LayoutRowVisual(state, i, layoutProgress);
         if(compositionFrame.Rows()) { v.opacity=1.f; v.height=std::max(row,v.height); }
         if (!compositionFrame.Rows() && (v.top >= contentBottom || v.top + v.height <= header)) continue;
@@ -24985,11 +25073,12 @@ void Paint(ViewState& state) {
         // The opaque native editor covers the filename; retain the item's
         // selection behind it, including its icon and the rest of the row.
         if (alpha > 0.f)
-            FillSelectionRect(state,selection,alpha*v.opacity,&shape,false,Theme::Highlight::Selected,0.f,&rowFeedback[i]);
+            FillSelectionRect(state,selection,alpha*v.opacity,&shape,false,Theme::Highlight::Selected,0.f,&selectedPaint.emplace_back(slot,PaintedFeedback{}).second);
     }
     // Deleted rows exist only as a tiny, bounded painting snapshot, not in
     // Shell state. Their shrinking height and opacity close the old gaps.
     if (state.selectionFeedbackVisible && state.rowTransitionActive) {
+        ghostPaint.resize(state.disappearingRows.size());
         for (const auto& old : state.disappearingRows) {
             const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
@@ -25012,7 +25101,7 @@ void Paint(ViewState& state) {
                 }
                 FillSelectionRect(state, selection,
                     HighlightOpacities(state)[0]*opacity,&shape,false,Theme::Highlight::Selected,0.f,
-                    &rowFeedback[-int(&old-state.disappearingRows.data())-1]);
+                    &ghostPaint[&old-state.disappearingRows.data()]);
             }
         }
     }
@@ -25121,14 +25210,15 @@ void Paint(ViewState& state) {
     // All icon/thumbnail/drive-bar pixels precede every label. Cache this
     // viewport's shared geometry and alpha once for the following text pass.
     struct PaintedItem {
-        int index; RowVisual visual; ItemGeometry geometry; DriveBarGeometry usage; float opacity;
+        int index; RowVisual visual; ItemGeometry geometry; DriveBarGeometry usage; float opacity; size_t slot;
     };
     std::vector<PaintedItem> paintedItems;
     paintedItems.reserve(visibleItems.size());
     std::optional<PipelineScope> contentTrace;
     contentTrace.emplace(state.background,L"render.items");
     bool uiComparisonRow=true;
-    for (int i : visibleItems) {
+    for (size_t slot=0;slot<visibleItems.size();++slot) {
+        const int i=visibleItems[slot];
         const Entry& e = ModelEntry(state,i);
         RowVisual v = LayoutRowVisual(state, i, layoutProgress);
         if(compositionFrame.Rows()) { v.opacity=1.f; v.height=std::max(row,v.height); }
@@ -25164,7 +25254,7 @@ void Paint(ViewState& state) {
             PipelineEvent(*state.background,{.operation=L"ui.drive.track[x,y,w,h]",.a=state.uiTraceItem,.b=state.token,
                 .v={usage.track.left,usage.track.top,usage.track.right-usage.track.left,
                     usage.track.bottom-usage.track.top}},true);
-        paintedItems.push_back({i,v,geometry,usage,contentOpacity});
+        paintedItems.push_back({i,v,geometry,usage,contentOpacity,slot});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
         // A travelling icon changes its draw bounds, while cache lookups use
@@ -25226,10 +25316,10 @@ void Paint(ViewState& state) {
                 w, top + height), D2D1_ANTIALIAS_MODE_ALIASED);
             const auto geometry = LayoutItem(state, {top, height, opacity, old.oldLeft, old.oldWidth});
             const float contentOpacity = opacity * ItemContentOpacity(state, old.entry);
-            const auto feedback=rowFeedback.find(-int(&old-state.disappearingRows.data())-1);
-            const auto ghostInk=!state.themeHighContrast && feedback!=rowFeedback.end() && feedback->second.base>0.f &&
-                feedback->second.Covers(geometry.text.left+.5f,(geometry.text.top+geometry.text.bottom)*.5f) ?
-                highlightInk[static_cast<size_t>(Theme::Highlight::Selected)] : ContrastPalette::Ink{nameColor,1.f};
+            ForegroundFeedback feedback;
+            if (!ghostPaint.empty()) feedback.selectedRow=&ghostPaint[&old-state.disappearingRows.data()];
+            const auto kind=state.themeHighContrast ? std::nullopt : feedback.CaptionState(state,geometry,EntryLabel(old.entry));
+            const auto ghostInk=kind ? highlightInk[size_t(*kind)] : ContrastPalette::Ink{nameColor,1.f};
             Text(state, EntryLabel(old.entry), geometry.text.left, geometry.text.top,
                  geometry.text.right, geometry.text.bottom,
                  ghostInk.rgb, false, ghostInk.Opacity(opacity,contentOpacity), false, geometry.wrapped,0,false,true);
@@ -25275,6 +25365,7 @@ void Paint(ViewState& state) {
     contentTrace.emplace(state.background,L"render.labels");
     const ContrastPalette::Ink nativeInk{nameColor,1.f};
     const bool filenameHighlight=ViewOptionEnabled(state,g_filenameOnly);
+    size_t selectedSlot=0;
     for (const auto& item:paintedItems) {
         const int i=item.index;
         RowSourceScope source(state,i,2);
@@ -25283,12 +25374,13 @@ void Paint(ViewState& state) {
         const auto& geometry=item.geometry;
         const auto& usage=item.usage;
         ForegroundFeedback feedback;
-        if(const auto found=rowFeedback.find(i); found!=rowFeedback.end()) feedback.selectedRow=&found->second;
+        while (selectedSlot<selectedPaint.size() && selectedPaint[selectedSlot].first<item.slot) ++selectedSlot;
+        if (selectedSlot<selectedPaint.size() && selectedPaint[selectedSlot].first==item.slot)
+            feedback.selectedRow=&selectedPaint[selectedSlot].second;
         feedback.moving=&movingFeedback;
         feedback.hover=&hoverFeedback;
         auto ink=nativeInk;
-        const float labelY=(geometry.text.top+geometry.text.bottom)*.5f;
-        if(const auto kind=feedback.StateAt(geometry.text.left+.5f,labelY); kind && !state.themeHighContrast)
+        if(const auto kind=state.themeHighContrast ? std::nullopt : feedback.CaptionState(state,geometry,EntryLabel(e)); kind)
             ink=highlightInk[static_cast<size_t>(*kind)];
         const auto detailInk=filenameHighlight ? nativeInk : ink;
         // Apply the user's metadata opacity after resolving foreground contrast.
@@ -25667,6 +25759,10 @@ void Paint(ViewState& state) {
         }
     }
     if (submitted) {
+        if (!clipboardPartial) {
+            state.acceptedScrollbars=scrollbars;
+            state.acceptedScrollbarToken=state.token;
+        }
         state.lastAcceptedPaint=state.graphicsPaintSerial;
         state.lastAcceptedPresentationModel=state.presentationSequence;
         if (state.presentObserverId) {
@@ -31153,7 +31249,11 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
             CapturePinchAnchor(state,*contact);
         const float sampledProgress=state.presenter && state.rowTransitionActive ?
             state.rowTransitionPresentedProgress : -1.f;
-        auto cells = CapturePresentedGridCells(state,false,sampledProgress);
+        const auto metrics=TargetItemMetrics(state,height96,bounded96);
+        std::optional<GridPacking> packing;
+        if (state.gridView) packing=PackGrid(state,metrics.row,metrics.font,metrics.icon,state.columnModeTransition ? state.headerPx : 0.f);
+        const bool reflow=zoomLayout || (packing && packing->columns!=oldColumns);
+        auto cells=reflow ? CapturePresentedGridCells(state,false,sampledProgress) : std::vector<CapturedRow>{};
         auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
             CaptureVisibleGroupHeaders(state,sampledProgress);
         // Take over the current pose rather than finishing a wheel/trackpad
@@ -31175,7 +31275,7 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         state.rowHeight96[state.gridView] = height96;
         if (IsWindow(state.activeTabHost))
             state.tabPresentations[state.activeTabHost].zoomHeight96[state.gridView] = height96;
-        UpdateMetrics(state);
+        ApplyItemMetrics(state,metrics,1.f,packing);
         ReconcileColumnViewportAfterRowCount(state);
         const float anchored = index >= 0 ? DocumentRowTop(state, index) +
             fraction * DisplayRowHeight(state, index) : fraction * state.rowPx;
@@ -33736,14 +33836,14 @@ void AttachBeforeFirstNativePaint(HWND child, Scan scan = ScanShellWindow) {
         if (!GetClassNameW(native,cls,ARRAYSIZE(cls))) return;
     }
     if (_wcsicmp(cls,L"SHELLDLL_DefView") || GetPropW(native,kColdAttachPaintCheckedProperty) ||
+        GetPropW(native,kColdAttachPaintPendingProperty) ||
         !IsWindowVisible(native) || GetWindowThreadProcessId(native,nullptr)!=GetCurrentThreadId()) return;
     const HWND frame=GetAncestor(native,GA_ROOT);
     if (!IsExplorerFrame(frame) || IsIconic(frame) || GetPropW(frame,kShellScanProperty)) return;
     const HWND tab=ActiveExplorerTab(frame);
     if (!IsWindow(tab) || OverlayForTab(tab)) return;
-    // Claim one attempt per view HWND before entering the guarded Shell scan.
-    // Discovery can be reentrant, and unsupported views keep painting normally.
-    if (!SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1))) return;
+    // ScanShellWindow guards reentry. Rearm unresolved discovery on Shell readiness.
+    if (!SetPropW(native,kColdAttachPaintPendingProperty,reinterpret_cast<HANDLE>(1))) return;
     scan(frame,tab,native);
     if (g_perf.load(std::memory_order_relaxed))
         Wh_Log(L"[GPU startup] COLD_PREPAINT frame=%p tab=%p native=%p attached=%d",
@@ -33858,6 +33958,8 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
                                      ARRAYSIZE(parentClass)) ||
             _wcsicmp(parentClass, L"SHELLDLL_DefView") != 0) return;
     }
+    if (viewEvent || contentEvent)
+        RemovePropW(viewEvent ? changed : GetParent(changed),kColdAttachPaintPendingProperty);
     const HWND frame = frameEvent ? changed : GetAncestor(changed, GA_ROOT);
     // New Shell tabs need their own startup request even while another tab
     // already has a renderer. CREATE is sufficient; retries retain this tab's
@@ -33949,6 +34051,7 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
             EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
                 RemovePropW(child,kColdAttachResolvedProperty);
                 RemovePropW(child,kColdAttachPaintCheckedProperty);
+                RemovePropW(child,kColdAttachPaintPendingProperty);
                 return TRUE;
             },0);
         }
@@ -34096,6 +34199,12 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             }
     if (msg == WM_SIZE || msg == WM_WINDOWPOSCHANGED || msg == WM_DPICHANGED || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE)
         RefreshViewToggleForFrame(hwnd, true, msg != WM_WINDOWPOSCHANGED);
+    if (msg==WM_TIMECHANGE || (msg==WM_SETTINGCHANGE && lp &&
+        (!_wcsicmp(reinterpret_cast<LPCWSTR>(lp),L"intl") || !_wcsicmp(reinterpret_cast<LPCWSTR>(lp),L"TimeZoneInformation"))) ||
+        (msg==WM_POWERBROADCAST && (wp==PBT_APMRESUMEAUTOMATIC || wp==PBT_APMRESUMESUSPEND))) {
+        for (HWND overlay : FrameOverlays(hwnd))
+            if (auto* state=State(overlay)) ++state->calendarRevision;
+    }
     if (msg == WM_ACTIVATE || msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
         for (HWND overlay : FrameOverlays(hwnd)) QueueInputFocusUpdate(overlay);
     // A topmost item tooltip must not float over the app that took activation.
@@ -35192,6 +35301,7 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
     receipt->failure=state.graphicsFailure; receipt->failureStage=state.graphicsFailureStage;
     receipt->standbyPending=state.graphicsStandbyPending;
     receipt->rowRevision=state.presentationRowRevision; receipt->rowOrigin=state.rowTransitionStartedQpc;
+    receipt->scrollbars=state.acceptedScrollbars;
     receipt->rowProgress=state.rowTransitionPresentedProgress; receipt->rows=state.rowTransitionActive;
     receipt->columnOrigin=state.presentationColumnOrigin; receipt->columns=state.columnTransitionActive;
     receipt->scrollOrigin=state.smoothStartedQpc; receipt->scroll=state.scrollNow;
@@ -35565,6 +35675,8 @@ void ConsumePresentation(ViewState& state) {
     }
     if(InactiveGraphics(state)) standby();
     if(!receipt->accepted) return;
+    state.acceptedScrollbars=receipt->scrollbars;
+    state.acceptedScrollbarToken=receipt->token;
     state.presentationAcceptedSequence=std::max(state.presentationAcceptedSequence,receipt->sequence);
     // Every model since the run began admitted the bar, so the lane drew it.
     if(state.horizontalScrollbarAdmitted && state.horizontalScrollbarAdmittedSequence &&
@@ -35815,6 +35927,12 @@ HRESULT ConfigureTouchRecognizer(TouchRecognizer& session) {
 }
 
 bool StartTouchRecognizer(ViewState& state) {
+    // Input may arrive before rendering initializes the view clock.
+    if (!state.qpcFrequency) {
+        LARGE_INTEGER frequency{};
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0) return false;
+        state.qpcFrequency=static_cast<double>(frequency.QuadPart);
+    }
     if (state.touchRecognizer) return true;
     auto session = std::make_shared<TouchRecognizer>();
     HRESULT hr = CreateInteractionContext(&session->context);
@@ -36382,6 +36500,114 @@ void AdvanceTouchInertia(ViewState& state) {
     else { Wh_Log(L"[GPU touch] inertia failed hr=0x%08X",unsigned(hr)); StopTouch(state); }
 }
 
+// Touch jitter: a resting or rolling finger reports a few pixels of wobble,
+// which pans, swipes and drags showed as shivering. Every contact goes through
+// an adaptive low-pass (the "1 Euro" filter, Casiez et al. 2012) before
+// anything reads it: heavy smoothing while the finger is slow, next to none
+// once it really moves, so a pan or fling keeps its responsiveness and the
+// recognizer still measures the real release speed. DOWN stays raw (hit
+// tests, taps). Applied at this one boundary, so pan, pinch, swipe, marquee,
+// drag and the scrollbars all see the same contact.
+constexpr double kTouchJitterMinCutoffHz = 0.8;   // cutoff for a still finger
+constexpr double kTouchJitterCutoffPerSpeed = 25; // Hz added per DIP/ms
+constexpr double kTouchJitterSpeedCutoffHz = 5;   // smoothing of the speed itself
+constexpr double kTouchJitterMinGapMs = 1., kTouchJitterMaxGapMs = 50.;
+
+static double TouchLowPassAlpha(double cutoffHz, double dtMs) {
+    const double tauMs = 1000. / (2. * 3.14159265358979323846 * cutoffHz);
+    return dtMs / (dtMs + tauMs);
+}
+
+// The filter itself, on one frame (every contact of it, QPC-stamped).
+// Separate from the view so a regression can drive it with real numbers.
+using TouchContactFilters = std::vector<TouchRecognizer::ContactFilter>;
+static void SmoothTouchContacts(TouchContactFilters& filters, POINTER_INFO* frame, UINT32 pointers,
+                                double qpcFrequency, UINT dpi) {
+    const double dipPx = std::max(1u, dpi) / 96.;
+    // A frame lists every contact the device still has: a filter whose
+    // contact isn't in it lost its UP (capture moved, a canceled packet).
+    std::erase_if(filters, [&](const auto& f) {
+        return std::none_of(frame, frame + pointers, [&](const POINTER_INFO& p) {
+            return p.pointerType == PT_TOUCH && p.pointerId == f.id;
+        });
+    });
+    for (UINT32 p = 0; p < pointers; ++p) {
+        auto& info = frame[p];
+        if (info.pointerType != PT_TOUCH) continue;
+        auto it = std::find_if(filters.begin(), filters.end(),
+                               [&](const auto& f) { return f.id == info.pointerId; });
+        const double rawX = info.ptPixelLocation.x, rawY = info.ptPixelLocation.y;
+        if (info.pointerFlags & POINTER_FLAG_DOWN || it == filters.end()) {
+            // The DOWN point stays raw: hit tests and taps use it.
+            if (it == filters.end()) it = filters.emplace(filters.end());  // (not insert(end, {}): that inserts nothing)
+            *it = {info.pointerId, info.PerformanceCount, rawX, rawY, 0., 0.};
+            // Himetric is the device's own space (its origin isn't the
+            // screen's): moved by the pixel offset times the device's scale.
+            RECT device{}, display{};
+            if (GetPointerDeviceRects(info.sourceDevice, &device, &display) &&
+                display.right > display.left && display.bottom > display.top) {
+                it->himetricPerPixelX = double(device.right - device.left) / (display.right - display.left);
+                it->himetricPerPixelY = double(device.bottom - device.top) / (display.bottom - display.top);
+            }
+            if (info.pointerFlags & POINTER_FLAG_UP) filters.erase(it);
+            continue;
+        }
+        const bool timed = qpcFrequency > 0. && info.PerformanceCount > it->qpc;
+        const double dt = timed ? std::clamp((info.PerformanceCount - it->qpc) * 1000. / qpcFrequency,
+                                             kTouchJitterMinGapMs, kTouchJitterMaxGapMs)
+                                : kTouchJitterMinGapMs;
+        if (timed) {
+            // No time passed (a coalesced or repeated sample): the speed
+            // can't be measured, so it isn't (a 1 ms guess made a jump look
+            // like a fast flick and switched the smoothing off).
+            it->qpc = info.PerformanceCount;
+            const double aSpeed = TouchLowPassAlpha(kTouchJitterSpeedCutoffHz, dt);
+            it->vx += aSpeed * ((rawX - it->x) / dt - it->vx);
+            it->vy += aSpeed * ((rawY - it->y) / dt - it->vy);
+        }
+        const double speedDip = std::hypot(it->vx, it->vy) / dipPx;
+        const double a = TouchLowPassAlpha(
+            kTouchJitterMinCutoffHz + kTouchJitterCutoffPerSpeed * speedDip, dt);
+        it->x += a * (rawX - it->x);
+        it->y += a * (rawY - it->y);
+        const LONG sx = std::lround(it->x), sy = std::lround(it->y);
+        info.ptHimetricLocation.x += LONG(std::lround((sx - rawX) * it->himetricPerPixelX));
+        info.ptHimetricLocation.y += LONG(std::lround((sy - rawY) * it->himetricPerPixelY));
+        info.ptPixelLocation = {sx, sy};
+        if (info.pointerFlags & POINTER_FLAG_UP) filters.erase(it);
+    }
+}
+
+static void SmoothTouchFrame(const ViewState& state, TouchRecognizer& session,
+                             POINTER_INFO* frame, UINT32 pointers) {
+    // Windows recognizes gestures from physical displacement. Filtering a
+    // pending move can keep a real threshold crossing below system slop.
+    // Seed at the acquisition point before filtering subsequent motion.
+    if (!state.touch.active || state.touch.gesture==TouchGesture::Pending)
+        session.filters.clear();
+    // A pinch controls zoom by the physical distance between contacts.
+    // Smooth its translation as a pair so filtering cannot shrink that span.
+    const bool pinch=state.touch.gesture==TouchGesture::Pinch && pointers==2;
+    POINTER_INFO original[2]{};
+    if (pinch) std::copy_n(frame,2,original);
+    SmoothTouchContacts(session.filters, frame, pointers, state.qpcFrequency,
+                        GetDpiForWindow(state.hwnd));
+    if (pinch) {
+        const auto translate=[&](POINT POINTER_INFO::* field) {
+            const auto& a=original[0].*field;
+            const auto& b=original[1].*field;
+            const auto& u=frame[0].*field;
+            const auto& v=frame[1].*field;
+            const LONG dx=std::lround(((double(u.x)-a.x)+(double(v.x)-b.x))*.5);
+            const LONG dy=std::lround(((double(u.y)-a.y)+(double(v.y)-b.y))*.5);
+            frame[0].*field={a.x+dx,a.y+dy};
+            frame[1].*field={b.x+dx,b.y+dy};
+        };
+        translate(&POINTER_INFO::ptPixelLocation);
+        translate(&POINTER_INFO::ptHimetricLocation);
+    }
+}
+
 // Shared native-input boundary: packet history is oldest-first on the owner
 // STA. Recognition uses Windows' device calibration and system thresholds.
 void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& session,
@@ -36390,6 +36616,11 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
     auto* expected = &state;
     for (UINT32 e = entries; e-- > 0;) {
         const auto* frame = packets + size_t(e) * pointers;
+        // This frame's own copy (QPC-stamped, smoothed). Local, not the
+        // session's: the calls below pump messages, a nested touch message
+        // runs FeedTouchFrames again, and a shared buffer reassigned there
+        // left `frame` dangling here (access violation, Explorer restarted).
+        std::vector<POINTER_INFO> local;
         const auto& original = frame[0];
         const DWORD inputTime = original.PerformanceCount && state.qpcFrequency > 0. ?
             DWORD(original.PerformanceCount*1000./state.qpcFrequency) : original.dwTime;
@@ -36409,14 +36640,19 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 session->packetClockTick = GetTickCount64();
             }
             const auto now = LONGLONG(GetTickCount64());
-            session->normalized.assign(frame,frame+pointers);
-            for (auto& p : session->normalized) if (!p.PerformanceCount) {
+            local.assign(frame,frame+pointers);
+            for (auto& p : local) if (!p.PerformanceCount) {
                 const auto tick = now+LONG(p.dwTime-DWORD(now));
                 p.PerformanceCount = UINT64(session->packetClock.QuadPart+
                     std::llround((tick-LONGLONG(session->packetClockTick))*state.qpcFrequency/1000.));
             }
-            frame = session->normalized.data();
+            frame = local.data();
         }
+        if (frame != local.data()) {
+            local.assign(frame, frame + pointers);
+            frame = local.data();
+        }
+        SmoothTouchFrame(state, *session, local.data(), pointers);
         const auto& first = frame[0];
         bool canceled = false;
         for (UINT32 p = 0; p < pointers; ++p) canceled |= (frame[p].pointerFlags & POINTER_FLAG_CANCELED) != 0;
@@ -36532,7 +36768,8 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
         double centerX=0.,centerY=0.; unsigned centerCount=0;
         for(UINT32 p=0;p<pointers;++p) if(frame[p].pointerType==PT_TOUCH &&
             (frame[p].pointerFlags&(POINTER_FLAG_INCONTACT|POINTER_FLAG_UP))) {
-            centerX+=frame[p].ptPixelLocation.x; centerY+=frame[p].ptPixelLocation.y; ++centerCount;
+            const auto& physical=packets[size_t(e)*pointers+p].ptPixelLocation;
+            centerX+=physical.x; centerY+=physical.y; ++centerCount;
         }
         if(centerCount && centerCount>=state.touch.contacts) {
             POINT center{LONG(std::lround(centerX/centerCount)),LONG(std::lround(centerY/centerCount))};
@@ -37758,6 +37995,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (!s->tabSwitchProbeUntil) UnregisterAnimationWindow(hwnd);
                 SetTimer(hwnd, kTimerId, kInactiveTabIdleTimerMs, nullptr);
                 return 0;
+            }
+            if (s->loaded && s->inScope && !s->directoryPending && !s->rename.editor) {
+                // Existing tab maintenance also catches midnight after an inactive tab wakes.
+                const auto stamp=DateGroupingStamp(*s);
+                if (stamp && stamp!=s->requestedCalendarStamp) QueueDirectoryRefresh(*s,false,true);
             }
             if (NativeColumnSnapshotReady(*s)) QueueFeatureInitialization(*s);
             if (s->loaded && !s->optimisticStartedAt && LayoutAnimationActive(*s, true)) {
@@ -41980,11 +42222,12 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab, HWND expectedNative)
         if (!pathResolved) {
             break;
         }
-        if (!IsSupportedLocation(path)) {
+        const bool supported=IsSupportedLocation(path);
+        if (!supported) {
             SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
             SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1));
         }
-        if (IsSupportedLocation(path)) {
+        if (supported) {
             AttachView(native,view,folder,shellBrowser,path,preparing);
             stage.Mark(L"AttachView discovered tab");
             if (HWND overlay = OverlayForTab(targetTab))

@@ -105,6 +105,48 @@ function Invoke-RegressionGate {
 # Fail fast on a machine that would invalidate every result: start a short-lived
 # private probe and look for an injected mod engine before anything is compiled
 # or run. The in-run observation remains as a backstop.
+function Assert-ShellHookRegistration {
+    # Explorer's in-place rename (CInplaceRename::_HookMouse) registers a
+    # thread WH_MOUSE hook backed by explorerframe.dll and ends the edit when
+    # that fails. When the session cannot register DLL-backed hooks, rename
+    # fails in Explorer itself and every rename result would be meaningless.
+    if (!('RegressionShellHook' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class RegressionShellHook {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr LoadLibraryW(string name);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool FreeLibrary(IntPtr module);
+    [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SetWindowsHookExW(int id, IntPtr proc, IntPtr module, uint thread);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool UnhookWindowsHookEx(IntPtr hook);
+    // Returns 0 when the hook registers, otherwise the Win32 error.
+    public static int Probe() {
+        IntPtr module = LoadLibraryW("explorerframe.dll");
+        if (module == IntPtr.Zero) return Marshal.GetLastWin32Error();
+        try {
+            // Registered and removed at once on this thread, which owns no
+            // windows, so the procedure is never called.
+            IntPtr proc = GetProcAddress(module, "DllCanUnloadNow");
+            if (proc == IntPtr.Zero) return Marshal.GetLastWin32Error();
+            IntPtr hook = SetWindowsHookExW(7 /* WH_MOUSE */, proc, module, GetCurrentThreadId());
+            if (hook == IntPtr.Zero) return Marshal.GetLastWin32Error();
+            UnhookWindowsHookEx(hook);
+            return 0;
+        } finally { FreeLibrary(module); }
+    }
+}
+'@
+    }
+    $code = [RegressionShellHook]::Probe()
+    if ($code) {
+        $reason = [ComponentModel.Win32Exception]::new($code).Message
+        throw ("PENDING: Windows cannot register DLL-backed window hooks in this session (SetWindowsHookExW with explorerframe.dll: $code, $reason). " +
+            "Explorer's own rename is broken until this clears, so nothing was compiled or run. Sign out or restart Windows, then rerun.")
+    }
+}
+
 function Assert-NoModuleInjection {
     $shell = Join-Path $PSHOME 'powershell.exe'
     if (!(Test-Path -LiteralPath $shell)) { $shell = Join-Path $PSHOME 'pwsh.exe' }
