@@ -24,7 +24,28 @@ inline void Load(OptionEffects::Settings& settings,const std::wstring& xml) {
     settings.Set(L"theme",xml); LoadSettings();
     Check(SettingsFixture::strings==0,"theme setting string ownership leaked");
 }
+struct OffscreenPalette {
+    unsigned long long next=0;
+    std::optional<std::tuple<std::shared_ptr<const Theme::Document>,Theme::Mode,COLORREF,COLORREF,
+        COLORREF,COLORREF,COLORREF,unsigned long long,std::array<float,3>>> previous;
+    void Resolve(ViewState& view) {
+        const auto theme=view.themeHighContrast ? nullptr : view.themeSnapshot;
+        const auto opacity=HighlightOpacities(theme.get(),view.themeMode);
+        const auto inputs=std::tuple{theme,view.themeMode,view.nativeEditBackground,view.nativeTextColor,
+            view.tipBaseBackground,view.tipBaseForeground,g_selectionRgb.load(),g_swipePalette.load(),opacity};
+        if(previous==inputs) return;
+        previous=inputs;
+        view.paletteRevision=++next;
+        auto seed=std::make_shared<ContrastPalette>();
+        seed->accent=g_swipePalette.load();
+        view.contrastPalette=ResolveContrastPalette({theme,view.themeMode,view.nativeEditBackground,
+            view.nativeTextColor,view.tipBaseBackground,view.tipBaseForeground,g_selectionRgb.load(),
+            opacity,next,0,false,view.themeHighContrast,{}},
+            g_swipePalette.load());
+    }
+};
 struct Surface {
+    OffscreenPalette palette;
     static constexpr UINT width=480,height=240;
     ViewState state;
     HWND frame=nullptr;
@@ -53,7 +74,8 @@ struct Surface {
         DropTarget(state); DestroyWindow(state.hwnd); state.hwnd=nullptr; DestroyWindow(frame);
     }
     template<class Draw> std::vector<DWORD> Render(Draw draw) {
-        state.themeSnapshot=Theme::Snapshot(); PrepareHighlightBrushes(state);
+        state.themeSnapshot=Theme::Snapshot(); palette.Resolve(state);
+        AccentDrawScope scope(AccentPalette(state)); PrepareHighlightBrushes(state);
         state.target->BeginDraw(); state.target->SetTransform(D2D1::Matrix3x2F::Identity());
         state.target->Clear(D2D1::ColorF(0,0.f)); draw(state);
         Check(SUCCEEDED(state.target->EndDraw()) && SUCCEEDED(cpu->CopyFromBitmap(nullptr,target.Get(),nullptr)),"theme draw/readback");
@@ -101,6 +123,7 @@ inline void BorderCacheReleased(const ThemeBorderStrokes& cache) {
 }
 
 struct Tooltip {
+    OffscreenPalette palette;
     StyleFixture::Session style;
     LayeredPixelsFixture::Session capture;
     ViewState state;
@@ -122,7 +145,8 @@ struct Tooltip {
     ~Tooltip() {state.itemTip.DropTarget(); state.itemTip.hwnd=nullptr; state.hwnd=nullptr; DestroyWindow(window);}
     void Show(Theme::Mode mode=Theme::Mode::Light,bool highContrast=false) {
         state.themeSnapshot=Theme::Snapshot(); state.themeMode=mode; state.itemTip.highContrast=highContrast;
-        ResolveItemTipPalette(state);
+        state.presentationOnly=true; state.presentationDpi=StyleFixture::dpi;
+        ResolveItemTipPalette(state); palette.Resolve(state); ResolveItemTipPalette(state);
         Check(LayoutItemTip(state,RECT{0,0,800,600}),"themed tooltip layout");
         RenderItemTip(state.itemTip);
         Check(!LayeredPixelsFixture::pixels.empty(),"tooltip submitted no pixels");
@@ -1472,7 +1496,7 @@ static void TestThemedSwipeComposition() {
     for(auto [p,value]:std::initializer_list<std::pair<SwipeIndicator::Property,double>>{{SwipeIndicator::X,20},{SwipeIndicator::Scale,1},
         {SwipeIndicator::Width,120},{SwipeIndicator::Height,40},{SwipeIndicator::Alpha,1},{SwipeIndicator::ArrowAlpha,1},
         {SwipeIndicator::Length,16},{SwipeIndicator::ArrowHeight,9}}) motion.springs[p].value=motion.springs[p].target=value;
-    const auto render=[&] {state.themeSnapshot=Theme::Snapshot(); Check(RenderSwipeFeedback(state),"themed swipe compositor submission");};
+    const auto render=[&] {state.themeSnapshot=Theme::Snapshot(); surface.palette.Resolve(state); Check(RenderSwipeFeedback(state),"themed swipe compositor submission");};
     Load(settings,Element(L"DrawSwipeIndicator",LR"(background="#101010" border-width="1px")")); render();
     Check(state.swipeComposition[0].visible && state.swipeCompositionSerial>0,"swipe fixture produced no foreground visual");
     const auto serial=state.swipeCompositionSerial; render(); Check(state.swipeCompositionSerial==serial,"unchanged swipe was needlessly recomposed");

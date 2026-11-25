@@ -2,6 +2,9 @@
 #include <fstream>
 static void TestStyleEvents(const std::wstring& fixture) {
     StyleFixture::Session faults;
+    StyleFixture::paletteOwner=GetCurrentThreadId();
+    struct ResetPaletteOwner {~ResetPaletteOwner(){StyleFixture::paletteOwner=0;}} resetPaletteOwner;
+    StyleFixture::workerAccent=RGB(0x2e,0x7d,0x32);
     const bool showButton=g_showNativeViewToggleButton.exchange(false);
     const bool accent=g_dynamicAccent.exchange(true);
     const bool touchpad=g_touchpadDirectManipulation.exchange(false);
@@ -57,12 +60,22 @@ static void TestStyleEvents(const std::wstring& fixture) {
         "style frame subscription");
     const auto probes=[] {return std::array<unsigned,4>{StyleFixture::themeQueries,
         StyleFixture::systemColorQueries,StyleFixture::accentQueries,StyleFixture::activations};};
-    const auto drain=[] {
+    const auto settle=[&] {
+        Check(Eventually([&] {
+            MSG m{};
+            while(PeekMessageW(&m,nullptr,kMsgPaletteReady,kMsgPaletteReady,PM_REMOVE))
+                OverlayProc(m.hwnd,m.message,m.wParam,m.lParam);
+            return first.contrastPalette && first.contrastPalette->revision==first.paletteRevision &&
+                second.contrastPalette && second.contrastPalette->revision==second.paletteRevision;
+        }),"tab worker palette publication");
+    };
+    settle();
+    const auto drain=[&] {
         MSG message{}; unsigned count=0;
         while(PeekMessageW(&message,nullptr,kMsgStyleChanged,kMsgStyleChanged,PM_REMOVE)) {
             OverlayProc(message.hwnd,message.message,message.wParam,message.lParam); ++count;
         }
-        return count;
+        settle(); return count;
     };
     const auto initial=probes();
     // Force real directory completion and multiple maintenance passes. The
@@ -83,16 +96,19 @@ static void TestStyleEvents(const std::wstring& fixture) {
     StyleFixture::colors={{{1,0,0,TMT_TEXTCOLOR},RGB(210,230,240)}};
     // The Windows accent changes; DWM colorization reports something else.
     StyleFixture::appAccent={255,0x18,0xA0,0x60}; StyleFixture::accent=0xFFAACC11;
+    StyleFixture::workerAccent=RGB(0x18,0xA0,0x60);
+    const auto accentReads=StyleFixture::workerAccentReads.load();
     SendMessageW(frame,WM_THEMECHANGED,0,0);
     SendMessageW(frame,WM_SYSCOLORCHANGE,0,0);
     SendMessageW(frame,WM_DWMCOLORIZATIONCOLORCHANGED,StyleFixture::accent,TRUE);
     Check(probes()==initial,"frame event performed color work synchronously");
     Check(drain()==2 && first.nativeTextColor==RGB(210,230,240) &&
-        second.nativeTextColor==first.nativeTextColor && g_selectionRgb==RGB(0x18,0xA0,0x60),
+        second.nativeTextColor==first.nativeTextColor && SelectionColor(first)==RGB(0x18,0xA0,0x60) &&
+        SelectionColor(second)==SelectionColor(first) && StyleFixture::workerAccentReads==accentReads+2,
         "coalesced frame events missed tabs without a toggle button");
     Check(StyleFixture::themeQueries==initial[0]+8 && StyleFixture::activations==initial[3]+2,
         "one event burst performed repeated palette resolutions");
-    const auto palette=g_swipePalette.load();
+    const auto palette=AccentPalette(first);
     const COLORREF bubble=COLORREF(palette&0xFFFFFF),glyph=COLORREF((palette>>24)&0xFFFFFF);
     const unsigned alpha=unsigned((palette>>48)&255);
     const auto blend=RGB((GetRValue(bubble)*(255-alpha)+GetRValue(glyph)*alpha)/255,
@@ -138,11 +154,11 @@ static void TestStyleEvents(const std::wstring& fixture) {
     Check(!first.viewToggle && !second.viewToggle,"style events created optional controls");
     StyleFixture::highContrast=true;
     QueueStyleChange(first,kStyleColors); drain();
-    Check(g_selectionRgb==RGB(12,110,210) && (g_swipePalette.load()&0xFFFFFF)==RGB(12,110,210),
+    Check(SelectionColor(first)==RGB(12,110,210) && (AccentPalette(first)&0xFFFFFF)==RGB(12,110,210),
         "high contrast selection/badge did not use the system highlight");
     StyleFixture::highContrast=false;
     QueueStyleChange(first,kStyleColors); drain();
-    Check(g_selectionRgb==RGB(0x18,0xA0,0x60),"selection failed to restore DWM accent after high contrast");
+    Check(SelectionColor(first)==RGB(0x18,0xA0,0x60),"selection failed to restore Windows accent after high contrast");
     // Sent frame broadcasts must reach the same queue as posted/native hints.
     // Inactive tabs keep the hint until they own the active view again.
     struct RestoreHosts {

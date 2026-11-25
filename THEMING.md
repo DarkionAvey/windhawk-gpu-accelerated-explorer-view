@@ -64,6 +64,8 @@ as needed. The selected-and-hovered state also inherits the selected style.
 |---|---|
 | `background` | A color or `linear-gradient(...)` |
 | `background-color` | A solid color |
+| `text-color` | `auto` (default), `accent`, or a color such as `#e8eef5` |
+| `opacity` | A fraction from 0 to 1, a percentage such as `60%`, or `none`. When omitted, uses the matching selection, hover, or selected-hover opacity setting. |
 | `border-color` | A color; defaults to the Windows accent color |
 | `border-width` | A nonnegative number or a value such as `1px`; defaults to `0` |
 
@@ -74,10 +76,30 @@ scale with display scaling and are rounded to whole screen pixels. For example,
 at 150% or 200%. Borders stay inside the highlight and do not change item
 positions or spacing.
 
+Automatic text uses translucent light or dark ink, like the back and forward
+swipe arrows. Automatic text prefers white when solid white would reach 3.8:1.
+The renderer aims for 7:1 for highlighted filenames and uses nearly opaque ink
+when that target is out of reach. The secondary text opacity setting applies after automatic ink is
+resolved. Setting it to zero hides secondary text.
+Each highlight state resolves its own ink after its
+background color and opacity are blended over Explorer’s current app background.
+For a gradient, the first stop supplies the reference color. Filename-only
+highlights change just the filename. To override one appearance or restore
+automatic contrast on a more specific state, for example:
+
+```xml
+<theme>
+  <element name="FillSelectionRect:selected" background="#224466" text-color="#f1e6cd">
+    <light background="#dce9f5" text-color="auto" />
+  </element>
+  <element name="FillSelectionRect:selected:hover" background="accent" text-color="auto" />
+</theme>
+```
+
 Colors can be `accent`, `transparent`, or hex values such as `#39f`, `#3399ff`,
 and `#3399ff80`. In eight-digit colors, the last two digits set transparency:
 `00` is transparent and `ff` is opaque. Existing selection and hover opacity
-settings still apply to both backgrounds and borders. Use the regular mod
+settings supply the default opacity for both backgrounds and borders. Use the regular mod
 settings for fonts, sizes, corner rounding, and filename-only selection.
 
 Light and dark blocks follow Windows app appearance. Theme overrides are
@@ -117,7 +139,7 @@ logical pixels at 96 DPI.
 |---|---|
 | `height` | A fixed length, or `auto` to follow the list item height during zoom and Compact view. |
 | `font-size` | A positive fixed length, a percentage of the current item height, or `auto` to match the list text size. |
-| `text-color` | A color for captions and sort arrows. The default follows Windows. |
+| `text-color` | A color for captions and sort arrows. Use `auto` for contrast against Explorer’s background. Omitting the property keeps the Windows color. |
 | `border-width` | Thickness of the column dividers and header rules. Omit it to keep the usual one-screen-pixel lines. |
 | `border-color` | A color for the dividers and rules. The default follows Windows. |
 | `border-opacity` | A number from `0` to `1`, a percentage, or `none`. Omit it to keep the usual subtle lines. |
@@ -578,7 +600,7 @@ Light and dark blocks work as usual.
 - `font-size` takes a pixel value, a percentage of the current item height,
   or `auto` to follow the list text size. In grid views, `auto` uses the
   default section text size.
-- `text-color` sets the title color and supports `accent`.
+- `text-color` defaults to `auto`. The title and expand/collapse chevron use Explorer’s background at rest and the corresponding `FillSelectionRect` background when hovered, keyboard-selected, or both. With filename-only highlighting, the chevron can sit outside the highlight and keep its resting color. Set a color or `accent` to override the automatic title color.
 
 Omitted properties use the view defaults. A taller font expands the heading
 as needed to leave vertical padding.

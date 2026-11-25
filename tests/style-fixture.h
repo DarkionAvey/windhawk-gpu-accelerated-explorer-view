@@ -6,12 +6,18 @@
 #include <vssym32.h>
 #include <dwmapi.h>
 #include <roapi.h>
+#include <winstring.h>
+#include <atomic>
 #include <windows.ui.viewmanagement.h>
 #include <map>
 #include <tuple>
 #include <string>
 #include <cstring>
 namespace StyleFixture {
+inline std::atomic<DWORD> paletteOwner{0};
+inline std::atomic<COLORREF> workerAccent{0};
+inline std::atomic<unsigned> workerAccentReads{0};
+inline bool PaletteWorker() {const auto owner=paletteOwner.load(); return owner && owner!=GetCurrentThreadId();}
 inline thread_local bool enabled=false, highContrast=false, failApp=false, failSystem=false;
 inline thread_local UINT dpi=96, wheel=3;
 inline thread_local unsigned activations=0, fontQueries=0, fillQueries=0;
@@ -71,6 +77,7 @@ inline HRESULT WINAPI Font(HTHEME theme,HDC dc,int part,int state,int property,L
     ++fontQueries; *value=themeFont; return S_OK;
 }
 inline COLORREF WINAPI SystemColor(int index) {
+    if(PaletteWorker() && index==COLOR_HIGHLIGHT) return RGB(12,110,210);
     if(!enabled) return ::GetSysColor(index);
     ++systemColorQueries;
     return index==COLOR_WINDOW || index==COLOR_BTNFACE ? window :
@@ -114,6 +121,12 @@ struct AppColors final : ABI::Windows::UI::ViewManagement::IUISettings3 {
     HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel*) override {return E_NOTIMPL;}
     HRESULT STDMETHODCALLTYPE GetColorValue(ABI::Windows::UI::ViewManagement::UIColorType type,
             ABI::Windows::UI::Color* value) override {
+        if(PaletteWorker() && type==ABI::Windows::UI::ViewManagement::UIColorType_Accent) {
+            ++workerAccentReads;
+            const auto rgb=workerAccent.load();
+            *value={255,GetRValue(rgb),GetGValue(rgb),GetBValue(rgb)};
+            return S_OK;
+        }
         *value=type==ABI::Windows::UI::ViewManagement::UIColorType_Background ? appBg :
             type==ABI::Windows::UI::ViewManagement::UIColorType_Accent ? appAccent : appFg;
         return S_OK;
@@ -124,6 +137,9 @@ struct AppColors final : ABI::Windows::UI::ViewManagement::IUISettings3 {
     HRESULT STDMETHODCALLTYPE remove_ColorValuesChanged(EventRegistrationToken) override {return E_NOTIMPL;}
 };
 inline HRESULT WINAPI Activate(HSTRING name,IInspectable** value) {
+    if(PaletteWorker() && !wcscmp(WindowsGetStringRawBuffer(name,nullptr),L"Windows.UI.ViewManagement.UISettings")) {
+        static AppColors colors; *value=&colors; return S_OK;
+    }
     if(!enabled) return ::RoActivateInstance(name,value);
     ++activations; *value=nullptr;
     if(failApp) return E_FAIL;

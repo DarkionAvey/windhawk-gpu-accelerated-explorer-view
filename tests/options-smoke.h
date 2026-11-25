@@ -292,33 +292,33 @@ static void TestUserOptions() {
         // The Windows accent (UISettings) wins over a different DWM title-bar
         // colorization, as with an automatic accent picked from the wallpaper.
         StyleFixture::accent=0xFFAACC11;
-        set(L"Selection.selectionColor",L"#C08040");
-        set(L"Selection.selectionColor",L"accent");
+        set(L"Selection.selectionColor",L"#C08040"); RefreshThemeColor();
+        set(L"Selection.selectionColor",L"accent"); RefreshThemeColor();
         Check(g_dynamicAccent && g_selectionRgb==RGB(0x2E,0x7D,0x32),
             "selection used DWM colorization instead of the Windows accent");
         // A settings thread that cannot activate UISettings keeps the last real
         // accent, never the DWM color.
         StyleFixture::failApp=true;
-        set(L"Selection.selectionColor",L"#C08040");
-        set(L"Selection.selectionColor",L"accent");
+        set(L"Selection.selectionColor",L"#C08040"); RefreshThemeColor();
+        set(L"Selection.selectionColor",L"accent"); RefreshThemeColor();
         Check(g_selectionRgb==RGB(0x2E,0x7D,0x32),
             "accent lookup without UISettings replaced the last Windows accent");
         // No Windows accent ever read: DWM colorization, then the system
         // highlight, are the only fallbacks.
         g_systemAccent=CLR_INVALID;
-        set(L"Selection.selectionColor",L"#C08040");
+        set(L"Selection.selectionColor",L"#C08040"); RefreshThemeColor();
         StyleFixture::accentStatus=E_FAIL;
-        set(L"Selection.selectionColor",L"invalid");
+        set(L"Selection.selectionColor",L"invalid"); RefreshThemeColor();
         Check(g_dynamicAccent && g_selectionRgb==RGB(12,110,210),
             "failed accent lookup retained the previous custom color");
         StyleFixture::accentStatus=S_OK; StyleFixture::accent=0;
-        set(L"Selection.selectionColor",L"accent");
+        set(L"Selection.selectionColor",L"accent"); RefreshThemeColor();
         Check(g_selectionRgb==RGB(12,110,210),"transparent/uninitialized accent accepted");
         StyleFixture::failApp=false; StyleFixture::appAccent.A=0;
-        set(L"Selection.selectionColor",L"accent");
+        set(L"Selection.selectionColor",L"accent"); RefreshThemeColor();
         Check(g_selectionRgb==RGB(12,110,210),"transparent Windows accent accepted");
         StyleFixture::accent=0xFFAACC11;
-        set(L"Selection.selectionColor",L" accent\t");
+        set(L"Selection.selectionColor",L" accent\t"); RefreshThemeColor();
         Check(g_dynamicAccent && g_selectionRgb==RGB(0xAA,0xCC,0x11),"valid DWM fallback conversion/trim");
         g_systemAccent=knownAccent;
         StyleFixture::wheel=WHEEL_PAGESCROLL; LoadSettings();

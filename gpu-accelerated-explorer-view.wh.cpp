@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.14
+// @version         1.1.15
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -122,7 +122,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $name: Grid view corner rounding
       $description: 0 = square corners; -1 = pill shape; higher = rounder corners.
     - marqueeOpacity: 30
-      $name: Selection rectangle opacity (%)
+      $name: Drag selection rectangle opacity (%)
       $description: Higher = more visible drag rectangle; lower = fainter.
   $name: Selection
 - Hover:
@@ -314,8 +314,10 @@ struct SurfaceStyle {
     float shadowOpacity = 1.f;
     bool borderColorDefined = false;
     std::optional<float> borderOpacity, fontSize;
+    std::optional<float> highlightOpacity;
     bool fontSizePercent = false;
     std::optional<Color> textColor;
+    bool autoTextColor=false;
     BorderStyle borderStyle = BorderStyle::Solid;
     std::optional<float> height;
     std::optional<Shadow> shadow; // Absence keeps the native tooltip shadow.
@@ -340,6 +342,7 @@ struct DriveStyle {
     bool enabled = false, trackOrigin = false, scaled = false;
 };
 using Elements = std::map<std::wstring, Element, std::less<>>;
+inline const SurfaceStyle defaultGroupHeading{.autoTextColor=true};
 struct Document {
     Elements elements;
     std::array<std::array<SurfaceStyle, 3>, 2> highlights;
@@ -350,7 +353,7 @@ struct Document {
         SurfaceStyle header, vertical, horizontal;
     };
     std::array<ColumnHeaderStyle, 2> columnHeaders;
-    std::array<SurfaceStyle, 2> groupHeadings;
+    std::array<SurfaceStyle, 2> groupHeadings{defaultGroupHeading,defaultGroupHeading};
     std::array<std::optional<SurfaceStyle>, 2> thumbnails;
     std::array<std::array<SurfaceStyle,6>,2> checkboxes;
     std::array<bool,2> checkboxEnabled{};
@@ -882,6 +885,7 @@ void CompileStyles(Document& document) {
         {L"border-width", &SurfaceStyle::borderWidth}, {L"border-radius", &SurfaceStyle::borderRadius},
         {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}, {L"height", &SurfaceStyle::height},
         {L"shadow-opacity", &SurfaceStyle::shadowOpacity}, {L"border-opacity", &SurfaceStyle::borderOpacity},
+        {L"opacity", &SurfaceStyle::highlightOpacity},
         {L"font-size", &SurfaceStyle::fontSize}, {L"text-color", &SurfaceStyle::textColor}};
     constexpr std::wstring_view names[] = {L"FillSelectionRect:selected", L"FillSelectionRect:hover", L"FillSelectionRect:selected:hover"};
     for (size_t mode = 0; mode < document.highlights.size(); ++mode) {
@@ -901,7 +905,8 @@ void CompileStyles(Document& document) {
                         using Field = std::remove_cvref_t<decltype(style.*member)>;
                         if constexpr (std::is_same_v<Field, float> || std::is_same_v<Field, std::optional<float>>) {
                             auto text = Parser::Trim(*value);
-                            if (binding.name == L"shadow-opacity" || binding.name == L"border-opacity") {
+                            if (binding.name == L"opacity" && !element.starts_with(L"FillSelectionRect")) return;
+                            if (binding.name == L"opacity" || binding.name == L"shadow-opacity" || binding.name == L"border-opacity") {
                                 const bool percent = text.ends_with(L"%");
                                 if (percent) text.remove_suffix(1);
                                 const float opacity = !percent && text == L"none" ? 0.f :
@@ -948,7 +953,15 @@ void CompileStyles(Document& document) {
                                 } else paint = ReadPaint(text);
                                 style.*member = std::move(paint);
                             } else {
+                                if constexpr (std::is_same_v<Field,std::optional<Color>>) {
+                                    if (Parser::Trim(text)==L"auto") {
+                                        style.autoTextColor=true;
+                                        (style.*member).reset();
+                                        return;
+                                    }
+                                }
                                 style.*member = ReadColor(text);
+                                if constexpr (std::is_same_v<Field,std::optional<Color>>) style.autoTextColor=false;
                                 if (binding.name == L"border-color") style.borderColorDefined = true;
                             }
                         }
@@ -1071,6 +1084,7 @@ template<size_t N> struct ThemeContrastResources {
     std::array<ComPtr<ID2D1LinearGradientBrush>,N> gradients;
     std::array<ThemeGradientRamps,N> ramps;
     std::array<D2D1_COLOR_F,N> marks{};
+    unsigned long long markRevision=0;
 };
 struct ThemeBorderStrokes {
     std::array<ComPtr<ID2D1StrokeStyle>, 2> styles;
@@ -1205,6 +1219,7 @@ constexpr UINT_PTR kClickRenameTimerId = 108;
 constexpr UINT kZoomAutoRefitDebounceMs = 200;
 constexpr UINT kMsgDispose = WM_APP + 31;
 constexpr UINT kMsgSettings = WM_APP + 32;
+constexpr UINT kMsgPaletteReady = WM_APP + 87;
 constexpr UINT kMsgThemeSettings = WM_APP + 85;
 // A multiple rename that could not be performed: shown from its own dispatch
 // after the rename transaction has unwound (lParam: the view token).
@@ -3324,8 +3339,39 @@ struct PresentationLane;
 struct PresentationModel;
 struct SectionBadge;
 using SectionBadges = std::map<std::wstring, SectionBadge>;
+struct ContrastPalette;
+struct PaletteRequest {
+    std::shared_ptr<const Theme::Document> theme;
+    Theme::Mode mode;
+    COLORREF background, foreground, tipBackground, tipForeground, selection;
+    std::array<float,3> opacity;
+    unsigned long long revision, cachedAccent;
+    bool dynamicAccent, highContrast;
+    std::shared_ptr<const ContrastPalette> tooltipBase;
+};
+struct ContrastPalette {
+    struct Ink {
+        unsigned rgb=0;
+        float alpha=1.f, minimumAlpha=0.f;
+        float Opacity(float rowOpacity,float contentOpacity) const {
+            return std::max(contentOpacity*alpha,rowOpacity*minimumAlpha);
+        }
+    };
+    // Each key identifies a compiled surface in the retained theme. A null
+    // surface is the Explorer backdrop, used by transparent headings.
+    std::shared_ptr<const Theme::Document> theme;
+    std::unordered_map<const Theme::SurfaceStyle*,Ink> foregrounds;
+    Ink Foreground(const Theme::SurfaceStyle* surface,Ink fallback) const {
+        const auto found=foregrounds.find(surface);
+        return found!=foregrounds.end() ? found->second : fallback;
+    }
+    COLORREF tipBackground=CLR_INVALID, selection=RGB(0,120,215);
+    unsigned long long revision=0, surfaceRevision=0, accent=0;
+    std::array<float,3> opacity{};
+    Theme::Mode mode=Theme::Mode::Light;
+};
 struct TabBackground : std::enable_shared_from_this<TabBackground> {
-    enum class Lane { Directory, Layout, Properties, Icons, NativeRows, Selection, Columns, IconProvider, Details, Capacity, Watch, Trace, Presentation };
+    enum class Lane { Directory, Layout, Properties, Icons, NativeRows, Selection, Columns, Palette, IconProvider, Details, Capacity, Watch, Trace, Presentation };
     struct Pool {
         PTP_POOL handle = nullptr;
         TP_CALLBACK_ENVIRON environment{};
@@ -3370,6 +3416,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     Worker nativeRows{this, Lane::NativeRows};
     Worker selection{this, Lane::Selection};
     Worker columns{this, Lane::Columns};
+    Worker palette{this, Lane::Palette};
     Worker watch{this, Lane::Watch};
     Worker traceWorker{this, Lane::Trace};
     Worker presentation{this, Lane::Presentation};
@@ -3409,6 +3456,8 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<ColumnCatalogJob> columnCatalogJobs;
     std::optional<StatusButtonSnapshot> statusButtonJob,statusButtonResult;
     std::optional<ItemTipJob> itemTipJob, itemTipResult;
+    std::optional<PaletteRequest> paletteJob;
+    std::shared_ptr<const ContrastPalette> paletteResult;
     bool typeSearchUnicodeJob=false; // Protected by directoryLock, consumed on Columns.
     std::atomic<unsigned long long> itemTipGeneration{0};
     // Listing whose parent-folder Size binding the Columns lane may keep.
@@ -3429,9 +3478,9 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     // One inventory for startup-independent stop, completion and destruction.
     // The regulator owns every lazily started provider, including blocked ones.
     auto Workers() const {
-        std::array<const Worker*, 10 + kIconProviderWorkers + 2 * kPropertyProviderWorkers> workers{
-            &directory, &layout, &properties, &icons, &nativeRows, &selection, &columns, &watch, &traceWorker,&presentation};
-        size_t next = 10;
+        std::array<const Worker*, 11 + kIconProviderWorkers + 2 * kPropertyProviderWorkers> workers{
+            &directory, &layout, &properties, &icons, &nativeRows, &selection, &columns, &palette, &watch, &traceWorker,&presentation};
+        size_t next = 11;
         for (const auto& worker : iconProviders) workers[next++] = &worker;
         for (const auto& worker : detailProviders) workers[next++] = &worker;
         for (const auto& worker : capacityProviders) workers[next++] = &worker;
@@ -4046,6 +4095,7 @@ struct ItemTip {
     std::vector<ItemTipRow> rows;
     COLORREF background = CLR_INVALID, foreground = CLR_INVALID, label = CLR_INVALID;
     Theme::SurfaceStyle style;
+    unsigned long long accentPalette=0;
     bool opaqueBackground = true;
     D2D1_RECT_F textBounds{}; // Conservative clipped layout bounds, body-local.
     ThemeGradientRamps gradientRamps;
@@ -5128,12 +5178,15 @@ struct ViewState {
     std::shared_ptr<const Theme::Document> themeSnapshot = Theme::Snapshot();
     Theme::Mode themeMode = Theme::Mode::Light;
     bool themeHighContrast = false;
+    std::shared_ptr<const ContrastPalette> contrastPalette;
+    unsigned long long paletteRevision=0;
+    COLORREF tipBaseBackground=CLR_INVALID, tipBaseForeground=CLR_INVALID;
     struct HighlightResources {
         std::shared_ptr<const Theme::Document> snapshot;
         Theme::Mode mode = Theme::Mode::Light;
         COLORREF accent = CLR_INVALID;
         std::array<ComPtr<ID2D1LinearGradientBrush>, 3> gradients;
-        std::array<int, 3> opacity{};
+        std::array<float, 3> opacity{};
         // 64..16384 texels, in powers of two: under 3 MiB of pixel data for
         // all three states combined. No per-item entries or resize churn.
         std::array<ThemeGradientRamps, 3> ramps;
@@ -5208,7 +5261,7 @@ struct ViewState {
         std::shared_ptr<const Theme::Document> theme;
         Theme::Mode themeMode=Theme::Mode::Light;
         bool highContrast=false;
-        unsigned long long palette=0;
+        unsigned long long palette=0, contrastRevision=0;
         COLORREF background=CLR_INVALID,foreground=CLR_INVALID;
         LARGE_INTEGER origin{},fadeStarted{};
         double frequency=0.;
@@ -5352,7 +5405,7 @@ struct SwipeFeedbackSnapshot {
     X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(zoomFromCompact) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
     X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(headerTextHeight96) X(headerFontSize96) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
-    X(nativeTextColor) X(nativeHeaderTextColor) X(themeSnapshot) X(themeMode) X(themeHighContrast) \
+    X(nativeTextColor) X(nativeHeaderTextColor) X(nativeEditBackground) X(contrastPalette) X(themeSnapshot) X(themeMode) X(themeHighContrast) \
     X(cachedNativeMode) X(folderPath) X(selectedFlags) \
     X(presentationStyleRevision) X(presentationGroupIntents) X(lastInteractionTick) X(pipelineInputTime) X(uiTraceUntil)
 
@@ -5672,8 +5725,9 @@ std::optional<float> ThemedHeadingFontSize(const Theme::SurfaceStyle* style, int
 }
 
 const Theme::SurfaceStyle* GroupHeadingTheme(const ViewState& state) {
-    return state.themeSnapshot && !state.themeHighContrast ?
-        &state.themeSnapshot->groupHeadings[static_cast<size_t>(state.themeMode)] : nullptr;
+    if(state.themeHighContrast) return nullptr;
+    return state.themeSnapshot ? &state.themeSnapshot->groupHeadings[static_cast<size_t>(state.themeMode)] :
+        &Theme::defaultGroupHeading;
 }
 
 float DefaultGroupHeadingHeight(bool gridView, int dpi, float row, float font) {
@@ -7852,7 +7906,7 @@ D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
 // accent read on a WinRT-capable thread is kept for threads that cannot
 // activate UISettings (settings load), never replaced by a guess.
 std::atomic<COLORREF> g_systemAccent{CLR_INVALID};
-bool ReadSystemAccent(COLORREF& accent) {
+bool ReadSystemAccent(COLORREF& accent,bool remember) {
     using namespace ABI::Windows::UI::ViewManagement;
     constexpr wchar_t name[] = L"Windows.UI.ViewManagement.UISettings";
     HSTRING_HEADER header{}; HSTRING className = nullptr;
@@ -7862,49 +7916,61 @@ bool ReadSystemAccent(COLORREF& accent) {
         FAILED(RoActivateInstance(className, &instance)) || FAILED(instance.As(&colors)) ||
         FAILED(colors->GetColorValue(UIColorType_Accent, &value)) || value.A != 255) return false;
     accent = RGB(value.R, value.G, value.B);
-    g_systemAccent.store(accent, std::memory_order_relaxed);
+    if(remember) g_systemAccent.store(accent,std::memory_order_relaxed);
     return true;
 }
 
-// queryAccent=false reuses the accent a tab's palette refresh just read with
-// its own UISettings activation, so a color event costs one activation per tab.
-void RefreshThemeColor(bool queryAccent = true) {
+// Find the least opaque ink
+// that meets the requested contrast against the resting surface.
+ContrastPalette::Ink ContrastInk(COLORREF surface,double ratio=4.5,unsigned steps=255,
+                                 std::optional<COLORREF> foreground=std::nullopt) {
+    const unsigned ink=foreground ? *foreground : ReadableForeground(surface,{});
+    unsigned low=0,high=steps;
+    while(low<high) {
+        const unsigned mid=(low+high)/2;
+        const auto channel=[&](BYTE c){return (c*(steps-mid)+GetRValue(ink)*mid)/steps;};
+        const auto blended=RGB(channel(GetRValue(surface)),channel(GetGValue(surface)),channel(GetBValue(surface)));
+        if(ColorContrast(blended,surface)>=ratio) high=mid; else low=mid+1;
+    }
+    // If the target is unreachable, the search saturates at full opacity.
+    return {ink,float(high)/steps};
+}
+unsigned long long ReadAccentPalette(bool highContrast,unsigned long long previous,bool remember=false) {
+    constexpr auto systemAccentBit=1ull<<61;
     DWORD dwm = 0; BOOL opaque = FALSE;
     COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     if (!ValidRgb(accent)) accent = RGB(0,120,215);
     COLORREF system = CLR_INVALID;
-    if ((queryAccent && ReadSystemAccent(system)) ||
-        ValidRgb(system = g_systemAccent.load(std::memory_order_relaxed)))
+    const bool haveSystem=ReadSystemAccent(system,remember) ||
+        ValidRgb(system = !remember && (previous&systemAccentBit) ? COLORREF(previous&0xffffff) :
+            g_systemAccent.load(std::memory_order_relaxed));
+    if (haveSystem)
         accent = system;
     else if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
         accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
-    HIGHCONTRASTW contrast{sizeof(contrast)};
-    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
-        (contrast.dwFlags&HCF_HIGHCONTRASTON);
     if(highContrast) accent=GetSysColor(COLOR_HIGHLIGHT);
-    if (g_dynamicAccent.load(std::memory_order_relaxed)) g_selectionRgb.store(accent);
     COLORREF foreground=highContrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : 0;
-    const auto previous=g_swipePalette.load(std::memory_order_relaxed);
-    const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : 0) | accent;
-    if((previous & ((3ull<<62)|0xFFFFFF))==key &&
-        (!highContrast || COLORREF((previous>>24)&0xFFFFFF)==foreground)) return;
+    const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : haveSystem ? systemAccentBit : 0) | accent;
+    if((previous & ((7ull<<61)|0xFFFFFF))==key &&
+        (!highContrast || COLORREF((previous>>24)&0xFFFFFF)==foreground)) return previous;
     unsigned alpha=255;
     if(!highContrast) {
-        foreground=ColorContrast(RGB(0,0,0),accent)>=ColorContrast(RGB(255,255,255),accent) ? RGB(0,0,0):RGB(255,255,255);
-        // Minimum translucent black/white that retains 4.5:1 contrast on the
-        // opaque accent surface. Compute only when the cached accent changes.
-        unsigned low=0,high=255;
-        while(low<high) {
-            const unsigned mid=(low+high)/2;
-            const COLORREF blended=RGB((GetRValue(accent)*(255-mid)+GetRValue(foreground)*mid)/255,
-                (GetGValue(accent)*(255-mid)+GetGValue(foreground)*mid)/255,
-                (GetBValue(accent)*(255-mid)+GetBValue(foreground)*mid)/255);
-            if(ColorContrast(blended,accent)>=4.5) high=mid; else low=mid+1;
-        }
-        alpha=high;
+        const auto ink=ContrastInk(accent);
+        foreground=ink.rgb;
+        alpha=unsigned(std::lround(ink.alpha*255));
     }
-    g_swipePalette.store(key | (static_cast<unsigned long long>(foreground)<<24) |
-        (static_cast<unsigned long long>(alpha)<<48),std::memory_order_relaxed);
+    return key | (static_cast<unsigned long long>(foreground)<<24) |
+        (static_cast<unsigned long long>(alpha)<<48);
+}
+
+// Retained for callers that explicitly refresh the standalone accent defaults.
+[[maybe_unused]] void RefreshThemeColor() {
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool highContrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
+        (contrast.dwFlags&HCF_HIGHCONTRASTON);
+    const auto palette=ReadAccentPalette(highContrast,g_swipePalette.load(),true);
+    g_swipePalette.store(palette,std::memory_order_relaxed);
+    if(g_dynamicAccent.load()) g_selectionRgb.store(COLORREF(palette&0xffffff));
 }
 
 // Convert COLORREF (0x00BBGGRR) to the Direct2D 0x00RRGGBB convention.
@@ -8002,6 +8068,171 @@ void OptIntoDarkMode(HWND hwnd, bool allow) {
 void RefreshItemTipPalette(ViewState& state, bool highContrast);
 void RefreshViewTogglePalette(ViewState& state);
 
+DWORD WINAPI DirectoryWorkerProc(LPVOID context);
+std::array<float,3> HighlightOpacities(const Theme::Document* theme,Theme::Mode mode);
+void QueueContrastPalette(ViewState& state,bool tooltipOnly=false) {
+    if (!state.hwnd || state.presentationOnly || !state.background) return;
+    auto& work=*state.background;
+    if (!work.hwnd) work.hwnd=state.hwnd;
+    if (!StartTabWorker(state.background,work.palette,DirectoryWorkerProc,THREAD_PRIORITY_BELOW_NORMAL)) return;
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        const auto theme=state.themeHighContrast ? nullptr : state.themeSnapshot;
+        const auto base=tooltipOnly && state.contrastPalette && state.contrastPalette->theme==theme &&
+            state.contrastPalette->mode==state.themeMode && state.contrastPalette->revision==state.paletteRevision ?
+            state.contrastPalette : nullptr;
+        const auto cachedAccent=state.contrastPalette && !state.themeHighContrast ? state.contrastPalette->accent : 0;
+        work.paletteJob=PaletteRequest{theme,state.themeMode,state.nativeEditBackground,state.nativeTextColor,
+            state.tipBaseBackground,state.tipBaseForeground,g_selectionRgb.load(),
+            HighlightOpacities(theme.get(),state.themeMode),++state.paletteRevision,cachedAccent,
+            g_dynamicAccent.load(),state.themeHighContrast,base};
+    }
+    SetEvent(work.palette.wake);
+}
+
+const auto& HighlightStyles(const Theme::Document* theme, Theme::Mode mode) {
+    static const std::array<Theme::SurfaceStyle,3> defaults{};
+    return theme ? theme->highlights[static_cast<size_t>(mode)] : defaults;
+}
+std::array<float,3> HighlightOpacities(const Theme::Document* theme,Theme::Mode mode) {
+    const auto& styles=HighlightStyles(theme,mode);
+    return {styles[0].highlightOpacity.value_or(g_selectionAlpha.load()/100.f),
+        styles[1].highlightOpacity.value_or(g_hoverAlpha.load()/100.f),
+        styles[2].highlightOpacity.value_or(g_bothAlpha.load()/100.f)};
+}
+const ContrastPalette* HighlightPalette(const ViewState& state) {
+    return state.themeHighContrast ? nullptr : state.contrastPalette.get();
+}
+const Theme::Document* PaintedHighlightTheme(const ViewState& state) {
+    const auto* palette=HighlightPalette(state);
+    return palette ? palette->theme.get() : nullptr;
+}
+Theme::Mode PaintedHighlightMode(const ViewState& state) {
+    const auto* palette=HighlightPalette(state);
+    return palette ? palette->mode : state.themeMode;
+}
+auto HighlightOpacities(const ViewState& state) {
+    const auto* palette=HighlightPalette(state);
+    return palette ? palette->opacity : HighlightOpacities(nullptr,state.themeMode);
+}
+unsigned long long AccentPalette(const ViewState& state) {
+    return state.contrastPalette ? state.contrastPalette->accent : g_swipePalette.load(std::memory_order_relaxed);
+}
+COLORREF SelectionColor(const ViewState& state) {
+    return state.contrastPalette ? state.contrastPalette->selection : g_selectionRgb.load(std::memory_order_relaxed);
+}
+// Existing brush helpers run in the scope of one immutable draw palette.
+thread_local unsigned long long drawingAccent=0;
+struct AccentDrawScope {
+    unsigned long long previous;
+    explicit AccentDrawScope(unsigned long long accent) : previous(std::exchange(drawingAccent,accent)) {}
+    ~AccentDrawScope() { drawingAccent=previous; }
+};
+unsigned long long DrawingAccent() {
+    return drawingAccent ? drawingAccent : g_swipePalette.load(std::memory_order_relaxed);
+}
+D2D1_COLOR_F HighlightColor(const Theme::Color& color,COLORREF accent);
+ContrastPalette::Ink ResolveForeground(const ContrastPalette* palette,const Theme::SurfaceStyle* backdrop,
+    unsigned fallback,const Theme::Color* explicitColor=nullptr) {
+    if(explicitColor) {
+        const auto ink=HighlightColor(*explicitColor,COLORREF(DrawingAccent()&0xffffff));
+        return {ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),std::lround(ink.b*255))),ink.a};
+    }
+    return palette ? palette->Foreground(backdrop,{fallback}) : ContrastPalette::Ink{fallback};
+}
+std::shared_ptr<const ContrastPalette> ResolveContrastPalette(const PaletteRequest& job,unsigned long long accentPalette) {
+    const COLORREF accent=COLORREF(accentPalette&0xffffff);
+    const auto mode=static_cast<size_t>(job.mode);
+    auto palette=job.tooltipBase ? std::make_shared<ContrastPalette>(*job.tooltipBase) : std::make_shared<ContrastPalette>();
+    palette->revision=job.revision;
+
+    const auto composite=[&](const Theme::Paint& paint,COLORREF fallback,float opacity,COLORREF base) {
+        COLORREF rgb=fallback;
+        if(paint.kind!=Theme::Paint::Kind::Default) {
+            const auto& color=paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color;
+            const auto resolved=HighlightColor(color,accent);
+            rgb=RGB(std::lround(resolved.r*255.f),std::lround(resolved.g*255.f),std::lround(resolved.b*255.f));
+            opacity*=resolved.a;
+        }
+        const auto blend=[&](BYTE b,BYTE c){return std::lround(b+(int(c)-int(b))*opacity);};
+        return RGB(blend(GetRValue(base),GetRValue(rgb)),blend(GetGValue(base),GetGValue(rgb)),blend(GetBValue(base),GetBValue(rgb)));
+    };
+    const auto resolveTooltip=[&] {
+        if(!job.theme || !ValidRgb(job.tipBackground)) return;
+        const auto& style=job.theme->tooltips[mode];
+        if(style.background.kind==Theme::Paint::Kind::Default) return;
+        palette->tipBackground=composite(style.background,accent,1.f,job.tipBackground);
+        palette->foregrounds.insert_or_assign(&style,ContrastPalette::Ink{
+            ThemeRgb(ReadableForeground(palette->tipBackground,{job.tipForeground}))});
+    };
+    if(job.tooltipBase) {
+        resolveTooltip();
+        return palette;
+    }
+    palette->mode=job.mode;
+    palette->accent=accentPalette;
+    palette->selection=job.dynamicAccent ? accent : job.selection;
+    palette->opacity=job.opacity;
+    palette->surfaceRevision=job.revision;
+    palette->theme=job.theme;
+    const auto addTextSurface=[&](const Theme::SurfaceStyle* style,COLORREF surface) {
+        // Prefer light text on midtone fills when it meets the polarity cutoff.
+        // The separate contrast targets still control how opaque the ink is.
+        constexpr double lightTextCutoff=3.8;
+        const COLORREF foreground=ColorContrast(RGB(255,255,255),surface)>=lightTextCutoff ?
+            RGB(255,255,255) : RGB(0,0,0);
+        auto ink=ContrastInk(surface,7.,255,foreground);
+        // Preserve the softened look, including when neither target is attainable.
+        ink.alpha=std::min(ink.alpha,.98f);
+        ink.minimumAlpha=std::min(ink.alpha,ContrastInk(surface,4.5,255,foreground).alpha);
+        palette->foregrounds.emplace(style,ink);
+    };
+    const auto& opacity=job.opacity;
+    const auto& highlights=HighlightStyles(job.theme.get(),job.mode);
+    // Declare the foreground owner and the surface painted under it for each
+    // supported state. The theme compiler has already applied mode and state
+    // inheritance. Several owners can share one contrast calculation.
+    struct TextState {
+        const Theme::SurfaceStyle* owner;
+        const Theme::SurfaceStyle* background;
+        float opacity;
+        bool defaultAuto;
+    };
+    std::vector<TextState> states;
+    const auto* groupStyle=job.theme ? &job.theme->groupHeadings[mode] : &Theme::defaultGroupHeading;
+    if(job.theme)
+        states.push_back({&job.theme->columnHeaders[mode].header,nullptr,0,false});
+    states.push_back({groupStyle,nullptr,0,false});
+    for(size_t i=0;i<highlights.size();++i) {
+        states.push_back({&highlights[i],&highlights[i],opacity[i],true});
+        states.push_back({groupStyle,&highlights[i],opacity[i],false});
+    }
+    const auto selectionColor=palette->selection;
+    for(const auto& state:states) {
+        if(state.owner->textColor || !(state.defaultAuto || state.owner->autoTextColor) ||
+            palette->foregrounds.contains(state.background)) continue;
+        addTextSurface(state.background,state.background ?
+            composite(state.background->background,selectionColor,state.opacity,job.background) : job.background);
+    }
+    if(job.theme) {
+        const auto addMark=[&](const Theme::SurfaceStyle& style,bool unchecked=false) {
+            const bool plain=unchecked && style.background.kind==Theme::Paint::Kind::Default;
+            auto ink=ContrastInk(composite(style.background,plain ? job.foreground : accent,
+                plain ? .08f : 1.f,job.background),3.,100);
+            ink.alpha=std::min(.95f,ink.alpha);
+            palette->foregrounds.emplace(&style,ink);
+        };
+        if(job.theme->checkboxEnabled[mode]) {
+            const auto& styles=job.theme->checkboxes[mode];
+            for(size_t i=0;i<styles.size();++i) addMark(styles[i],i<3);
+        }
+        if(job.theme->elements.contains(L"PaintGroupBadge")) addMark(job.theme->groupBadges[mode][0]);
+        if(job.theme->elements.contains(L"DrawSwipeIndicator")) addMark(job.theme->swipeIndicators[mode][0]);
+    }
+    resolveTooltip();
+    return palette;
+}
+
 bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     // Resolve WinRT only at attachment/theme/settings changes. Maintenance
     // probes reuse this tab's copied values, without activating a COM provider.
@@ -8020,14 +8251,6 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
                 state.nativeAppBackground = RGB(bg.R,bg.G,bg.B);
             if (SUCCEEDED(colors->GetColorValue(UIColorType_Foreground, &fg)) && fg.A == 255)
                 state.nativeAppForeground = RGB(fg.R,fg.G,fg.B);
-            // Explorer's UI thread can always read the accent; refresh it here,
-            // so a settings-load thread without WinRT never leaves the
-            // selection on another source's color.
-            ABI::Windows::UI::Color accent{};
-            if (SUCCEEDED(colors->GetColorValue(UIColorType_Accent, &accent)) && accent.A == 255 &&
-                g_systemAccent.exchange(RGB(accent.R,accent.G,accent.B),std::memory_order_relaxed) !=
-                    RGB(accent.R,accent.G,accent.B))
-                RefreshThemeColor(false);
         }
     }
     HIGHCONTRASTW contrast{sizeof(contrast)};
@@ -8088,6 +8311,7 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
         state.nativeAppBackground : GetSysColor(COLOR_WINDOW);
     state.nativeEditForeground = highContrast ? systemText :
         ReadableForeground(state.nativeEditBackground, {text, state.nativeAppForeground, systemText});
+    if (!state.paletteRevision || refreshAppPalette || changed) QueueContrastPalette(state);
     RefreshRenamePalette(state);
     RefreshItemTipPalette(state, highContrast);
     if (state.viewTogglePaletteDirty && IsWindow(state.viewToggle)) RefreshViewTogglePalette(state);
@@ -8294,7 +8518,6 @@ bool LoadSettings() {
     g_pipelineTracing.store(logging);
     g_uiTransitionLogging.store(logging);
     g_gpuMemoryLogging.store(logging);
-    RefreshThemeColor();
     const bool changed = observed != previous;
     previous.swap(observed);
     return changed;
@@ -11975,6 +12198,7 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         DetailJob detail;
         DirectoryWatchJob watch;
         ColumnCatalogJob catalog;
+        std::optional<PaletteRequest> palette;
         std::optional<StatusButtonSnapshot> statusButtons;
         std::optional<ItemTipJob> itemTip;
         bool haveCatalog = false, haveTypeSearchUnicode=false;
@@ -11990,6 +12214,8 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 directory = std::move(work.layoutJobs.back());
                 work.layoutJobs.pop_back();
                 haveDirectory = true;
+            } else if (lane.lane==TabBackground::Lane::Palette && work.paletteJob) {
+                palette=std::exchange(work.paletteJob,{});
             } else if (columnsLane && work.itemTipJob) {
                 itemTip=std::exchange(work.itemTipJob,{}); // Hover feedback precedes chrome probes.
             } else if (columnsLane && work.typeSearchUnicodeJob) {
@@ -12035,6 +12261,18 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         if (columnsLane && !itemTip) {
             const auto listing = work.itemTipListing.load(std::memory_order_acquire);
             if (!listing || sizeBinding.token != listing) sizeBinding.Reset();
+        }
+        if(palette) {
+            const auto accent=palette->tooltipBase ? palette->tooltipBase->accent :
+                ReadAccentPalette(palette->highContrast,palette->cachedAccent);
+            auto colors=ResolveContrastPalette(*palette,accent);
+            {
+                ExclusiveSrwLock lock(work.directoryLock);
+                if(work.paletteJob || work.stopping.load()) continue;
+                work.paletteResult=std::move(colors);
+            }
+            PostMessageW(work.hwnd,kMsgPaletteReady,WPARAM(work.notificationLifetime),0);
+            continue;
         }
         if(haveTypeSearchUnicode) {
             g_systemRelativeTime.Initialize();
@@ -19659,7 +19897,10 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
           bool filename=false, bool underline=false, float textCenter=-1.f, float textVertical=.5f,
           std::optional<float> groupFontSize=std::nullopt) {
     if (highlight && highlight->empty()) highlight = nullptr;
-    if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
+    if (header && !sortedHeader) {
+        const auto* style=ColumnHeaderTheme(state);
+        if(!style || !style->header.autoTextColor) opacity*=kMutedHeaderOpacity;
+    }
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
     RefreshTextRendering(state);
     ConfigureTextTarget(state,state.target.Get());
@@ -21351,12 +21592,12 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
 }
 
 bool ThemedHighlights(const ViewState& state) {
-    return state.themeSnapshot && !state.themeHighContrast &&
-        state.themeSnapshot->highlightEnabled[static_cast<size_t>(state.themeMode)];
+    const auto* theme=PaintedHighlightTheme(state);
+    return theme && theme->highlightEnabled[static_cast<size_t>(PaintedHighlightMode(state))];
 }
-D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
+D2D1_COLOR_F HighlightColor(const Theme::Color& color,COLORREF accentColor) {
     if(!color.accent && color.accentWeight<0.f) return Packed(color.rgb,color.alpha);
-    const auto accent=Packed(ThemeRgb(COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF)));
+    const auto accent=Packed(ThemeRgb(accentColor));
     auto result=color.accent ? accent:Packed(color.rgb);
     if(color.accentWeight>=0.f) {
         result.r+=(accent.r-result.r)*color.accentWeight;
@@ -21364,6 +21605,9 @@ D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
         result.b+=(accent.b-result.b)*color.accentWeight;
     }
     result.a=color.alpha; return result;
+}
+D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
+    return HighlightColor(color,COLORREF(DrawingAccent()&0xffffff));
 }
 struct ThemeGradientLine {
     D2D1_POINT_2F direction, start, end;
@@ -21393,16 +21637,15 @@ ComPtr<ID2D1LinearGradientBrush> NativeThemeGradient(ID2D1RenderTarget* target,c
 }
 void PrepareHighlightBrushes(ViewState& state) {
     auto& resources = state.highlightResources;
-    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
-    const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
-    const std::array<int, 3> opacity{g_selectionAlpha.load(std::memory_order_relaxed),
-        g_hoverAlpha.load(std::memory_order_relaxed), g_bothAlpha.load(std::memory_order_relaxed)};
-    if (resources.snapshot == snapshot && resources.mode == state.themeMode && resources.accent == accent &&
+    const COLORREF accent = COLORREF(DrawingAccent()&0xFFFFFF);
+    const auto snapshot=PaintedHighlightTheme(state) ? state.contrastPalette->theme : nullptr;
+    const auto opacity=HighlightOpacities(state);
+    if (resources.snapshot == snapshot && resources.mode == PaintedHighlightMode(state) && resources.accent == accent &&
         resources.opacity == opacity) return;
-    resources = {}; resources.snapshot = snapshot; resources.mode = state.themeMode; resources.accent = accent;
+    resources = {}; resources.snapshot = snapshot; resources.mode = PaintedHighlightMode(state); resources.accent = accent;
     resources.opacity = opacity;
     if (!snapshot) return;
-    const auto& styles = snapshot->highlights[static_cast<size_t>(state.themeMode)];
+    const auto& styles = snapshot->highlights[static_cast<size_t>(PaintedHighlightMode(state))];
     for (size_t i = 0; i < styles.size(); ++i) {
         const auto& paint = styles[i].background;
         if (paint.kind != Theme::Paint::Kind::Linear) continue;
@@ -21516,15 +21759,15 @@ void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds
                           float radius, float alpha, Theme::Highlight kind) {
     const size_t index = static_cast<size_t>(kind);
     DrawThemeSurface(state, part, bounds, radius, alpha,
-        state.themeSnapshot->highlights[static_cast<size_t>(state.themeMode)][index],
+        PaintedHighlightTheme(state)->highlights[static_cast<size_t>(PaintedHighlightMode(state))][index],
         state.highlightResources.gradients[index], state.highlightResources.ramps[index],
-        state.highlightResources.opacity[index]/100.f, ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)));
+        state.highlightResources.opacity[index], ThemeRgb(SelectionColor(state)));
 }
 bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
                           float alpha, float radius, size_t part, size_t interaction) {
     const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
     auto& resources = state.scrollbarResources;
-    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
+    const COLORREF accent = COLORREF(DrawingAccent()&0xFFFFFF);
     if (resources.snapshot != snapshot || resources.mode != state.themeMode || resources.accent != accent) {
         resources = {}; resources.snapshot = snapshot; resources.mode = state.themeMode; resources.accent = accent;
         if (snapshot) {
@@ -21553,7 +21796,7 @@ bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
 bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
     const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
     auto& resources = state.marqueeResources;
-    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
+    const COLORREF accent = COLORREF(DrawingAccent()&0xFFFFFF);
     const int configuredOpacity = g_marqueeAlpha.load(std::memory_order_relaxed);
     if (resources.snapshot != snapshot || resources.mode != state.themeMode ||
         resources.accent != accent || resources.opacity != configuredOpacity) {
@@ -21585,7 +21828,7 @@ bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
         physical.left = state.paintWidth-physical.right; physical.right = state.paintWidth-left;
     }
     DrawThemeSurface(state,physical,physical,radius,opacity,style,resources.gradient,resources.ramps,
-        configuredOpacity/100.f,ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),std::min(1.f,opacity*2.3f));
+        configuredOpacity/100.f,ThemeRgb(SelectionColor(state)),std::min(1.f,opacity*2.3f));
     return true;
 }
 bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fraction,
@@ -21598,7 +21841,7 @@ bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fracti
     }
     const auto& drive=snapshot->driveBars[mode][part];
     if(!drive.enabled) return false;
-    const COLORREF accent=COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xffffff);
+    const COLORREF accent=COLORREF(DrawingAccent()&0xffffff);
     if(!state.driveBarResources || state.driveBarResources->snapshot!=snapshot ||
         state.driveBarResources->mode!=state.themeMode || state.driveBarResources->accent!=accent) {
         state.driveBarResources=std::make_unique<ViewState::DriveBarResources>();
@@ -21624,12 +21867,35 @@ bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fracti
         resources.gradient,resources.ramps,1.f,fallbackColor,contentOpacity,512,&paint);
     return true;
 }
+struct PaintedFeedback {
+    struct Part {D2D1_RECT_F bounds; float radius;};
+    std::array<Part,8> parts{};
+    unsigned count=0;
+    float base=0.f, combined=0.f;
+    bool Covers(float x,float y) const {
+        for(unsigned i=0;i<count;++i) {
+            const auto& [r,radius]=parts[i];
+            if(x<r.left || x>=r.right || y<r.top || y>=r.bottom) continue;
+            const float dx=std::max({r.left+radius-x,x-(r.right-radius),0.f});
+            const float dy=std::max({r.top+radius-y,y-(r.bottom-radius),0.f});
+            if(dx*dx+dy*dy<=radius*radius) return true;
+        }
+        return false;
+    }
+};
+float FeedbackAlpha(const ViewState& state,Theme::Highlight kind,float opacity) {
+    if(!ThemedHighlights(state)) return opacity;
+    const auto& paint=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state))[static_cast<size_t>(kind)].background;
+    if(paint.kind==Theme::Paint::Kind::Default) return opacity;
+    return opacity*(paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color.alpha : paint.color.alpha);
+}
 void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                        const SelectionShape* shape = nullptr, bool outline = false,
-                       Theme::Highlight kind = Theme::Highlight::Selected, float combinedWeight = 0.f) {
-    if (rc.right <= rc.left + 1.f || rc.bottom <= rc.top || alpha <= 0.f)
+                       Theme::Highlight kind = Theme::Highlight::Selected, float combinedWeight = 0.f,
+                       PaintedFeedback* feedback=nullptr) {
+    if (rc.right <= rc.left + 1.f || rc.bottom <= rc.top || !VisibleOpacity(alpha))
         return;
-    const unsigned rgb = ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed));
+    const unsigned rgb = ThemeRgb(SelectionColor(state));
     const bool shaped = shape && shape->count && shape->bounds.right>shape->bounds.left &&
         shape->bounds.bottom>shape->bounds.top;
     for (unsigned i=0;i<(shaped ? shape->count : 1);++i) {
@@ -21644,14 +21910,23 @@ void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                 rc.top+(line.bottom-shape->bounds.top)*sy);
         }
         const float radius=SelectionRadius(state,part.right-part.left,part.bottom-part.top);
+        if(feedback && !outline && feedback->count<feedback->parts.size())
+            feedback->parts[feedback->count++]={part,radius};
         if (!outline && ThemedHighlights(state)) {
             // Crossfade paint contributions without an offscreen layer. At rest
             // this is one brush/fill; an in-flight hover can mix two styles.
             const float top = std::clamp(combinedWeight, 0.f, 1.f)*alpha;
             const float bottom = (alpha-top)/std::max(.000001f, 1.f-top);
+            if(feedback) {
+                feedback->base=FeedbackAlpha(state,kind,bottom);
+                feedback->combined=FeedbackAlpha(state,Theme::Highlight::SelectedHover,top);
+            }
             DrawHighlightSurface(state, part, rc, radius, bottom, kind);
             if (top > 0.f) DrawHighlightSurface(state, part, rc, radius, top, Theme::Highlight::SelectedHover);
-        } else if (!outline) Fill(state,part.left,part.top,part.right,part.bottom,rgb,alpha,radius);
+        } else if (!outline) {
+            if(feedback) feedback->base=alpha;
+            Fill(state,part.left,part.top,part.right,part.bottom,rgb,alpha,radius);
+        }
         else {
             if (state.rtlLayout) {
                 const float left=part.left;
@@ -21954,8 +22229,7 @@ void BeginHoverTransition(ViewState& state, int nextRow, bool animate, int nextS
 // alone cannot subtract alpha. Both resting and moving selections use this.
 float SelectionBaseOpacity(const ViewState& state, const HoverVisual& hover,
                            float visualRow, float left, float right) {
-    const float base = g_selectionAlpha.load(std::memory_order_relaxed) / 100.f;
-    const float combined = g_bothAlpha.load(std::memory_order_relaxed) / 100.f;
+    const auto [base,unusedHover,combined]=HighlightOpacities(state);
     const float horizontal = !state.gridView ? 1.f : std::clamp(
         (std::min(right, hover.right)-std::max(left, hover.left)) /
         std::max(1.f, std::min(right-left, hover.right-hover.left)), 0.f, 1.f);
@@ -22021,9 +22295,7 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
         }
     }
     selectedWeight = std::clamp(selectedWeight, 0.f, 1.f);
-    const float hoverAlpha = g_hoverAlpha.load(std::memory_order_relaxed) / 100.f;
-    const float base = g_selectionAlpha.load(std::memory_order_relaxed) / 100.f;
-    const float combined = g_bothAlpha.load(std::memory_order_relaxed) / 100.f;
+    const auto [base,hoverAlpha,combined]=HighlightOpacities(state);
     if (ThemedHighlights(state)) {
         const float alpha = hoverAlpha*(1.f-selectedWeight)+combined*selectedWeight;
         if (combinedWeight) *combinedWeight = alpha > 0.f ? combined*selectedWeight/alpha : 0.f;
@@ -22110,9 +22382,9 @@ template<size_t N> void ReleaseContrastSurfaces(ThemeContrastResources<N>& cache
 }
 // The same cached, translucent contrasting ink serves checks, chip counts and swipe chevrons.
 template<size_t N> void PrepareContrastSurfaces(ViewState& state,ThemeContrastResources<N>& cache,
-    const std::array<Theme::SurfaceStyle,N>& styles,bool checkbox=false) {
+    const std::array<Theme::SurfaceStyle,N>& styles) {
     const auto snapshot=state.themeSnapshot;
-    const COLORREF accent=COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xffffff);
+    const COLORREF accent=COLORREF(DrawingAccent()&0xffffff);
     const COLORREF bg=state.nativeEditBackground;
     const COLORREF fg=state.nativeTextColor==CLR_INVALID ? RGB(128,128,128):state.nativeTextColor;
     if(cache.snapshot!=snapshot || cache.mode!=state.themeMode || cache.accent!=accent ||
@@ -22123,19 +22395,12 @@ template<size_t N> void PrepareContrastSurfaces(ViewState& state,ThemeContrastRe
             const auto& paint=styles[i].background;
             if(paint.kind==Theme::Paint::Kind::Linear)
                 cache.gradients[i]=NativeThemeGradient(state.target.Get(),paint);
-            auto color=paint.kind==Theme::Paint::Kind::Default ?
-                Packed(ThemeRgb((!checkbox || i>=3) ? accent:fg),(!checkbox || i>=3) ? 1.f:.08f):
-                HighlightColor(paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color:paint.color);
-            const COLORREF rgb=RGB(std::lround(color.r*255),std::lround(color.g*255),std::lround(color.b*255));
-            const COLORREF fill=BlendColor(bg,rgb,int(std::lround(color.a*100)));
-            const COLORREF ink=ColorContrast(RGB(0,0,0),fill)>ColorContrast(RGB(255,255,255),fill) ? RGB(0,0,0):RGB(255,255,255);
-            int low=0,high=100;
-            while(low<high) {
-                const int mid=(low+high)/2;
-                if(ColorContrast(BlendColor(fill,ink,mid),fill)>=3.) high=mid; else low=mid+1;
-            }
-            cache.marks[i]=Packed(ThemeRgb(ink),std::min(.95f,low/100.f));
         }
+    } else if(cache.markRevision==(state.contrastPalette ? state.contrastPalette->surfaceRevision : 0)) return;
+    cache.markRevision=state.contrastPalette ? state.contrastPalette->surfaceRevision : 0;
+    for(size_t i=0;i<N;++i) {
+        const auto ink=ResolveForeground(HighlightPalette(state),&styles[i],ThemeRgb(fg));
+        cache.marks[i]=Packed(ink.rgb,ink.alpha);
     }
 }
 
@@ -22174,7 +22439,7 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
         }
         return rect;
     };
-    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const auto palette = DrawingAccent();
     const auto pill = mirror(badge.pill);
     float radius = (pill.bottom-pill.top)*.5f;
     const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
@@ -22223,10 +22488,38 @@ std::pair<unsigned,float> ResolveHeadingColor(unsigned fallback, const Theme::Co
     return {ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),
         std::lround(ink.b*255))),ink.a};
 }
+ContrastPalette::Ink TextForeground(const ViewState& state,const Theme::SurfaceStyle* style,
+    const Theme::SurfaceStyle* backdrop,unsigned fallback,bool defaultAuto=false) {
+    const bool useAuto=defaultAuto || (style && style->autoTextColor);
+    return ResolveForeground(useAuto ? HighlightPalette(state) : nullptr,backdrop,fallback,
+        style && style->textColor ? &*style->textColor : nullptr);
+}
+struct ForegroundFeedback {
+    PaintedFeedback focus;
+    const PaintedFeedback* selectedRow=nullptr;
+    const PaintedFeedback* moving=nullptr;
+    const PaintedFeedback* hover=nullptr;
+    std::optional<Theme::Highlight> StateAt(float x,float y) const {
+        const bool selected=(focus.base>0.f && focus.Covers(x,y)) ||
+            (selectedRow && selectedRow->base>0.f && selectedRow->Covers(x,y)) ||
+            (moving && moving->base>0.f && moving->Covers(x,y));
+        if(hover && hover->Covers(x,y)) {
+            if(hover->combined>0.f && hover->combined>=hover->base*(1.f-hover->combined))
+                return Theme::Highlight::SelectedHover;
+            if(hover->base>0.f) return selected ? Theme::Highlight::SelectedHover : Theme::Highlight::Hover;
+        }
+        return selected ? std::optional{Theme::Highlight::Selected} : std::nullopt;
+    }
+    const Theme::SurfaceStyle* At(const std::array<Theme::SurfaceStyle,3>& styles,float x,float y) const {
+        const auto kind=StateAt(x,y);
+        return kind ? &styles[static_cast<size_t>(*kind)] : nullptr;
+    }
+};
 void PaintGroupHeading(ViewState& state, const std::wstring& title,
                        bool collapsed, float top, float height,
                        float opacity, float listEnd, float windowWidth,
-                       unsigned headerColor, const ViewState::GroupSection* section = nullptr) {
+                       unsigned headerColor, const ViewState::GroupSection* section = nullptr,
+                       const ForegroundFeedback& feedback={}) {
     if (height <= .01f || opacity <= .01f) return;
     const int dpi = ViewDpi(state);
     const float leading = static_cast<float>(Scale96(14, dpi));
@@ -22237,7 +22530,13 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
     const float centerY = top + height * .5f;
     const float unit = static_cast<float>(Scale96(4, dpi)) *
         std::clamp(height / std::max(1.f, GroupHeadingHeight(state)), 0.f, 1.f);
-    state.brush->SetColor(Packed(headerColor, .75f * opacity));
+    const auto* style=GroupHeadingTheme(state);
+    const auto& highlights=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state));
+    if(style && style->autoTextColor) {
+        const auto arrow=TextForeground(state,style,feedback.At(highlights,centerXLogical,centerY),headerColor);
+        state.brush->SetColor(Packed(arrow.rgb,arrow.Opacity(opacity,.75f*opacity)));
+    }
+    else state.brush->SetColor(Packed(headerColor,.75f*opacity));
     const float thickness = std::max(1.f, static_cast<float>(Scale96(1, dpi)));
     // Follow the existing section expansion, including interrupted/reversed
     // toggles. Mirror after rotation so RTL opens downward too.
@@ -22260,11 +22559,10 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         state.sectionBadgeAnimating = true;
     PaintGroupBadge(state,badge,opacity);
     text.left += badge.shift;
-    const auto* style = GroupHeadingTheme(state);
-    const auto [color,alpha] = ResolveHeadingColor(headerColor,
-        style && style->textColor ? &*style->textColor : nullptr);
+    const auto ink=TextForeground(state,style,feedback.At(highlights,text.left,centerY),headerColor);
+
     Text(state, title, text.left, text.top, text.right, text.bottom,
-        color, false, .9f * opacity * alpha, false, false, nullptr, false,
+        ink.rgb, false, ink.Opacity(opacity,.9f*opacity), false, false, nullptr, false,
         false, false, -1.f, .5f, ThemedHeadingFontSize(style,dpi,state.gridView,state.rowPx,state.fontPx));
 }
 
@@ -22509,7 +22807,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     D2D1_COLOR_F mark{};
     if(themed) {
         auto& cache=state.checkboxResources;
-        PrepareContrastSurfaces(state,cache,snapshot->checkboxes[mode],true);
+        PrepareContrastSurfaces(state,cache,snapshot->checkboxes[mode]);
         const auto& styles=snapshot->checkboxes[mode];
         const size_t index=(checked ? 3:0)+(pressed ? 2:hot ? 1:0);
         const auto& style=styles[index];
@@ -22531,7 +22829,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     const float border = SelectionCheckboxBorder(rect.right-rect.left);
     const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
         rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
-    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const auto palette = DrawingAccent();
     const unsigned foreground = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
     if (!themed) {
     state.brush->SetColor(Packed(checked ? ThemeRgb(COLORREF(palette&0xFFFFFF)) : foreground,
@@ -24032,7 +24330,7 @@ void DrawSwipeIndicator(ViewState& state,const SwipeIndicator& motion,LARGE_INTE
     const auto [alpha,scale,w,h,l,r,cy,edge,farRadius,dx,dy,left]=
         LayoutSwipeIndicator(state,motion,now,width,top,bottom,compositorOpacity);
     if(alpha<=0.f || w<=0.f || h<=0.f) return;
-    const auto colors=g_swipePalette.load(std::memory_order_relaxed);
+    const auto colors=DrawingAccent();
     const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
     const bool themed=snapshot && snapshot->elements.contains(L"DrawSwipeIndicator");
     if(themed) PrepareContrastSurfaces(state,state.swipeResources,snapshot->swipeIndicators[static_cast<size_t>(state.themeMode)]);
@@ -24078,6 +24376,7 @@ float SwipeCompositionOpacity(const ViewState& state,const ViewState::SwipeCompo
 }
 
 bool RenderSwipeFeedback(ViewState& state) {
+    AccentDrawScope accentScope(AccentPalette(state));
     if(!state.swipeIndicator.direction && !state.swipeOutgoingIndicator.direction &&
         !state.swipeComposition[0].visual && !state.swipeComposition[1].visual) return true;
     const auto checked=[&](HRESULT result,const wchar_t* operation,int layer=-1) {
@@ -24115,8 +24414,8 @@ bool RenderSwipeFeedback(ViewState& state) {
         const bool sameIntent=layer.visual && layer.revision==state.swipeFeedbackRevision && layer.origin.QuadPart==motion.origin.QuadPart;
         const bool sameViewport=layer.viewport.width==UINT(client.right) && layer.viewport.height==UINT(client.bottom) &&
             layer.dpi==dpi && layer.rtl==state.rtlLayout;
-        const bool sameAppearance=layer.theme==state.themeSnapshot && layer.themeMode==state.themeMode &&
-            layer.highContrast==state.themeHighContrast && layer.palette==g_swipePalette.load(std::memory_order_relaxed) &&
+        const bool sameAppearance=layer.contrastRevision==(state.contrastPalette ? state.contrastPalette->surfaceRevision : 0) && layer.theme==state.themeSnapshot && layer.themeMode==state.themeMode &&
+            layer.highContrast==state.themeHighContrast && layer.palette==DrawingAccent() &&
             layer.background==state.nativeEditBackground && layer.foreground==state.nativeTextColor;
         if(sameIntent && sameViewport && sameAppearance &&
             ((motion.committed && layer.fade) || (!motion.moving && !layer.moving))) continue;
@@ -24185,7 +24484,8 @@ bool RenderSwipeFeedback(ViewState& state) {
             }
         }
         layer.theme=state.themeSnapshot; layer.themeMode=state.themeMode; layer.highContrast=state.themeHighContrast;
-        layer.palette=g_swipePalette.load(std::memory_order_relaxed); layer.background=state.nativeEditBackground;
+        layer.contrastRevision=state.contrastPalette ? state.contrastPalette->surfaceRevision : 0;
+        layer.palette=DrawingAccent(); layer.background=state.nativeEditBackground;
         layer.foreground=state.nativeTextColor;
         layer.revision=state.swipeFeedbackRevision; layer.origin=motion.origin;
         layer.viewport={UINT(client.right),UINT(client.bottom)}; layer.dpi=dpi; layer.rtl=state.rtlLayout; layer.top=top;
@@ -24217,6 +24517,7 @@ void Paint(ViewState& state) {
     // A cold navigation has no replacement names yet. Keep the accepted image;
     // confirmed empty folders (loaded=true) still replace it immediately.
     if(!state.loaded && !state.total) return;
+    AccentDrawScope accentScope(AccentPalette(state));
     PublishHorizontalScrollbar(state);
     GraphicsContinuation continuation(state);
     // D3D/DComp creation may dispatch nested window messages. A nested paint
@@ -24334,8 +24635,9 @@ void Paint(ViewState& state) {
     const unsigned headerColor = ThemeRgb(state.nativeHeaderTextColor != CLR_INVALID
         ? state.nativeHeaderTextColor : GetSysColor(COLOR_WINDOWTEXT));
     const auto* headerStyle=ColumnHeaderTheme(state);
-    const auto [captionColor,captionOpacity]=ResolveHeadingColor(headerColor,
-        headerStyle && headerStyle->header.textColor ? &*headerStyle->header.textColor : nullptr);
+    const auto captionInk=TextForeground(state,headerStyle ? &headerStyle->header : nullptr,nullptr,headerColor);
+    const auto captionColor=captionInk.rgb;
+    const auto captionOpacity=captionInk.alpha;
     const auto rule=[&](const Theme::SurfaceStyle* style, float defaultOpacity) {
         const auto [color,alpha]=ResolveHeadingColor(headerColor,style && style->borderColorDefined ? &style->borderColor : nullptr);
         const float opacity=style ? style->borderOpacity.value_or(defaultOpacity) : defaultOpacity;
@@ -24665,6 +24967,7 @@ void Paint(ViewState& state) {
         typeSearchNow - state.lastTyped <= kTypeSearchTimeoutMs;
     // One shared visual geometry for backgrounds, selection, icons, and text.
     // Actual row indices and Shell selection have already been committed.
+    std::unordered_map<int,PaintedFeedback> rowFeedback;
     if (state.selectionFeedbackVisible) for (int i : visibleItems) {
         RowVisual v = LayoutRowVisual(state, i, layoutProgress);
         if(compositionFrame.Rows()) { v.opacity=1.f; v.height=std::max(row,v.height); }
@@ -24682,7 +24985,7 @@ void Paint(ViewState& state) {
         // The opaque native editor covers the filename; retain the item's
         // selection behind it, including its icon and the rest of the row.
         if (alpha > 0.f)
-            FillSelectionRect(state, selection, alpha * v.opacity,&shape);
+            FillSelectionRect(state,selection,alpha*v.opacity,&shape,false,Theme::Highlight::Selected,0.f,&rowFeedback[i]);
     }
     // Deleted rows exist only as a tiny, bounded painting snapshot, not in
     // Shell state. Their shrinking height and opacity close the old gaps.
@@ -24708,13 +25011,15 @@ void Paint(ViewState& state) {
                         xName + old.selectedNameWidth + pad, listEnd});
                 }
                 FillSelectionRect(state, selection,
-                    g_selectionAlpha.load() / 100.f * opacity,&shape);
+                    HighlightOpacities(state)[0]*opacity,&shape,false,Theme::Highlight::Selected,0.f,
+                    &rowFeedback[-int(&old-state.disappearingRows.data())-1]);
             }
         }
     }
     D2D1_RECT_F movingSelectionRect{};
     SelectionShape movingSelectionShape;
     float movingSelectionOpacity=0.f;
+    PaintedFeedback movingFeedback, hoverFeedback;
     if (state.selectionFeedbackVisible && state.keyboardSelectionAnimating &&
         state.keyboardSelectionTo == state.selected &&
         state.selected >= 0 && state.selected < state.total) {
@@ -24732,7 +25037,7 @@ void Paint(ViewState& state) {
         InterpolateSelectionBounds(state, rc, progress);
         movingSelectionRect=rc; movingSelectionShape=shape;
         movingSelectionOpacity=SelectionBaseOpacity(state,hover,visualRow,rc.left,rc.right);
-        FillSelectionRect(state,rc,movingSelectionOpacity,&shape);
+        FillSelectionRect(state,rc,movingSelectionOpacity,&shape,false,Theme::Highlight::Selected,0.f,&movingFeedback);
     }
     // Windows-style focus-only caret for Ctrl+arrow navigation. Reuse the
     // selection geometry and brush; no separate text layout or frame worker.
@@ -24781,11 +25086,11 @@ void Paint(ViewState& state) {
         // A header has no selected Shell item underneath its own hover.
         // Atlas item geometry may overlap its source band during reflow.
         hoverOverlayOpacity=(sectionHover && KeyboardFocusedSection(state)<0 && !state.keyboardSelectionAnimating ?
-            g_hoverAlpha.load(std::memory_order_relaxed)/100.f : HoverOverlayOpacity(state,hover,visibleItems,&hoverCombinedWeight))*opacity;
+            HighlightOpacities(state)[1] : HoverOverlayOpacity(state,hover,visibleItems,&hoverCombinedWeight))*opacity;
         if (!compositionFrame.Rows() || !sectionHover) {
             RowSourceScope source(state,index,0);
             FillSelectionRect(state, hoverRect,
-                hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight);
+                hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight,&hoverFeedback);
         }
     }
     // The decorative passes above may cross the edge margins in square mode,
@@ -24892,10 +25197,10 @@ void Paint(ViewState& state) {
                     nameColor, .18f * contentOpacity, radius);
             const auto& fill=usage.fill;
             if (fraction > 0.f && fill.bottom>fill.top && !DrawDriveBar(state,0,fill,fraction,
-                ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),contentOpacity,&bar))
+                ThemeRgb(SelectionColor(state)),contentOpacity,&bar))
                 Fill(state, fill.left, fill.top,
                     fill.left + width * fraction, fill.bottom,
-                    ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),
+                    ThemeRgb(SelectionColor(state)),
                     .82f * contentOpacity, (fill.bottom-fill.top)*.5f);
         }
         if (compositionFrame.active && !compositionFrame.Rows()) compositionFrame.Background();
@@ -24903,6 +25208,10 @@ void Paint(ViewState& state) {
         if (growing) state.target->PopAxisAlignedClip();
     }
     contentTrace.reset();
+    const auto& highlightStyles=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state));
+    std::array<ContrastPalette::Ink,3> highlightInk;
+    for(size_t i=0;i<highlightInk.size();++i)
+        highlightInk[i]=TextForeground(state,state.themeHighContrast ? nullptr : &highlightStyles[i],&highlightStyles[i],nameColor,true);
     // Old ghosts draw behind surviving/new items. The contents clip to their
     // collapsing row; there is no stale hit target or resurrected selection.
     if (state.rowTransitionActive) {
@@ -24917,9 +25226,13 @@ void Paint(ViewState& state) {
                 w, top + height), D2D1_ANTIALIAS_MODE_ALIASED);
             const auto geometry = LayoutItem(state, {top, height, opacity, old.oldLeft, old.oldWidth});
             const float contentOpacity = opacity * ItemContentOpacity(state, old.entry);
+            const auto feedback=rowFeedback.find(-int(&old-state.disappearingRows.data())-1);
+            const auto ghostInk=!state.themeHighContrast && feedback!=rowFeedback.end() && feedback->second.base>0.f &&
+                feedback->second.Covers(geometry.text.left+.5f,(geometry.text.top+geometry.text.bottom)*.5f) ?
+                highlightInk[static_cast<size_t>(Theme::Highlight::Selected)] : ContrastPalette::Ink{nameColor,1.f};
             Text(state, EntryLabel(old.entry), geometry.text.left, geometry.text.top,
                  geometry.text.right, geometry.text.bottom,
-                 nameColor, false, contentOpacity, false, geometry.wrapped,0,false,true);
+                 ghostInk.rgb, false, ghostInk.Opacity(opacity,contentOpacity), false, geometry.wrapped,0,false,true);
             state.target->PopAxisAlignedClip();
         }
     }
@@ -24960,6 +25273,8 @@ void Paint(ViewState& state) {
     uiComparisonRow=true;
     std::vector<DWRITE_TEXT_RANGE> highlightRanges; // Reused by every painted name.
     contentTrace.emplace(state.background,L"render.labels");
+    const ContrastPalette::Ink nativeInk{nameColor,1.f};
+    const bool filenameHighlight=ViewOptionEnabled(state,g_filenameOnly);
     for (const auto& item:paintedItems) {
         const int i=item.index;
         RowSourceScope source(state,i,2);
@@ -24967,7 +25282,17 @@ void Paint(ViewState& state) {
         const auto& v=item.visual;
         const auto& geometry=item.geometry;
         const auto& usage=item.usage;
-        const float contentOpacity=item.opacity;
+        ForegroundFeedback feedback;
+        if(const auto found=rowFeedback.find(i); found!=rowFeedback.end()) feedback.selectedRow=&found->second;
+        feedback.moving=&movingFeedback;
+        feedback.hover=&hoverFeedback;
+        auto ink=nativeInk;
+        const float labelY=(geometry.text.top+geometry.text.bottom)*.5f;
+        if(const auto kind=feedback.StateAt(geometry.text.left+.5f,labelY); kind && !state.themeHighContrast)
+            ink=highlightInk[static_cast<size_t>(*kind)];
+        const auto detailInk=filenameHighlight ? nativeInk : ink;
+        // Apply the user's metadata opacity after resolving foreground contrast.
+        const float detailOpacity=detailInk.Opacity(v.opacity,item.opacity)*detailsAlpha;
         const bool growing=v.height<row-.1f;
         if (growing) state.target->PushAxisAlignedClip(D2D1::RectF(0.f,v.top,w,v.top+v.height),D2D1_ANTIALIAS_MODE_ALIASED);
         state.uiTraceDrawItem=state.uiTracePaint && (i==state.selected || uiComparisonRow);
@@ -24984,7 +25309,7 @@ void Paint(ViewState& state) {
         else CachedSearchHighlightRanges(state, EntryLabel(e), highlightRanges);
         if (!(state.rename.editor && i == state.rename.index))
             Text(state, EntryLabel(e), geometry.text.left, geometry.text.top,
-                nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
+                nameTextRight, geometry.text.bottom, ink.rgb, false, ink.Opacity(v.opacity,item.opacity),
                 false, geometry.wrapped, &highlightRanges,false,true,
                 state.clickPolicy.singleClick && (state.clickPolicy.underlineCold ||
                     (state.clickPolicy.underlineHot && (state.hovered==i || TouchHotRow(state)==i))),
@@ -24994,8 +25319,8 @@ void Paint(ViewState& state) {
                     state.columnEpoch, state.propertyEpoch);
                 if (caption && !caption->empty())
                     Text(state, *caption, usage.caption.left, usage.caption.top,
-                        usage.caption.right, usage.caption.bottom, nameColor, false,
-                        contentOpacity * detailsAlpha);
+                        usage.caption.right, usage.caption.bottom, detailInk.rgb, false,
+                        detailOpacity);
             }
         if (TileLayout(state) && !DriveTiles(state)) {
             // Tile details use the same secondary text as Details columns.
@@ -25003,8 +25328,8 @@ void Paint(ViewState& state) {
             for (int line = 0; line < 2; ++line)
                 if (!lines[line]->empty())
                     Text(state, *lines[line], geometry.detail[line].left, geometry.detail[line].top,
-                        geometry.detail[line].right, geometry.detail[line].bottom, nameColor, false,
-                        contentOpacity * detailsAlpha, false, false, nullptr, true);
+                        geometry.detail[line].right, geometry.detail[line].bottom, detailInk.rgb, false,
+                        detailOpacity, false, false, nullptr, true);
         }
         if (const float reveal = ContentReveal(state); reveal > 0.f) {
             // Content lines use the same secondary text as tile lines. Date
@@ -25012,8 +25337,8 @@ void Paint(ViewState& state) {
             // fade with the zoom that enters or leaves Content.
             if (!e.type.empty())
                 Text(state, e.type, geometry.detail[0].left, geometry.detail[0].top,
-                    geometry.detail[0].right, geometry.detail[0].bottom, nameColor, false,
-                    contentOpacity * detailsAlpha * reveal, false, false, nullptr, true);
+                    geometry.detail[0].right, geometry.detail[0].bottom, detailInk.rgb, false,
+                    detailOpacity * reveal, false, false, nullptr, true);
             const std::wstring* aside[] = {&e.date, &e.size};
             for (int line = 0; line < 2; ++line) {
                 if (aside[line]->empty()) continue;
@@ -25024,8 +25349,8 @@ void Paint(ViewState& state) {
                 else { shown.assign(label); shown.append(L": "); shown.append(*aside[line]); }
                 Text(state, shown,
                     geometry.aside[line].left, geometry.aside[line].top,
-                    geometry.aside[line].right, geometry.aside[line].bottom, nameColor, false,
-                    contentOpacity * detailsAlpha * reveal, false, false, nullptr, true);
+                    geometry.aside[line].right, geometry.aside[line].bottom, detailInk.rgb, false,
+                    detailOpacity * reveal, false, false, nullptr, true);
             }
         }
         if (details && !state.gridView) {
@@ -25045,9 +25370,9 @@ void Paint(ViewState& state) {
                     const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
                     // A device/upload failure retains the complete text fallback.
                     if ((!icons || !DrawStatusIcons(state, *icons, left, v.top + cell.top,
-                            right, v.top + cell.bottom, fade * contentOpacity)) && text)
+                            right, v.top + cell.bottom, fade * item.opacity)) && text)
                         Text(state, *text, left, v.top + cell.top, right, v.top + cell.bottom,
-                         nameColor, false, detailsAlpha * fade * contentOpacity, false, false, 0, true);
+                         detailInk.rgb, false, detailOpacity * fade, false, false, 0, true);
                 }
             }
         }
@@ -25064,6 +25389,7 @@ void Paint(ViewState& state) {
     struct HeadingPaint {
         const std::wstring* title; bool collapsed; RowVisual visual; int key=0;
         const ViewState::GroupSection* section=nullptr; // Outgoing headings carry no badge.
+        ForegroundFeedback feedback;
     };
     std::vector<HeadingPaint> headings;
     // Outgoing headings stay behind current headings. Reserve every displayed
@@ -25110,17 +25436,22 @@ void Paint(ViewState& state) {
     // ClearBodyBand reserves transparent space above items for sticky headings.
     // Restore shared input feedback after masking item contents. Header bands
     // must not cut holes into a selection/hover moving between ordinary rows.
-    for (const auto& heading:headings) {
+    PaintedFeedback sectionHoverFeedback;
+    for (auto& heading:headings) {
         RowSourceScope source(state,heading.key,0,true);
+        heading.feedback.moving=&movingFeedback;
         state.target->PushAxisAlignedClip(D2D1::RectF(0.f,heading.visual.top,w,
             heading.visual.top+heading.visual.height),D2D1_ANTIALIAS_MODE_ALIASED);
         FillSelectionRect(state,movingSelectionRect,movingSelectionOpacity,&movingSelectionShape);
         if(heading.section && state.keyboardSectionKey && heading.section->key==*state.keyboardSectionKey && state.inputFocusIndicators) {
             const auto focus=GroupHoverRect(state,heading.key,heading.visual);
             const float visualRow=(heading.visual.top-header+state.scrollNow)/std::max(1.f,row);
-            FillSelectionRect(state,focus,SelectionBaseOpacity(state,hover,visualRow,focus.left,focus.right)*heading.visual.opacity);
+            FillSelectionRect(state,focus,SelectionBaseOpacity(state,hover,visualRow,focus.left,focus.right)*heading.visual.opacity,
+                nullptr,false,Theme::Highlight::Selected,0.f,&heading.feedback.focus);
         }
-        FillSelectionRect(state,hoverRect,hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight);
+        FillSelectionRect(state,hoverRect,hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight,
+            sectionHoverFeedback.count ? nullptr : &sectionHoverFeedback);
+        heading.feedback.hover=&sectionHoverFeedback;
         state.target->PopAxisAlignedClip();
     }
     state.target->PopAxisAlignedClip(); // group hover background margins
@@ -25130,7 +25461,7 @@ void Paint(ViewState& state) {
     for (const auto& heading:headings) {
         RowSourceScope source(state,heading.key,2,true);
         PaintGroupHeading(state,*heading.title,heading.collapsed,heading.visual.top,
-            heading.visual.height,heading.visual.opacity,listEnd,w,headerColor,heading.section);
+            heading.visual.height,heading.visual.opacity,listEnd,w,headerColor,heading.section,heading.feedback);
     }
     state.target->PopAxisAlignedClip(); // group feedback below all group text
     ClearBodyBand(state,frameTarget,0.f,columnHeader);
@@ -25165,7 +25496,7 @@ void Paint(ViewState& state) {
                 state.marqueeEndTick - now : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f);
         }
         if ((right > left || bottom > top) && opacity > 0.f) {
-            const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
+            const COLORREF c = SelectionColor(state);
             const unsigned rgb = ThemeRgb(c);
             const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
             if (!DrawMarquee(state, rc, opacity)) {
@@ -31913,7 +32244,8 @@ public:
         preview->dpi=dpi; preview->count=count;
         preview->countLabel=FormatDragCount(count,state.rtlLayout);
         preview->rtl=state.rtlLayout; preview->background=state.nativeEditBackground;
-        preview->foreground=state.nativeEditForeground; preview->accent=g_selectionRgb.load(std::memory_order_relaxed);
+        preview->foreground=state.nativeEditForeground; preview->accent=SelectionColor(state);
+        preview->badgePalette=AccentPalette(state);
         BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0); preview->animate=animations!=FALSE;
         preview->token=ULONG_PTR(g_nextToken.fetch_add(1,std::memory_order_relaxed));
         POINT pointer{}; MONITORINFO monitor{sizeof(monitor)};
@@ -32064,8 +32396,8 @@ public:
         const auto text=effect ? ReadShellDropText(data_.Get(),effect):ShellDropText{};
         if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return DRAGDROP_S_USEDEFAULTCURSORS;
         caption_=text;
-        const auto accent=g_selectionRgb.load(std::memory_order_relaxed);
-        const auto badgePalette=g_swipePalette.load(std::memory_order_relaxed);
+        const auto accent=SelectionColor(*live);
+        const auto badgePalette=AccentPalette(*live);
         const auto background=ValidRgb(live->itemTip.background) ? live->itemTip.background:live->nativeEditBackground;
         const auto foreground=ValidRgb(live->itemTip.foreground) ? live->itemTip.foreground:live->nativeEditForeground;
         if(preview.effect!=effect || preview.background!=background || preview.foreground!=foreground ||
@@ -32276,6 +32608,7 @@ void ResolveItemTipPalette(ViewState& state) {
     auto& tip = state.itemTip;
     const bool highContrast = tip.highContrast;
     tip.paletteDirty = false;
+    tip.accentPalette=AccentPalette(state);
     COLORREF background = GetSysColor(COLOR_INFOBK), foreground = GetSysColor(COLOR_INFOTEXT);
     if (!highContrast) {
         if (HTHEME theme = OpenItemTipTheme(state, IsWindow(tip.hwnd) ? tip.hwnd : state.hwnd)) {
@@ -32313,13 +32646,21 @@ void ResolveItemTipPalette(ViewState& state) {
         (paint.kind == Theme::Paint::Kind::Solid ? paint.color.alpha == 1.f :
          std::all_of(paint.stops.begin(),paint.stops.end(),[](const auto& stop) { return stop.color.alpha == 1.f; }));
     if (paint.kind != Theme::Paint::Kind::Default) {
-        const auto reference = HighlightColor(paint.kind == Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color);
-        const COLORREF rgb = RGB(BYTE(std::clamp(roundf(reference.r*255.f),0.f,255.f)),
-            BYTE(std::clamp(roundf(reference.g*255.f),0.f,255.f)),BYTE(std::clamp(roundf(reference.b*255.f),0.f,255.f)));
-        // Transparency is estimated over the native tooltip surface; sampling
-        // the user's desktop behind a translucent popup would be expensive.
-        background = BlendColor(background,rgb,int(std::clamp(roundf(reference.a*100.f),0.f,100.f)));
-        foreground = ReadableForeground(background,{foreground});
+        if(state.tipBaseBackground!=background || state.tipBaseForeground!=foreground) {
+            state.tipBaseBackground=background; state.tipBaseForeground=foreground;
+            QueueContrastPalette(state,true);
+        }
+        if(state.contrastPalette && state.contrastPalette->revision==state.paletteRevision &&
+            state.contrastPalette->theme==state.themeSnapshot && state.contrastPalette->mode==state.themeMode &&
+            ValidRgb(state.contrastPalette->tipBackground)) {
+            background=state.contrastPalette->tipBackground;
+            const auto& style=state.themeSnapshot->tooltips[static_cast<size_t>(state.themeMode)];
+            const auto ink=ResolveForeground(state.contrastPalette.get(),&style,ThemeRgb(foreground));
+            foreground=RGB(ink.rgb>>16,ink.rgb>>8,ink.rgb);
+        } else {
+            tip.style.background={};
+            tip.opaqueBackground=true;
+        }
     }
     const COLORREF label = highContrast ? foreground : BlendColor(foreground, background, 35);
     tip.ClearSurface();
@@ -32768,6 +33109,7 @@ bool OpaqueItemTipText(const ItemTip& tip,float radius) {
 // One layered popup: body placement/layout stays fixed while its outer shadow
 // extends the window around it. Fixed theme lengths use logical 96-DPI pixels.
 void RenderItemTip(ItemTip& tip) {
+    AccentDrawScope accentScope(tip.accentPalette);
     if (!IsWindow(tip.hwnd) || !tip.nameLayout || tip.size.cx <= 0 || tip.size.cy <= 0) return;
     const int dpi = DpiOf(tip.hwnd);
     const float scale = dpi/96.f;
@@ -34622,7 +34964,7 @@ void SynchronizePresentationGeneration(ViewState& state) {
 
 bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,const std::shared_ptr<PresentationLane>& lane) {
     ApplySwipeFeedback(state,model);
-    if (state.themeSnapshot != model.themeSnapshot || state.themeMode != model.themeMode ||
+    if (state.contrastPalette != model.contrastPalette || state.themeSnapshot != model.themeSnapshot || state.themeMode != model.themeMode ||
         state.themeHighContrast != model.themeHighContrast) {
         state.clipboardStaticBuffers = 0; state.clipboardWiggleOnly = false;
     }
@@ -36779,9 +37121,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!changes) return 0;
             HideItemTip(*s); // Its face, palette or Folder Options policy may change.
             if (changes & kStyleColors) {
-                // High contrast and the cached accent apply now; the palette
-                // refresh below reads a changed accent and reapplies it.
-                RefreshThemeColor(false);
                 s->viewTogglePaletteDirty=true;
                 const float groupHeight = GroupHeadingHeight(*s);
                 RefreshNativePalette(*s,true);
@@ -38797,12 +39136,30 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         break;
+    case kMsgPaletteReady:
+        if(s && wParam==WPARAM(s->lifetimeToken)) {
+            std::shared_ptr<const ContrastPalette> colors;
+            {
+                ExclusiveSrwLock lock(s->background->directoryLock);
+                colors=std::exchange(s->background->paletteResult,{});
+            }
+            if(colors && colors->revision==s->paletteRevision) {
+                s->contrastPalette=std::move(colors);
+                s->clipboardStaticBuffers=0; s->clipboardWiggleOnly=false;
+                if(s->dragPreview) PublishDragPreview(*s);
+                s->itemTip.paletteDirty=true;
+                if(IsWindowVisible(s->itemTip.hwnd)) ResolveItemTipPalette(*s);
+                Redraw(*s);
+            }
+        }
+        return 0;
     case kMsgThemeSettings:
         if (s) {
             const auto snapshot = Theme::Snapshot();
             if (snapshot != s->themeSnapshot) {
                 const float groupHeight = GroupHeadingHeight(*s);
                 s->themeSnapshot = snapshot;
+                QueueContrastPalette(*s);
                 UpdateColumnHeaderHeight(*s,CompactReveal(*s));
                 if (groupHeight != GroupHeadingHeight(*s)) LayoutGroupSections(*s);
                 ClampScroll(*s);

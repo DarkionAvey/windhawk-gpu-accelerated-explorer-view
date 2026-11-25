@@ -1,5 +1,9 @@
  # Changelog
 
+## 1.1.15
+- **ADDED** Selected and hovered file labels automatically choose a contrasting, softly blended text color. Theme XML can override it for each highlight state and for light or dark mode.
+- **ADDED** Section headers automatically adjust their text and chevron colors to the highlight. Column headers can opt in with `text-color="auto"`.
+
 ## 1.1.14
 - **FIXED** Keep the same item anchored during touch pinch zoom, use consistent cached artwork, and keep grid transitions onscreen deep inside large folders.
 - **FIXED** Check the first native paint when leaving Home so supported views can attach before the native list appears.
