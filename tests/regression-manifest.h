@@ -194,6 +194,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("explorer-column-bridge", PARALLEL, TestExplorerColumnBridge(fixture)),
     REGRESSION("pane-resize-presentation-details", PARALLEL, TestPaneResizePresentation(fixture,false)),
     REGRESSION("pane-resize-presentation-grid", PARALLEL, TestPaneResizePresentation(fixture,true)),
+    FOCUSED("vram-tabs-4k", PARALLEL, TestVramTabs4k(fixture)),
     // Workers, images and frame production.
     REGRESSION("publication-and-epochs", PARALLEL, TestPublicationAndEpochs()),
     REGRESSION("worker-apartment", PARALLEL, TestWorkerApartment()),

@@ -10,10 +10,11 @@ static void TestPaneResizePresentation(const std::wstring& directory,bool grid) 
     for(const auto* name:{L"CabinetWClass",L"CtrlNotifySink",L"SHELLDLL_DefView"}) {cls.lpszClassName=name; RegisterClassW(&cls);}
     cls.lpfnWndProc=OverlayProc; cls.lpszClassName=kOverlayClass; RegisterClassW(&cls);
     constexpr int kLeft=300; // Space a navigation pane occupies left of the content host.
+    constexpr int kTop=100, kListHeight=600; // Command/address bars above it; panes never change its height.
     HWND frame=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"CabinetWClass",L"pane resize fixture",
         WS_POPUP|WS_VISIBLE,-32000,-32000,1200,700,nullptr,nullptr,cls.hInstance,nullptr);
-    HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,kLeft,0,600,700,frame,nullptr,cls.hInstance,nullptr);
-    HWND native=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,600,700,host,nullptr,cls.hInstance,nullptr);
+    HWND host=CreateWindowExW(0,L"CtrlNotifySink",L"",WS_CHILD|WS_VISIBLE,kLeft,kTop,600,kListHeight,frame,nullptr,cls.hInstance,nullptr);
+    HWND native=CreateWindowExW(0,L"SHELLDLL_DefView",L"",WS_CHILD|WS_VISIBLE,0,0,600,kListHeight,host,nullptr,cls.hInstance,nullptr);
     Check(frame && host && native,"pane resize native hierarchy");
     FocusFixture::Session focus(frame,nullptr);
     struct Cleanup {
@@ -61,15 +62,15 @@ static void TestPaneResizePresentation(const std::wstring& directory,bool grid) 
         RECT r{}; GetWindowRect(window,&r); MapWindowPoints(nullptr,frame,reinterpret_cast<POINT*>(&r),2); return r;
     };
     const auto resizeHost=[&](int width) {
-        Check(SetWindowPos(host,nullptr,0,0,width,700,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"content host resize");
-        SetWindowPos(native,nullptr,0,0,width,700,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        Check(SetWindowPos(host,nullptr,0,0,width,kListHeight,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"content host resize");
+        SetWindowPos(native,nullptr,0,0,width,kListHeight,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
     };
     Check(Eventually([&] {ColumnBridgeFixture::Pump(); return state->loaded && state->total>0;}),"pane resize names");
     auto first=shown("first frame was not shown");
     const auto chain=first->swapchain;
     const auto reach=frameClient();
-    Check(extent(chain).cx==reach.cx && extent(chain).cy==reach.cy,
-        "first buffers did not cover the frame client area");
+    Check(extent(chain).cx==reach.cx && extent(chain).cy==kListHeight,
+        "first buffers did not span the frame width at the list's own height");
     // Pane toggles and splitter steps: size-only host changes inside the frame.
     for(const int width:{900,450,610,611,1200-kLeft,500,880}) {
         Regression::Scope step(("host-width="+std::to_string(width)).c_str());
@@ -87,13 +88,13 @@ static void TestPaneResizePresentation(const std::wstring& directory,bool grid) 
     // through transient positions. The posted follow-up repositions it.
     {
         const RECT settled=boundsOf(overlay);
-        Check(SetWindowPos(host,nullptr,0,0,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"content host move");
+        Check(SetWindowPos(host,nullptr,0,kTop,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"content host move");
         const RECT held=boundsOf(overlay);
         Check(EqualRect(&held,&settled),"overlay followed a transient host move inside the layout pass");
         Check(Eventually([&] {
             ColumnBridgeFixture::Pump(); const RECT a=boundsOf(overlay), e=boundsOf(host); return EqualRect(&a,&e);
         }),"posted follow-up did not reposition the overlay after a host move");
-        Check(SetWindowPos(host,nullptr,kLeft,0,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"content host move back");
+        Check(SetWindowPos(host,nullptr,kLeft,kTop,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE),"content host move back");
         Check(Eventually([&] {
             ColumnBridgeFixture::Pump(); const RECT a=boundsOf(overlay), e=boundsOf(host); return EqualRect(&a,&e);
         }),"overlay did not return with the host");
@@ -113,19 +114,19 @@ static void TestPaneResizePresentation(const std::wstring& directory,bool grid) 
     Check(SetWindowPos(frame,nullptr,0,0,1000,700,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE),"frame shrink");
     resizeHost(1000-kLeft);
     Check(shown("frame shrink was not shown")->swapchain==grown->swapchain,"on-screen shrink replaced the displayed chain");
-    // Off screen, the chain returns to the frame reach and is published before
+    // Off screen, the chain returns to the frame width and list height and is published before
     // standby completes, so the hidden tab keeps exactly one image.
     ShowWindow(overlay,SW_HIDE);
     const auto hidden=shown("hidden tab did not reach standby",true);
     Check(hidden->swapchain!=grown->swapchain && extent(hidden->swapchain).cx==frameClient().cx &&
-        extent(hidden->swapchain).cy==frameClient().cy,"hidden tab kept buffers beyond the frame reach");
+        extent(hidden->swapchain).cy==kListHeight,"hidden tab kept buffers beyond the frame width or list height");
     ShowWindow(overlay,SW_SHOWNOACTIVATE);
     resizeHost(950-kLeft);
     Check(shown("returned tab resize was not shown")->swapchain==hidden->swapchain,
         "a pane toggle after the tab returned rebuilt its chain");
     std::cout<<"PASS: "<<(grid ? "grid" : "details")
         <<" pane toggles/splitter steps follow the host in its layout pass without replacing the displayed chain; "
-          "moves use the posted path; frame growth allocates the frame reach; off-screen trim keeps one image\n";
+          "moves use the posted path; buffers span the frame width at the list height; off-screen trim keeps one image\n";
     response.Reset(); view.Reset(); item.Reset();
     OleUninitialize();
 }

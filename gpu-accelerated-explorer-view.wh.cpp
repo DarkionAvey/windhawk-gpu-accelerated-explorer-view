@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.17
+// @version         1.1.18
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -19222,17 +19222,18 @@ bool GrowOnlyBuffers(const ViewState& state) {
     return FrameSizing(state) || (state.presentationOnly && !state.exactBuffersRequested);
 }
 
-// Explorer's panes and splitters only redistribute the frame's client area,
-// so lane buffers covering it never need replacing for those. Buffers are
-// created, grown and trimmed to this reach; only a larger frame (maximize,
-// edge drags, a bigger monitor) needs more.
-void ExtendToFrameReach(const ViewState& state, UINT& width, UINT& height) {
+// Explorer's side panes and splitters only redistribute the frame's client
+// width, so lane buffers as wide as it never need replacing for those. The
+// list's height is set by the frame and its fixed chrome (command bar, address
+// bar, status bar), not by panes, so buffers keep the viewport's own height.
+// Buffers are created, grown and trimmed to this reach; only a larger frame
+// (maximize, edge drags, a bigger monitor) needs more.
+void ExtendToFrameReach(const ViewState& state, UINT& width, UINT&) {
     if (!state.presentationOnly || !state.target) return;
     RECT frame{};
     if (!GetClientRect(state.frameHwnd,&frame)) return; // Thread-safe read; no message is sent.
     const UINT limit = state.target->GetMaximumBitmapSize();
     width = std::max(width,std::min(UINT(std::max<LONG>(0,frame.right)),limit));
-    height = std::max(height,std::min(UINT(std::max<LONG>(0,frame.bottom)),limit));
 }
 
 bool ResizeTarget(ViewState& state, UINT width, UINT height) {

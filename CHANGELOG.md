@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.18
+- **IMPROVED** Uses less graphics memory with many tabs open, especially on high-resolution screens, without bringing back flicker when panes open or close.
+
 ## 1.1.17
 - **FIXED** The rename field closes right away when the item being renamed is deleted, recycled or renamed elsewhere (for example with the toolbar Delete button), and the item disappears without waiting for the edit to end.
 - **FIXED** The view no longer flickers when you open or close the preview pane, drag its divider, or resize the window, in both list and grid views.
