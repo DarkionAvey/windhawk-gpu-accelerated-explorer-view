@@ -1,5 +1,15 @@
  # Changelog
 
+## 1.1.19
+- **ADDED** Expandable folders in Details view (off by default, under Columns and sorting). Click the arrow before a folder, or press Right and Left, to show or hide its contents below it. The arrow turns and the contents slide in and out like other list changes; a folder that takes more than a second to open shows a spinner instead of the arrow. Branch lines show how deep each item sits; pointing at a line highlights it, and clicking it closes that folder. Items inside expanded folders work like the rest of the list: click, Ctrl and Shift selection, drag selection, Select All, arrow keys, Enter, Delete, Copy and Cut, dragging them elsewhere, and their right-click menu. Renaming them comes in a later update.
+- **ADDED** Expanded folders show "This folder is empty", or Windows' own error text such as "Access is denied", after their name when there is nothing to list.
+- **ADDED** Pointing at a branch line shows which folder it belongs to, relative to the open folder.
+- **ADDED** Going Back, Forward or Up reopens the folders you had expanded and selects the folder you came from.
+- **ADDED** Switching to the native view with items selected inside one expanded folder opens that folder and selects them there.
+
+- **IMPROVED** Group heading and folder arrows are as tall as the text beside them and grow with zoom. The space before a row's checkbox, arrow or icon stays the same at any zoom.
+- **IMPROVED** With "Ellipsis in the middle of filenames" set to Always on, details columns are shortened in the middle too.
+
 ## 1.1.18
 - **IMPROVED** Uses less graphics memory with many tabs open, especially on high-resolution screens, without bringing back flicker when panes open or close.
 

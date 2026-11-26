@@ -83,6 +83,7 @@ struct Browser {
     DWORD cookie = 0;
     unsigned shellHints = 0;
     bool registered = false;
+    bool returning = false;
     explicit Browser(bool travelLog = false, bool listViewGroups = false) {
         if (travelLog) {
             WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
@@ -168,7 +169,9 @@ struct Browser {
         Check(GetFolderPath(state.folderView.Get(), location, folder) && IsSupportedLocation(location),
             "native provider destination was rejected as an unsupported location");
         ClearOptimisticNavigation(state); // The real native completion above confirms this binding.
-        ResetForNewDirectory(state, location, folder, false, state.activeTabHost);
+        // `returning`: the navigation is a Back/Up return into an ancestor,
+        // so the child it came from is revealed (off for every other test).
+        ResetForNewDirectory(state, location, folder, returning, state.activeTabHost);
         state.deferColumnProviders = false; UpdateMetrics(state);
         auto result = WaitForComplete(*state.background, state.directoryToken);
         if (result.error!=ERROR_SUCCESS || result.entries.size()!=size_t(expected))
@@ -179,7 +182,8 @@ struct Browser {
         Check(Eventually([&] {
             Pump(); ReceiveDirectoryResults(state);
             return state.directoryWatch && !state.directoryPending && !state.namespaceCheckPending &&
-                !state.watchedChangePending && state.loaded && state.total == expected;
+                // The folder's own rows; reopened inline folders add their children.
+                !state.watchedChangePending && state.loaded && state.rootTotal == expected;
         }, 30000), "provider watch/model did not settle after navigation");
     }
     ~Browser() {

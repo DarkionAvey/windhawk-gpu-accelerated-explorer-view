@@ -56,6 +56,7 @@ inline const Coverage kCoverage[]={
     {L"Gestures.twoFingerContextMenu",L"additional-gestures"},
     {L"Columns.folderPlacement",L"option-live-sweep-details"},
     {L"Columns.autoRefitColumns",L"resize-auto-refit"},
+    {L"Columns.expandableFolders",L"inline-dirs-expand-collapse"},
     {L"enableLogging",L"option-live-sweep-details"},
 };
 
