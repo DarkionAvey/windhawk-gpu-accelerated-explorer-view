@@ -1989,6 +1989,7 @@ static void TestPreviewInput() {
 #include "style-smoke.h"
 #include "style-events-smoke.h"
 #include "column-bridge-smoke.h"
+#include "pane-resize-smoke.h"
 #include "column-minimum-smoke.h"
 #include "namespace-mutations-smoke.h"
 #include "status-button-smoke.h"

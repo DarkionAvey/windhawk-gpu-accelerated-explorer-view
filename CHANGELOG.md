@@ -1,5 +1,10 @@
  # Changelog
 
+## 1.1.17
+- **FIXED** The rename field closes right away when the item being renamed is deleted, recycled or renamed elsewhere (for example with the toolbar Delete button), and the item disappears without waiting for the edit to end.
+- **FIXED** The view no longer flickers when you open or close the preview pane, drag its divider, or resize the window, in both list and grid views.
+- **FIXED** With the preview pane open, moving between folders no longer pushes the navigation pane aside for a moment.
+
 ## 1.1.16
 - **IMPROVED** Pinch zoom skips capturing a new animation when the grid keeps its columns. Painting multiple selected items reuses the tab's memory.
 

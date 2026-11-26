@@ -192,6 +192,8 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("namespace-item-mutations", PARALLEL, TestNamespaceItemMutations(fixture)),
     REGRESSION("native-suppression", PARALLEL, TestNativeSuppression()),
     REGRESSION("explorer-column-bridge", PARALLEL, TestExplorerColumnBridge(fixture)),
+    REGRESSION("pane-resize-presentation-details", PARALLEL, TestPaneResizePresentation(fixture,false)),
+    REGRESSION("pane-resize-presentation-grid", PARALLEL, TestPaneResizePresentation(fixture,true)),
     // Workers, images and frame production.
     REGRESSION("publication-and-epochs", PARALLEL, TestPublicationAndEpochs()),
     REGRESSION("worker-apartment", PARALLEL, TestWorkerApartment()),
@@ -253,6 +255,7 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("rename-text-weight", PARALLEL, TestRenameTextWeight(fixture)),
     REGRESSION("rename-text-metrics", PARALLEL, TestRenameTextMetrics(fixture)),
     REGRESSION("created-item-rename", PARALLEL, TestCreatedItemRename(fixture)),
+    REGRESSION("rename-edited-item-removed", PARALLEL, TestRenameEditedItemRemoved(fixture)),
     REGRESSION("rename-typing", PARALLEL, TestRenameTyping(fixture)),
     REGRESSION("rename-editing-shortcuts", PARALLEL, TestRenameEditingShortcuts(fixture)),
     REGRESSION("rename-click-end", PARALLEL, TestRenameClickEnd(fixture)),

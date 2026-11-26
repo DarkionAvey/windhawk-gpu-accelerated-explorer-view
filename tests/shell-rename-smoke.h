@@ -882,6 +882,66 @@ static void TestCreatedItemRename(const std::wstring& fixture) {
         "rename field\n";
 }
 
+// The Shell removes the edited item (toolbar Delete, Recycle Bin, a rename in
+// another window). The open field must close at once and the row disappear,
+// while removing an unrelated item leaves the field open.
+static void TestRenameEditedItemRemoved(const std::wstring& fixture) {
+    using namespace ShellRenameFixture;
+    enum class Change { Unrelated, Delete, Rename };
+    for (Change change : {Change::Unrelated, Change::Delete, Change::Rename}) {
+        Regression::Scope scope("change=" + std::to_string(int(change)));
+        const auto root = std::filesystem::path(fixture) / (L"removed-" + std::to_wstring(int(change)));
+        CreateFiles(root, {L"edited.txt", L"other.txt"});
+        ProviderSelectionFixture::Browser host;
+        auto& state = host.state;
+        FocusFixture::Session focus(host.frame, state.hwnd);
+        host.Navigate(root.wstring(), 2);
+        SetTimer(state.hwnd, kTimerId, 250, nullptr); // The active overlay's idle timer.
+        Check(Eventually([&] { Pump(host); return state.directoryWatch && state.directoryWatch->registration; }),
+            "Shell change registration");
+        const auto edited = (root / L"edited.txt").wstring();
+        const int row = GpuRowForNativePath(state, edited);
+        Check(row >= 0, "edited item row");
+        state.selectedFlags.Fill(0); state.selectedFlags[size_t(row)] = 1; state.selected = state.anchor = row;
+        Check(SyncNativeSelection(state), "edited item selection");
+        BeginRename(state, row);
+        const HWND editor = state.rename.editor;
+        Check(editor && state.rename.path == edited, "rename field for the edited item");
+        ::SetFocus(editor); FocusFixture::focus = editor;
+        // Explorer's own file operation engine performs the IO and reports it.
+        ComPtr<IFileOperation> operation;
+        Check(SUCCEEDED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation))) &&
+            SUCCEEDED(operation->SetOperationFlags(FOF_NO_UI)), "Shell file operation");
+        const auto subject = change == Change::Unrelated ? (root / L"other.txt").wstring() : edited;
+        ComPtr<IShellItem> item;
+        Check(SUCCEEDED(SHCreateItemFromParsingName(subject.c_str(), nullptr, IID_PPV_ARGS(&item))), "subject item");
+        Check(SUCCEEDED(change == Change::Rename ? operation->RenameItem(item.Get(), L"moved.txt", nullptr) :
+            operation->DeleteItem(item.Get(), nullptr)) && SUCCEEDED(operation->PerformOperations()),
+            "Shell file operation result");
+        if (change == Change::Unrelated) {
+            // The open field defers the refresh; the delivered change is latched.
+            Check(Eventually([&] { Pump(host); return state.watchedChangePending; }, 15000),
+                "the unrelated delete's Shell notification was not received");
+            Check(state.rename.editor == editor && IsWindow(editor) && state.rename.path == edited,
+                "deleting another item closed the rename field");
+            CancelRename(state);
+            Check(Eventually([&] { Pump(host); return GpuRowForNativePath(state, subject) < 0 && !state.directoryPending; },
+                15000), "the unrelated deleted item's row stayed listed after the field closed");
+        } else {
+            Check(Eventually([&] { Pump(host); return !state.rename.editor; }, 15000),
+                "the rename field stayed open after its item was removed");
+            Check(!IsWindow(editor), "the removed item's rename EDIT still exists");
+            Check(Eventually([&] { Pump(host); return GpuRowForNativePath(state, edited) < 0 && !state.directoryPending; },
+                15000), "the removed item's row stayed listed after the field closed");
+            if (change == Change::Rename)
+                Check(std::filesystem::exists(root / L"moved.txt") && !std::filesystem::exists(edited),
+                    "the external rename was overwritten by the closing field");
+        }
+        for (int i = 0; i < 4; ++i) Pump(host);
+    }
+    std::cout << "PASS: deleting or renaming the edited item closes its rename field; other deletes do not\n";
+}
+
 namespace RenameTypingFixture {
 inline thread_local HWND counted = nullptr;
 inline thread_local unsigned directDraws = 0;

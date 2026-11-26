@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.16
+// @version         1.1.17
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -5195,6 +5195,7 @@ struct ViewState {
     ULONGLONG lastGpuMemoryLog = 0;
     bool resizeDeferred = false;
     bool presentationFrameSizing = false; // Lane copy of the owner's interactive sizing state.
+    bool exactBuffersRequested = false; // Lane: an off-screen pass returns to exact buffers.
     bool hardwareTarget = false;
     int wheelRemainder = 0;
     ULONGLONG lastRefresh = 0;
@@ -7254,6 +7255,8 @@ HRESULT WINAPI RaiseStructureEventHook(IRawElementProviderSimple* provider,Struc
 }
 
 RECT CurrentNativeViewportBounds(ViewState::NativeViewportOwnership& viewport);
+void EnsureOverlayTop(ViewState& state);
+static HWND FolderContentHost(HWND native);
 
 LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                     UINT_PTR id, DWORD_PTR owner) {
@@ -7332,11 +7335,31 @@ LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // final values while USER is still inside the pre-layout transaction.
     constrain();
     if (msg == WM_WINDOWPOSCHANGED && lp &&
-        (reinterpret_cast<WINDOWPOS*>(lp)->flags & (SWP_NOSIZE | SWP_NOMOVE)) != (SWP_NOSIZE | SWP_NOMOVE) &&
-        !GetPropW(hwnd, kNativeLayoutQueuedProperty)) {
-        SetPropW(hwnd, kNativeLayoutQueuedProperty, reinterpret_cast<HANDLE>(1));
-        if (!PostMessageW(reinterpret_cast<HWND>(owner), kMsgEnsureTop, 0, reinterpret_cast<LPARAM>(hwnd)))
-            RemovePropW(hwnd, kNativeLayoutQueuedProperty);
+        (reinterpret_cast<WINDOWPOS*>(lp)->flags & (SWP_NOSIZE | SWP_NOMOVE)) != (SWP_NOSIZE | SWP_NOMOVE)) {
+        // Follow a resize of the bound view's geometry host inside Explorer's
+        // own layout pass (pane toggles, splitter drags, frame sizing), so DWM
+        // never composes the resized host beside the old overlay bounds.
+        // Moves are not followed here: a navigation lays the replacement view
+        // out through transient positions (e.g. x=0 over the navigation
+        // pane) before its final one, and a view still being bound is not
+        // this overlay's geometry yet. Those keep the posted follow-up, which
+        // runs after the whole pass and also repairs suppression/stacking.
+        static thread_local bool following = false;
+        const UINT flags = reinterpret_cast<WINDOWPOS*>(lp)->flags;
+        if (auto* state = State(reinterpret_cast<HWND>(owner)); state && !following &&
+            (flags & SWP_NOMOVE) && !state->nativePresentationPending &&
+            (!state->pendingShellView || state->pendingShellView == state->nativeHwnd) &&
+            hwnd == (FolderContentHost(state->nativeHwnd) ? FolderContentHost(state->nativeHwnd) : state->nativeHwnd) &&
+            GetWindowThreadProcessId(state->hwnd, nullptr) == GetCurrentThreadId()) {
+            following = true; // Suppression may reposition this host again.
+            EnsureOverlayTop(*state);
+            following = false;
+        }
+        if (!GetPropW(hwnd, kNativeLayoutQueuedProperty)) {
+            SetPropW(hwnd, kNativeLayoutQueuedProperty, reinterpret_cast<HANDLE>(1));
+            if (!PostMessageW(reinterpret_cast<HWND>(owner), kMsgEnsureTop, 0, reinterpret_cast<LPARAM>(hwnd)))
+                RemovePropW(hwnd, kNativeLayoutQueuedProperty);
+        }
     }
     return result;
 }
@@ -19188,6 +19211,30 @@ bool FrameSizing(const ViewState& state) {
         GetPropW(state.frameHwnd,kFrameSizingProperty) != nullptr;
 }
 
+// Replacing the swap chain makes DWM recompose the whole scene for a frame,
+// which shows as a flicker of everything the overlay draws. While the view is
+// on screen, the presentation lane therefore never replaces it for a smaller
+// viewport (pane toggles, splitter drags, window resizes). Buffers only grow,
+// and Paint leaves the excess transparent outside the window. Off screen
+// (AdvanceStandbyGraphics) they return to the frame reach, where the rebuild
+// is invisible. The lane-less path keeps its WM_EXITSIZEMOVE exact request.
+bool GrowOnlyBuffers(const ViewState& state) {
+    return FrameSizing(state) || (state.presentationOnly && !state.exactBuffersRequested);
+}
+
+// Explorer's panes and splitters only redistribute the frame's client area,
+// so lane buffers covering it never need replacing for those. Buffers are
+// created, grown and trimmed to this reach; only a larger frame (maximize,
+// edge drags, a bigger monitor) needs more.
+void ExtendToFrameReach(const ViewState& state, UINT& width, UINT& height) {
+    if (!state.presentationOnly || !state.target) return;
+    RECT frame{};
+    if (!GetClientRect(state.frameHwnd,&frame)) return; // Thread-safe read; no message is sent.
+    const UINT limit = state.target->GetMaximumBitmapSize();
+    width = std::max(width,std::min(UINT(std::max<LONG>(0,frame.right)),limit));
+    height = std::max(height,std::min(UINT(std::max<LONG>(0,frame.bottom)),limit));
+}
+
 bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if(state.presenter && !state.presentationOnly) { Redraw(state); return true; }
     GraphicsContinuation continuation(state);
@@ -19199,20 +19246,22 @@ bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if (width == 0 || height == 0) return true;
     const auto current = state.backbuffer ? state.backbuffer->GetPixelSize() : D2D1_SIZE_U{};
     if (current.width == width && current.height == height) {state.resizeDeferred=false; return true;}
-    // While the user drags a frame edge, buffers only grow, and a growing
-    // axis extends to the monitor's work area at once. Paint clears the whole
-    // buffer and draws only the client, so the excess stays transparent and
-    // outside the window. WM_EXITSIZEMOVE requests the exact size again.
-    if (FrameSizing(state) && current.width && current.height) {
+    // A growing axis allocates, once, the largest extent the viewport can
+    // reach before the next rebuild would be needed: the monitor's work area
+    // while the user drags a frame edge, otherwise the frame reach. Any later
+    // step within it reuses the buffers.
+    if (GrowOnlyBuffers(state) && current.width && current.height) {
         if (current.width >= width && current.height >= height) {state.resizeDeferred=false; return true;}
-        MONITORINFO monitor{sizeof(monitor)};
-        if (GetMonitorInfoW(MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST),&monitor)) {
-            const UINT limit = state.target->GetMaximumBitmapSize();
-            const UINT workWidth = UINT(std::max<LONG>(0,monitor.rcWork.right-monitor.rcWork.left));
-            const UINT workHeight = UINT(std::max<LONG>(0,monitor.rcWork.bottom-monitor.rcWork.top));
-            if (width > current.width) width = std::max(width,std::min(workWidth,limit));
-            if (height > current.height) height = std::max(height,std::min(workHeight,limit));
-        }
+        if (FrameSizing(state)) {
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetMonitorInfoW(MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST),&monitor)) {
+                const UINT limit = state.target->GetMaximumBitmapSize();
+                const UINT workWidth = UINT(std::max<LONG>(0,monitor.rcWork.right-monitor.rcWork.left));
+                const UINT workHeight = UINT(std::max<LONG>(0,monitor.rcWork.bottom-monitor.rcWork.top));
+                if (width > current.width) width = std::max(width,std::min(workWidth,limit));
+                if (height > current.height) height = std::max(height,std::min(workHeight,limit));
+            }
+        } else ExtendToFrameReach(state,width,height);
         width = std::max(width,current.width); height = std::max(height,current.height);
     }
     // Shell view replacement/top-order repairs can send WM_SIZE during a
@@ -19305,7 +19354,11 @@ bool EnsureTarget(ViewState& state) {
     state.imageTextureLimit=std::min(kPlatformImageDimension,state.target->GetMaximumBitmapSize());
     {
         state.graphicsFailureStage=3;
-        hr=CreatePresentationBuffers(state,width,height);
+        // Nothing is on screen yet, so allocating the frame reach now costs no
+        // visible rebuild later when a pane closes or a splitter widens the view.
+        UINT bufferWidth=width, bufferHeight=height;
+        ExtendToFrameReach(state,bufferWidth,bufferHeight);
+        hr=CreatePresentationBuffers(state,bufferWidth,bufferHeight);
         if(FAILED(hr)) goto failed;
     }
     state.graphicsFailureStage=4;
@@ -23234,7 +23287,7 @@ bool PrepareModeComposition(ViewState& state) {
     // Buffers grown during interactive sizing are wider than the client;
     // planes still match the client. Otherwise a mismatch is a pending resize.
     const UINT clientWidth = static_cast<UINT>(std::max<LONG>(0,client.right));
-    if (!clientWidth || !size.width || !size.height || size.width<clientWidth || (size.width!=clientWidth && !FrameSizing(state)) ||
+    if (!clientWidth || !size.width || !size.height || size.width<clientWidth || (size.width!=clientWidth && !GrowOnlyBuffers(state)) ||
         state.columns.size() != state.columnMotion.size()) return false;
     size.width = clientWidth;
     mode.started = state.columnTransitionStartedQpc;
@@ -25920,6 +25973,37 @@ void AdvanceStandbyGraphics(ViewState& state) {
         if (!state.graphicsStandby || !InactiveGraphics(state)) return;
         if (state.modeRootAttached || state.modeComposition.started.QuadPart) {
             RegisterViewAnimation(state); return; // Present backpressure: retry on the next real frame wake.
+        }
+    }
+    // Buffers grown on screen beyond the frame reach (edge drags to the work
+    // area, a frame that has since shrunk) return to it only where replacing
+    // the chain cannot be seen: a hidden overlay. A standby image still
+    // covering a tab handoff keeps its buffers. The reach is kept, not the
+    // exact viewport, so pane toggles after the tab returns never rebuild.
+    // A minimized frame has no client area to measure and is left alone.
+    // Paint publishes the replacement before trimming, so the old chain is
+    // released. Only a tab that already shows an image has one to replace.
+    RECT frame{};
+    if (state.presentationOnly && state.backbuffer && state.presentedSwapChain &&
+        !IsWindowVisible(state.hwnd) && GetClientRect(state.frameHwnd,&frame) &&
+        frame.right>0 && frame.bottom>0) {
+        RECT client{}; ViewClientRect(state,&client);
+        UINT width=UINT(std::max<LONG>(1,client.right)), height=UINT(std::max<LONG>(1,client.bottom));
+        ExtendToFrameReach(state,width,height);
+        const auto size=state.backbuffer->GetPixelSize();
+        const bool oversized=size.width>width || size.height>height;
+        if (oversized || state.presentedSwapChain!=state.swapChain) {
+            {
+                ScopedFlag exact(state.exactBuffersRequested);
+                if (oversized && !ResizeTarget(state,width,height)) return;
+                Paint(state);
+            }
+            if (!state.graphicsReady) return;
+            if (!state.graphicsStandby || !InactiveGraphics(state)) return;
+            if (state.presentedSwapChain!=state.swapChain) {
+                RegisterViewAnimation(state); return; // Present backpressure: retry on the next real frame wake.
+            }
+            ProfileGpuMemory(state,L"standby.frame-buffers",true);
         }
     }
     if (!state.graphicsStandbyTrimmed) {
@@ -37218,6 +37302,27 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             (event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) && pidls && pidls[1])
             renamedIdentity.reset(ILCloneFull(pidls[1]));
         SHChangeNotification_Unlock(lock);
+        // The edited item (or a folder containing it) was deleted, recycled
+        // or renamed away. Directory refresh is deferred while the editor
+        // owns its row, so dismiss the editor now; the latched change then
+        // removes the row without waiting for the user to end the edit.
+        if (s && s->rename.editor && !s->rename.finishing && identity && !s->rename.path.empty() &&
+            (event & (SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER))) {
+            auto removedStorage = std::make_unique<ShellPathStorage>();
+            auto& removed = removedStorage->value;
+            if (SHGetPathFromIDListEx(identity.get(), removed, ARRAYSIZE(removed), GPFIDL_DEFAULT)) {
+                const auto& edited = s->rename.path;
+                const size_t length = wcslen(removed);
+                const bool affected = length && _wcsnicmp(edited.c_str(), removed, length) == 0 &&
+                    (edited.size() == length || edited[length] == L'\\' || removed[length - 1] == L'\\');
+                if (affected) {
+                    if (g_perf.load(std::memory_order_relaxed))
+                        Wh_Log(L"[GPU rename] edited item removed event=0x%08X path=%s",
+                            event, edited.c_str());
+                    CloseRenameEditor(*s, true);
+                }
+            }
+        }
         if (namespaceChange) {
             if (updatedItem && identity) QueueShellItemUpdate(*s, NamespaceItemKey(identity.get()));
             const auto root = s->directoryFolderIdentity.get();
@@ -38417,6 +38522,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ClampScroll(*s);
             RepositionRenameEdit(*s);
             Redraw(*s);
+            // The window already has its new bounds: publish the matching
+            // layout now. During splitter drags the queued WM_PAINT is starved
+            // by Explorer's posted layout traffic, and the frame wake yields to
+            // input that the splitter, not the overlay, receives. With a lane
+            // this only captures the model; drawing stays on the lane.
+            if (s->presenter && IsWindowVisible(hwnd)) {
+                UpdateWindow(hwnd);
+                if (State(hwnd) != s) return 0; // Painting may rebind the view.
+            }
             // Use the *same* navigation auto-refit pipeline after a settled,
             // meaningful viewport resize; no refit in WM_SIZE itself.
             if (wParam != SIZE_MINIMIZED)
