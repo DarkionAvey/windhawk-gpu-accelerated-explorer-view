@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.19
+// @version         1.1.20
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1232,6 +1232,8 @@ constexpr UINT kMsgDispose = WM_APP + 31;
 constexpr UINT kMsgSettings = WM_APP + 32;
 constexpr UINT kMsgPaletteReady = WM_APP + 87;
 constexpr UINT kMsgInlineTreeReady = WM_APP + 88;
+// Reopen inline folders once a change into Details has ended (wParam: lifetime).
+constexpr UINT kMsgInlineTreeReopen = WM_APP + 89;
 constexpr UINT kMsgThemeSettings = WM_APP + 85;
 // A multiple rename that could not be performed: shown from its own dispatch
 // after the rename transaction has unwound (lParam: the view token).
@@ -4222,7 +4224,65 @@ struct PaintedFeedback {
         return false;
     }
 };
-struct ViewState {
+// One folder's listed contents, ordering and change tracking: the data part
+// of a view, separate from its window, presentation and native binding.
+// ViewState derives from it as the tab's *bound* model (the folder the native
+// view shows); detached models (expanded folders, future Miller columns) can
+// be FolderModels of their own. Fields keep their names, so `state.entries`
+// and every other existing access reads the bound model unchanged.
+struct FolderModel {
+    // Identity of the folder.
+    ComPtr<IShellFolder> folder;
+    SharedPidl directoryFolderIdentity; // Captured once per binding, never per refresh/hover.
+    std::wstring folderPath;
+    ShellVisibilityPolicy visibility;
+    // Ordering and grouping.
+    SortSpec sort = DefaultSort();
+    SortSpec displayedSort = DefaultSort(); // sort that actually produced the visible rows
+    ShellGroupSpec grouping;
+    ShellGroupSpec displayedGrouping;
+    // Group headings are layout items, not Shell items. Physical item indices
+    // remain unchanged for QuickLook, PIDL selection and file operations.
+    struct GroupSection {
+        std::wstring key, title;
+        int first = 0, end = 0;
+        float documentTop = 0.f, documentEnd = 0.f;
+        bool collapsed = false;
+        float fraction = 1.f;
+        float from = 1.f, to = 1.f;
+        LARGE_INTEGER started{};
+    };
+    std::vector<GroupSection> sections;
+    std::vector<int> rowGroup; // O(1) row-to-section lookup
+    // Rows, their lookups and resolved details.
+    std::vector<Entry> entries;
+    int total = 0;
+    // Rows that belong to the native view's folder. Equals total unless inline
+    // folders are expanded; every comparison with the native view uses it.
+    int rootTotal = 0;
+    EntryPathIndex entryPathIndex; // Worker-built; moves with the active snapshot.
+    EntryPathUpdates entryPathUpdates;
+    RowDetailsCache rowDetails; // Active folder's identity cache; moves with its snapshot.
+    std::shared_ptr<const NamespaceIdentities> namespaceIdentities;
+    unsigned long long displayedOrderHash = 0; // Worker-computed ordered name digest.
+    unsigned long long displayedMetadataHash = 0; // Worker-computed attributes digest.
+    SelectionFlags selectedFlags;
+    // Enumeration state and generations. Directory I/O, sorting and type
+    // resolution run on the tab's background lanes, never in paint or timers.
+    bool loaded = false;
+    bool directoryPending = false;
+    bool namesPreview = false;
+    unsigned long long directoryToken = 0; // independent refresh generation
+    // Change tracking. The watch belongs to the active folder and never
+    // enters the cache; dirChange aliases into it and never owns it.
+    bool watchedChangePending = false;
+    std::shared_ptr<FolderChangeStamp> validatedFolderStamp;
+    unsigned long long validatedFolderRevision = 0;
+    HANDLE dirChange = INVALID_HANDLE_VALUE;
+    std::unique_ptr<FolderWatch> directoryWatch;
+};
+
+struct ViewState : FolderModel {
     ItemTip itemTip;
     // The bridge state is owner-STA-only. A presentation instance contains
     // sparse immutable model rows and owns its graphics exclusively on a lane.
@@ -4477,10 +4537,6 @@ struct ViewState {
     // these items once its view for that folder exists. Owner-only.
     OwnedPidl nativeRevealFolder;
     std::vector<OwnedPidl> nativeRevealItems;
-    ComPtr<IShellFolder> folder;
-    SharedPidl directoryFolderIdentity; // Captured once per binding, never per refresh/hover.
-    std::wstring folderPath;
-    ShellVisibilityPolicy visibility;
     bool compactRows = false; // Explorer's View > Compact view, for list rows.
     bool visibilitySignalQueued = false;
     bool visibilitySelectionSyncPending = false;
@@ -4524,25 +4580,9 @@ struct ViewState {
     std::wstring immediateBackFrom;
     std::wstring immediateBackTo;
     HWND immediateBackTab = nullptr;
-    SortSpec sort = DefaultSort();
-    SortSpec displayedSort = DefaultSort(); // sort that actually produced the visible rows
-    ShellGroupSpec grouping;
     ShellGroupSpec queuedDirectoryGrouping; // Captured for provisional worker reconciliation.
-    ShellGroupSpec displayedGrouping;
     unsigned calendarRevision=0;
     unsigned long long calendarStamp=0, requestedCalendarStamp=0;
-    // Group headings are layout items, not Shell items. Physical item indices
-    // remain unchanged for QuickLook, PIDL selection and file operations.
-    struct GroupSection {
-        std::wstring key, title;
-        int first = 0, end = 0;
-        float documentTop = 0.f, documentEnd = 0.f;
-        bool collapsed = false;
-        float fraction = 1.f;
-        float from = 1.f, to = 1.f;
-        LARGE_INTEGER started{};
-    };
-    std::vector<GroupSection> sections;
     std::optional<std::wstring> keyboardSectionKey; // Empty group keys are valid; null means item focus.
     std::shared_ptr<const SectionBadges> sectionBadges;
     bool sectionBadgeAnimating = false; // Lane paint only: a painted badge is still moving.
@@ -4551,7 +4591,6 @@ struct ViewState {
     unsigned long long groupRevealEpoch = 0;
     using GroupIntents=std::map<std::wstring,GroupSection>;
     std::shared_ptr<const GroupIntents> presentationGroupIntents;
-    std::vector<int> rowGroup; // O(1) row-to-section lookup
     bool groupAnimating = false;
     LARGE_INTEGER groupFrameQpc{}; // Geometry sample shared with the input owner.
     int hotSection = -1;
@@ -4575,10 +4614,6 @@ struct ViewState {
     ULONGLONG lastFolderNativeNextAttempt = 0;
     bool lastFolderNativeAfterPaint = false;
     unsigned long long lastFolderNativePresentAfter = 0;
-    std::vector<Entry> entries;
-    // Rows that belong to the native view's folder. Equals total unless inline
-    // folders are expanded; every comparison with the native view uses it.
-    int rootTotal = 0;
     struct InlineTreeNode {
         std::wstring path; // Expanded folder (filesystem path), at any depth.
         unsigned short depth = 1; // Depth of its children.
@@ -4593,6 +4628,7 @@ struct ViewState {
         DWORD error = ERROR_SUCCESS; // Of the latest listing; shown once loaded.
     };
     std::vector<InlineTreeNode> inlineTree; // Belongs to inlineTreeFolder only.
+    bool inlineTreeReopenQueued = false; // kMsgInlineTreeReopen is in the queue.
     std::wstring inlineTreeFolder;
     // Expanded folders of folders this tab left, with their last listings, so
     // Back/Forward reopen them at once and then refresh. An entry lives only
@@ -4619,8 +4655,6 @@ struct ViewState {
     // The Shell menu of a selection that includes inline children, while its
     // popup is open; owner-drawn submenus are forwarded to it.
     ComPtr<IContextMenu> inlineMenu;
-    EntryPathIndex entryPathIndex; // Worker-built; moves with the active snapshot.
-    EntryPathUpdates entryPathUpdates;
     bool returningListFocus = false;
     bool selectionTraceRunning = false;
     unsigned long long selectionTraceSequence = 0;
@@ -4668,23 +4702,14 @@ struct ViewState {
     float zebraExtentFrom = 0.f, zebraExtentTo = 0.f, zebraExtentPresented = 0.f;
     LARGE_INTEGER zebraExtentStartedQpc{};
     FolderCache folderCache; // Central authority for ALL visited filesystem folders.
-    RowDetailsCache rowDetails; // Active folder's identity cache; moves with its snapshot.
-    unsigned long long displayedOrderHash = 0; // Worker-computed ordered name digest.
-    unsigned long long displayedMetadataHash = 0; // Worker-computed attributes digest.
     // Directory I/O, sorting, locale formatting and file-type resolution run
     // on a dedicated background worker, never in WM_PAINT / WM_TIMER.
-    bool directoryPending = false;
-    bool namesPreview = false;
     bool refreshAgain = false;
-    std::shared_ptr<const NamespaceIdentities> namespaceIdentities;
     bool namespaceCheckPending = false;
     // Filesystem-watch bursts are coalesced before starting the GPU diff.
     // These fields belong to the active folder and never enter the cache.
-    bool watchedChangePending = false;
     bool watchedChangeVerifyOnly = false;
     bool directoryFlushQueued = false;
-    std::shared_ptr<FolderChangeStamp> validatedFolderStamp;
-    unsigned long long validatedFolderRevision = 0;
     unsigned long long observerSequence = 0, observerId = 0, presentObserverId = 0;
     LONGLONG observerQpc = 0, presentObserverQpc = 0, observerCommitQpc = 0;
     bool sortCheckPending = false, sortCheckOverflow = false;
@@ -4725,7 +4750,6 @@ struct ViewState {
     int iconsResolved = 0;
     bool iconUploadsPending = false;
     unsigned long long token = 0; // icon-generation identity
-    unsigned long long directoryToken = 0; // independent refresh generation
     ULONGLONG iconTick = 0;
     ULONGLONG iconViewportGeneration = 1;
     float scrollNow = 0.f, scrollTarget = 0.f;
@@ -4836,7 +4860,6 @@ struct ViewState {
     // synthetic Shell selection.
     std::wstring postDeletionFocusPath;
     int restoredKeyboardRow = -1;
-    SelectionFlags selectedFlags;
     // Per-tab clipboard snapshot. Updated on WM_CLIPBOARDUPDATE and on attach;
     // only visible content is tested at paint time. No row-vector traversal.
     ClipboardPaths clipboardPaths, clipboardPendingPaths;
@@ -5208,8 +5231,6 @@ struct ViewState {
     float measuredNameAvailable = -1.f;
     float measuredNameWidth = 0.f;
     int dragDivider = -1, dragStartX = 0, dragStartPos = 0;
-    HANDLE dirChange = INVALID_HANDLE_VALUE; // Alias into directoryWatch, never owns it.
-    std::unique_ptr<FolderWatch> directoryWatch;
     unsigned long long watchToken = 0;
     // Per-tab, per-directory Shell notifications. A recent interactive New
     // command licenses one created item for immediate GPU inline editing.
@@ -5226,7 +5247,6 @@ struct ViewState {
     unsigned long long creationCommandToken = 0;
     // bit 1 = folder, bit 2 = file, bit 3 = either.
     unsigned creationCommandMask = 0;
-    int total = 0;
     int selected = -1;
     // The native host stays hidden throughout GPU mode, including resize and
     // loading. Its COM model remains alive; no region repair or draw race.
@@ -5255,7 +5275,6 @@ struct ViewState {
     float iconPx = 19.f;
     float listIconPx = 19.f; // Retain the header's Name inset while a grid is active.
     bool visible = true;
-    bool loaded = false;
     unsigned featureInitializationStep = 0;
     bool featureInitializationQueued = false;
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
@@ -6063,9 +6082,16 @@ bool SelectableRow(const ViewState& state, int index) {
 // Inline folders exist only in the Details list; List/grid modes keep their
 // own layouts. Grouping belongs to the open folder (the one the native view
 // shows): children sit under their folder inside its group, ungrouped.
-bool InlineTreeActive(const ViewState& state) {
+// Layout: the tree's geometry (the arrow's space, indentation, child depth),
+// also while the Details columns are still animating in, so a grid-to-Details
+// morph targets the final icon and arrow positions.
+bool InlineTreeLayout(const ViewState& state) {
     return g_expandableFolders.load(std::memory_order_relaxed) && state.columnsView &&
-        !state.columnModeTransition && !state.gridView && !state.thisPcGpu;
+        !state.gridView && !state.thisPcGpu;
+}
+// Active: rows can be grafted and toggled, once that layout has settled.
+bool InlineTreeActive(const ViewState& state) {
+    return InlineTreeLayout(state) && !state.columnModeTransition;
 }
 // Filesystem folders only in this stage; namespace rows and archives keep
 // their native behaviour.
@@ -15213,11 +15239,12 @@ void QueueVisibleDetails(ViewState& state);
 void RequestVisibleIcons(ViewState& state);
 // A layout that can show the tree again (Details after a grid or Content)
 // reopens what was expanded when it left, with the listings it had.
-void ReopenInlineTree(ViewState& state) {
+// `present`: the rows unfold as insertions (after an animated layout change).
+void ReopenInlineTree(ViewState& state, bool present = false) {
     if (!InlineTreeActive(state) || !state.inlineTree.empty() || !state.loaded || state.namesPreview) return;
     RestoreInlineTreeExpansion(state);
     if (state.inlineTree.empty()) return;
-    RegraftInlineTree(state, false);
+    RegraftInlineTree(state, present);
     QueueVisibleDetails(state);
     RequestVisibleIcons(state);
 }
@@ -16745,7 +16772,7 @@ float SelectionCheckboxSpace(const ViewState& state, bool settled) {
 float NameTrailingGap(const ViewState& state) { return static_cast<float>(Scale96(8, ViewDpi(state))); }
 // Inline depth of a presented row, or -1 when no tree is presented.
 int InlineTreeRowDepth(const ViewState& state, int index) {
-    if (!InlineTreeActive(state) || index < 0 || index >= state.total ||
+    if (!InlineTreeLayout(state) || index < 0 || index >= state.total ||
         (!state.presentationOnly && static_cast<size_t>(index) >= state.entries.size())) return -1;
     return ModelEntry(state, index).treeDepth;
 }
@@ -16826,7 +16853,7 @@ float ListCheckboxSpace(const ViewState& state) {
 float ListIconLeft(const ViewState& state, int depth, bool header = false) {
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
     float x = start + ListLeadingGap(state) + ListCheckboxSpace(state);
-    if (InlineTreeActive(state)) {
+    if (InlineTreeLayout(state)) {
         x += InlineTreeChevronBox(state) + IconPixelSize(state, header) * .42f +
             std::max(0, depth) * InlineTreeLevelWidth(state);
     }
@@ -16903,7 +16930,7 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
         }
     } else {
         // Every row reserves the chevron; children add one level each.
-        const bool tree = InlineTreeActive(state);
+        const bool tree = InlineTreeLayout(state);
         const float nested = tree && visual.treeDepth > 0 ? InlineTreeLevelWidth(state) * visual.treeDepth : 0.f;
         const float iconX = ListIconLeft(state, visual.treeDepth);
         const float iconY = visual.top + (state.rowPx-side)*.5f;
@@ -17412,7 +17439,7 @@ RowVisual LayoutRowMotionVisual(const ViewState& state, int index, float progres
 RowVisual LayoutRowVisual(const ViewState& state, int index,
                           float progress) {
     RowVisual visual = LayoutRowMotionVisual(state, index, progress);
-    if (InlineTreeActive(state) && index >= 0 && index < state.total &&
+    if (InlineTreeLayout(state) && index >= 0 && index < state.total &&
         (state.presentationOnly || static_cast<size_t>(index) < state.entries.size()))
         visual.treeDepth = ModelEntry(state, index).treeDepth;
     return visual;
@@ -17420,7 +17447,7 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
 // A disappearing row keeps its own indentation while it collapses away.
 RowVisual GhostRowVisual(const ViewState& state, const CapturedRow& old, float top, float height, float opacity) {
     RowVisual visual{top, height, opacity, old.oldLeft, old.oldWidth};
-    if (InlineTreeActive(state)) visual.treeDepth = old.entry.treeDepth;
+    if (InlineTreeLayout(state)) visual.treeDepth = old.entry.treeDepth;
     return visual;
 }
 RowVisual LayoutRowMotionVisual(const ViewState& state, int index,
@@ -17884,13 +17911,21 @@ void ReconcileColumnViewportAfterRowCount(ViewState& state) {
 // and resize call UpdateColumns directly and never start this transition.
 void StopColumnTransition(ViewState& state) {
     if (!state.columnTransitionActive) return;
-    if (state.columnModeTransition) state.headerPx = state.columnHeaderTo;
+    const bool viewMode = state.columnModeTransition;
+    if (viewMode) state.headerPx = state.columnHeaderTo;
     state.columnModeTransition = false;
     state.columnTransitionActive = false;
     state.columnMotion.clear();
     state.disappearingColumns.clear();
     for (auto& column : state.columns) column.opacity = 1.f;
     UnregisterAnimationWhenIdle(state);
+    // Every end of a change into Details (finished, interrupted or settled):
+    // the folders expanded before it unfold again. Posted, not called: this
+    // runs inside other operations (a new mode change, column settling), and
+    // the continuation re-checks that Details is still the settled layout.
+    if (viewMode && !state.inlineTreeReopenQueued && IsWindow(state.hwnd) && !state.presentationOnly)
+        state.inlineTreeReopenQueued = PostMessageW(state.hwnd, kMsgInlineTreeReopen,
+            WPARAM(state.lifetimeToken), 0) != FALSE;
 }
 
 // A restrained overshoot makes displaced columns settle organically without
@@ -18049,7 +18084,6 @@ void FinishColumnTransition(ViewState& state) {
     if (viewMode) { UpdateColumns(state); ClampScroll(state); }
     else ReconcileColumnViewportAfterRowCount(state);
     if (viewMode) QueueFeatureInitialization(state);
-    if (viewMode) ReopenInlineTree(state); // Back in Details: inline folders return.
     Redraw(state);
 }
 
@@ -26675,7 +26709,7 @@ void Paint(ViewState& state) {
         // A failed listing shows the system's own text for its error instead.
         const std::wstring* treeCaption = !e.treeEmpty ? nullptr :
             e.treeError ? InlineTreeErrorCaption(e.treeError) : &g_emptyFolderCaption;
-        if (treeCaption && !treeCaption->empty() && e.treeDepth >= 0 && InlineTreeActive(state) &&
+        if (treeCaption && !treeCaption->empty() && e.treeDepth >= 0 && InlineTreeLayout(state) &&
             !(state.rename.editor && i == state.rename.index) && !geometry.wrapped) {
             const float gap = static_cast<float>(Scale96(12, ViewDpi(state)));
             const float left = geometry.text.left + ColumnTextWidth(state, EntryLabel(e), false) + gap;
@@ -41351,6 +41385,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case kMsgInlineTreeReady:
         if(s && wParam==WPARAM(s->lifetimeToken)) ReceiveInlineTreeResults(*s);
+        return 0;
+    case kMsgInlineTreeReopen:
+        if(s && wParam==WPARAM(s->lifetimeToken)) {
+            s->inlineTreeReopenQueued = false;
+            if (!s->columnTransitionActive) ReopenInlineTree(*s, true);
+        }
         return 0;
     case kMsgTypeSearchReady:
         if(s && wParam==WPARAM(s->lifetimeToken) && s->typeSearchWaiting) {

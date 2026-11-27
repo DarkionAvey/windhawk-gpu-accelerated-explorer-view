@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.20
+- **FIXED** Switching from a grid to Details no longer makes folder arrows jump at the end of the animation, and expanded folders always reopen.
+
 ## 1.1.19
 - **ADDED** Expandable folders in Details view (off by default, under Columns and sorting). Click the arrow before a folder, or press Right and Left, to show or hide its contents below it. The arrow turns and the contents slide in and out like other list changes; a folder that takes more than a second to open shows a spinner instead of the arrow. Branch lines show how deep each item sits; pointing at a line highlights it, and clicking it closes that folder. Items inside expanded folders work like the rest of the list: click, Ctrl and Shift selection, drag selection, Select All, arrow keys, Enter, Delete, Copy and Cut, dragging them elsewhere, and their right-click menu. Renaming them comes in a later update.
 - **ADDED** Expanded folders show "This folder is empty", or Windows' own error text such as "Access is denied", after their name when there is nothing to list.

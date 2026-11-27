@@ -31,6 +31,7 @@ struct Live {
             const bool owned=message.hwnd==state.hwnd && (message.message==kMsgPreparedSelection ||
                 message.message==kMsgFlushDirectoryChanges || message.message==kMsgNativeCatalog ||
                 message.message==kMsgInlineTreeReady || message.message==kMsgAdoptNativeSelectAll ||
+                message.message==kMsgInlineTreeReopen ||
                 (message.message==WM_TIMER && message.wParam==kInlineTreeBusyTimerId));
             if(owned) OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
             else { TranslateMessage(&message); DispatchMessageW(&message); }

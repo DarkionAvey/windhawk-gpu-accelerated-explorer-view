@@ -375,6 +375,8 @@ static const Regression::Test kRegressions[] = {
         [](HWND frame) { TestInlineDriveBars(frame); })),
     FOCUSED("dense-rows", PARALLEL, TestDenseRowPublication()),
     FOCUSED("native-viewport-cost", SERIAL(Regression::QuietCpu), TestNativeViewportCost(fixture)),
+    FOCUSED("inline-dirs-spike-write-no-history", PARALLEL, TestInlineDirsSpikeWriteNoHistory(fixture)),
+    FOCUSED("inline-dirs-spike-latency", SERIAL(Regression::QuietCpu), TestInlineDirsSpikeLatency(fixture)),
     FOCUSED("live-sort", PARALLEL, RegressionManifest::LiveSort(fixture)),
     FOCUSED("row-composition", PARALLEL, RegressionManifest::RowComposition()),
     FOCUSED("selection-ui-mode", PARALLEL, TestSelectionUiModeReads()),

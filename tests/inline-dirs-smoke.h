@@ -42,6 +42,8 @@ struct Tab {
         state.hwnd=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,L"STATIC",L"private inline dirs",
             WS_POPUP,-32000,-32000,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         Check(state.hwnd!=nullptr,"inline dirs window");
+        // The overlay's own continuations reach OverlayProc with this state.
+        SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(&state));
         state.nativeHwnd=state.frameHwnd=state.activeTabHost=state.background->hwnd=state.hwnd;
         state.folderPath=folder; state.visible=state.inScope=state.detailsViewActive=true;
         state.rtlLayout=rtl; state.paintWidth=1000.f;
@@ -53,6 +55,7 @@ struct Tab {
         Check(EnsureTarget(state),"inline dirs text formats");
     }
     ~Tab() {
+        SetWindowLongPtrW(state.hwnd,GWLP_USERDATA,0);
         UnregisterAnimationWindow(state.hwnd); Stop(state.background); DropTarget(state); DestroyWindow(state.hwnd);
     }
     int Row(const std::wstring& name) const {
@@ -67,6 +70,8 @@ struct Tab {
             MSG message{};
             while(PeekMessageW(&message,state.hwnd,WM_TIMER,WM_TIMER,PM_REMOVE))
                 if(message.wParam==kInlineTreeBusyTimerId) InlineTreeBusyTick(state);
+            while(PeekMessageW(&message,state.hwnd,kMsgInlineTreeReopen,kMsgInlineTreeReopen,PM_REMOVE))
+                OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
             bool pending=false;
             {
                 ExclusiveSrwLock lock(state.background->directoryLock);
@@ -227,8 +232,34 @@ static void TestInlineDirsLayoutSwitch(const std::wstring& fixture) {
             Check(s.total==7 && tab.Row(L"deep.txt")>=0 && s.entries[size_t(tab.Row(L"deep.txt"))].treeDepth==2,
                 "returning to Details did not reopen the expanded folders");
         }
+    // Grid to Details, animated, three round trips, ending the column change
+    // by completion or by interruption: the morph's destination already has
+    // the arrow's space (no jump when the columns settle), and the expanded
+    // folders reopen every time.
+    {
+        Tab tab(root,96);
+        auto& s=tab.state;
+        tab.Toggle(L"alpha"); tab.Toggle(L"sub");
+        for(int trip=0;trip<3;++trip) for(bool interrupt:{false,true}) {
+            Regression::Scope scope("round trip "+std::to_string(trip)+" interrupt="+std::to_string(interrupt));
+            ApplyViewLayout(s,{FVM_ICON,48},true,true);
+            StopRowTransition(s); FinishColumnTransition(s);
+            Check(s.total==3,"grid kept children");
+            ApplyViewLayout(s,{FVM_DETAILS,16},true,true);
+            const int zeta=tab.Row(L"zeta.txt");
+            const float during=tab.Item(zeta).icon.left;
+            const float expected=NameColumnStart(s)+float(MulDiv(16,96,96))+
+                ExpectedChevronBox(CapHeight(s.textFormat.Get()),96)+s.iconPx*.42f;
+            Check(Near(during,expected),"the morph's destination icon leaves no room for the arrow");
+            if(interrupt) StopColumnTransition(s); else FinishColumnTransition(s);
+            StopRowTransition(s);
+            tab.Settle();
+            Check(Near(tab.Item(tab.Row(L"zeta.txt")).icon.left,during),"the icon jumped when the columns settled");
+            Check(s.total==7 && tab.Row(L"deep.txt")>=0,"the expanded folders did not reopen after the layout change");
+        }
+    }
     std::cout<<"PASS: icon, Tiles, Content and List layouts show only the folder's own items (animated or not); "
-        "Details reopens the expanded folders\n";
+        "Details reopens the expanded folders every time, and its morph targets the arrow's space\n";
 }
 
 // Grouping belongs to the open folder. In a grouped folder, expanded children
