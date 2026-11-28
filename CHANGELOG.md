@@ -1,5 +1,20 @@
  # Changelog
 
+## 1.1.21
+- **ADDED** Items inside expanded folders can be renamed (F2 or a slow click), and middle-clicking a folder inside an expanded folder opens it in a new tab.
+- **ADDED** Alt+Enter shows the properties of a selection that includes items from expanded folders.
+- **ADDED** On a touchscreen, tapping a folder's icon opens or closes it, as the arrow is a small target for a finger.
+- **ADDED** Several selected items from different expanded folders can be renamed together, each in its own folder, as in Explorer's search results.
+
+- **IMPROVED** Right-clicking items inside expanded folders opens Windows 11's own context menu, the same one as for any other file, also when the selection spans several folders. The classic menu remains only on Windows builds where this isn't available.
+
+- **FIXED** When the selection includes items from expanded folders, Explorer's toolbar (Cut, Copy, Delete, Rename, Properties, Share and others) acts on the whole selection, also when it starts inside an expanded folder, and the status bar shows its real count and size.
+- **FIXED** Properties of a selection that includes items from expanded folders opens the same property sheet Explorer shows for those items.
+- **FIXED** Error messages when a rename fails now use Windows' own text in your language.
+- **FIXED** Context menu commands such as Send to, Compress and app extensions act on the whole selection when it mixes items of the open folder and of expanded folders, not only on the open folder's part.
+- **FIXED** Deleting items inside an expanded folder removes their rows right away instead of about a second later.
+- **FIXED** Expanded folders now update when Windows reports that a folder was refreshed, for example after a large copy or move into it, instead of waiting for the next single-file change.
+
 ## 1.1.20
 - **FIXED** Switching from a grid to Details no longer makes folder arrows jump at the end of the animation, and expanded folders always reopen.
 

@@ -200,6 +200,22 @@ and the default gate stops at the first failure.
   machine-wide Shell notification broker delivered an event.
 - Wait for completion signals (receipts, accepted sequences, pending flags)
   with `Eventually`; deadlines are failure bounds, not sleeps.
+- **Judge an outcome once its work has completed; never poll for the
+  outcome itself.** `Eventually(outcome, 30000)` turns every wrong outcome
+  into a 30-second stall (and a Shell failure often dings meanwhile). Instead:
+  - Synchronous calls (`SetNameOf`, `IFileOperation::PerformOperations`, a
+    Shell verb invoked with `CMIC_MASK_FLAG_NO_UI`, Copy/Cut) have finished
+    when they return: check the disk or clipboard right after them.
+  - Deliver the Shell's report yourself with `SHChangeNotify(...,
+    SHCNF_FLUSH)` (it returns once delivered), then wait only for the mod's
+    own completion state (no queued jobs, no pending flags: `Live::Settled`
+    in `inline-dirs-live-smoke.h`) and check the outcome once.
+  - A wait whose completion state is reached without the expected result
+    returns at once and fails (see `Present` in
+    `inline-dirs-live-parity-smoke.h`); the deadline then only catches a
+    hung worker.
+  - A known instant (a double-click time, an animation end) is emulated by
+    setting the due time or using `AnimationClockFixture`, not waited out.
 - Assertions never depend on elapsed time; print timings as `PROFILE`.
 
 **Serial is only for machine-wide state no process can isolate**, declared as

@@ -950,6 +950,17 @@ inline HDC WINAPI CountingGetDC(HWND hwnd) { if (hwnd && hwnd == counted) ++dire
 inline thread_local POINT cursor{};
 inline BOOL WINAPI CursorAt(LPPOINT point) { if (!point) return FALSE; *point = cursor; return TRUE; }
 inline DWORD WINAPI MessageAt() { return MAKELONG(static_cast<short>(cursor.x), static_cast<short>(cursor.y)); }
+// The EDIT reads Shift/Ctrl/Alt for its keys; a person using the machine may
+// hold them. The test sends no modifiers, so they read as released.
+inline bool Modifier(int key) {
+    switch (key) {
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU: case VK_LWIN: case VK_RWIN: return true;
+    default: return false;
+    }
+}
+inline SHORT WINAPI KeyState(int key) { return Modifier(key) ? 0 : ::GetKeyState(key); }
+inline SHORT WINAPI AsyncKeyState(int key) { return Modifier(key) ? 0 : ::GetAsyncKeyState(key); }
 // Point one module's imported functions at replacements (as a function hook
 // on them would), returning the slots patched so they can be restored.
 inline std::vector<std::pair<void**, void*>> PatchImports(HMODULE module, const std::map<std::string, void*>& replacements) {
@@ -1024,7 +1035,9 @@ static void TestRenameTyping(const std::wstring& fixture) {
     g_releaseDcOriginal = &::ReleaseDC;
     g_renameSinkAvailable = true;
     const auto patched = RenameTypingFixture::PatchImports(editModule,
-        {{"GetDC", reinterpret_cast<void*>(&GetDcHook)}, {"ReleaseDC", reinterpret_cast<void*>(&ReleaseDcHook)}});
+        {{"GetDC", reinterpret_cast<void*>(&GetDcHook)}, {"ReleaseDC", reinterpret_cast<void*>(&ReleaseDcHook)},
+         {"GetKeyState", reinterpret_cast<void*>(&RenameTypingFixture::KeyState)},
+         {"GetAsyncKeyState", reinterpret_cast<void*>(&RenameTypingFixture::AsyncKeyState)}});
     struct Unpatch { std::vector<std::pair<void**, void*>> slots; ~Unpatch() {
         RenameTypingFixture::Restore(slots); g_renameSinkAvailable = false; RenameTypingFixture::counted = nullptr; } }
         unpatch{patched};

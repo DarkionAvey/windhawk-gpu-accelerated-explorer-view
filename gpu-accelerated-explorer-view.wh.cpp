@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.20
+// @version         1.1.21
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1234,6 +1234,10 @@ constexpr UINT kMsgPaletteReady = WM_APP + 87;
 constexpr UINT kMsgInlineTreeReady = WM_APP + 88;
 // Reopen inline folders once a change into Details has ended (wParam: lifetime).
 constexpr UINT kMsgInlineTreeReopen = WM_APP + 89;
+// Tell Explorer's selection listeners about a GPU-only selection change (wParam: lifetime).
+constexpr UINT kMsgInlineSelectionNotice = WM_APP + 90;
+// Start the mod's rename for a selection with inline children (wParam: lifetime).
+constexpr UINT kMsgInlineSelectionRename = WM_APP + 91;
 constexpr UINT kMsgThemeSettings = WM_APP + 85;
 // A multiple rename that could not be performed: shown from its own dispatch
 // after the rename transaction has unwound (lParam: the view token).
@@ -3187,12 +3191,20 @@ struct TouchRecognizer {
 // Drain these only AFTER Windhawk removes detours, in Wh_ModUninit. Waiting
 // before removal would admit new calls indefinitely (including modal loops).
 enum class ApiHook { Dispatch, Accelerator, Show, ShowAsync, Position, DeferredPosition, StructureEvent,
-    GetDC, ReleaseDC, NewMenuInvoke, Count };
+    GetDC, ReleaseDC, NewMenuInvoke, SelectionMenuInvoke, SelectionBridge, InlineMenu, Count };
 constexpr const wchar_t* kApiHookNames[]{L"DispatchMessageW",L"TranslateAcceleratorW",
     L"ShowWindow",L"ShowWindowAsync",L"SetWindowPos",L"DeferWindowPos",L"UiaRaiseStructureChangedEvent",
-    L"GetDC",L"ReleaseDC",L"CNewMenu::InvokeCommand"};
+    L"GetDC",L"ReleaseDC",L"CNewMenu::InvokeCommand",L"CDefFolderMenu::InvokeCommand",L"CDefView selection bridge",
+    L"CDefView item menu"};
 static_assert(std::size(kApiHookNames)==static_cast<size_t>(ApiHook::Count),"every API hook has a drain name");
 std::array<std::atomic<unsigned>,static_cast<size_t>(ApiHook::Count)> g_apiCallbacks{};
+// Explorer's own item menu for selections with inline children
+// (InstallInlineNativeMenu): available when its shell32 symbols were found;
+// the request in progress on this (owner) thread, by tab (never a pointer a
+// reentrant close could leave dangling).
+std::atomic<bool> g_inlineNativeMenu{false};
+struct InlineMenuRequest { HWND owner = nullptr; unsigned long long lifetime = 0; bool learned = false; };
+thread_local InlineMenuRequest t_inlineMenuRequest;
 struct ApiCallbackGuard {
     std::atomic<unsigned>& count;
     explicit ApiCallbackGuard(ApiHook hook) : count(g_apiCallbacks[static_cast<size_t>(hook)]) {
@@ -4620,6 +4632,7 @@ struct ViewState : FolderModel {
         std::vector<Entry> children; // Sorted listing; empty until loaded.
         bool loaded = false;
         unsigned long long request = 0;
+        unsigned long long received = 0; // Request whose listing arrived; below request while one is in flight.
         SortSpec sort; // Order the listing was requested in.
         std::shared_ptr<std::atomic<bool>> cancelled;
         LARGE_INTEGER requestedQpc{}; // First listing request, for the busy indicator.
@@ -4629,6 +4642,18 @@ struct ViewState : FolderModel {
     };
     std::vector<InlineTreeNode> inlineTree; // Belongs to inlineTreeFolder only.
     bool inlineTreeReopenQueued = false; // kMsgInlineTreeReopen is in the queue.
+    // A rebuild of the expanded rows held back while a rename field is open
+    // (as the open folder's re-list is); run once the field closes.
+    bool inlineTreeRegraftDeferred = false;
+    bool inlineSelectionNoticeQueued = false; // kMsgInlineSelectionNotice is in the queue.
+    bool inlineSelectionWasDetached = false; // The last notice described a selection with children.
+    // The selection's Shell IDs, valid for one selection and row set (InlineSelectionPidls).
+    struct InlineSelectionCache {
+        std::vector<OwnedPidl> items;
+        std::vector<std::wstring> paths; // The selected rows it was built for, in row order.
+        unsigned long long directory = 0;
+        bool failed = false; // An item had no identity (deleted, offline): asked again only after the rows change.
+    } inlineSelectionCache;
     std::wstring inlineTreeFolder;
     // Expanded folders of folders this tab left, with their last listings, so
     // Back/Forward reopen them at once and then refresh. An entry lives only
@@ -6072,6 +6097,16 @@ bool TreeChildRow(const ViewState& state, int index) {
     if (index < 0 || index >= state.total) return false;
     if (!state.presentationOnly && static_cast<size_t>(index) >= state.entries.size()) return false;
     return ModelEntry(state, index).treeDepth > 0;
+}
+bool InlineSelectionDetached(const ViewState& state);
+void QueueInlineSelectionNotice(ViewState& state);
+void RenameInlineSelection(ViewState& state, const std::wstring& text);
+// Rows the native view mirrors: the open folder's own rows. Inline children
+// belong to other folders and stay GPU-selected only; Explorer's own readers of
+// a selection that includes them get the whole selection from the selection
+// bridge (InstallSelectionBridge) instead.
+bool NativeMirrorsRow(const ViewState& state, size_t row) {
+    return row < state.entries.size() && !state.entries[row].treeDepth;
 }
 // Every shown row takes part in selection, including inline children. The
 // native view mirrors only its own rows; commands on a selection that holds
@@ -12749,12 +12784,14 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             if (SUCCEEDED(observed) && pidl) {
                 // Subscribe to child-file Shell hints. The callback filters
                 // direct rows; filesystem interrupt watching stays nonrecursive.
+                // UPDATEDIR (refresh, coalesced bursts) re-lists an expanded
+                // inline folder; the open filesystem folder keeps its own watch.
                 SHChangeNotifyEntry entry{pidl, TRUE};
                 result.watch->registration = SHChangeNotifyRegister(work.hwnd,
                     SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
                     SHCNE_MKDIR | SHCNE_CREATE | SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES |
                     SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER |
-                    (namespaceFolder ? SHCNE_UPDATEDIR : 0),
+                    SHCNE_UPDATEDIR,
                     kMsgShellItemCreated, 1, &entry);
             }
             if (pidl) CoTaskMemFree(pidl);
@@ -15449,6 +15486,17 @@ void Select(ViewState& state, int index, bool keyboardNavigation);
 // or disappear use the same insertion/deletion motion as a folder change.
 void RegraftInlineTree(ViewState& state, bool present = true) {
     if (!state.loaded || state.namesPreview || state.presentationOnly) return;
+    // An open rename field keeps its rows: the rebuild waits for the field to
+    // close, exactly as the open folder's re-list does (ObserveDirectoryWatch).
+    // The edited item's own removal closes the field first (the Shell change
+    // handler), so it is never kept over a vanished item.
+    if (state.rename.editor) {
+        state.inlineTreeRegraftDeferred = true;
+        if (g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU rename] inline folder rows rebuild held while renaming: %s", state.rename.path.c_str());
+        return;
+    }
+    state.inlineTreeRegraftDeferred = false;
     const bool active = PrepareInlineTreeForFolder(state);
     if (!active && state.rootTotal == state.total) return; // Nothing presented, nothing to add.
     HarvestInlineTreeRows(state);
@@ -15475,7 +15523,6 @@ void RegraftInlineTree(ViewState& state, bool present = true) {
         }
     }
     StopRowTransition(state);
-    if (state.rename.editor) CancelRename(state);
     const float oldHeader = state.headerPx;
     // Old positions of child rows by path, so rows that come into view after
     // the change start from where they really were, even off screen.
@@ -15509,6 +15556,7 @@ void RegraftInlineTree(ViewState& state, bool present = true) {
     GraftInlineTree(state, roots, rootMap);
     state.typeSearchCandidates.Reset();
     state.entries.swap(roots);
+    state.inlineSelectionCache.failed = false; // Rows rebuilt: identities are asked again.
     RetireCachedEntries(state, roots);
     state.total = static_cast<int>(state.entries.size());
     state.rootTotal = static_cast<int>(rootMap.size());
@@ -15557,6 +15605,9 @@ void RegraftInlineTree(ViewState& state, bool present = true) {
     state.presentationEntries.reset();
     RebuildGroupSections(state);
     ReconcileColumnViewportAfterRowCount(state);
+    // Selected children may have left with a collapse: Explorer's command bar
+    // and status bar re-read the selection.
+    QueueInlineSelectionNotice(state);
     if (!present) return;
     ClampScroll(state);
     if (!captures.empty()) {
@@ -15721,6 +15772,24 @@ void NoteInlineTreeChange(ViewState& state, const std::wstring& path, const std:
                 removed = true;
             } else ++it;
         }
+    // A deleted item leaves its folder's listing at once, as an open folder's
+    // own rows do; the re-list below still confirms the folder. A rename keeps
+    // its row until the re-list publishes the new name (no gap).
+    if (gone && renamed.empty())
+        if (auto* node = FindInlineTreeNode(state, parentOf(path))) {
+            auto& children = node->children;
+            const auto end = std::remove_if(children.begin(), children.end(), [&](const Entry& child) {
+                return _wcsicmp(child.path.c_str(), path.c_str()) == 0;
+            });
+            if (end != children.end()) {
+                std::vector<Entry> retired(std::make_move_iterator(end), std::make_move_iterator(children.end()));
+                children.erase(end, children.end());
+                RetireCachedEntries(state, retired);
+                removed = true;
+            }
+        }
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU tree] Shell change gone=%d removed=%d: %s", gone, removed, path.c_str());
     for (const auto* item : {&path, &renamed})
         if (!item->empty())
             if (auto* node = FindInlineTreeNode(state, parentOf(*item))) RequestInlineTreeNode(state, *node);
@@ -15728,6 +15797,25 @@ void NoteInlineTreeChange(ViewState& state, const std::wstring& path, const std:
         SyncInlineTreeSpinners(state);
         ScheduleInlineTreeBusy(state);
         RegraftInlineTree(state);
+    }
+}
+// A committed rename of an inline child: its folder's stored listing (and,
+// for an expanded folder, its own node and every node below it) take the new
+// identity at once, so a re-list of the open folder before the child folder's
+// own re-list keeps the row, its selection and its expansion.
+void RenameInlineTreeItem(ViewState& state, const std::wstring& oldPath, const std::wstring& newPath,
+                          const std::wstring& name, const std::wstring& label) {
+    if (state.inlineTree.empty() || oldPath.empty() || newPath.empty()) return;
+    for (auto& node : state.inlineTree) {
+        for (auto& child : node.children)
+            if (_wcsicmp(child.path.c_str(), oldPath.c_str()) == 0) {
+                child.path = newPath; child.name = name; child.label = label;
+            }
+        if (_wcsicmp(node.path.c_str(), oldPath.c_str()) == 0) node.path = newPath;
+        else if (InlineTreeWithin(node.path, oldPath)) node.path = newPath + node.path.substr(oldPath.size());
+        else continue;
+        for (auto& child : node.children)
+            if (InlineTreeWithin(child.path, oldPath)) child.path = newPath + child.path.substr(oldPath.size());
     }
 }
 void ReceiveInlineTreeResults(ViewState& state) {
@@ -15745,6 +15833,7 @@ void ReceiveInlineTreeResults(ViewState& state) {
         if (result.error != ERROR_SUCCESS && g_perf.load(std::memory_order_relaxed))
             Wh_Log(L"[GPU tree] listing failed (%lu): %s", result.error, result.path.c_str());
         node->error = result.error;
+        node->received = result.request;
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
         if (!node->loaded && node->spinnerQpc.QuadPart &&
             InlineTreeElapsedMs(state, node->spinnerQpc, now) < static_cast<double>(kInlineTreeBusyMinimumMs)) {
@@ -15763,8 +15852,11 @@ void ReceiveInlineTreeResults(ViewState& state) {
     }
     SyncInlineTreeSpinners(state);
     ScheduleInlineTreeBusy(state);
+    // Also a rebuild held back while a rename field was open (now closed).
+    if (state.inlineTreeRegraftDeferred && !state.rename.editor) changed = true;
     if (changed) RegraftInlineTree(state);
-    if (changed) RevealInlineTreeReturn(state);
+    // A held rebuild reveals once it runs (the rows are not there yet).
+    if (changed && !state.inlineTreeRegraftDeferred) RevealInlineTreeReturn(state);
 }
 
 bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
@@ -15919,6 +16011,8 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     else if (!state.namesPreview) state.namesPreviewLatencyMs = durationMs;
     // A new sorted snapshot can change row indices. Do not leave a live
     // editor positioned over a different filename after an external refresh.
+    if (state.rename.editor && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] closing: the open folder was listed again");
     if (state.rename.editor) CancelRename(state);
     // A directory worker maps identities, not presentation time. Once motion
     // has reached a frame, sample its current clock for every subsequent diff,
@@ -23193,7 +23287,12 @@ bool InlineTreeExpanderHit(ViewState& state, int index, POINT point) {
         !InsideListX(state, point.x) || RowFromPoint(state, point.y, point.x) != index) return false;
     // The whole height of the row is the arrow's target, not just the glyph.
     const RowVisual visual = LayoutRowVisual(state, index, CurrentRowProgress(state));
-    const auto rect = InlineTreeExpanderRect(state, LayoutItem(state, visual));
+    const auto geometry = LayoutItem(state, visual);
+    auto rect = InlineTreeExpanderRect(state, geometry);
+    // A finger is wider than the arrow: on touch, the folder's icon toggles
+    // too. (Finder's list view keeps icon clicks for selection, so a mouse
+    // keeps that.)
+    if (state.pointingDevice == PointingDevice::Touch) rect.right = geometry.icon.right;
     const float x = static_cast<float>(LogicalX(state, point.x)), y = static_cast<float>(point.y);
     return x >= rect.left && x < rect.right && y >= visual.top && y < visual.top + visual.height;
 }
@@ -27562,9 +27661,10 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
 
 bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& selection) {
     size_t selected = state.selectedFlags.Count(0,state.selectedFlags.size());
-    if (state.rootTotal != state.total) // Selected inline children are never prepared.
+    if (state.rootTotal != state.total) { // Only mirrored rows are ever prepared.
         for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
-            if (state.entries[i].treeDepth && state.selectedFlags[i]) --selected;
+            if (state.selectedFlags[i] && !NativeMirrorsRow(state, i)) --selected;
+    }
     if (state.token != selection.viewToken || state.directoryToken != selection.directoryToken || state.nativeHwnd != selection.native ||
         selected != selection.entries.size()) return false;
     for (const Entry& entry : selection.entries) {
@@ -27626,7 +27726,7 @@ bool CollectSelectedPidls(ViewState& state, PidlSelection& pidls) {
         if (static_cast<size_t>(i) >= state.entries.size()) return false;
         // Inline children belong to another folder; never offer them to the
         // native view (it answers S_OK and selects nothing, see the probe).
-        if (state.entries[static_cast<size_t>(i)].treeDepth) continue;
+        if (!NativeMirrorsRow(state, size_t(i))) continue;
         PITEMID_CHILD child = nullptr;
         const HRESULT hr=EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
         OwnedPidl owned(child);
@@ -27908,7 +28008,7 @@ void ApplyImportedNativeSelection(ViewState& state,
         // inline children are not part of an echo and stay selected.
         size_t count = 0;
         for (size_t i = 0; i < state.selectedFlags.size(); ++i)
-            count += state.selectedFlags[i] != 0 && !state.entries[i].treeDepth;
+            count += state.selectedFlags[i] != 0 && NativeMirrorsRow(state, i);
         if (count == state.nativeSelectionPaths.size()) {
             bool same = true;
             int nativeFocus = -1;
@@ -28450,7 +28550,7 @@ bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool rev
     for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i) {
         // Inline children belong to other folders; they stay GPU-selected and
         // are not offered to the native view (they would come back rejected).
-        if (!state.selectedFlags[i] || state.entries[i].treeDepth) continue;
+        if (!state.selectedFlags[i] || !NativeMirrorsRow(state, i)) continue;
         if (static_cast<int>(i) == state.selected) job->focused = static_cast<int>(job->entries.size());
         Entry entry;
         entry.name = state.entries[i].name;
@@ -28597,6 +28697,14 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
                 QueueNativeSelectionHint(*state);
         }
     } continuation{state.hwnd,state.lifetimeToken};
+    // After this commit (whatever path it takes), Explorer's selection
+    // listeners are told when the selection includes inline children.
+    struct InlineSelectionNotice {
+        HWND owner; unsigned long long lifetime;
+        ~InlineSelectionNotice() {
+            if (auto* live = State(owner); live && live->lifetimeToken == lifetime) QueueInlineSelectionNotice(*live);
+        }
+    } inlineNotice{state.hwnd, state.lifetimeToken};
     ScopedFlag committing(state.nativeSelectionCommitting);
     size_t desired = 0;
     std::vector<std::wstring> selectedPaths;
@@ -28604,7 +28712,7 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
     for (size_t i = 0; i < state.selectedFlags.size(); ++i) {
         if (!state.selectedFlags[i]) continue;
         // A selected inline child is GPU-only; the native view gets none.
-        if (i < state.entries.size() && state.entries[i].treeDepth) continue;
+        if (!NativeMirrorsRow(state, i)) continue;
         ++desired;
         if (desired <= kMaxDirectNativeSelectionItems &&
             i < state.entries.size())
@@ -30132,6 +30240,10 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.path.clear();
     r.folder.clear();
     r.tab = r.native = nullptr;
+    // Expanded rows held back while renaming are rebuilt after the rename
+    // transaction unwinds (posted: its completion still addresses rows).
+    if (state.inlineTreeRegraftDeferred && IsWindow(state.hwnd))
+        PostMessageW(state.hwnd, kMsgInlineTreeReady, WPARAM(state.lifetimeToken), 0);
     r.finishing = false;
     r.textLayoutDirty = false;
     r.requestedTextRectValid = false;
@@ -30209,6 +30321,8 @@ bool CloseRenameEditor(ViewState& state, bool restoreFocus = false) {
 
 void CancelRename(ViewState& state) {
     if (state.rename.finishing || !state.rename.editor) return;
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] cancelled: %s", state.rename.path.c_str());
     CloseRenameEditor(state);
 }
 
@@ -30737,7 +30851,11 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 // `multiple` accepts a larger selection containing `index`, as Explorer's F2
 // and Rename command do; the commit is then DefView's own (FinishRename).
 void BeginRename(ViewState& state, int index, bool createdItem = false, bool multiple = false) {
-    if (TreeChildRow(state, index)) return; // Inline children are renamed in a later stage.
+    // An inline child is renamed through its own folder (FinishRename). A set
+    // that includes children renames together (RenameInlineSelection,
+    // Explorer's numbering), each item in its own folder, as Explorer renames
+    // a set chosen from search results.
+    const bool inlineSet = InlineSelectionDetached(state);
     if (state.thisPcGpu || IsRecycleBinLocation(state.folderPath) || state.rename.editor ||
         (!state.renamePreviewPath.empty() && state.renamePreviewToken == state.token) || !state.visible || !state.inScope ||
         !IsWindow(state.frameHwnd) || GetParent(state.hwnd) != state.frameHwnd ||
@@ -30778,7 +30896,8 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
         state.nativeHwnd != native || state.rename.editor || !state.visible || !state.inScope ||
         !TabOwnsActiveView(state) || index >= state.total || size_t(index) >= state.entries.size() ||
         state.entries[size_t(index)].path != path) return;
-    if (selectedCount > 1) {
+    // A native set reaches Explorer first; an inline set is the mod's own.
+    if (selectedCount > 1 && !inlineSet) {
         // A set over kMaxDirectNativeSelectionItems reaches Explorer through
         // the selection lane. Open the editor once Explorer holds the whole
         // set, so the commit never waits on (or races) that preparation.
@@ -30832,6 +30951,9 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
     // SetNameOf(SHGDN_INFOLDER) keeps that extension on commit.
     const bool labelled = !state.entries[static_cast<size_t>(index)].label.empty();
     const std::wstring name = EntryLabel(state.entries[static_cast<size_t>(index)]);
+    if (inlineSet && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] starting for %zu item(s) with children selected: %s", selectedCount,
+            state.entries[size_t(index)].path.c_str());
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
     const bool wrapped = RenameItemGeometry(state, index).wrapped;
@@ -31358,7 +31480,17 @@ void FinishRename(ViewState& state, bool commit) {
         // the Shell change notifications publish them.
         if (!CloseRenameEditor(state) || !current()) return;
         if (state.presenter) SubmitPresentation(state);
-        if (changed) RenameSelectionNatively(state, newName);
+        // A set with children: each item renamed in its own folder.
+        if (changed) {
+            if (InlineSelectionDetached(state)) {
+                // The mod's own file operation: input returns to the list as
+                // after a single rename (DefView does this for its own set).
+                // Left on the frame, Explorer's accelerator chain would
+                // translate each key several times.
+                RenameInlineSelection(state, newName);
+                if (current() && returnInput) ReturnListInputFocus(state, editor);
+            } else RenameSelectionNatively(state, newName);
+        }
         else {
             if (valid) SyncNativeSelection(state);
             if (current() && returnInput) ReturnListInputFocus(state, editor);
@@ -31401,6 +31533,7 @@ void FinishRename(ViewState& state, bool commit) {
             entry.name = success ? name : oldName;
             entry.label = !success ? oldLabel : label != name ? label : L"";
             if (success) SetIndexedEntryPath(*live, row, path);
+            if (success && entry.treeDepth) RenameInlineTreeItem(*live, oldPath, path, entry.name, entry.label);
             live->selectedFlags.assign(live->entries.size(), 0);
             live->selectedFlags[size_t(row)] = 1;
             live->selected = live->anchor = row;
@@ -31444,10 +31577,29 @@ void FinishRename(ViewState& state, bool commit) {
     if (!GetFolderPath(view.Get(), actual, activeFolder) || !current() ||
         _wcsicmp(actual.c_str(), parent.c_str()) != 0 ||
         !IsTargetPath(actual)) { complete(false, L"", L""); return; }
+    // An inline child lives in its own folder: rename it there, with the same
+    // Shell call. The open folder above is still verified, so a navigation
+    // during the edit never commits into another view.
+    std::wstring itemFolder = parent;
+    if (TreeChildRow(state, index)) {
+        PIDLIST_ABSOLUTE absolute = nullptr;
+        ComPtr<IShellFolder> owning;
+        PCUITEMID_CHILD leaf = nullptr;
+        if (FAILED(SHParseDisplayName(oldPath.c_str(), nullptr, &absolute, 0, nullptr)) || !absolute ||
+            FAILED(SHBindToParent(absolute, IID_PPV_ARGS(&owning), &leaf)) || !owning) {
+            if (absolute) CoTaskMemFree(absolute);
+            complete(false, L"", L""); return;
+        }
+        CoTaskMemFree(absolute);
+        activeFolder = std::move(owning);
+        const size_t slash = oldPath.find_last_of(L'\\');
+        itemFolder = oldPath.substr(0, slash == 2 ? slash + 1 : slash);
+        if (!current()) return;
+    }
     // Shell handles extension rules and name validation. Only commit via
     // SetNameOf, never via a native hidden edit or fabricated keystrokes.
     std::wstring originalName = oldName;
-    std::wstring committedName = newName, committedPath = JoinPath(parent, newName);
+    std::wstring committedName = newName, committedPath = JoinPath(itemFolder, newName);
     ULONG eaten = 0;
     PITEMID_CHILD child = nullptr;
     HRESULT hr = activeFolder->ParseDisplayName(native,
@@ -31482,8 +31634,11 @@ void FinishRename(ViewState& state, bool commit) {
         complete(false, L"", L"");
         Wh_Log(L"[GPU rename] Shell rename failed hr=0x%08X: %s -> %s",
                static_cast<unsigned>(hr), oldPath.c_str(), newName.c_str());
-        if (current()) MessageBoxW(owner, L"Explorer could not rename this item.",
-                    L"Rename", MB_OK | MB_ICONWARNING);
+        // The same notice as a failed set (shell32's localized "Cannot rename"
+        // text and caption, shown from its own dispatch, never inside this
+        // rename transaction); a cancelled Shell prompt already informed the user.
+        if (current() && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+            ReportMultipleRenameFailure(state, L"the Shell did not rename the item", originalName, hr);
     }
 }
 
@@ -31507,6 +31662,72 @@ void BeginOptimisticNavigation(ViewState& state, const std::wstring& path,
 void MaybeDisplayImmediateBack(HWND overlay, const wchar_t* reason);
 void RollbackOptimisticNavigation(HWND overlay, const std::wstring& destination);
 
+// Explorer's command bar and status bar re-read the list's selection only when
+// the native view raises SelectionChanged, which a GPU-only change (a selection
+// that includes inline children) never does. Deliver that same documented
+// event (DShellFolderViewEvents) to the view's other listeners, so they ask
+// again and receive the whole selection (InlineSelectionViewOwner). Also once
+// when the selection stops including children, so they return to the native
+// answer. Coalesced and posted: never inside a selection commit.
+void QueueInlineSelectionNotice(ViewState& state) {
+    if (state.inlineSelectionNoticeQueued || state.presentationOnly || !IsWindow(state.hwnd)) return;
+    if (!InlineSelectionDetached(state) && !state.inlineSelectionWasDetached) return;
+    state.inlineSelectionNoticeQueued = PostMessageW(state.hwnd, kMsgInlineSelectionNotice,
+        WPARAM(state.lifetimeToken), 0) != FALSE;
+}
+void DeliverInlineSelectionNotice(ViewState& state) {
+    state.inlineSelectionNoticeQueued = false;
+    const bool detached = InlineSelectionDetached(state);
+    if (!detached && !state.inlineSelectionWasDetached) return;
+    state.inlineSelectionWasDetached = detached;
+    const auto connection = state.selectionEventConnection;
+    if (!connection) {
+        if (g_perf.load(std::memory_order_relaxed)) Wh_Log(L"[GPU selection] no selection event source to notify");
+        return;
+    }
+    ComPtr<IUnknown> own;
+    if (state.selectionEventSink) state.selectionEventSink.As(&own);
+    ComPtr<IEnumConnections> connections;
+    if (FAILED(connection->EnumConnections(&connections)) || !connections) return;
+    std::vector<ComPtr<IDispatch>> listeners;
+    CONNECTDATA data{};
+    while (connections->Next(1, &data, nullptr) == S_OK) {
+        ComPtr<IUnknown> sink; sink.Attach(data.pUnk);
+        ComPtr<IUnknown> identity; ComPtr<IDispatch> dispatch;
+        if (sink && SUCCEEDED(sink.As(&identity)) && identity != own && SUCCEEDED(sink.As(&dispatch)))
+            listeners.push_back(std::move(dispatch));
+    }
+    // A listener runs Explorer code: the tab may close while it does.
+    const HWND owner = state.hwnd;
+    const auto lifetime = state.lifetimeToken;
+    for (const auto& listener : listeners) {
+        if (auto* live = State(owner); live != &state || live->lifetimeToken != lifetime) return;
+        if (g_perf.load(std::memory_order_relaxed)) {
+            HMODULE module = nullptr; wchar_t name[MAX_PATH]{};
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCWSTR>((*reinterpret_cast<void***>(listener.Get()))[6]), &module);
+            if (module) GetModuleFileNameW(module, name, ARRAYSIZE(name));
+            Wh_Log(L"[GPU selection] SelectionChanged delivered to a listener in %s (children selected=%d)",
+                module ? PathFindFileNameW(name) : L"?", int(detached));
+        }
+        DISPPARAMS none{};
+        listener->Invoke(DISPID_SELECTIONCHANGED, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &none,
+            nullptr, nullptr, nullptr);
+    }
+}
+// Nonzero while the mod invokes its own inline-selection menu, so the
+// selection-menu hook never reroutes it (SelectionMenuInvokeHook).
+thread_local unsigned t_inlineMenuInvoking = 0;
+// A menu runs for the current Explorer window: its site is the tab's browser,
+// so commands that open folders (Open, Open in new tab) stay in this window.
+struct InlineMenuInvocation {
+    IContextMenu* menu;
+    InlineMenuInvocation(ViewState& state, IContextMenu* target) : menu(target) {
+        ++t_inlineMenuInvoking;
+        if (state.shellBrowser) IUnknown_SetSite(menu, state.shellBrowser.Get());
+    }
+    ~InlineMenuInvocation() { IUnknown_SetSite(menu, nullptr); --t_inlineMenuInvoking; }
+};
 // ---- Commands on selections that include inline children ----
 // The native view holds only its own rows, so such a selection is acted on
 // through its items' own Shell objects: the parent folder's UI objects when
@@ -31518,15 +31739,33 @@ bool InlineSelectionDetached(const ViewState& state) {
         if (state.selectedFlags[i] && state.entries[i].treeDepth) return true;
     return false;
 }
+// The selection's absolute Shell IDs, built once per selection (and row set)
+// and reused by every request: Explorer's listeners, the command bar, menus and
+// data objects ask many times per change. The open folder's rows come from its
+// bound folder; children are parsed through their own folder, bound once per
+// folder, instead of each path from the desktop.
 bool InlineSelectionPidls(ViewState& state, std::vector<OwnedPidl>& items) {
+    // Keyed on the selected items themselves (in row order), so a row renamed
+    // or replaced in place is never handed out with its old identity.
+    auto& cache = state.inlineSelectionCache;
+    std::vector<std::wstring> paths;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.selectedFlags[i]) paths.push_back(state.entries[i].path);
+    if (cache.failed && cache.directory == state.directoryToken && cache.paths == paths) return false;
+    if (!cache.items.empty() && cache.directory == state.directoryToken && cache.paths == paths) {
+        for (const auto& item : cache.items) items.emplace_back(ILCloneFull(item.get()));
+        return true;
+    }
+    LARGE_INTEGER started{}; QueryPerformanceCounter(&started);
+    std::vector<OwnedPidl> built;
     OwnedPidl folder;
+    std::unordered_map<std::wstring, std::pair<OwnedPidl, ComPtr<IShellFolder>>> parents;
     for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i) {
         if (!state.selectedFlags[i]) continue;
         const Entry& e = state.entries[i];
         PIDLIST_ABSOLUTE raw = nullptr;
-        if (!e.path.starts_with(L"windhawk:")) {
-            if (FAILED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr))) raw = nullptr;
-        } else if (!e.treeDepth) {
+        if (!e.treeDepth) {
+            // The open folder's own row: its bound folder and cached child ID.
             if (!folder) {
                 PIDLIST_ABSOLUTE parent = state.directoryFolderIdentity ?
                     ILCloneFull(state.directoryFolderIdentity.get()) : nullptr;
@@ -31538,14 +31777,186 @@ bool InlineSelectionPidls(ViewState& state, std::vector<OwnedPidl>& items) {
                 raw = ILCombine(folder.get(), child);
                 CoTaskMemFree(child);
             }
+            if (!raw && !e.path.starts_with(L"windhawk:") &&
+                FAILED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr))) raw = nullptr;
+        } else {
+            const size_t slash = e.path.find_last_of(L'\\');
+            if (slash != std::wstring::npos) {
+                const std::wstring parentPath = e.path.substr(0, slash == 2 ? slash + 1 : slash);
+                auto found = parents.find(parentPath);
+                if (found == parents.end()) {
+                    PIDLIST_ABSOLUTE parent = nullptr;
+                    ComPtr<IShellFolder> shell;
+                    if (SUCCEEDED(SHParseDisplayName(parentPath.c_str(), nullptr, &parent, 0, nullptr)) && parent)
+                        SHBindToObject(nullptr, parent, nullptr, IID_PPV_ARGS(&shell));
+                    found = parents.emplace(parentPath, std::make_pair(OwnedPidl(parent), std::move(shell))).first;
+                }
+                auto& [parentId, shell] = found->second;
+                if (parentId && shell) {
+                    std::wstring name = e.name;
+                    PIDLIST_RELATIVE child = nullptr;
+                    if (SUCCEEDED(shell->ParseDisplayName(nullptr, nullptr, name.data(), nullptr, &child, nullptr)) && child) {
+                        raw = ILCombine(parentId.get(), child);
+                        CoTaskMemFree(child);
+                    }
+                }
+            }
+            if (!raw && FAILED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr))) raw = nullptr;
         }
         if (!raw) {
-            Wh_Log(L"[GPU tree] selected item has no Shell identity: %s", e.path.c_str());
+            // Explorer polls the selection while a deleted item's row still waits
+            // for its folder's re-list: remember the miss instead of parsing again.
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU tree] selected item has no Shell identity: %s", e.path.c_str());
+            cache.items.clear();
+            cache.paths = std::move(paths);
+            cache.directory = state.directoryToken;
+            cache.failed = true;
             return false;
         }
-        items.emplace_back(raw);
+        built.emplace_back(raw);
     }
-    return !items.empty();
+    if (built.empty()) return false;
+    if (g_perf.load(std::memory_order_relaxed)) {
+        LARGE_INTEGER ended{}, frequency{}; QueryPerformanceCounter(&ended); QueryPerformanceFrequency(&frequency);
+        Wh_Log(L"[GPU tree] selection identities built: %zu items in %.2f ms", built.size(),
+            (ended.QuadPart - started.QuadPart) * 1000.0 / frequency.QuadPart);
+    }
+    for (const auto& item : built) items.emplace_back(ILCloneFull(item.get()));
+    cache.items = std::move(built);
+    cache.paths = std::move(paths);
+    cache.directory = state.directoryToken;
+    cache.failed = false;
+    return true;
+}
+// Several items (one folder or several, as in search results), renamed
+// together as Explorer renames a set: the typed name with " (1)", " (2)", ...
+// in row order, each item in its own folder and keeping its own extension.
+// One Shell file operation, so it is undoable in one step.
+// Records what the Shell actually named each item (collisions and policy can
+// change the requested name), so the renamed rows keep their selection.
+class InlineRenameSink final : public IFileOperationProgressSink {
+public:
+    struct Result { ComPtr<IShellItem> item; std::wstring leaf, label; };
+    std::vector<Result> results;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IFileOperationProgressSink)) {
+            *out = static_cast<IFileOperationProgressSink*>(this); AddRef(); return S_OK;
+        }
+        *out = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override { const ULONG left = --references; if (!left) delete this; return left; }
+    HRESULT STDMETHODCALLTYPE StartOperations() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE FinishOperations(HRESULT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreRenameItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostRenameItem(DWORD, IShellItem* item, LPCWSTR name, HRESULT hr, IShellItem* created) override {
+        if (FAILED(hr) || !item) return S_OK;
+        std::wstring leaf = name ? name : L"";
+        PWSTR parsed = nullptr;
+        if (created && SUCCEEDED(created->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &parsed)) && parsed) {
+            leaf = parsed; CoTaskMemFree(parsed);
+        }
+        std::wstring label;
+        if (created && SUCCEEDED(created->GetDisplayName(SIGDN_NORMALDISPLAY, &parsed)) && parsed) {
+            label = parsed; CoTaskMemFree(parsed);
+        }
+        if (label == leaf) label.clear();
+        if (!leaf.empty()) results.push_back({item, std::move(leaf), std::move(label)});
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE PreMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreDeleteItem(DWORD, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostDeleteItem(DWORD, IShellItem*, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreNewItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostNewItem(DWORD, IShellItem*, LPCWSTR, LPCWSTR, DWORD, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE UpdateProgress(UINT, UINT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResetTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PauseTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResumeTimer() override { return S_OK; }
+private:
+    std::atomic<ULONG> references{1};
+};
+void RenameInlineSelection(ViewState& state, const std::wstring& text) {
+    std::vector<OwnedPidl> items;
+    std::vector<const Entry*> rows;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.selectedFlags[i]) rows.push_back(&state.entries[i]);
+    if (!InlineSelectionPidls(state, items) || items.size() != rows.size()) {
+        ReportMultipleRenameFailure(state, L"the selected items have no Shell identity", text, E_FAIL);
+        return;
+    }
+    ComPtr<IFileOperation> operation;
+    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation));
+    if (SUCCEEDED(hr)) hr = operation->SetOwnerWindow(state.frameHwnd);
+    if (SUCCEEDED(hr)) hr = operation->SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR);
+    ComPtr<InlineRenameSink> sink;
+    sink.Attach(new InlineRenameSink());
+    DWORD cookie = 0;
+    if (SUCCEEDED(hr) && FAILED(operation->Advise(sink.Get(), &cookie))) cookie = 0;
+    std::vector<std::pair<ComPtr<IShellItem>, std::wstring>> queued; // Item and its old path.
+    for (size_t i = 0; SUCCEEDED(hr) && i < items.size(); ++i) {
+        const Entry& e = *rows[i];
+        const std::wstring extension = e.folder ? std::wstring() : std::wstring(PathFindExtensionW(e.name.c_str()));
+        std::wstring base = text;
+        // A typed extension equal to the item's own is not doubled.
+        if (!extension.empty() && base.size() > extension.size() &&
+            !_wcsicmp(base.c_str() + base.size() - extension.size(), extension.c_str()))
+            base.resize(base.size() - extension.size());
+        const std::wstring name = base + L" (" + std::to_wstring(i + 1) + L")" + extension;
+        ComPtr<IShellItem> item;
+        hr = SHCreateItemFromIDList(items[i].get(), IID_PPV_ARGS(&item));
+        if (SUCCEEDED(hr)) hr = operation->RenameItem(item.Get(), name.c_str(), nullptr);
+        if (SUCCEEDED(hr)) queued.emplace_back(item, e.path);
+    }
+    const HWND owner = state.hwnd, native = state.nativeHwnd;
+    const auto lifetime = state.lifetimeToken, token = state.token;
+    const std::wstring folder = state.folderPath;
+    if (SUCCEEDED(hr)) {
+        NativeFileCommandScope scope(&state);
+        hr = operation->PerformOperations();
+    }
+    if (cookie) operation->Unadvise(cookie);
+    // The operation is modal and reentrant: the tab may have navigated or closed.
+    auto* live = State(owner);
+    if (live != &state || live->lifetimeToken != lifetime || live->token != token ||
+        live->nativeHwnd != native || live->folderPath != folder || g_unloading.load(std::memory_order_acquire)) return;
+    // Renamed rows keep their identity, selection and focus, as a single
+    // rename does: the rows and inline nodes take the new paths before the
+    // Shell notifications re-list them, so the regraft finds the same rows.
+    // Otherwise the selection is lost and the keyboard resumes from a stale
+    // caret (Down skipped rows after the set was renamed).
+    bool renamed = false;
+    for (const auto& result : sink->results)
+        for (const auto& [item, oldPath] : queued) {
+            int order = 1;
+            if (FAILED(item->Compare(result.item.Get(), SICHINT_CANONICAL, &order)) || order) continue;
+            const size_t slash = oldPath.find_last_of(L'\\');
+            const int row = slash == std::wstring::npos ? -1 : GpuRowForNativePath(state, oldPath);
+            if (row >= 0) {
+                const std::wstring path = oldPath.substr(0, slash + 1) + result.leaf;
+                auto& entry = state.entries[size_t(row)];
+                entry.name = result.leaf; entry.label = result.label;
+                SetIndexedEntryPath(state, row, path);
+                if (entry.treeDepth) RenameInlineTreeItem(state, oldPath, path, entry.name, entry.label);
+                renamed = true;
+            }
+            break;
+        }
+    if (renamed) {
+        state.typeSearchCandidates.Reset();
+        ClearPostDeletionCaret(state);
+        Redraw(state);
+        if (state.presenter) SubmitPresentation(state);
+    }
+    BOOL aborted = FALSE;
+    if (operation) operation->GetAnyOperationsAborted(&aborted);
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED) && !aborted)
+        ReportMultipleRenameFailure(state, L"the Shell did not rename the set", text, hr);
 }
 // Switching to the native view: a selection that lies entirely inside one
 // expanded child folder opens that folder natively and selects the items
@@ -31673,17 +32084,28 @@ ComPtr<IDataObject> InlineSelectionDataObject(ViewState& state, int* count) {
     std::vector<OwnedPidl> items;
     ComPtr<IDataObject> objects;
     if (!InlineSelectionPidls(state, items)) return objects;
-    std::vector<PCIDLIST_ABSOLUTE> ids;
-    for (const auto& item : items) ids.push_back(item.get());
-    ComPtr<IShellItemArray> array;
-    if (SUCCEEDED(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(ids.size()), ids.data(), &array)) && array)
-        array->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&objects));
-    if (count) *count = static_cast<int>(ids.size());
+    // The same object Explorer builds for these items: their shared folder's
+    // own, or the desktop's over absolute IDs (as for search results). Its
+    // property sheet and drop targets then see exactly the selected items.
+    if (FAILED(InlineSelectionObject(state, items, objects.ReleaseAndGetAddressOf()))) objects.Reset();
+    if (count) *count = static_cast<int>(items.size());
     return objects;
 }
 // Runs a canonical verb (delete, copy, cut) or, with no verb, the default
 // command, exactly as the item's Shell menu would.
 bool InvokeInlineSelectionCommand(ViewState& state, const char* verb, DWORD modifiers = 0, POINT* at = nullptr) {
+    if (g_perf.load(std::memory_order_relaxed)) {
+        // The exact items a command acts on, for diagnosing what the Shell received.
+        size_t count = 0;
+        for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+            if (state.selectedFlags[i]) {
+                ++count;
+                Wh_Log(L"[GPU tree] command '%S' item %zu: depth=%u folder=%d %s", verb ? verb : "default", count,
+                    unsigned(state.entries[i].treeDepth), int(state.entries[i].folder), state.entries[i].path.c_str());
+            }
+        Wh_Log(L"[GPU tree] command '%S' on %zu selected items (rows=%d, own rows=%d)", verb ? verb : "default",
+            count, state.total, state.rootTotal);
+    }
     ComPtr<IContextMenu> menu;
     if (!InlineSelectionMenu(state, menu)) return false;
     HMENU popup = CreatePopupMenu();
@@ -31711,6 +32133,7 @@ bool InvokeInlineSelectionCommand(ViewState& state, const char* verb, DWORD modi
         }
         if (verb || GetMenuDefaultItem(popup, FALSE, 0) != static_cast<UINT>(-1)) {
             NativeFileCommandScope scope(&state);
+            InlineMenuInvocation invocation(state, menu.Get());
             const HRESULT hr = menu->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
             invoked = SUCCEEDED(hr);
             if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
@@ -31720,16 +32143,46 @@ bool InvokeInlineSelectionCommand(ViewState& state, const char* verb, DWORD modi
     DestroyMenu(popup);
     return invoked;
 }
-// The selection's own Shell menu, hosted as a classic popup: Windows 11's
-// modern menu belongs to the native view and can't show foreign items.
+// Properties of a selection that includes inline children: the items' own
+// "properties" command, exactly as Explorer's menu runs it (their shared
+// folder's, or the desktop's for several folders, as in search results). The
+// sheet then summarizes the selected items as Explorer does. It opens
+// asynchronously, owned by the Shell.
+bool ShowInlineSelectionProperties(ViewState& state) {
+    return InvokeInlineSelectionCommand(state, "properties", CMIC_MASK_ASYNCOK);
+}
+// Rename of a selection that includes inline children, from any route (F2,
+// the context menu, Explorer's command bar): the mod's own rename session, for
+// one item or a set (each item in its own folder, as in search results). The
+// Shell's "rename" verb would only ask the native view to edit an item it
+// doesn't hold.
+bool BeginInlineSelectionRename(ViewState& state) {
+    int first = -1;
+    size_t count = 0;
+    for (size_t i = 0; i < state.selectedFlags.size() && i < state.entries.size(); ++i)
+        if (state.selectedFlags[i]) { ++count; if (first < 0) first = static_cast<int>(i); }
+    if (!count) return false;
+    const int target = state.selected >= 0 && static_cast<size_t>(state.selected) < state.selectedFlags.size() &&
+        state.selectedFlags[size_t(state.selected)] ? state.selected : first;
+    BeginRename(state, target, false, count > 1);
+    return state.rename.editor != nullptr;
+}
+// The selection's own Shell menu, hosted as a classic popup: the fallback when
+// Explorer's item menu is unavailable (InstallInlineNativeMenu found no symbols).
 void InlineSelectionContextMenu(ViewState& state, POINT screen, bool keyboard) {
     ComPtr<IContextMenu> menu;
     if (!InlineSelectionMenu(state, menu)) return;
     HMENU popup = CreatePopupMenu();
     if (!popup) return;
     constexpr UINT first = 1, last = 0x7FFF;
-    UINT flags = CMF_NORMAL;
+    // Asked as Explorer's own view asks: an item menu in an Explorer window
+    // (Open in new tab and other window verbs), sited on the tab's browser
+    // before handlers add their entries (some decide on it), and with Rename
+    // (any set renames, each item in its own folder). Without these the menu
+    // lacked Rename and window-dependent entries.
+    UINT flags = CMF_NORMAL | CMF_ITEMMENU | CMF_EXPLORE | CMF_CANRENAME;
     if (GetKeyState(VK_SHIFT) & 0x8000) flags |= CMF_EXTENDEDVERBS;
+    if (state.shellBrowser) IUnknown_SetSite(menu.Get(), state.shellBrowser.Get());
     if (SUCCEEDED(menu->QueryContextMenu(popup, 0, first, last, flags))) {
         if (keyboard) {
             // Open at the focused row, like a keyboard menu in the native list.
@@ -31749,16 +32202,11 @@ void InlineSelectionContextMenu(ViewState& state, POINT screen, bool keyboard) {
         auto* live = State(owner);
         if (live == &state && live->lifetimeToken == lifetime) {
             state.inlineMenu.Reset();
-            // Properties of items from different folders is the Shell's
-            // multiple-file property sheet over their data object.
-            wchar_t verb[64]{};
-            if (chosen >= first && SUCCEEDED(menu->GetCommandString(chosen - first, GCS_VERBW, nullptr,
-                    reinterpret_cast<LPSTR>(verb), ARRAYSIZE(verb))) && _wcsicmp(verb, L"properties") == 0) {
-                if (const auto objects = InlineSelectionDataObject(state, nullptr)) {
-                    const HRESULT hr = SHMultiFileProperties(objects.Get(), 0);
-                    if (FAILED(hr)) Wh_Log(L"[GPU tree] properties failed hr=0x%08X", static_cast<unsigned>(hr));
-                }
-            } else if (chosen >= first) {
+            wchar_t chosenVerb[64]{};
+            if (chosen >= first)
+                menu->GetCommandString(chosen - first, GCS_VERBW, nullptr, reinterpret_cast<LPSTR>(chosenVerb), ARRAYSIZE(chosenVerb));
+            if (chosen >= first && !_wcsicmp(chosenVerb, L"rename")) BeginInlineSelectionRename(state);
+            else if (chosen >= first) {
                 CMINVOKECOMMANDINFOEX info{};
                 info.cbSize = sizeof(info);
                 info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE | CMIC_MASK_ASYNCOK |
@@ -31770,12 +32218,14 @@ void InlineSelectionContextMenu(ViewState& state, POINT screen, bool keyboard) {
                 info.nShow = SW_SHOWNORMAL;
                 info.ptInvoke = screen;
                 NativeFileCommandScope scope(&state);
+                InlineMenuInvocation invocation(state, menu.Get());
                 const HRESULT hr = menu->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
                 if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
                     Wh_Log(L"[GPU tree] menu command failed hr=0x%08X", static_cast<unsigned>(hr));
             }
         }
     }
+    IUnknown_SetSite(menu.Get(), nullptr);
     DestroyMenu(popup);
 }
 // Owner-drawn and lazily filled submenus (Send to, Open with) of that menu.
@@ -31798,9 +32248,21 @@ bool ForwardInlineMenuMessage(ViewState& state, UINT msg, WPARAM wParam, LPARAM 
 
 void Open(ViewState& state, int index, bool newTab = false) {
     WindowCallbackGuard callback;
-    if (TreeChildRow(state, index) || (InlineSelectionDetached(state) && index >= 0 &&
+    // Middle-click on the open folder's own row always takes the native path
+    // below (it selects that row alone), even while a selection with inline
+    // children is held.
+    if (TreeChildRow(state, index) || (!newTab && InlineSelectionDetached(state) && index >= 0 &&
             static_cast<size_t>(index) < state.selectedFlags.size() && state.selectedFlags[size_t(index)])) {
-        if (newTab) return;
+        if (newTab) {
+            // Middle-click on a child folder: Explorer's own "Open in new tab"
+            // verb on that folder (the native view can't select it).
+            if (!g_middleClickNewTab.load(std::memory_order_relaxed) ||
+                static_cast<size_t>(index) >= state.entries.size() || !state.entries[size_t(index)].folder) return;
+            Select(state, index);
+            if (!InvokeInlineSelectionCommand(state, "opennewtab"))
+                Wh_Log(L"[GPU tree] open in new tab unavailable: %s", state.entries[size_t(index)].path.c_str());
+            return;
+        }
         if (!ModelSelected(state, index)) Select(state, index);
         size_t selected = 0;
         for (size_t i = 0; i < state.selectedFlags.size(); ++i) selected += state.selectedFlags[i] != 0;
@@ -32050,8 +32512,18 @@ void NativeContextMenu(ViewState& state, POINT screen, bool keyboard) {
     // entering its menu operation. Keyboard requests share the same session so
     // Show more options and later native commands see one consistent layout.
     SetNativeInputLayout(state, true);
-    SendMessageW(target, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(target),
-        keyboard ? static_cast<LPARAM>(-1) : MAKELPARAM(screen.x, screen.y));
+    {
+        // A selection with inline children: Explorer's item menu, built from
+        // the whole selection (DefViewGetItemsHook, DefViewBackgroundMenuHook).
+        struct Request {
+            InlineMenuRequest previous = t_inlineMenuRequest;
+            explicit Request(InlineMenuRequest request) { t_inlineMenuRequest = request; }
+            ~Request() { t_inlineMenuRequest = previous; }
+        } request(InlineSelectionDetached(state) && g_inlineNativeMenu.load(std::memory_order_acquire) ?
+            InlineMenuRequest{owner, lifetime} : InlineMenuRequest{});
+        SendMessageW(target, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(target),
+            keyboard ? static_cast<LPARAM>(-1) : MAKELPARAM(screen.x, screen.y));
+    }
     auto* live = State(owner);
     if (live != &state || live->lifetimeToken != lifetime) return;
     live->nativeContextMenuOpening = false;
@@ -32101,9 +32573,10 @@ void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = fals
     const bool clickedSelected = index < static_cast<int>(state.selectedFlags.size()) &&
         state.selectedFlags[static_cast<size_t>(index)] != 0;
     if (!clickedSelected) Select(state, index);
-    // A selection with inline children: the native view would offer a menu
-    // for different items, so show the items' own Shell menu.
-    if (InlineSelectionDetached(state)) {
+    // A selection with inline children takes Explorer's own (modern) item menu
+    // through the same request below (InstallInlineNativeMenu). Without its
+    // symbols, the items' own Shell menu as a classic menu.
+    if (InlineSelectionDetached(state) && !g_inlineNativeMenu.load(std::memory_order_acquire)) {
         InlineSelectionContextMenu(state, screen, keyboard);
         return;
     }
@@ -39019,13 +39492,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool updatedItem = (event & (SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES)) != 0;
         const LONG structural = event & (SHCNE_CREATE | SHCNE_MKDIR | SHCNE_DELETE | SHCNE_RMDIR |
                                          SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER);
+        const bool inlineRefresh = s && (event & SHCNE_UPDATEDIR) && !s->inlineTree.empty();
         std::wstring created;
         // Clone only an applicable filesystem identity while holding the
         // notification's shared memory. Never activate a Shell item/provider
         // under that lock, especially during bursts of UPDATEITEM/CREATE.
         OwnedPidl identity, renamedIdentity;
         if (s && s->inScope && !s->thisPcGpu && pidls && pidls[0] &&
-            (namespaceChange || updatedItem || structural))
+            (namespaceChange || updatedItem || structural || inlineRefresh))
             identity.reset(ILCloneFull(pidls[0]));
         if (s && s->inScope && !s->thisPcGpu &&
             (event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) && pidls && pidls[1])
@@ -39078,6 +39552,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s && updatedItem && !created.empty())
             QueueShellItemUpdate(*s, created);
+        // A refresh of an expanded folder lists it again, as the open folder
+        // re-lists on its own refresh. The graft honours the rename hold.
+        if (inlineRefresh) {
+            auto* node = !created.empty() && _wcsicmp(s->inlineTreeFolder.c_str(), s->folderPath.c_str()) == 0
+                ? FindInlineTreeNode(*s, created) : nullptr;
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU tree] Shell folder refresh event=0x%08X expanded=%d: %s",
+                    event, node != nullptr, created.c_str());
+            if (node) RequestInlineTreeNode(*s, *node);
+        }
         if (s && structural && !created.empty() && !s->inlineTree.empty()) {
             std::wstring renamed;
             if (renamedIdentity) {
@@ -40424,7 +40908,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (s->rowTransitionActive) StopRowTransition(*s);
             const int row = RowFromPoint(*s,point.y,point.x);
             if (row < 0 || size_t(row) >= s->entries.size() || !s->entries[size_t(row)].folder ||
-                TreeChildRow(*s,row) || IsRecycleBinLocation(s->folderPath)) return 0;
+                IsRecycleBinLocation(s->folderPath)) return 0;
             // Dispatch on press, with no capture or pending button state: injected
             // selection clicks, focus changes and missing UP cannot trap input.
             Open(*s,row,true);
@@ -41385,6 +41869,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case kMsgInlineTreeReady:
         if(s && wParam==WPARAM(s->lifetimeToken)) ReceiveInlineTreeResults(*s);
+        return 0;
+    case kMsgInlineSelectionRename:
+        if (s && wParam == WPARAM(s->lifetimeToken) && InlineSelectionDetached(*s)) BeginInlineSelectionRename(*s);
+        return 0;
+    case kMsgInlineSelectionNotice:
+        if (s && wParam == WPARAM(s->lifetimeToken)) DeliverInlineSelectionNotice(*s);
         return 0;
     case kMsgInlineTreeReopen:
         if(s && wParam==WPARAM(s->lifetimeToken)) {
@@ -44310,6 +44800,7 @@ void NoteNativeNewFolderShortcut(const MSG& msg) {
 // run the Shell's New menu object. Its command records the creation intent
 // for the view it creates into: one path for every route, matched by the
 // Shell's creation notification and opened as the GPU rename field.
+bool ShellImplementation(void* address);
 using NewMenuInvoke_t = HRESULT (STDMETHODCALLTYPE*)(IContextMenu*, LPCMINVOKECOMMANDINFO);
 NewMenuInvoke_t g_newMenuInvokeOriginal = nullptr;
 
@@ -44366,15 +44857,428 @@ void* NewMenuInvokeCommandAddress() {
     CoUninitialize();
     // The implementation lives in the Shell's own module, never in COM's
     // proxy/stub libraries; anything else is not the object we meant.
+    return ShellImplementation(address) ? address : nullptr;
+}
+
+// A method address taken from a Shell object's vtable is hooked only when it is
+// the Shell's own implementation, never COM's shared proxy/stub code.
+bool ShellImplementation(void* address) {
     HMODULE owner = nullptr;
     wchar_t name[MAX_PATH]{};
     if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &owner) ||
-        !GetModuleFileNameW(owner, name, ARRAYSIZE(name))) return nullptr;
+        !GetModuleFileNameW(owner, name, ARRAYSIZE(name))) return false;
     const wchar_t* leaf = PathFindFileNameW(name);
     for (const wchar_t* proxy : {L"combase.dll", L"ole32.dll", L"oleaut32.dll", L"rpcrt4.dll"})
-        if (!_wcsicmp(leaf, proxy)) return nullptr;
-    return address;
+        if (!_wcsicmp(leaf, proxy)) return false;
+    return true;
+}
+// Two paths keep Explorer's commands on the whole selection when it includes
+// inline children:
+// - the selection bridge (InstallSelectionBridge) answers what Explorer asks
+//   the view for: the selection's items, count, menu and data, so the command
+//   bar, status bar and Shell code see and act on the whole selection;
+// - this reroute catches a verb run on a selection menu sited on the native
+//   view (one Explorer built internally from the native part, or the bridge's
+//   own menu once Explorer sites it) and sends it to the mod's handlers, which
+//   own rename (the GPU editor) and the multi-folder property sheet.
+// Both build their Shell objects through InlineSelectionMenu/-Pidls.
+using SelectionMenuInvoke_t = HRESULT (STDMETHODCALLTYPE*)(IContextMenu*, LPCMINVOKECOMMANDINFO);
+SelectionMenuInvoke_t g_selectionMenuInvokeOriginal = nullptr;
+bool RouteSelectionMenuCommand(IContextMenu* menu, LPCMINVOKECOMMANDINFO info, HRESULT& result) {
+    result = S_OK;
+    if (t_inlineMenuInvoking || g_unloading.load(std::memory_order_acquire) || !menu || !info ||
+        info->cbSize < sizeof(CMINVOKECOMMANDINFO)) return false;
+    // Only the native view's own selection menu: its site is that view.
+    ComPtr<IObjectWithSite> site; ComPtr<IServiceProvider> services; ComPtr<IShellView> view;
+    HWND native = nullptr;
+    if (FAILED(menu->QueryInterface(IID_PPV_ARGS(&site))) || FAILED(site->GetSite(IID_PPV_ARGS(&services))) ||
+        FAILED(services->QueryService(SID_SFolderView, IID_PPV_ARGS(&view))) || FAILED(view->GetWindow(&native)) ||
+        !native || GetWindowThreadProcessId(native, nullptr) != GetCurrentThreadId()) return false;
+    ViewState* state = State(reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty)));
+    if (!state || state->nativeHwnd != native || !state->visible || !state->inScope ||
+        state->rename.editor || !InlineSelectionDetached(*state)) return false;
+    // The verb, named or by menu offset.
+    std::wstring verb;
+    const auto* ex = info->cbSize >= sizeof(CMINVOKECOMMANDINFOEX) && (info->fMask & CMIC_MASK_UNICODE) ?
+        reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info) : nullptr;
+    if (ex && ex->lpVerbW && !IS_INTRESOURCE(ex->lpVerbW)) verb = ex->lpVerbW;
+    else if (!IS_INTRESOURCE(info->lpVerb)) { const char* a = info->lpVerb; verb.assign(a, a + strlen(a)); }
+    else {
+        wchar_t named[64]{};
+        if (SUCCEEDED(menu->GetCommandString(reinterpret_cast<UINT_PTR>(info->lpVerb), GCS_VERBW, nullptr,
+                reinterpret_cast<LPSTR>(named), ARRAYSIZE(named)))) verb = named;
+    }
+    if (verb.empty()) {
+        Wh_Log(L"[GPU tree] Explorer command without a verb on a selection with children; left to Explorer");
+        return false;
+    }
+    // Item commands only. The folder's background verbs (paste, new, view
+    // options) run through the same Shell menu and stay Explorer's.
+    static constexpr const wchar_t* kItemVerbs[]{L"delete", L"cut", L"copy", L"rename", L"properties",
+        L"open", L"opennewtab", L"opennewwindow", L"openas", L"runas", L"print", L"edit", L"copyaspath",
+        L"Windows.ModernShare", L"link"};
+    if (std::none_of(std::begin(kItemVerbs), std::end(kItemVerbs),
+            [&](const wchar_t* known) { return !_wcsicmp(known, verb.c_str()); })) {
+        Wh_Log(L"[GPU tree] Explorer command '%s' on a selection with children left to Explorer", verb.c_str());
+        return false;
+    }
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU tree] routed Explorer command '%s' to the whole selection", verb.c_str());
+    if (!_wcsicmp(verb.c_str(), L"rename")) {
+        result = BeginInlineSelectionRename(*state) ? S_OK : E_FAIL;
+        return true;
+    }
+    bool done;
+    if (!_wcsicmp(verb.c_str(), L"properties")) done = ShowInlineSelectionProperties(*state);
+    else {
+        const std::string ascii(verb.begin(), verb.end());
+        done = InvokeInlineSelectionCommand(*state, ascii.c_str(), info->fMask & (CMIC_MASK_SHIFT_DOWN | CMIC_MASK_CONTROL_DOWN));
+    }
+    result = done ? S_OK : E_FAIL;
+    return true;
+}
+HRESULT STDMETHODCALLTYPE SelectionMenuInvokeHook(IContextMenu* menu, LPCMINVOKECOMMANDINFO info) {
+    ApiCallbackGuard callback(ApiHook::SelectionMenuInvoke);
+    HRESULT result = S_OK;
+    if (RouteSelectionMenuCommand(menu, info, result)) return result;
+    return g_selectionMenuInvokeOriginal(menu, info);
+}
+// The Shell's default folder menu implementation, shared by its instances.
+void* SelectionMenuInvokeCommandAddress() {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(apartment)) return nullptr;
+    void* address = nullptr;
+    {
+        ComPtr<IShellFolder> desktop;
+        ComPtr<IContextMenu> menu;
+        if (SUCCEEDED(SHGetDesktopFolder(&desktop))) {
+            DEFCONTEXTMENU definition{};
+            definition.psf = desktop.Get();
+            if (SUCCEEDED(SHCreateDefaultContextMenu(&definition, IID_PPV_ARGS(&menu))) && menu)
+                address = (*reinterpret_cast<void***>(menu.Get()))[4]; // IContextMenu::InvokeCommand
+        }
+    }
+    CoUninitialize();
+    return ShellImplementation(address) ? address : nullptr;
+}
+
+// ---- Selection bridge: Explorer's own selection readers ----
+// Explorer's command bar, ribbon, status bar and Shell code read the list's
+// selection through the native view's own interfaces (measured in 1.1.21: the
+// command bar asks Items(SVGIO_SELECTION, IShellItemArray) and then the
+// selection's IContextMenu; the status bar asks ItemCount/Items). The native
+// view can't hold other folders' items, so while the selection includes inline
+// children these calls are answered with the whole selection. Hooked on the
+// Shell's view implementation, shared by every list; the mod's own calls, other
+// item sets and other interfaces keep Explorer's answer, so the mod's
+// selection mirroring and every comparison with the native view are unchanged.
+using ViewGetItemObject_t = HRESULT (STDMETHODCALLTYPE*)(IShellView*, UINT, REFIID, void**);
+using ViewItemCount_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView*, UINT, int*);
+using ViewItems_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView*, UINT, REFIID, void**);
+using ViewGetSelection_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView2*, BOOL, IShellItemArray**);
+using ViewSelectItem_t = HRESULT (STDMETHODCALLTYPE*)(IShellView*, PCUITEMID_CHILD, SVSIF);
+using FolderSelectItem_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView*, int, DWORD);
+ViewSelectItem_t g_viewSelectItemOriginal = nullptr;
+using ViewDoRename_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView2*);
+ViewDoRename_t g_viewDoRenameOriginal = nullptr;
+FolderSelectItem_t g_folderSelectItemOriginal = nullptr;
+ViewGetItemObject_t g_viewGetItemObjectOriginal = nullptr;
+ViewItemCount_t g_viewItemCountOriginal = nullptr;
+ViewItems_t g_viewItemsOriginal = nullptr;
+ViewGetSelection_t g_viewGetSelectionOriginal = nullptr;
+bool CalledFromThisModule(void* address) {
+    HMODULE module = nullptr, self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        static_cast<LPCWSTR>(address), &module);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&CalledFromThisModule), &self);
+    return module && module == self;
+}
+// The tab whose native view this is, when its selection includes inline
+// children and the caller is Explorer (not this mod).
+ViewState* InlineSelectionViewOwner(IUnknown* view, void* caller) {
+    if (!view || g_unloading.load(std::memory_order_relaxed) || CalledFromThisModule(caller)) return nullptr;
+    ComPtr<IShellView> shell;
+    HWND native = nullptr;
+    if (FAILED(view->QueryInterface(IID_PPV_ARGS(&shell))) || FAILED(shell->GetWindow(&native)) || !native ||
+        GetWindowThreadProcessId(native, nullptr) != GetCurrentThreadId()) return nullptr;
+    ViewState* state = State(reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty)));
+    return state && state->nativeHwnd == native && state->visible && state->inScope &&
+        InlineSelectionDetached(*state) ? state : nullptr;
+}
+ComPtr<IShellItemArray> InlineSelectionItemArray(ViewState& state) {
+    std::vector<OwnedPidl> items;
+    ComPtr<IShellItemArray> array;
+    if (!InlineSelectionPidls(state, items)) return array;
+    std::vector<PCIDLIST_ABSOLUTE> ids;
+    for (const auto& item : items) ids.push_back(item.get());
+    if (FAILED(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(ids.size()), ids.data(), &array))) array.Reset();
+    if (g_perf.load(std::memory_order_relaxed)) {
+        // What Explorer is handed, once per selection change, as the array
+        // itself reports it (a consumer dropping items shows up against it).
+        static const ViewState* lastState = nullptr;
+        static unsigned long long lastRevision = 0;
+        const auto revision = state.selectedFlags.Revision();
+        if (lastState != &state || lastRevision != revision) {
+            lastState = &state; lastRevision = revision;
+            DWORD count = 0;
+            if (array) array->GetCount(&count);
+            Wh_Log(L"[GPU selection] handed to Explorer: %lu items (selected rows %zu)", count, ids.size());
+            for (DWORD i = 0; i < count; ++i) {
+                ComPtr<IShellItem> item; PWSTR name = nullptr;
+                if (SUCCEEDED(array->GetItemAt(i, &item)) && SUCCEEDED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &name))) {
+                    Wh_Log(L"[GPU selection]   %lu: %s", i + 1, name);
+                    CoTaskMemFree(name);
+                }
+            }
+        }
+    }
+    return array;
+}
+// The selection's own menu, data or items for Explorer's commands and its item
+// menu (the selection bridge and CDefView::_GetItems): the same objects the GPU
+// keyboard and classic menu use. Other interfaces keep Explorer's answer
+// (E_NOINTERFACE here).
+HRESULT InlineSelectionViewObject(ViewState& state, REFIID riid, void** out) {
+    if (IsEqualIID(riid, IID_IShellItemArray)) {
+        auto array = InlineSelectionItemArray(state);
+        return array ? array->QueryInterface(riid, out) : E_FAIL;
+    }
+    if (IsEqualIID(riid, IID_IObjectCollection) || IsEqualIID(riid, IID_IObjectArray)) {
+        const auto array = InlineSelectionItemArray(state);
+        ComPtr<IObjectCollection> collection;
+        DWORD count = 0;
+        HRESULT hr = array ? CoCreateInstance(CLSID_EnumerableObjectCollection, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&collection)) : E_FAIL;
+        if (SUCCEEDED(hr)) hr = array->GetCount(&count);
+        for (DWORD i = 0; SUCCEEDED(hr) && i < count; ++i) {
+            ComPtr<IShellItem> item;
+            hr = array->GetItemAt(i, &item);
+            if (SUCCEEDED(hr)) hr = collection->AddObject(item.Get());
+        }
+        return SUCCEEDED(hr) ? collection->QueryInterface(riid, out) : hr;
+    }
+    if (IsEqualIID(riid, IID_IContextMenu) || IsEqualIID(riid, IID_IContextMenu2) || IsEqualIID(riid, IID_IContextMenu3)) {
+        ComPtr<IContextMenu> menu;
+        return InlineSelectionMenu(state, menu) ? menu->QueryInterface(riid, out) : E_FAIL;
+    }
+    if (IsEqualIID(riid, IID_IDataObject)) {
+        const auto objects = InlineSelectionDataObject(state, nullptr);
+        return objects ? objects->QueryInterface(riid, out) : E_FAIL;
+    }
+    return E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE ViewGetItemObjectHook(IShellView* view, UINT item, REFIID riid, void** out) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (out && (item & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0)))
+            if (SUCCEEDED(InlineSelectionViewObject(*state, riid, out))) return S_OK;
+    return g_viewGetItemObjectOriginal(view, item, riid, out);
+}
+HRESULT STDMETHODCALLTYPE ViewItemCountHook(IFolderView* view, UINT flags, int* count) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (count && (flags & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0))) {
+            // The same identities the item array is built from (cached), so the
+            // count and the items always agree, including Explorer's fallback.
+            std::vector<OwnedPidl> items;
+            if (InlineSelectionPidls(*state, items)) { *count = static_cast<int>(items.size()); return S_OK; }
+        }
+    return g_viewItemCountOriginal(view, flags, count);
+}
+HRESULT STDMETHODCALLTYPE ViewItemsHook(IFolderView* view, UINT flags, REFIID riid, void** out) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (out && (flags & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0)))
+            if (SUCCEEDED(InlineSelectionViewObject(*state, riid, out))) return S_OK;
+    return g_viewItemsOriginal(view, flags, riid, out);
+}
+HRESULT STDMETHODCALLTYPE ViewGetSelectionHook(IFolderView2* view, BOOL noneImpliesFolder, IShellItemArray** out) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (out)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0)))
+            if (auto array = InlineSelectionItemArray(*state)) { *out = array.Detach(); return S_OK; }
+    return g_viewGetSelectionOriginal(view, noneImpliesFolder, out);
+}
+// The Shell's "rename" verb (command bar Rename, menus) asks the view to edit
+// an item (SVSI_EDIT). With inline children selected the view holds no such
+// row: the mod's own rename starts instead, posted so the Shell call unwinds.
+// `item`: the open folder's item the request names (none for DoRename). The
+// view also edits items it creates (New folder, Ctrl+Shift+N, a paste) with
+// SVSI_EDIT; such an item is not part of the GPU selection and keeps the
+// native route.
+bool BridgeInlineRename(IUnknown* view, UINT flags, void* caller, PCUITEMID_CHILD item = nullptr) {
+    if ((flags & SVSI_EDIT) != SVSI_EDIT) return false;
+    auto* state = InlineSelectionViewOwner(view, caller);
+    if (!state) return false;
+    if (item) {
+        // By the item's own leaf name: a selected child's ID is relative to its
+        // own folder, not the open one, so it is never resolved as a path here.
+        STRRET value{}; PWSTR leaf = nullptr;
+        const bool named = state->folder &&
+            SUCCEEDED(state->folder->GetDisplayNameOf(item, SHGDN_INFOLDER | SHGDN_FORPARSING, &value)) &&
+            SUCCEEDED(StrRetToStrW(&value, item, &leaf)) && leaf;
+        bool selected = false;
+        for (size_t i = 0; named && !selected && i < state->entries.size() && i < state->selectedFlags.size(); ++i)
+            selected = state->selectedFlags[i] && !_wcsicmp(PathFindFileNameW(state->entries[i].path.c_str()), leaf);
+        CoTaskMemFree(leaf);
+        if (!selected) return false;
+    }
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] Explorer asked the view to rename (flags=0x%X); the mod's rename starts instead", flags);
+    PostMessageW(state->hwnd, kMsgInlineSelectionRename, WPARAM(state->lifetimeToken), 0);
+    return true;
+}
+// Explorer's command bar Rename asks the view to rename its selection.
+HRESULT STDMETHODCALLTYPE ViewDoRenameHook(IFolderView2* view) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (BridgeInlineRename(view, SVSI_EDIT, __builtin_return_address(0))) return S_OK;
+    return g_viewDoRenameOriginal(view);
+}
+HRESULT STDMETHODCALLTYPE ViewSelectItemHook(IShellView* view, PCUITEMID_CHILD item, SVSIF flags) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (item && BridgeInlineRename(view, flags, __builtin_return_address(0), item)) return S_OK;
+    return g_viewSelectItemOriginal(view, item, flags);
+}
+HRESULT STDMETHODCALLTYPE FolderSelectItemHook(IFolderView* view, int index, DWORD flags) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    // The item at that index, from the view itself (Item is not bridged).
+    PITEMID_CHILD item = nullptr;
+    if ((flags & SVSI_EDIT) == SVSI_EDIT && view && FAILED(view->Item(index, &item))) item = nullptr;
+    const bool bridged = item && BridgeInlineRename(view, flags, __builtin_return_address(0), item);
+    if (item) CoTaskMemFree(item);
+    if (bridged) return S_OK;
+    return g_folderSelectItemOriginal(view, index, flags);
+}
+// The Shell's view implementation, from a windowless instance (no folder I/O).
+void InstallSelectionBridge() {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(apartment)) return;
+    void* slots[7]{};
+    {
+        ComPtr<IShellFolder> desktop;
+        ComPtr<IShellView> view;
+        SFV_CREATE create{sizeof(create)};
+        if (SUCCEEDED(SHGetDesktopFolder(&desktop))) {
+            create.pshf = desktop.Get();
+            if (SUCCEEDED(SHCreateShellFolderView(&create, &view)) && view) {
+                slots[0] = (*reinterpret_cast<void***>(view.Get()))[15]; // IShellView::GetItemObject
+                slots[4] = (*reinterpret_cast<void***>(view.Get()))[14]; // IShellView::SelectItem
+                ComPtr<IFolderView2> folder;
+                if (SUCCEEDED(view.As(&folder))) {
+                    void** table = *reinterpret_cast<void***>(folder.Get());
+                    slots[1] = table[7];  // IFolderView::ItemCount
+                    slots[2] = table[8];  // IFolderView::Items
+                    slots[3] = table[32]; // IFolderView2::GetSelection
+                    slots[5] = table[15]; // IFolderView::SelectItem
+                    slots[6] = table[41]; // IFolderView2::DoRename
+                }
+            }
+        }
+    }
+    CoUninitialize();
+    if (ShellImplementation(slots[0])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewGetItemObject_t>(slots[0]),
+        ViewGetItemObjectHook, &g_viewGetItemObjectOriginal);
+    if (ShellImplementation(slots[1])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewItemCount_t>(slots[1]),
+        ViewItemCountHook, &g_viewItemCountOriginal);
+    if (ShellImplementation(slots[2])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewItems_t>(slots[2]),
+        ViewItemsHook, &g_viewItemsOriginal);
+    if (ShellImplementation(slots[3])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewGetSelection_t>(slots[3]),
+        ViewGetSelectionHook, &g_viewGetSelectionOriginal);
+    if (ShellImplementation(slots[4])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewSelectItem_t>(slots[4]),
+        ViewSelectItemHook, &g_viewSelectItemOriginal);
+    if (ShellImplementation(slots[5])) WindhawkUtils::SetFunctionHook(reinterpret_cast<FolderSelectItem_t>(slots[5]),
+        FolderSelectItemHook, &g_folderSelectItemOriginal);
+    if (ShellImplementation(slots[6])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewDoRename_t>(slots[6]),
+        ViewDoRenameHook, &g_viewDoRenameOriginal);
+}
+
+// ---- Explorer's own (modern) item menu for selections with inline children ----
+// Measured in 1.1.21 (docs/1.1.21-native-menu-decision.md): ExplorerFrame's
+// UIItemsView::ShowContextMenu asks its own list whether a row is selected
+// and calls CDefView::OnSelectionContextMenu or ::OnBackgroundContextMenu
+// (same signature). Every item-menu piece then reads the selection from
+// CDefView::_GetItems: the menu object (_GetItems(selection, 1, IContextMenu))
+// and the menu's commands (_GetItems(selection, 0, IShellItemArray)); the
+// presenter reads IFolderView::Items, which the selection bridge answers.
+// So the mod's request for inline children takes the item path, and that
+// view's _GetItems answers with the whole selection. The menu object is the
+// one the items' own folder builds (several folders: the desktop's default
+// menu, as for search results), never CDefView's, which would name the open
+// folder's files. Without these symbols the classic menu is used.
+using DefViewMenu_t = HRESULT (*)(void*, const POINT*);
+using DefViewGetItems_t = HRESULT (*)(void*, UINT, int, REFIID, void**);
+DefViewMenu_t g_defViewBackgroundMenuOriginal = nullptr;
+DefViewMenu_t g_defViewSelectionMenu = nullptr; // Called, not hooked.
+DefViewGetItems_t g_defViewGetItemsOriginal = nullptr;
+// The CDefView object behind a tab's native view, learned during the mod's
+// own menu request (its _GetItems is the first one called on that thread).
+struct InlineMenuView { void* defView; HWND owner; unsigned long long lifetime, token; };
+thread_local std::vector<InlineMenuView> t_inlineMenuViews;
+ViewState* InlineMenuOwner(void* defView) {
+    // The request's own view: the first _GetItems inside the request (the
+    // menu message is sent to that view and handled synchronously).
+    if (auto& request = t_inlineMenuRequest; request.owner && !request.learned)
+        if (auto* requesting = State(request.owner); requesting && requesting->lifetimeToken == request.lifetime) {
+            request.learned = true;
+            const InlineMenuView view{defView, requesting->hwnd, requesting->lifetimeToken, requesting->token};
+            const auto known = std::find_if(t_inlineMenuViews.begin(), t_inlineMenuViews.end(),
+                [&](const auto& entry) { return entry.owner == view.owner; });
+            if (known == t_inlineMenuViews.end()) t_inlineMenuViews.push_back(view);
+            else *known = view;
+        }
+    for (auto it = t_inlineMenuViews.begin(); it != t_inlineMenuViews.end();) {
+        auto* state = State(it->owner);
+        if (!state || state->lifetimeToken != it->lifetime || state->token != it->token) {
+            it = t_inlineMenuViews.erase(it); // The tab or its folder is gone.
+            continue;
+        }
+        if (it->defView == defView)
+            return !g_unloading.load(std::memory_order_relaxed) && InlineSelectionDetached(*state) ? state : nullptr;
+        ++it;
+    }
+    return nullptr;
+}
+HRESULT DefViewGetItemsHook(void* self, UINT svgio, int option, REFIID riid, void** out) {
+    ApiCallbackGuard callback(ApiHook::InlineMenu);
+    if (out && (svgio & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineMenuOwner(self)) {
+            // The same objects the selection bridge hands Explorer's readers.
+            const HRESULT hr = InlineSelectionViewObject(*state, riid, out);
+            if (SUCCEEDED(hr)) return hr;
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU menu] the selection's items were unavailable (hr=0x%08X); Explorer's own answer is used",
+                    static_cast<unsigned>(hr));
+        }
+    return g_defViewGetItemsOriginal(self, svgio, option, riid, out);
+}
+HRESULT DefViewBackgroundMenuHook(void* self, const POINT* point) {
+    ApiCallbackGuard callback(ApiHook::InlineMenu);
+    // Only the mod's own request for a selection of inline children, which
+    // Explorer's list holds none of: the item menu is the one requested.
+    if (t_inlineMenuRequest.owner && g_defViewSelectionMenu) return g_defViewSelectionMenu(self, point);
+    return g_defViewBackgroundMenuOriginal(self, point);
+}
+void InstallInlineNativeMenu() {
+    HMODULE shell32 = GetModuleHandleW(L"shell32.dll");
+    if (!shell32) return;
+    WindhawkUtils::SYMBOL_HOOK hooks[]{
+        {{L"public: virtual long __cdecl CDefView::OnBackgroundContextMenu(struct tagPOINT const *)"},
+            &g_defViewBackgroundMenuOriginal, DefViewBackgroundMenuHook, true},
+        {{L"public: virtual long __cdecl CDefView::OnSelectionContextMenu(struct tagPOINT const *)"},
+            &g_defViewSelectionMenu, nullptr, true},
+        {{L"private: long __cdecl CDefView::_GetItems(unsigned int,int,struct _GUID const &,void * *)"},
+            &g_defViewGetItemsOriginal, DefViewGetItemsHook, true},
+    };
+    const bool found = WindhawkUtils::HookSymbols(shell32, hooks, ARRAYSIZE(hooks));
+    // Only all three together give the item menu; otherwise the classic one.
+    g_inlineNativeMenu.store(found && g_defViewBackgroundMenuOriginal && g_defViewSelectionMenu && g_defViewGetItemsOriginal,
+        std::memory_order_release);
+    if (!g_inlineNativeMenu.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU menu] Explorer's item menu for expanded folders is unavailable on this Windows build "
+               L"(background=%d selection=%d items=%d); the classic menu is used",
+            g_defViewBackgroundMenuOriginal != nullptr, g_defViewSelectionMenu != nullptr, g_defViewGetItemsOriginal != nullptr);
 }
 
 // Native-owned shortcuts remain native. Frame/GPU shortcuts use the active
@@ -44570,6 +45474,16 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
         DispatchMessageW(&renamedInput);
         return TRUE; // Consumed exactly once; Explorer's MSG stays untouched.
     }
+    // Alt+Enter on a selection that spans folders: Explorer's own handler
+    // would show the native (empty) selection's properties instead.
+    if (msg && msg->message == WM_SYSKEYDOWN && msg->wParam == VK_RETURN && !(msg->lParam & (1LL << 30)) &&
+        !g_unloading.load(std::memory_order_relaxed))
+        if (auto* state = State(OverlayUnder(GetAncestor(msg->hwnd, GA_ROOT)));
+            state && state->visible && state->inScope && !state->rename.editor && !state->optimisticStartedAt &&
+            OverlayHasInputFocus(*state) && TabOwnsActiveView(*state) && InlineSelectionDetached(*state)) {
+                ShowInlineSelectionProperties(*state);
+                return TRUE;
+            }
     if (msg && HandleNativeFileKey(*msg)) return TRUE;
     if (msg) NoteNativeNewFolderShortcut(*msg);
     if(msg && msg->message==WM_KEYDOWN) {
@@ -45810,6 +46724,19 @@ BOOL Wh_ModInit() {
     if (void* invoke = NewMenuInvokeCommandAddress())
         WindhawkUtils::SetFunctionHook(reinterpret_cast<NewMenuInvoke_t>(invoke),
             NewMenuInvokeHook, &g_newMenuInvokeOriginal);
+    // Explorer's selection commands (command bar, ribbon, native list) on a
+    // selection with inline children act on all of it. Optional: without the
+    // hook they act on the open folder's part only, as before.
+    if (void* invoke = SelectionMenuInvokeCommandAddress())
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<SelectionMenuInvoke_t>(invoke),
+            SelectionMenuInvokeHook, &g_selectionMenuInvokeOriginal);
+    // Explorer's selection readers (command bar, status bar, Shell code) see
+    // the whole selection when it includes inline children. Optional: without
+    // it they see the open folder's part only.
+    InstallSelectionBridge();
+    // Explorer's own item menu for selections with inline children. Optional:
+    // without its symbols those selections use the classic menu.
+    InstallInlineNativeMenu();
     // Retain this early suppression hook: applying hooks after startup is slow
     // in Windhawk, and the first owned native dispatch must already be batched.
     // Install last: failure before this point cannot release a module while

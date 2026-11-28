@@ -464,3 +464,31 @@ static void TestDetailsMetadataMiddleEllipsis(const std::wstring& fixture) {
     g_writeFactory.Reset();
     std::cout<<"PASS: Details metadata is shortened in the middle only with middle ellipsis Always on\n";
 }
+
+// Touch: the folder icon toggles too (a finger is wider than the arrow); a
+// mouse keeps the icon for selection. Type-to-select finds shown children.
+static void TestInlineDirsTouchAndTypeSearch(const std::wstring& fixture) {
+    using namespace InlineDirs;
+    StyleFixture::Session style;
+    OptionScope option(true);
+    const auto root=MakeTree(fixture,L"inline-touch");
+    Tab tab(root,96);
+    auto& s=tab.state;
+    const int alpha=tab.Row(L"alpha");
+    const auto item=tab.Item(alpha);
+    const POINT icon{LONG((item.icon.left+item.icon.right)*.5f),LONG((item.icon.top+item.icon.bottom)*.5f)};
+    s.pointingDevice=PointingDevice::Mouse;
+    Check(!InlineTreeExpanderHit(s,alpha,icon),"a mouse click on the folder icon toggles the folder");
+    s.pointingDevice=PointingDevice::Touch;
+    Check(InlineTreeExpanderHit(s,alpha,icon),"a touch tap on the folder icon does not toggle the folder");
+    const POINT name{LONG(item.text.left+4.f),icon.y};
+    Check(!InlineTreeExpanderHit(s,alpha,name),"a touch tap on the name toggles the folder");
+    s.pointingDevice=PointingDevice::Mouse;
+    tab.Toggle(L"alpha"); tab.Toggle(L"sub");
+    Select(s,tab.Row(L"zeta.txt"),true);
+    s.typeSearch.clear();
+    s.typeSearch=L"dee";
+    ApplyTypeSearch(s,L'e');
+    Check(s.selected==tab.Row(L"deep.txt"),"type-to-select did not reach a shown child");
+    std::cout<<"PASS: touch taps on folder icons toggle (mouse clicks select); type-to-select finds shown children\n";
+}

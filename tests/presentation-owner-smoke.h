@@ -244,8 +244,18 @@ static void TestPresentationOwners() {
             HANDLE control=CreateEventW(nullptr,FALSE,TRUE,nullptr);
             Check(control!=nullptr,"native compositor control event");
             const auto interrupted=clock(1,&control,5000);
-            const auto tick=clock(1,&control,5000);
+            // No compositor frame arrives while the display is off or busy
+            // with the machine's own use: only that wait is repeated (the
+            // control event is auto-reset and stays clear). Any other result
+            // is judged at once.
+            auto tick=clock(1,&control,5000);
+            for(int wait=1; tick==WAIT_TIMEOUT && wait<8; ++wait) tick=clock(1,&control,5000);
             CloseHandle(control);
+            if(interrupted!=WAIT_OBJECT_0 || tick!=WAIT_OBJECT_0+1)
+                std::cout<<"COMPOSITOR control wait="<<interrupted<<" heartbeat wait="<<tick
+                    <<" (258: no compositor frame arrived; 0xC01E0006: the display is off or occluded)"<<std::endl;
+            Check(interrupted!=0xC01E0006u && tick!=0xC01E0006u,
+                "the compositor reports the display off or occluded (STATUS_GRAPHICS_PRESENT_OCCLUDED): turn the display on");
             Check(interrupted==WAIT_OBJECT_0 && tick==WAIT_OBJECT_0+1,
                 "native compositor clock did not distinguish control wake from heartbeat");
         }

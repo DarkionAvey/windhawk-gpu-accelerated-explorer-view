@@ -103,7 +103,10 @@ inline thread_local unsigned shellWindowsCalls=0;
 inline thread_local bool suppressRenameError=false;
 inline thread_local unsigned renameErrors=0;
 inline int WINAPI Message(HWND window,LPCWSTR text,LPCWSTR title,UINT flags) {
-    if (suppressRenameError && !wcscmp(title,L"Rename")) {++renameErrors; return IDOK;}
+    // The rename error uses Windows' own text and default caption (no fixed
+    // language), so it is recognized by its warning style while suppressed.
+    (void)title;
+    if (suppressRenameError && (flags & MB_ICONMASK) == MB_ICONWARNING && text && *text) {++renameErrors; return IDOK;}
     return ::MessageBoxW(window,text,title,flags);
 }
 inline HRESULT WINAPI Create(REFCLSID cls,IUnknown* outer,DWORD flags,REFIID iid,void** result) {

@@ -12,6 +12,8 @@ namespace SelectionLogFixture {
 inline thread_local std::vector<std::wstring>* sink=nullptr;
 // Diagnostics may also capture every "[GPU selection" decision line.
 inline thread_local bool allSelection=false;
+// Or, when set, every line starting with this prefix instead.
+inline thread_local const wchar_t* prefix=nullptr;
 inline std::atomic<void(*)(PCWSTR)> frameSink{nullptr};
 // Format every line, as Windhawk does once the user enables logging, so a
 // runtime formatting fault crashes the test with its option context.
@@ -23,8 +25,8 @@ struct FormatAll {
 inline void Log(PCWSTR format,...) {
     const auto frames=frameSink.load(std::memory_order_acquire);
     const bool frame=frames && !std::wcsncmp(format,L"[GPU frames]",12);
-    const bool captured=frame || (sink &&
-        !std::wcsncmp(format,allSelection ? L"[GPU selection" : L"[GPU selection trace]",allSelection ? 14 : 21));
+    const bool captured=frame || (sink && (prefix ? !std::wcsncmp(format,prefix,std::wcslen(prefix)) :
+        !std::wcsncmp(format,allSelection ? L"[GPU selection" : L"[GPU selection trace]",allSelection ? 14 : 21)));
     if(!captured && !formatAll.load(std::memory_order_relaxed)) return;
     std::vector<wchar_t> buffer(16384);
     va_list args; va_start(args,format);

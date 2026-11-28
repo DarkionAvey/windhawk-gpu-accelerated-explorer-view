@@ -274,7 +274,13 @@ static void TestRenameHandoff(const std::wstring& directory) {
         SetWindowTextW(state.rename.editor,L"rejected folder");
         ReportApiFixture::suppressRenameError=true;
         const auto errors=ReportApiFixture::renameErrors;
-        FinishRename(state,true); ReportApiFixture::suppressRenameError=false;
+        FinishRename(state,true);
+        // The failure is posted, then shown by its own dispatch (no rename on the stack).
+        MSG notice{};
+        Check(PeekMessageW(&notice,state.hwnd,kMsgRenameFailureNotice,kMsgRenameFailureNotice,PM_REMOVE),
+            "the Shell's rename failure was not posted");
+        OverlayProc(notice.hwnd,notice.message,notice.wParam,notice.lParam);
+        ReportApiFixture::suppressRenameError=false;
         Check(state.entries[0].name==L"new folder" && state.renamePreviewPath.empty() &&
             ReportApiFixture::renameErrors==errors+1,"Shell failure did not restore the real name/report error");
         state.presenter.reset(); CloseHandle(lane->wake); lane->wake=nullptr;

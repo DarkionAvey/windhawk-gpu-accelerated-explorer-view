@@ -31,7 +31,8 @@ struct Live {
             const bool owned=message.hwnd==state.hwnd && (message.message==kMsgPreparedSelection ||
                 message.message==kMsgFlushDirectoryChanges || message.message==kMsgNativeCatalog ||
                 message.message==kMsgInlineTreeReady || message.message==kMsgAdoptNativeSelectAll ||
-                message.message==kMsgInlineTreeReopen ||
+                message.message==kMsgInlineTreeReopen || message.message==kMsgInlineSelectionNotice ||
+                message.message==kMsgInlineSelectionRename ||
                 (message.message==WM_TIMER && message.wParam==kInlineTreeBusyTimerId));
             if(owned) OverlayProc(state.hwnd,message.message,message.wParam,message.lParam);
             else { TranslateMessage(&message); DispatchMessageW(&message); }
@@ -44,13 +45,30 @@ struct Live {
             queued=!state.background->treeJobs.empty() || !state.background->treeResults.empty();
         }
         if(queued) return false;
-        for(const auto& node:state.inlineTree) if(!node.loaded) return false;
+        // A job the worker is running is in neither queue: wait for its listing.
+        for(const auto& node:state.inlineTree) if(!node.loaded || node.received!=node.request) return false;
         return state.loaded && !state.directoryPending && !state.watchedChangePending;
     }
     void Settle(const char* what) {
         Check(Eventually([&] { Pump(); ReceiveDirectoryResults(state); ReceiveInlineTreeResults(state); return Idle(); },30000),what);
         StopRowTransition(state);
     }
+    // Completion, not time: deliver the Shell's change reports for these
+    // folders now (SHCNF_FLUSH returns once they are delivered), let the mod
+    // finish every job they start (Idle), then judge the outcome once. A wrong
+    // outcome fails at once instead of waiting out a deadline.
+    void Flush(std::initializer_list<std::wstring> relatives) {
+        for(const auto& relative:relatives) {
+            const auto folder=relative.empty() ? root : Path(relative);
+            SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_PATHW|SHCNF_FLUSH,folder.c_str(),nullptr);
+        }
+    }
+    template<class Done> void Settled(Done done,const char* what) {
+        Settle(what);
+        Check(done(),what);
+    }
+    // Only for outcomes with no completion signal the mod can observe (none
+    // in these tests); prefer Flush + Settled.
     template<class Done> void Until(Done done,const char* what) {
         Check(Eventually([&] { Pump(); ReceiveDirectoryResults(state); ReceiveInlineTreeResults(state); return done(); },30000),what);
         StopRowTransition(state);
@@ -64,6 +82,10 @@ struct Live {
     }
     void Toggle(const std::wstring& relative) {
         const int row=Row(relative);
+        if(row<0) {
+            std::cout<<"LIVE rows for missing "<<std::string(relative.begin(),relative.end())<<":"<<std::endl;
+            for(const auto& e:state.entries) std::cout<<"  "<<e.treeDepth<<" "<<std::string(e.path.begin(),e.path.end())<<std::endl;
+        }
         Check(row>=0,"live inline row missing");
         ToggleInlineFolder(state,row);
     }
@@ -184,7 +206,7 @@ static void TestInlineDirsLiveNativeSelection(const std::wstring& fixture) {
     live.CheckConsistent("expanded");
     live.SelectOnly({L"alpha\\a.txt",L"zeta.txt",L"gamma\\c.txt"});
     SyncNativeSelection(s);
-    live.Until([&] {return live.NativeSelected()==1;},"native view did not hold only the folder's own selected row");
+    live.Until([&] {return live.NativeSelected()==1;},"native view did not hold the open folder's own selected row");
     Check(InlineSelectionDetached(s),"a selection with children was not treated as spanning folders");
     live.SelectOnly({L"alpha\\sub\\deep.txt"});
     SyncNativeSelection(s);
@@ -199,7 +221,9 @@ static void TestInlineDirsLiveNativeSelection(const std::wstring& fixture) {
     live.NativeSelectAll();
     live.Until([&] {return s.selectedFlags.Count(0,s.selectedFlags.size())==s.entries.size();},
         "native Select All did not select the shown children");
-    Check(live.NativeSelected()==s.rootTotal,"native Select All count differs from the folder's own rows");
+    live.Until([&] {return live.NativeSelected()==s.rootTotal;},"native Select All count differs from the folder's own rows");
+    live.Settle("select all echo");
+    Check(s.selectedFlags.Count(0,s.selectedFlags.size())==s.entries.size(),"the native Select All echo undid the shown children");
     std::cout<<"PASS: live native selection holds only the folder's own rows; child selections stay GPU-only; "
         "collapse hands selection over; Select All includes shown children\n";
 }
@@ -554,3 +578,4 @@ static void TestInlineDirsLiveStress(const std::wstring& fixture) {
     std::cout<<"PASS: rapid toggles with a refresh, a 1500-item folder, 25 nested levels, select-all then collapse and "
         "cancelled listings leave a consistent tree\n";
 }
+

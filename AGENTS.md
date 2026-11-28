@@ -84,6 +84,11 @@
 - A failure is final: tests run once, are never retried, and the first
   failure stops the whole run. Do not add retries or tolerance to hide flaky
   timing; find and fix the cause.
+- Never poll for an outcome with a long deadline (`Eventually(outcome,
+  30000)`): a wrong outcome then stalls the run for the whole deadline.
+  Complete the work deterministically (synchronous calls, `SHCNF_FLUSH`
+  deliveries), wait only for the mod's own completion state, and judge the
+  outcome once, failing at once. See tests/README.md "Writing a regression".
 - A new or changed user option needs an `OptionCatalog` entry, an effect
   assertion against an independent expectation (pixels, DPI arithmetic,
   DirectWrite measurement; not the mod's own helpers) and a
