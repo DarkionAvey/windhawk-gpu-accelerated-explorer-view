@@ -1,5 +1,8 @@
  # Changelog
 
+## 1.1.22
+- **FIXED** Renaming items from several expanded folders at once no longer loses part of the selection when Windows reports the changes late.
+
 ## 1.1.21
 - **ADDED** Items inside expanded folders can be renamed (F2 or a slow click), and middle-clicking a folder inside an expanded folder opens it in a new tab.
 - **ADDED** Alt+Enter shows the properties of a selection that includes items from expanded folders.

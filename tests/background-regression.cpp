@@ -2032,6 +2032,7 @@ static void TestPreviewInput() {
 #include "additional-gestures-smoke.h"
 #include "checkbox-smoke.h"
 #include "private-desktop-fixture.h"
+#include "inline-dirs-live-input-smoke.h"
 #include "shell-rename-smoke.h"
 #include "rename-appearance-smoke.h"
 #include "rename-vertical-alignment-smoke.h"
@@ -2142,6 +2143,79 @@ int wmain(int argc,wchar_t** argv) {
         const bool injected = GetModuleHandleW(L"MacType64.dll") ||
             GetModuleHandleW(L"MacType64.Core.dll");
         return injected ? 1 : 0;
+    }
+    if (argc == 2 && wcscmp(argv[1], L"--check-shell-undo") == 0) {
+        // Windows' Undo can stop recording renames until a restart (seen in
+        // native Explorer too). Rename a private file through a real folder
+        // view, as the mod does, and ask that view's menu for Undo.
+        // 0: recorded; 1: not recorded; 2: the check could not run.
+        if (FAILED(OleInitialize(nullptr))) return 2;
+        int verdict = 2;
+        wchar_t temp[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, temp);
+        const auto folder = std::filesystem::path(temp) /
+            (L"gpu-overlay-undo-check-" + std::to_wstring(GetCurrentProcessId()));
+        std::error_code ignored;
+        std::filesystem::create_directories(folder, ignored);
+        CloseHandle(CreateFileW((folder / L"a.txt").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr));
+        {
+            const HWND frame = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"private undo check",
+                WS_POPUP, -32000, -32000, 600, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            ComPtr<IExplorerBrowser> browser;
+            ComPtr<IShellView> view;
+            PIDLIST_ABSOLUTE raw = nullptr;
+            RECT bounds{0, 0, 600, 400}; FOLDERSETTINGS settings{FVM_DETAILS, FWF_NOBROWSERVIEWSTATE};
+            if (frame && SUCCEEDED(CoCreateInstance(CLSID_ExplorerBrowser, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&browser))) &&
+                SUCCEEDED(browser->Initialize(frame, &bounds, &settings)) &&
+                SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &raw, 0, nullptr))) {
+                OwnedPidl identity(raw);
+                browser->SetOptions(EBO_NOTRAVELLOG);
+                if (SUCCEEDED(browser->BrowseToIDList(identity.get(), SBSP_ABSOLUTE))) {
+                    const auto pump = [] { MSG m{}; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } };
+                    const auto undoOffered = [&] {
+                        ComPtr<IContextMenu> menu;
+                        if (FAILED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&menu))) || !menu) return false;
+                        HMENU popup = CreatePopupMenu();
+                        bool found = false;
+                        if (SUCCEEDED(menu->QueryContextMenu(popup, 0, 1, 0x7FFF, CMF_NORMAL)))
+                            for (UINT id = 0; id < 0x7FFE && !found; ++id) {
+                                wchar_t verb[80]{};
+                                found = SUCCEEDED(menu->GetCommandString(id, GCS_VERBW, nullptr,
+                                    reinterpret_cast<LPSTR>(verb), ARRAYSIZE(verb))) && !_wcsicmp(verb, L"undo");
+                            }
+                        DestroyMenu(popup);
+                        return found;
+                    };
+                    // The view exists once navigation completes (deadline: a hung Shell).
+                    const ULONGLONG start = GetTickCount64();
+                    ComPtr<IFolderView2> items; int count = 0;
+                    while (GetTickCount64() - start < 20000 &&
+                           !(SUCCEEDED(browser->GetCurrentView(IID_PPV_ARGS(&view))) && SUCCEEDED(view.As(&items)) &&
+                             SUCCEEDED(items->ItemCount(SVGIO_ALLVIEW, &count)) && count == 1)) { pump(); view.Reset(); MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT); }
+                    ComPtr<IShellFolder> parent; PCUITEMID_CHILD child = nullptr; PIDLIST_ABSOLUTE file = nullptr;
+                    if (count == 1 && SUCCEEDED(SHParseDisplayName((folder / L"a.txt").c_str(), nullptr, &file, 0, nullptr))) {
+                        OwnedPidl fileIdentity(file);
+                        if (SUCCEEDED(SHBindToParent(fileIdentity.get(), IID_PPV_ARGS(&parent), &child)) &&
+                            SUCCEEDED(parent->SetNameOf(frame, child, L"b.txt", SHGDN_INFOLDER | SHGDN_FOREDITING, nullptr))) {
+                            // Windows adds the rename to Undo shortly after it returns.
+                            const ULONGLONG renamed = GetTickCount64();
+                            bool offered = false;
+                            while (!(offered = undoOffered()) && GetTickCount64() - renamed < 10000) {
+                                pump(); MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
+                            }
+                            verdict = offered ? 0 : 1;
+                        }
+                    }
+                }
+            }
+            view.Reset();
+            if (browser) browser->Destroy();
+            browser.Reset();
+            if (frame) DestroyWindow(frame);
+        }
+        std::filesystem::remove_all(folder, ignored);
+        OleUninitialize();
+        return verdict;
     }
     if(argc==2 && wcscmp(argv[1],L"--list-tests")==0) {
         // name, concurrency, gate, resources: consumed by run-regressions.ps1.

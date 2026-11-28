@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.21
+// @version         1.1.22
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -15807,15 +15807,24 @@ void RenameInlineTreeItem(ViewState& state, const std::wstring& oldPath, const s
                           const std::wstring& name, const std::wstring& label) {
     if (state.inlineTree.empty() || oldPath.empty() || newPath.empty()) return;
     for (auto& node : state.inlineTree) {
+        bool renamedHere = false;
         for (auto& child : node.children)
             if (_wcsicmp(child.path.c_str(), oldPath.c_str()) == 0) {
                 child.path = newPath; child.name = name; child.label = label;
+                renamedHere = true;
             }
+        bool moved = true;
         if (_wcsicmp(node.path.c_str(), oldPath.c_str()) == 0) node.path = newPath;
         else if (InlineTreeWithin(node.path, oldPath)) node.path = newPath + node.path.substr(oldPath.size());
-        else continue;
-        for (auto& child : node.children)
-            if (InlineTreeWithin(child.path, oldPath)) child.path = newPath + child.path.substr(oldPath.size());
+        else moved = false;
+        if (moved)
+            for (auto& child : node.children)
+                if (InlineTreeWithin(child.path, oldPath)) child.path = newPath + child.path.substr(oldPath.size());
+        // A listing still in flight was taken before the rename reached the
+        // disk (requested by an earlier Shell report): it would bring the old
+        // name back over this row. List again from now; the older result is
+        // then superseded and dropped.
+        if (renamedHere || moved) RequestInlineTreeNode(state, node);
     }
 }
 void ReceiveInlineTreeResults(ViewState& state) {
@@ -20592,6 +20601,8 @@ void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColor
 // A chevron's two pixel-snapped strokes meet at one tip point, closed by a
 // disc of the stroke's width: a round join, so the tip is one continuous
 // corner instead of two square line ends with a notch between them.
+// (A translucent chevron shows the overlap brighter: see
+// docs/1.1.22-chevron-overlap.md before changing this.)
 void StrokeChevron(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F tip,D2D1_POINT_2F b,
                    ID2D1SolidColorBrush* brush,float width=1.f) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;

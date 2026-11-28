@@ -58,10 +58,15 @@ struct Live {
     // finish every job they start (Idle), then judge the outcome once. A wrong
     // outcome fails at once instead of waiting out a deadline.
     void Flush(std::initializer_list<std::wstring> relatives) {
+        const unsigned before=host.shellHints;
         for(const auto& relative:relatives) {
             const auto folder=relative.empty() ? root : Path(relative);
             SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_PATHW|SHCNF_FLUSH,folder.c_str(),nullptr);
         }
+        // SHCNF_FLUSH returns once the Shell has sent its reports; under load
+        // they reach this window's queue later. Delivered means received here
+        // (the Shell may merge the reports into one).
+        Check(Eventually([&] {Pump(); return host.shellHints>before;},30000),"the Shell's refresh report never arrived");
     }
     template<class Done> void Settled(Done done,const char* what) {
         Settle(what);

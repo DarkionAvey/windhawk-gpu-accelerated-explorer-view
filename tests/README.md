@@ -50,6 +50,20 @@ run retains the working source and temporary binaries, and leaves latest.cpp
 unchanged, without pruning archives. Update CHANGELOG.md with the results after
 testing.
 
+## Hook check (advisory)
+
+Every run that builds the pipeline also starts `hook-symbol-check.ps1` beside
+the tests and prints its report (`HOOK CHECK:` lines) after them; it never
+changes a result. It reads from the mod source every Windhawk symbol hook, every
+hooked export and every function looked up by name, then checks each one in the
+first and latest build of every Windows 11 version and Windows 10 22H2
+(Winbindex index, Microsoft symbol server; `hook-symbol-reader.cpp` reads PDBs
+with Windows' dbghelp). Downloads are cached under
+`%LOCALAPPDATA%\gpu-overlay\symbol-cache`; an unreachable server is retried for
+two minutes, then the check reports itself skipped. Hotpatch images (partial
+binaries) are skipped for the previous full build. Insider and ARM64 builds are
+not indexed and not checked.
+
 ## Parallel execution
 
 Double-click root `test-mod.bat` and enter or drag in a numbered working

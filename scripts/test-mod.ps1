@@ -52,6 +52,8 @@ if (Test-Path -LiteralPath $summary) {
         Write-Host 'Tests could not start. See preparation-and-run.log for the error.'
     }
 }
+$hookSummary = Join-Path $artifacts 'hook-symbol-check.txt'
+if (Test-Path -LiteralPath $hookSummary) { Get-Content -LiteralPath $hookSummary | ForEach-Object { Write-Host "Hook check: $_" } }
 Write-Host ('Running time: {0:N2}s' -f $runClock.Elapsed.TotalSeconds)
 $coverageSummary = Join-Path $artifacts 'coverage\summary.txt'
 $coverageHtml = Join-Path $artifacts 'coverage\html\index.html'

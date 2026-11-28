@@ -2,7 +2,7 @@
 // @id              gpu-accelerated-explorer-view
 // @name            GPU-accelerated explorer.exe list and grid views
 // @description     GPU-accelerated list and grid views replacement for explorer.exe. Includes smooth scrolling and interactive animations
-// @version         1.1.7
+// @version         1.1.22
 // @author          DarkionAvey
 // @include         explorer.exe
 // @architecture    x86-64
@@ -83,7 +83,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $description: Dim the names of files that begin with a dot.
     - middleEllipsis: gridOnly
       $name: Ellipsis in the middle of filenames
-      $description: Preserve the end of a shortened filename, including its extension.
+      $description: Show the beginning and end of a shortened filename. Always on also applies to the details columns.
       $options:
         - gridOnly: Only in grid view
         - alwaysOn: Always on
@@ -122,7 +122,7 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
       $name: Grid view corner rounding
       $description: 0 = square corners; -1 = pill shape; higher = rounder corners.
     - marqueeOpacity: 30
-      $name: Selection rectangle opacity (%)
+      $name: Drag selection rectangle opacity (%)
       $description: Higher = more visible drag rectangle; lower = fainter.
   $name: Selection
 - Hover:
@@ -176,6 +176,9 @@ Enable **Enable logging** when reproducing a bug and include Windhawk's log in t
     - autoRefitColumns: true
       $name: Automatically fit columns
       $description: Auto fit columns when folder data and layout are ready, when switching to Details, after window resizing, and after zooming. Auto fit will not trigger when existing text already fits.
+    - expandableFolders: false
+      $name: Expandable folders in Details view
+      $description: Show an arrow before each folder. Click it, or press Right and Left, to show or hide the folder's contents below it. In grouped folders, the contents stay under their folder.
   $name: Columns and sorting
 - theme: ""
   $name: Theme XML (experimental)
@@ -312,6 +315,12 @@ struct SurfaceStyle {
     float borderRadius = 4.f;
     bool borderRadiusPercent = false;
     float shadowOpacity = 1.f;
+    bool borderColorDefined = false;
+    std::optional<float> borderOpacity, fontSize;
+    std::optional<float> highlightOpacity;
+    bool fontSizePercent = false;
+    std::optional<Color> textColor;
+    bool autoTextColor=false;
     BorderStyle borderStyle = BorderStyle::Solid;
     std::optional<float> height;
     std::optional<Shadow> shadow; // Absence keeps the native tooltip shadow.
@@ -336,12 +345,18 @@ struct DriveStyle {
     bool enabled = false, trackOrigin = false, scaled = false;
 };
 using Elements = std::map<std::wstring, Element, std::less<>>;
+inline const SurfaceStyle defaultGroupHeading{.autoTextColor=true};
 struct Document {
     Elements elements;
     std::array<std::array<SurfaceStyle, 3>, 2> highlights;
     std::array<bool, 2> highlightEnabled{};
     std::array<SurfaceStyle, 2> tooltips;
     std::array<SurfaceStyle, 2> marquees;
+    struct ColumnHeaderStyle {
+        SurfaceStyle header, vertical, horizontal;
+    };
+    std::array<ColumnHeaderStyle, 2> columnHeaders;
+    std::array<SurfaceStyle, 2> groupHeadings{defaultGroupHeading,defaultGroupHeading};
     std::array<std::optional<SurfaceStyle>, 2> thumbnails;
     std::array<std::array<SurfaceStyle,6>,2> checkboxes;
     std::array<bool,2> checkboxEnabled{};
@@ -454,7 +469,7 @@ struct Parser {
         // Track semantic scope independently of XML depth: optional theme
         // wrappers never change which element owns its appearance properties.
         struct Scope { Element* element = nullptr; bool appearance = false, scale = false;
-            int mode = -1; ScaleStop* stop = nullptr; };
+            int mode = -1; ScaleStop* stop = nullptr; const std::wstring* elementName = nullptr; };
         Scope scope;
         std::vector<Scope> parents;
         parents.reserve(16);
@@ -495,7 +510,8 @@ struct Parser {
                     scope.mode = int(index);
                     scope.appearance = true;
                 } else {
-                    if (scope.element) Fail(L"Keep styled elements beside one another, not inside one another");
+                    if (scope.element && (tag != L"element" || scope.appearance || scope.scale))
+                        Fail(L"Put named subelements directly inside their styled element");
                     std::wstring name = tag;
                     if (tag == L"element") {
                         const auto attribute = attributes.find(L"name");
@@ -503,10 +519,12 @@ struct Parser {
                         name = std::move(attribute->second); attributes.erase(attribute);
                     }
                     if (Trim(name).empty()) Fail(L"Each element needs a name");
+                    if (scope.elementName) name = *scope.elementName + L":" + name;
                     if (name.size() > 256 ||
                         std::any_of(name.begin(), name.end(), [](wchar_t c) { return c < 32 || c == 127; }))
                         Fail(L"Each element needs a name of between 1 and 256 characters",E_INVALIDARG,false);
-                    scope = {&document->elements.try_emplace(std::move(name)).first->second, false};
+                    const auto entry = document->elements.try_emplace(std::move(name)).first;
+                    scope = {.element=&entry->second,.elementName=&entry->first};
                     merge(scope.element->universal, std::move(attributes));
                 }
                 if (reader->IsEmptyElement()) scope = parent;
@@ -863,13 +881,15 @@ void CompileDriveScale(DriveStyle& style, const Element& element, size_t mode) {
 }
 void CompileStyles(Document& document) {
     // Property metadata binds names to members; no per-element assignment chain.
-    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*, std::optional<float> SurfaceStyle::*>;
+    using Member = std::variant<Paint SurfaceStyle::*, Color SurfaceStyle::*, float SurfaceStyle::*, std::optional<Shadow> SurfaceStyle::*, BorderStyle SurfaceStyle::*, std::optional<float> SurfaceStyle::*, std::optional<Color> SurfaceStyle::*>;
     struct Binding { std::wstring_view name; Member member; };
     const Binding bindings[] = {{L"background-color", &SurfaceStyle::background},
         {L"background", &SurfaceStyle::background}, {L"border-color", &SurfaceStyle::borderColor},
         {L"border-width", &SurfaceStyle::borderWidth}, {L"border-radius", &SurfaceStyle::borderRadius},
         {L"box-shadow", &SurfaceStyle::shadow}, {L"border-style", &SurfaceStyle::borderStyle}, {L"height", &SurfaceStyle::height},
-        {L"shadow-opacity", &SurfaceStyle::shadowOpacity}};
+        {L"shadow-opacity", &SurfaceStyle::shadowOpacity}, {L"border-opacity", &SurfaceStyle::borderOpacity},
+        {L"opacity", &SurfaceStyle::highlightOpacity},
+        {L"font-size", &SurfaceStyle::fontSize}, {L"text-color", &SurfaceStyle::textColor}};
     constexpr std::wstring_view names[] = {L"FillSelectionRect:selected", L"FillSelectionRect:hover", L"FillSelectionRect:selected:hover"};
     for (size_t mode = 0; mode < document.highlights.size(); ++mode) {
         auto& styles = document.highlights[mode];
@@ -888,28 +908,35 @@ void CompileStyles(Document& document) {
                         using Field = std::remove_cvref_t<decltype(style.*member)>;
                         if constexpr (std::is_same_v<Field, float> || std::is_same_v<Field, std::optional<float>>) {
                             auto text = Parser::Trim(*value);
-                            if constexpr (std::is_same_v<Field, float>) {
-                                if (member == &SurfaceStyle::shadowOpacity) {
-                                    const bool percent = text.ends_with(L"%");
-                                    if (percent) text.remove_suffix(1);
-                                    const float opacity = !percent && text == L"none" ? 0.f :
-                                        Number(text)/(percent ? 100.f : 1.f);
-                                    if (opacity < 0.f || opacity > 1.f) throw std::invalid_argument("shadow opacity");
-                                    style.shadowOpacity = opacity;
+                            if (binding.name == L"opacity" && !element.starts_with(L"FillSelectionRect")) return;
+                            if (binding.name == L"opacity" || binding.name == L"shadow-opacity" || binding.name == L"border-opacity") {
+                                const bool percent = text.ends_with(L"%");
+                                if (percent) text.remove_suffix(1);
+                                const float opacity = !percent && text == L"none" ? 0.f :
+                                    Number(text)/(percent ? 100.f : 1.f);
+                                if (opacity < 0.f || opacity > 1.f) throw std::invalid_argument("opacity");
+                                style.*member = opacity;
+                                return;
+                            }
+                            if constexpr (std::is_same_v<Field, std::optional<float>>) {
+                                if(text==L"auto") {
+                                    if (element==L"DrawColumnHeader" || element==L"PaintGroupHeading") style.*member = -1.f;
+                                    else (style.*member).reset();
+                                    if (binding.name==L"font-size") style.fontSizePercent=false;
                                     return;
                                 }
                             }
-                            if constexpr (std::is_same_v<Field, std::optional<float>>) {
-                                if(text==L"auto") {(style.*member).reset(); return;}
-                            }
                             const bool corner = binding.name == L"border-radius";
-                            const bool percent = corner && allowPercentageRadius && text.ends_with(L"%");
+                            const bool font = binding.name == L"font-size";
+                            const bool percent = (font || (corner && allowPercentageRadius)) && text.ends_with(L"%");
                             if (percent) text.remove_suffix(1);
                             else if (text.ends_with(L"px")) text.remove_suffix(2);
                             const float width = Number(text);
-                            if (!std::isfinite(width) || width < 0.f) throw std::invalid_argument("nonnegative length");
+                            if (!std::isfinite(width) || width < 0.f || (font && width == 0.f))
+                                throw std::invalid_argument("length");
                             style.*member = width;
                             if (corner) style.borderRadiusPercent = percent;
+                            if (font) style.fontSizePercent = percent;
                         } else if constexpr (std::is_same_v<Field, BorderStyle>) {
                             constexpr std::pair<std::wstring_view, BorderStyle> choices[] = {
                                 {L"solid",BorderStyle::Solid},{L"dashed",BorderStyle::Dashed},
@@ -928,7 +955,18 @@ void CompileStyles(Document& document) {
                                     paint.kind = Paint::Kind::Solid; paint.color = ReadColor(text);
                                 } else paint = ReadPaint(text);
                                 style.*member = std::move(paint);
-                            } else style.*member = ReadColor(text);
+                            } else {
+                                if constexpr (std::is_same_v<Field,std::optional<Color>>) {
+                                    if (Parser::Trim(text)==L"auto") {
+                                        style.autoTextColor=true;
+                                        (style.*member).reset();
+                                        return;
+                                    }
+                                }
+                                style.*member = ReadColor(text);
+                                if constexpr (std::is_same_v<Field,std::optional<Color>>) style.autoTextColor=false;
+                                if (binding.name == L"border-color") style.borderColorDefined = true;
+                            }
                         }
                     }, binding.member);
                 } catch (const std::exception&) {
@@ -954,6 +992,15 @@ void CompileStyles(Document& document) {
         apply(document.tooltips[mode],L"RenderItemTip");
         document.marquees[mode].borderWidth = 1.f;
         apply(document.marquees[mode], L"DrawMarquee");
+        apply(document.groupHeadings[mode], L"PaintGroupHeading");
+        auto& columnHeader=document.columnHeaders[mode];
+        columnHeader.header.borderWidth=-1.f; // Omitted: keep the native one-pixel rules.
+        apply(columnHeader.header, L"DrawColumnHeader");
+        columnHeader.vertical=columnHeader.horizontal=columnHeader.header;
+        apply(columnHeader.vertical, L"DrawColumnHeader:vertical");
+        apply(columnHeader.horizontal, L"DrawColumnHeader:horizontal");
+        apply(columnHeader.vertical, L"DrawColumnHeader:vertical-divider");
+        apply(columnHeader.horizontal, L"DrawColumnHeader:horizontal-divider");
         constexpr std::wstring_view checkboxNames[]={L"DrawSelectionCheckbox",L"DrawSelectionCheckbox:hover",
             L"DrawSelectionCheckbox:pressed",L"DrawSelectionCheckbox:checked",L"DrawSelectionCheckbox:checked:hover",
             L"DrawSelectionCheckbox:checked:pressed"};
@@ -1040,6 +1087,7 @@ template<size_t N> struct ThemeContrastResources {
     std::array<ComPtr<ID2D1LinearGradientBrush>,N> gradients;
     std::array<ThemeGradientRamps,N> ramps;
     std::array<D2D1_COLOR_F,N> marks{};
+    unsigned long long markRevision=0;
 };
 struct ThemeBorderStrokes {
     std::array<ComPtr<ID2D1StrokeStyle>, 2> styles;
@@ -1170,10 +1218,26 @@ constexpr UINT_PTR kTypeSearchTimerId = 105;
 constexpr UINT_PTR kZoomAutoRefitTimerId = 106;
 constexpr UINT_PTR kTouchHoldTimerId = 107;
 constexpr UINT_PTR kClickRenameTimerId = 108;
+constexpr UINT_PTR kInlineTreeBusyTimerId = 109;
+// A folder listing slower than this shows a busy indicator at its arrow; once
+// shown, the indicator stays at least kInlineTreeBusyMinimumMs, so a listing
+// that finishes just after the delay does not flash it.
+constexpr ULONGLONG kInlineTreeBusyDelayMs = 1000;
+constexpr ULONGLONG kInlineTreeBusyMinimumMs = 500;
+// Item-tip identity prefix for an inline folder's guide; never a real path.
+constexpr wchar_t kInlineGuideTipKey[] = L"\x1Fguide\x1F";
 // Input batching only: expiry never substitutes for gesture/animation/data completion.
 constexpr UINT kZoomAutoRefitDebounceMs = 200;
 constexpr UINT kMsgDispose = WM_APP + 31;
 constexpr UINT kMsgSettings = WM_APP + 32;
+constexpr UINT kMsgPaletteReady = WM_APP + 87;
+constexpr UINT kMsgInlineTreeReady = WM_APP + 88;
+// Reopen inline folders once a change into Details has ended (wParam: lifetime).
+constexpr UINT kMsgInlineTreeReopen = WM_APP + 89;
+// Tell Explorer's selection listeners about a GPU-only selection change (wParam: lifetime).
+constexpr UINT kMsgInlineSelectionNotice = WM_APP + 90;
+// Start the mod's rename for a selection with inline children (wParam: lifetime).
+constexpr UINT kMsgInlineSelectionRename = WM_APP + 91;
 constexpr UINT kMsgThemeSettings = WM_APP + 85;
 // A multiple rename that could not be performed: shown from its own dispatch
 // after the rename transaction has unwound (lParam: the view token).
@@ -1252,6 +1316,8 @@ bool RegisterFrameHookReleaseMessage() {
 constexpr unsigned kStyleColors = 1, kStyleFonts = 2, kStyleFontCollection = 4, kStyleInput = 8;
 constexpr wchar_t kFrameSizingProperty[] = L"WindhawkGpuFrameSizing";
 constexpr wchar_t kColdAttachResolvedProperty[] = L"WindhawkGpuColdAttachResolved";
+constexpr wchar_t kColdAttachPaintPendingProperty[] = L"WindhawkGpuColdAttachPaintPending";
+constexpr wchar_t kColdAttachPaintCheckedProperty[] = L"WindhawkGpuColdAttachPaintChecked";
 constexpr size_t kMaxCoalescedShellItems = 32;
 constexpr ULONGLONG kShellVisualCoalesceMs = 100;
 // One navigation-rebind policy regardless of whether the signal came from
@@ -1300,6 +1366,7 @@ constexpr int kScrollbarHitTolerance96 = 3;
 constexpr int kScrollbarContentGap96 = 5;
 constexpr int kHorizontalScrollbarHeight96 = 13;
 constexpr int kHeader96 = 38;
+constexpr int kCompactHeader96 = 28;
 // Internal animation debugging control. Edit and recompile: 2.0 doubles
 // durations (half speed), 0.5 halves durations (double speed).
 constexpr double kAnimationDurationScale = 1.0;
@@ -1360,6 +1427,7 @@ std::atomic<int> g_row96{32};
 std::atomic<int> g_fontPercent{44}; // List/Details; keep the existing settings key.
 std::atomic<int> g_gridFontPercent{100};
 std::atomic<bool> g_autoRefitColumns{true};
+std::atomic<bool> g_expandableFolders{false};
 // The settings callback may run on a different thread from Explorer's view.
 // Text formats take a snapshot only when they are created, never per frame.
 SRWLOCK g_fontFamilyLock = SRWLOCK_INIT;
@@ -1611,6 +1679,25 @@ struct ColumnMotion {
     float fromOpacity = 1.f, toOpacity = 1.f;
     bool entering = false;
 };
+enum class ScrollAxis { Vertical, Horizontal };
+// Inventory of independently checked view morph surfaces. New animated
+// surfaces must have corresponding assertions in the scene regression.
+enum class ViewMorphPart {
+    RowFeedback, Icon, Text, GroupHeading, ColumnHeader,
+    VerticalTrack, VerticalThumb, HorizontalTrack, HorizontalThumb, Count
+};
+struct ScrollbarGeometry {
+    float left = 0.f, right = 0.f, top = 0.f, bottom = 0.f;
+    float thumbStart = 0.f, thumbLength = 0.f, travel = 0.f;
+    float scrollRange = 0.f;
+    ScrollAxis axis = ScrollAxis::Vertical;
+    bool usable = false;
+};
+struct ScrollbarLayoutMotion {
+    std::array<ScrollbarGeometry,2> from;
+    std::optional<unsigned long long> rowRevision;
+    bool columnMode = false;
+};
 struct ScrollbarMotion {
     float activeFrom = 0.f, activeTo = 0.f;
     float pressedFrom = 0.f, pressedTo = 0.f;
@@ -1765,6 +1852,15 @@ struct Entry : EntrySortKey {
     bool detailsPending = false;
     unsigned long long detailsPendingEpoch = 0; // Older slow properties cannot block new columns.
     unsigned long long detailsPendingToken = 0; // Pending work from other folder visits is stale.
+    // Inline folder tree (expandable folders in Details). Depth 0 rows belong
+    // to the native view's folder; deeper rows are grafted, read-only children
+    // of an expanded folder and are never mirrored to the native selection.
+    unsigned short treeDepth = 0;
+    bool treeExpanded = false;
+    // Expanded and loaded with nothing to show (treeError zero), or its listing
+    // failed (treeError set, e.g. access denied); the row says so after its name.
+    bool treeEmpty = false;
+    DWORD treeError = 0;
     // Every field participates, so presentation reuse cannot miss a new one.
     bool operator==(const Entry&) const = default;
 };
@@ -1789,6 +1885,7 @@ struct CapturedGroupHeader {
     std::wstring key, title;
     float oldTop = 0.f; // Window coordinates at capture time.
     bool collapsed = false;
+    float oldHeight = -1.f, oldOpacity = 1.f;
 };
 struct SelectionShape {
     D2D1_RECT_F bounds{};
@@ -1842,6 +1939,7 @@ struct RowVisual {
     float fromTextCenter = 0.f, fromTextVertical = .5f;
     SelectionShape fromSelection;
     bool selectionCaptured = false;
+    int treeDepth = -1; // Inline folder depth of the row; -1 when no tree is presented.
 };
 
 // DirectWrite layouts are device-independent. Keep shaping and trimming state
@@ -2181,6 +2279,7 @@ struct FolderChangeStamp {
     }
 };
 struct CachedFolderSnapshot {
+    unsigned long long calendarStamp=0;
     std::shared_ptr<const std::vector<Entry>> presentationEntries;
     SharedPidl folderIdentity;
     std::wstring path;
@@ -2936,6 +3035,23 @@ struct DirectoryResult {
     DWORD error = ERROR_SUCCESS;
 };
 
+// One expanded folder's listing, enumerated on the tab's names lane. Each
+// node owns its cancellation flag, so collapsing it cancels only its work.
+struct InlineTreeJob {
+    std::wstring path;
+    unsigned long long request = 0;
+    std::shared_ptr<std::atomic<bool>> cancelled;
+    SortSpec sort;
+    ShellVisibilityPolicy visibility;
+    unsigned short depth = 1;
+};
+struct InlineTreeResult {
+    std::wstring path;
+    unsigned long long request = 0;
+    std::vector<Entry> entries;
+    DWORD error = ERROR_SUCCESS;
+};
+
 struct PreparedNativeSelection {
     unsigned long long generation = 0, viewToken = 0;
     unsigned long long directoryToken = 0;
@@ -3023,6 +3139,14 @@ struct TouchRecognizer {
     unsigned outputCount = 0;
     bool overflow = false, stopping = false;
     std::vector<POINTER_INFO> packets, contacts, normalized;
+    // Adaptive contact smoothing (SmoothTouchFrame), one entry per contact.
+    struct ContactFilter {
+        UINT32 id = 0;
+        UINT64 qpc = 0;
+        double x = 0., y = 0., vx = 0., vy = 0.; // pixels; pixels/ms
+        double himetricPerPixelX = 0., himetricPerPixelY = 0.; // 0: unknown device mapping
+    };
+    std::vector<ContactFilter> filters;
     LARGE_INTEGER packetClock{};
     ULONGLONG packetClockTick = 0;
     UINT32 frame = 0;
@@ -3059,7 +3183,7 @@ struct TouchRecognizer {
         if (context) StopInteractionContext(context);
         if (tapContext) StopInteractionContext(tapContext);
         stopping = false;
-        contacts.clear(); outputCount = 0; overflow = false;
+        contacts.clear(); filters.clear(); outputCount = 0; overflow = false;
     }
 };
 
@@ -3067,12 +3191,20 @@ struct TouchRecognizer {
 // Drain these only AFTER Windhawk removes detours, in Wh_ModUninit. Waiting
 // before removal would admit new calls indefinitely (including modal loops).
 enum class ApiHook { Dispatch, Accelerator, Show, ShowAsync, Position, DeferredPosition, StructureEvent,
-    GetDC, ReleaseDC, NewMenuInvoke, Count };
+    GetDC, ReleaseDC, NewMenuInvoke, SelectionMenuInvoke, SelectionBridge, InlineMenu, Count };
 constexpr const wchar_t* kApiHookNames[]{L"DispatchMessageW",L"TranslateAcceleratorW",
     L"ShowWindow",L"ShowWindowAsync",L"SetWindowPos",L"DeferWindowPos",L"UiaRaiseStructureChangedEvent",
-    L"GetDC",L"ReleaseDC",L"CNewMenu::InvokeCommand"};
+    L"GetDC",L"ReleaseDC",L"CNewMenu::InvokeCommand",L"CDefFolderMenu::InvokeCommand",L"CDefView selection bridge",
+    L"CDefView item menu"};
 static_assert(std::size(kApiHookNames)==static_cast<size_t>(ApiHook::Count),"every API hook has a drain name");
 std::array<std::atomic<unsigned>,static_cast<size_t>(ApiHook::Count)> g_apiCallbacks{};
+// Explorer's own item menu for selections with inline children
+// (InstallInlineNativeMenu): available when its shell32 symbols were found;
+// the request in progress on this (owner) thread, by tab (never a pointer a
+// reentrant close could leave dangling).
+std::atomic<bool> g_inlineNativeMenu{false};
+struct InlineMenuRequest { HWND owner = nullptr; unsigned long long lifetime = 0; bool learned = false; };
+thread_local InlineMenuRequest t_inlineMenuRequest;
 struct ApiCallbackGuard {
     std::atomic<unsigned>& count;
     explicit ApiCallbackGuard(ApiHook hook) : count(g_apiCallbacks[static_cast<size_t>(hook)]) {
@@ -3271,8 +3403,40 @@ struct PresentationLane;
 struct PresentationModel;
 struct SectionBadge;
 using SectionBadges = std::map<std::wstring, SectionBadge>;
+struct ContrastPalette;
+struct PaletteRequest {
+    std::shared_ptr<const Theme::Document> theme;
+    Theme::Mode mode;
+    COLORREF background, foreground, tipBackground, tipForeground, selection;
+    std::array<float,3> opacity;
+    unsigned long long revision, cachedAccent;
+    bool dynamicAccent, highContrast;
+    std::shared_ptr<const ContrastPalette> tooltipBase;
+};
+struct ContrastPalette {
+    struct Ink {
+        unsigned rgb=0;
+        float alpha=1.f, minimumAlpha=0.f;
+        float Opacity(float rowOpacity,float contentOpacity) const {
+            return std::max(contentOpacity*alpha,rowOpacity*minimumAlpha);
+        }
+    };
+    // Each key identifies a compiled surface in the retained theme. A null
+    // surface is the Explorer backdrop, used by transparent headings.
+    std::shared_ptr<const Theme::Document> theme;
+    std::unordered_map<const Theme::SurfaceStyle*,Ink> foregrounds;
+    Ink Foreground(const Theme::SurfaceStyle* surface,Ink fallback) const {
+        const auto found=foregrounds.find(surface);
+        return found!=foregrounds.end() ? found->second : fallback;
+    }
+    COLORREF background=CLR_INVALID, foreground=CLR_INVALID;
+    COLORREF tipBackground=CLR_INVALID, selection=RGB(0,120,215);
+    unsigned long long revision=0, surfaceRevision=0, accent=0;
+    std::array<float,3> opacity{};
+    Theme::Mode mode=Theme::Mode::Light;
+};
 struct TabBackground : std::enable_shared_from_this<TabBackground> {
-    enum class Lane { Directory, Layout, Properties, Icons, NativeRows, Selection, Columns, IconProvider, Details, Capacity, Watch, Trace, Presentation };
+    enum class Lane { Directory, Layout, Properties, Icons, NativeRows, Selection, Columns, Palette, IconProvider, Details, Capacity, Watch, Trace, Presentation };
     struct Pool {
         PTP_POOL handle = nullptr;
         TP_CALLBACK_ENVIRON environment{};
@@ -3317,6 +3481,7 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     Worker nativeRows{this, Lane::NativeRows};
     Worker selection{this, Lane::Selection};
     Worker columns{this, Lane::Columns};
+    Worker palette{this, Lane::Palette};
     Worker watch{this, Lane::Watch};
     Worker traceWorker{this, Lane::Trace};
     Worker presentation{this, Lane::Presentation};
@@ -3356,12 +3521,18 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     std::deque<ColumnCatalogJob> columnCatalogJobs;
     std::optional<StatusButtonSnapshot> statusButtonJob,statusButtonResult;
     std::optional<ItemTipJob> itemTipJob, itemTipResult;
+    std::optional<PaletteRequest> paletteJob;
+    std::shared_ptr<const ContrastPalette> paletteResult;
     bool typeSearchUnicodeJob=false; // Protected by directoryLock, consumed on Columns.
     std::atomic<unsigned long long> itemTipGeneration{0};
     // Listing whose parent-folder Size binding the Columns lane may keep.
     std::atomic<unsigned long long> itemTipListing{0};
     std::deque<DirectoryWatchJob> watchJobs;
     std::deque<DirectoryResult> directoryResults;
+    // Inline folder listings; directoryLock guards both queues.
+    std::deque<InlineTreeJob> treeJobs;
+    std::deque<InlineTreeResult> treeResults;
+    bool treeNotificationQueued = false;
     using RetiredPayload=std::variant<std::vector<Entry>, RowDetailsCache,
         std::shared_ptr<const NamespaceIdentities>, std::shared_ptr<const std::vector<Entry>>,
         std::shared_ptr<const PresentationModel>, std::vector<IconPixels>, ClipboardPaths, EntryPathUpdates,
@@ -3376,9 +3547,9 @@ struct TabBackground : std::enable_shared_from_this<TabBackground> {
     // One inventory for startup-independent stop, completion and destruction.
     // The regulator owns every lazily started provider, including blocked ones.
     auto Workers() const {
-        std::array<const Worker*, 10 + kIconProviderWorkers + 2 * kPropertyProviderWorkers> workers{
-            &directory, &layout, &properties, &icons, &nativeRows, &selection, &columns, &watch, &traceWorker,&presentation};
-        size_t next = 10;
+        std::array<const Worker*, 11 + kIconProviderWorkers + 2 * kPropertyProviderWorkers> workers{
+            &directory, &layout, &properties, &icons, &nativeRows, &selection, &columns, &palette, &watch, &traceWorker,&presentation};
+        size_t next = 11;
         for (const auto& worker : iconProviders) workers[next++] = &worker;
         for (const auto& worker : detailProviders) workers[next++] = &worker;
         for (const auto& worker : capacityProviders) workers[next++] = &worker;
@@ -3986,6 +4157,7 @@ struct PresentationRowCache {
 struct ItemTip {
     HWND hwnd = nullptr;
     std::wstring item;       // Displayed or pending item identity.
+    UINT32 mutedPrefix = 0;  // Leading name characters drawn in the label color.
     std::wstring suppressed; // Dismissed by input until another item is hovered.
     unsigned long long token = 0; // Pending Columns-lane request; 0 when none.
     POINT anchor{};          // Screen point of the hover that requested it.
@@ -3993,6 +4165,7 @@ struct ItemTip {
     std::vector<ItemTipRow> rows;
     COLORREF background = CLR_INVALID, foreground = CLR_INVALID, label = CLR_INVALID;
     Theme::SurfaceStyle style;
+    unsigned long long accentPalette=0;
     bool opaqueBackground = true;
     D2D1_RECT_F textBounds{}; // Conservative clipped layout bounds, body-local.
     ThemeGradientRamps gradientRamps;
@@ -4040,13 +4213,88 @@ struct ItemTip {
         nameFormat.Reset(); labelFormat.Reset(); valueFormat.Reset();
         nameLayout.Reset(); rowLayouts.clear(); rowTops.clear();
         item.clear(); suppressed.clear(); name.clear(); rows.clear();
+        mutedPrefix = 0;
         token = 0; metricsDpi = 0; textStyle = {};
     }
     ~ItemTip() { Release(); }
 };
 void RenderItemTip(ItemTip& tip);
 
-struct ViewState {
+struct PaintedFeedback {
+    struct Part {D2D1_RECT_F bounds; float radius;};
+    std::array<Part,8> parts{};
+    unsigned count=0;
+    float base=0.f, combined=0.f;
+    bool Covers(float x,float y) const {
+        for(unsigned i=0;i<count;++i) {
+            const auto& [r,radius]=parts[i];
+            if(x<r.left || x>=r.right || y<r.top || y>=r.bottom) continue;
+            const float dx=std::max({r.left+radius-x,x-(r.right-radius),0.f});
+            const float dy=std::max({r.top+radius-y,y-(r.bottom-radius),0.f});
+            if(dx*dx+dy*dy<=radius*radius) return true;
+        }
+        return false;
+    }
+};
+// One folder's listed contents, ordering and change tracking: the data part
+// of a view, separate from its window, presentation and native binding.
+// ViewState derives from it as the tab's *bound* model (the folder the native
+// view shows); detached models (expanded folders, future Miller columns) can
+// be FolderModels of their own. Fields keep their names, so `state.entries`
+// and every other existing access reads the bound model unchanged.
+struct FolderModel {
+    // Identity of the folder.
+    ComPtr<IShellFolder> folder;
+    SharedPidl directoryFolderIdentity; // Captured once per binding, never per refresh/hover.
+    std::wstring folderPath;
+    ShellVisibilityPolicy visibility;
+    // Ordering and grouping.
+    SortSpec sort = DefaultSort();
+    SortSpec displayedSort = DefaultSort(); // sort that actually produced the visible rows
+    ShellGroupSpec grouping;
+    ShellGroupSpec displayedGrouping;
+    // Group headings are layout items, not Shell items. Physical item indices
+    // remain unchanged for QuickLook, PIDL selection and file operations.
+    struct GroupSection {
+        std::wstring key, title;
+        int first = 0, end = 0;
+        float documentTop = 0.f, documentEnd = 0.f;
+        bool collapsed = false;
+        float fraction = 1.f;
+        float from = 1.f, to = 1.f;
+        LARGE_INTEGER started{};
+    };
+    std::vector<GroupSection> sections;
+    std::vector<int> rowGroup; // O(1) row-to-section lookup
+    // Rows, their lookups and resolved details.
+    std::vector<Entry> entries;
+    int total = 0;
+    // Rows that belong to the native view's folder. Equals total unless inline
+    // folders are expanded; every comparison with the native view uses it.
+    int rootTotal = 0;
+    EntryPathIndex entryPathIndex; // Worker-built; moves with the active snapshot.
+    EntryPathUpdates entryPathUpdates;
+    RowDetailsCache rowDetails; // Active folder's identity cache; moves with its snapshot.
+    std::shared_ptr<const NamespaceIdentities> namespaceIdentities;
+    unsigned long long displayedOrderHash = 0; // Worker-computed ordered name digest.
+    unsigned long long displayedMetadataHash = 0; // Worker-computed attributes digest.
+    SelectionFlags selectedFlags;
+    // Enumeration state and generations. Directory I/O, sorting and type
+    // resolution run on the tab's background lanes, never in paint or timers.
+    bool loaded = false;
+    bool directoryPending = false;
+    bool namesPreview = false;
+    unsigned long long directoryToken = 0; // independent refresh generation
+    // Change tracking. The watch belongs to the active folder and never
+    // enters the cache; dirChange aliases into it and never owns it.
+    bool watchedChangePending = false;
+    std::shared_ptr<FolderChangeStamp> validatedFolderStamp;
+    unsigned long long validatedFolderRevision = 0;
+    HANDLE dirChange = INVALID_HANDLE_VALUE;
+    std::unique_ptr<FolderWatch> directoryWatch;
+};
+
+struct ViewState : FolderModel {
     ItemTip itemTip;
     // The bridge state is owner-STA-only. A presentation instance contains
     // sparse immutable model rows and owns its graphics exclusively on a lane.
@@ -4198,6 +4446,10 @@ struct ViewState {
     unsigned long long detailsRefreshEpoch = 0;
     ULONGLONG lastColumnsProbe = 0;
     float columnContentWidth = 0.f, horizontalScroll = 0.f;
+    ScrollbarLayoutMotion scrollbarLayoutMotion;
+    std::array<ScrollbarGeometry,2> acceptedScrollbars{};
+    std::optional<unsigned long long> acceptedScrollbarToken;
+    bool presentationScrollbarGeometryPending = false;
     bool horizontalScrollbarAdmitted = false; // Optional chrome waits for settled column geometry.
     unsigned long long horizontalScrollbarDeferrals = 0; // Overflow held back while columns settled.
     bool horizontalScrollbarPublished = false; // A presented frame has shown the admitted bar.
@@ -4292,10 +4544,11 @@ struct ViewState {
     bool viewSignalRequiresScan = false;
     ComPtr<IFolderView2> folderView;
     ComPtr<IShellBrowser> shellBrowser;
-    ComPtr<IShellFolder> folder;
-    SharedPidl directoryFolderIdentity; // Captured once per binding, never per refresh/hover.
-    std::wstring folderPath;
-    ShellVisibilityPolicy visibility;
+    // Switching to the native view while the selection lies inside one
+    // expanded child folder browses there; the native view then selects
+    // these items once its view for that folder exists. Owner-only.
+    OwnedPidl nativeRevealFolder;
+    std::vector<OwnedPidl> nativeRevealItems;
     bool compactRows = false; // Explorer's View > Compact view, for list rows.
     bool visibilitySignalQueued = false;
     bool visibilitySelectionSyncPending = false;
@@ -4339,23 +4592,9 @@ struct ViewState {
     std::wstring immediateBackFrom;
     std::wstring immediateBackTo;
     HWND immediateBackTab = nullptr;
-    SortSpec sort = DefaultSort();
-    SortSpec displayedSort = DefaultSort(); // sort that actually produced the visible rows
-    ShellGroupSpec grouping;
     ShellGroupSpec queuedDirectoryGrouping; // Captured for provisional worker reconciliation.
-    ShellGroupSpec displayedGrouping;
-    // Group headings are layout items, not Shell items. Physical item indices
-    // remain unchanged for QuickLook, PIDL selection and file operations.
-    struct GroupSection {
-        std::wstring key, title;
-        int first = 0, end = 0;
-        float documentTop = 0.f, documentEnd = 0.f;
-        bool collapsed = false;
-        float fraction = 1.f;
-        float from = 1.f, to = 1.f;
-        LARGE_INTEGER started{};
-    };
-    std::vector<GroupSection> sections;
+    unsigned calendarRevision=0;
+    unsigned long long calendarStamp=0, requestedCalendarStamp=0;
     std::optional<std::wstring> keyboardSectionKey; // Empty group keys are valid; null means item focus.
     std::shared_ptr<const SectionBadges> sectionBadges;
     bool sectionBadgeAnimating = false; // Lane paint only: a painted badge is still moving.
@@ -4364,7 +4603,6 @@ struct ViewState {
     unsigned long long groupRevealEpoch = 0;
     using GroupIntents=std::map<std::wstring,GroupSection>;
     std::shared_ptr<const GroupIntents> presentationGroupIntents;
-    std::vector<int> rowGroup; // O(1) row-to-section lookup
     bool groupAnimating = false;
     LARGE_INTEGER groupFrameQpc{}; // Geometry sample shared with the input owner.
     int hotSection = -1;
@@ -4388,9 +4626,60 @@ struct ViewState {
     ULONGLONG lastFolderNativeNextAttempt = 0;
     bool lastFolderNativeAfterPaint = false;
     unsigned long long lastFolderNativePresentAfter = 0;
-    std::vector<Entry> entries;
-    EntryPathIndex entryPathIndex; // Worker-built; moves with the active snapshot.
-    EntryPathUpdates entryPathUpdates;
+    struct InlineTreeNode {
+        std::wstring path; // Expanded folder (filesystem path), at any depth.
+        unsigned short depth = 1; // Depth of its children.
+        std::vector<Entry> children; // Sorted listing; empty until loaded.
+        bool loaded = false;
+        unsigned long long request = 0;
+        unsigned long long received = 0; // Request whose listing arrived; below request while one is in flight.
+        SortSpec sort; // Order the listing was requested in.
+        std::shared_ptr<std::atomic<bool>> cancelled;
+        LARGE_INTEGER requestedQpc{}; // First listing request, for the busy indicator.
+        LARGE_INTEGER spinnerQpc{};   // When the busy indicator appeared; zero if never.
+        std::optional<std::vector<Entry>> deferred; // Listing held until the indicator's minimum time.
+        DWORD error = ERROR_SUCCESS; // Of the latest listing; shown once loaded.
+    };
+    std::vector<InlineTreeNode> inlineTree; // Belongs to inlineTreeFolder only.
+    bool inlineTreeReopenQueued = false; // kMsgInlineTreeReopen is in the queue.
+    // A rebuild of the expanded rows held back while a rename field is open
+    // (as the open folder's re-list is); run once the field closes.
+    bool inlineTreeRegraftDeferred = false;
+    bool inlineSelectionNoticeQueued = false; // kMsgInlineSelectionNotice is in the queue.
+    bool inlineSelectionWasDetached = false; // The last notice described a selection with children.
+    // The selection's Shell IDs, valid for one selection and row set (InlineSelectionPidls).
+    struct InlineSelectionCache {
+        std::vector<OwnedPidl> items;
+        std::vector<std::wstring> paths; // The selected rows it was built for, in row order.
+        unsigned long long directory = 0;
+        bool failed = false; // An item had no identity (deleted, offline): asked again only after the rows change.
+    } inlineSelectionCache;
+    std::wstring inlineTreeFolder;
+    // Expanded folders of folders this tab left, with their last listings, so
+    // Back/Forward reopen them at once and then refresh. An entry lives only
+    // while its folder is in this tab's folder cache.
+    std::map<std::wstring, std::vector<InlineTreeNode>, CaseInsensitiveFolderLess> inlineTreeMemory;
+    // Folder this tab returned from (Back/Up into an ancestor). Once restored
+    // expansion lists it, its row is selected and centred instead of the root.
+    std::wstring inlineTreeReturnPath;
+    unsigned long long inlineTreeRequest = 0;
+    // Presentation state (copied to the presentation lane): the chevron turns
+    // on the shared UI clock, and slow listings show a busy indicator instead.
+    struct InlineTreeChevron {
+        std::wstring path;
+        LARGE_INTEGER started{};
+        float from = 0.f; // 0 collapsed .. 1 expanded, where the turn started.
+        bool expanded = false;
+    };
+    std::vector<InlineTreeChevron> inlineTreeChevrons;
+    struct InlineTreeSpinner { std::wstring path; LARGE_INTEGER shown{}; };
+    std::vector<InlineTreeSpinner> inlineTreeSpinners;
+    // Branch under the pointer: the expanded folder whose line is hovered.
+    std::wstring inlineGuideHotPath;
+    int inlineGuideHotDepth = -1;
+    // The Shell menu of a selection that includes inline children, while its
+    // popup is open; owner-drawn submenus are forwarded to it.
+    ComPtr<IContextMenu> inlineMenu;
     bool returningListFocus = false;
     bool selectionTraceRunning = false;
     unsigned long long selectionTraceSequence = 0;
@@ -4421,6 +4710,8 @@ struct ViewState {
     std::vector<ZebraBand> zebraBands, zebraFromBands, zebraTargetBands;
     // Paint-only working sets, reused every frame for their capacity.
     struct ZebraBody { const std::wstring* key; float top, bottom; };
+    std::vector<std::pair<size_t,PaintedFeedback>> selectionPaintScratch;
+    std::vector<PaintedFeedback> ghostPaintScratch;
     std::vector<ZebraBand> zebraNextScratch, zebraPresentedScratch;
     std::vector<std::pair<float,float>> zebraBlankScratch, zebraFillScratch;
     std::vector<ZebraBody> zebraBodyScratch;
@@ -4436,23 +4727,14 @@ struct ViewState {
     float zebraExtentFrom = 0.f, zebraExtentTo = 0.f, zebraExtentPresented = 0.f;
     LARGE_INTEGER zebraExtentStartedQpc{};
     FolderCache folderCache; // Central authority for ALL visited filesystem folders.
-    RowDetailsCache rowDetails; // Active folder's identity cache; moves with its snapshot.
-    unsigned long long displayedOrderHash = 0; // Worker-computed ordered name digest.
-    unsigned long long displayedMetadataHash = 0; // Worker-computed attributes digest.
     // Directory I/O, sorting, locale formatting and file-type resolution run
     // on a dedicated background worker, never in WM_PAINT / WM_TIMER.
-    bool directoryPending = false;
-    bool namesPreview = false;
     bool refreshAgain = false;
-    std::shared_ptr<const NamespaceIdentities> namespaceIdentities;
     bool namespaceCheckPending = false;
     // Filesystem-watch bursts are coalesced before starting the GPU diff.
     // These fields belong to the active folder and never enter the cache.
-    bool watchedChangePending = false;
     bool watchedChangeVerifyOnly = false;
     bool directoryFlushQueued = false;
-    std::shared_ptr<FolderChangeStamp> validatedFolderStamp;
-    unsigned long long validatedFolderRevision = 0;
     unsigned long long observerSequence = 0, observerId = 0, presentObserverId = 0;
     LONGLONG observerQpc = 0, presentObserverQpc = 0, observerCommitQpc = 0;
     bool sortCheckPending = false, sortCheckOverflow = false;
@@ -4493,7 +4775,6 @@ struct ViewState {
     int iconsResolved = 0;
     bool iconUploadsPending = false;
     unsigned long long token = 0; // icon-generation identity
-    unsigned long long directoryToken = 0; // independent refresh generation
     ULONGLONG iconTick = 0;
     ULONGLONG iconViewportGeneration = 1;
     float scrollNow = 0.f, scrollTarget = 0.f;
@@ -4604,7 +4885,6 @@ struct ViewState {
     // synthetic Shell selection.
     std::wstring postDeletionFocusPath;
     int restoredKeyboardRow = -1;
-    SelectionFlags selectedFlags;
     // Per-tab clipboard snapshot. Updated on WM_CLIPBOARDUPDATE and on attach;
     // only visible content is tested at paint time. No row-vector traversal.
     ClipboardPaths clipboardPaths, clipboardPendingPaths;
@@ -4736,7 +5016,7 @@ struct ViewState {
         bool middleTrim=false;
     };
     std::unordered_map<int, WidthEntry> widthCache;
-    TextLayoutCache textLayouts[4]; // Body, header, sorted header, wrapped icon labels.
+    TextLayoutCache textLayouts[5]; // Body, header, sorted header, wrapped icon labels, themed group titles.
     struct {
         ComPtr<IDWriteTextFormat> format;
         std::vector<std::wstring> labels;
@@ -4945,6 +5225,10 @@ struct ViewState {
     float swipeEdgeX = 0.f; // Only displacement left over after column scrolling.
     double touchpadPinchHeight96 = 0.;
     int pinchRevealRow = -1; // Selection fully visible when a direct pinch began.
+    int pinchAnchorRow = -1;
+    float pinchAnchorFraction = 0.f;
+    std::wstring pinchAnchorPath;
+    unsigned long long pinchAnchorToken = 0;
     // An intentional horizontal gesture is locked separately from vertical pan.
     // The preview uses compositor redraws only while it is visible or fading.
     bool swipeHorizontal = false;
@@ -4972,8 +5256,6 @@ struct ViewState {
     float measuredNameAvailable = -1.f;
     float measuredNameWidth = 0.f;
     int dragDivider = -1, dragStartX = 0, dragStartPos = 0;
-    HANDLE dirChange = INVALID_HANDLE_VALUE; // Alias into directoryWatch, never owns it.
-    std::unique_ptr<FolderWatch> directoryWatch;
     unsigned long long watchToken = 0;
     // Per-tab, per-directory Shell notifications. A recent interactive New
     // command licenses one created item for immediate GPU inline editing.
@@ -4990,7 +5272,6 @@ struct ViewState {
     unsigned long long creationCommandToken = 0;
     // bit 1 = folder, bit 2 = file, bit 3 = either.
     unsigned creationCommandMask = 0;
-    int total = 0;
     int selected = -1;
     // The native host stays hidden throughout GPU mode, including resize and
     // loading. Its COM model remains alive; no region repair or draw race.
@@ -5011,11 +5292,14 @@ struct ViewState {
     int scroll = 0;
     float rowPx = 32.f;
     float headerPx = 38.f;
+    float headerTextHeight96 = 0.f;
+    float headerFontSize96 = 0.f;
     float fontPx = 17.f;
+    // Cap height per em of textFormat's face; 0 = not yet read, < 0 = unavailable.
+    mutable float bodyCapRatio = 0.f; // Lazily read cache; paint may hold const state.
     float iconPx = 19.f;
     float listIconPx = 19.f; // Retain the header's Name inset while a grid is active.
     bool visible = true;
-    bool loaded = false;
     unsigned featureInitializationStep = 0;
     bool featureInitializationQueued = false;
     const unsigned long long lifetimeToken = g_nextToken.fetch_add(1);
@@ -5046,10 +5330,12 @@ struct ViewState {
     bool graphicsReleaseQueued = false, graphicsSuspended = false, gpuDeviceCounted = false;
     bool graphicsStandby = false, graphicsStandbyPending = false, graphicsStandbyTrimmed = false;
     unsigned long long graphicsPaintSerial = 0, lastAcceptedPaint = 0;
+    unsigned long long lastAcceptedPresentationModel = 0;
     unsigned graphicsOperations = 0; // Native/COM dispatch can reenter any graphics scope.
     ULONGLONG lastGpuMemoryLog = 0;
     bool resizeDeferred = false;
     bool presentationFrameSizing = false; // Lane copy of the owner's interactive sizing state.
+    bool exactBuffersRequested = false; // Lane: an off-screen pass returns to exact buffers.
     bool hardwareTarget = false;
     int wheelRemainder = 0;
     ULONGLONG lastRefresh = 0;
@@ -5066,12 +5352,15 @@ struct ViewState {
     std::shared_ptr<const Theme::Document> themeSnapshot = Theme::Snapshot();
     Theme::Mode themeMode = Theme::Mode::Light;
     bool themeHighContrast = false;
+    std::shared_ptr<const ContrastPalette> contrastPalette;
+    unsigned long long paletteRevision=0;
+    COLORREF tipBaseBackground=CLR_INVALID, tipBaseForeground=CLR_INVALID;
     struct HighlightResources {
         std::shared_ptr<const Theme::Document> snapshot;
         Theme::Mode mode = Theme::Mode::Light;
         COLORREF accent = CLR_INVALID;
         std::array<ComPtr<ID2D1LinearGradientBrush>, 3> gradients;
-        std::array<int, 3> opacity{};
+        std::array<float, 3> opacity{};
         // 64..16384 texels, in powers of two: under 3 MiB of pixel data for
         // all three states combined. No per-item entries or resize churn.
         std::array<ThemeGradientRamps, 3> ramps;
@@ -5143,11 +5432,8 @@ struct ViewState {
         ComPtr<IDCompositionEffectGroup> opacity;
         ComPtr<IDCompositionAnimation> fade;
         unsigned long long revision=0,traceRevision=0;
-        std::shared_ptr<const Theme::Document> theme;
-        Theme::Mode themeMode=Theme::Mode::Light;
         bool highContrast=false;
-        unsigned long long palette=0;
-        COLORREF background=CLR_INVALID,foreground=CLR_INVALID;
+        unsigned long long palette=0, contrastRevision=0;
         LARGE_INTEGER origin{},fadeStarted{};
         double frequency=0.;
         D2D1_RECT_F bounds{};
@@ -5265,7 +5551,7 @@ struct SwipeFeedbackSnapshot {
     X(startupAnimationsSuppressed) \
     X(itemsPerRow) X(itemWidth) X(columns) X(columnEpoch) X(propertyEpoch) X(columnContentWidth) \
     X(imageMemoryAllowance) X(imageCacheFloor) \
-    X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
+    X(scrollbarLayoutMotion) X(columnVerticalBarVisible) X(horizontalScroll) X(horizontalScrollbarAdmitted) X(horizontalScrollbarPublished) \
     X(columnTransitionActive) X(columnTransitionSpring) \
     X(columnModeTransition) X(columnPresentationPending) X(columnHeaderFrom) X(columnHeaderTo) \
     X(columnTransitionStartedQpc) X(columnMotion) X(disappearingColumns) X(columnDragArmed) X(columnDragActive) \
@@ -5289,10 +5575,11 @@ struct SwipeFeedbackSnapshot {
     X(zoomAnimating) X(zoomFromHeight96) X(zoomFromRowPx) X(zoomFromFontPx) X(zoomFromIconPx) X(zoomToIconPx) \
     X(zoomToFontPx) X(zoomToRowPx) X(zoomFromScroll) X(zoomAnchorRow) X(zoomStartedQpc) X(zoomFromContent) X(zoomFromCompact) X(horizontalAnimating) \
     X(horizontalFrom) X(horizontalTarget) X(horizontalStartedQpc) X(draggingHorizontal) X(draggingScrollbar) \
-    X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
-    X(nativeTextColor) X(nativeHeaderTextColor) X(themeSnapshot) X(themeMode) X(themeHighContrast) \
+    X(dragDivider) X(total) X(selected) X(rowPx) X(headerPx) X(headerTextHeight96) X(headerFontSize96) X(fontPx) X(iconPx) X(listIconPx) X(visible) X(loaded) \
+    X(nativeTextColor) X(nativeHeaderTextColor) X(nativeEditBackground) X(contrastPalette) X(themeSnapshot) X(themeMode) X(themeHighContrast) \
     X(cachedNativeMode) X(folderPath) X(selectedFlags) \
-    X(presentationStyleRevision) X(presentationGroupIntents) X(lastInteractionTick) X(pipelineInputTime) X(uiTraceUntil)
+    X(presentationStyleRevision) X(presentationGroupIntents) X(lastInteractionTick) X(pipelineInputTime) X(uiTraceUntil) \
+    X(inlineTreeChevrons) X(inlineTreeSpinners) X(inlineGuideHotPath) X(inlineGuideHotDepth)
 
 struct PresentationModel : SwipeFeedbackSnapshot {
 #define PRESENTATION_FIELD(name) std::remove_cvref_t<decltype(std::declval<ViewState>().name)> name{};
@@ -5302,6 +5589,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     LARGE_INTEGER columnIntentOrigin{};
     RECT client{}; int dpi=96; LOGFONTW font{};
     bool frameSizing=false; // The frame is between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE.
+    bool scrollbarGeometryPending=false;
     bool active=false,inputFocus=false,selectionFeedback=false;
     HWND renameEditor=nullptr; int renameIndex=-1;
     float documentHeight=0.f;
@@ -5317,6 +5605,7 @@ struct PresentationModel : SwipeFeedbackSnapshot {
     ClipboardPaths clipboard;
 };
 struct PresentationReceipt {
+    std::array<ScrollbarGeometry,2> scrollbars{};
     unsigned long long sequence=0,lifetime=0,token=0,directoryToken=0,rowRevision=0;
     unsigned long long frames=0;
     unsigned long long swipeFeedbackRevision=0;
@@ -5591,6 +5880,13 @@ bool ViewOptionEnabled(const ViewState& state, const std::atomic<ViewOption>& op
     const auto value = option.load(std::memory_order_relaxed);
     return value == ViewOption::AlwaysOn || (value == ViewOption::GridOnly && state.gridView);
 }
+// Middle ellipsis: filenames follow the option; with Always on, the other body
+// text (Details metadata columns, tile and content lines) trims the same way.
+// Column headers and group headings keep end trimming.
+bool MiddleTrimmedText(const ViewState& state, bool filename, bool bodyText) {
+    if (filename) return ViewOptionEnabled(state, g_middleEllipsis);
+    return bodyText && g_middleEllipsis.load(std::memory_order_relaxed) == ViewOption::AlwaysOn;
+}
 bool FileThumbnails(const ViewState& state) {
     return state.gridView ? state.layoutNativeMode != FVM_SMALLICON :
         g_listThumbnails.load(std::memory_order_relaxed);
@@ -5598,9 +5894,44 @@ bool FileThumbnails(const ViewState& state) {
 bool UsesThumbnails(const ViewState& state, const Entry& entry) {
     return !entry.folder && FileThumbnails(state);
 }
-float GroupHeadingHeight(const ViewState& state) {
+float ItemTextLinePitch(float font);
+
+std::optional<float> ThemedHeadingFontSize(const Theme::SurfaceStyle* style, int dpi, bool gridView, float row, float font) {
+    if (!style || !style->fontSize) return std::nullopt;
+    const float size = *style->fontSize;
+    if (size < 0.f) return gridView ? std::nullopt : std::optional<float>(font);
+    const double scale = style->fontSizePercent ? row/100.0 : dpi/96.0;
+    return static_cast<float>(std::clamp(size*scale,1.0,double(kPlatformImageDimension)));
+}
+
+const Theme::SurfaceStyle* GroupHeadingTheme(const ViewState& state) {
+    if(state.themeHighContrast) return nullptr;
+    return state.themeSnapshot ? &state.themeSnapshot->groupHeadings[static_cast<size_t>(state.themeMode)] :
+        &Theme::defaultGroupHeading;
+}
+
+float DefaultGroupHeadingHeight(bool gridView, int dpi, float row, float font) {
+    return gridView ?
+        std::max(float(Scale96(24, dpi)), ItemTextLinePitch(font) + Scale96(8, dpi)) : row;
+}
+
+float GroupHeadingHeight(const ViewState& state, float row, float font) {
     const int dpi = ViewDpi(state);
-    return state.gridView ? std::max(float(Scale96(24, dpi)), state.fontPx * 1.5f + Scale96(8, dpi)) : state.rowPx;
+    const float normal = DefaultGroupHeadingHeight(state.gridView,dpi,row,font);
+    const auto* style = GroupHeadingTheme(state);
+    if (!style) return normal;
+    const auto fontSize = ThemedHeadingFontSize(style,dpi,state.gridView,row,font);
+    const auto height = style->height;
+    const bool fixedHeight = height && *height >= 0.f;
+    const bool autoHeight = height && *height < 0.f && !state.gridView;
+    if (!fixedHeight && !autoHeight && !fontSize) return normal;
+    const float requested = fixedHeight ? static_cast<float>(std::round(std::min(
+        *height*(dpi/96.0),double(kPlatformImageDimension)))) : normal;
+    const float minimum = std::ceil(ItemTextLinePitch(fontSize.value_or(font))) + 2.f*Scale96(2,dpi);
+    return std::max(requested,minimum);
+}
+float GroupHeadingHeight(const ViewState& state) {
+    return GroupHeadingHeight(state,state.rowPx,state.fontPx);
 }
 int ItemLineCount(const ViewState& state, int count) {
     return (count + std::max(1, state.itemsPerRow) - 1) / std::max(1, state.itemsPerRow);
@@ -5608,55 +5939,60 @@ int ItemLineCount(const ViewState& state, int count) {
 float SelectionCheckboxSpace(const ViewState& state, bool settled = false);
 bool SelectionCheckboxRevealMoving(const ViewState& state);
 bool SortChevronFlipping(const ViewState& state);
-void LayoutGroupSections(ViewState& state) {
-    state.itemsPerRow = 1;
+struct GridPacking { int columns; float width; };
+GridPacking PackGrid(const ViewState& state,float row,float font,float icon,float header) {
+    RECT client{}; ViewClientRect(state, &client);
+    const int dpi = ViewDpi(state);
+    // Pack the destination once, then move existing cells to it using
+    // the zoom clock. Packing interpolated icon sizes snaps at each
+    // integer column boundary partway through an otherwise smooth zoom.
+    const float checkboxSpace = (TileLayout(state) || state.layoutNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
+    // ExplorerFrame collection.smallicons: ItemGridLayout columnwidth
+    // 308rp and itemspacing 1rp. The checkbox lives inside that column.
+    const bool small = state.layoutNativeMode == FVM_SMALLICON;
+    const float smallPitch = float(Scale96(308,dpi) + Scale96(1,dpi));
+    const float minimum = (small ? 0.f : checkboxSpace) + (TileLayout(state) ?
+        std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
+            icon + font * 12.f + Scale96(24, dpi)) :
+        small ? std::max(smallPitch, checkboxSpace + icon + font * 6.f) :
+        std::max(static_cast<float>(GetSystemMetricsForDpi(SM_CXICONSPACING,dpi)), icon + Scale96(16, dpi)));
+    float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
+    auto extent = [&](int columns) {
+        const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
+        const float heading = GroupHeadingHeight(state,row,font);
+        const float gap = DefaultGroupHeadingHeight(true,dpi,row,font);
+        if (state.sections.empty()) return lines(state.total) * row;
+        float height = 0.f;
+        for (const auto& s : state.sections)
+            height += heading + (lines(s.end-s.first) * row + gap) * s.fraction;
+        return height;
+    };
+    int columns = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
+    if (g_scrollbar.load(std::memory_order_relaxed) &&
+        extent(columns) > std::max(0.f, client.bottom - header)) {
+        width = std::max(1.f, width - VerticalScrollbarClearance(dpi));
+        columns = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
+    }
+    return {columns,small ? std::min(width,minimum) : width/columns};
+}
+void LayoutGroupSections(ViewState& state,std::optional<GridPacking> packing=std::nullopt) {
+    state.itemsPerRow=1;
     if (state.gridView) {
-        RECT client{}; ViewClientRect(state, &client);
-        const int dpi = ViewDpi(state);
-        // Pack the destination once, then move existing cells to it using
-        // the zoom clock. Packing interpolated icon sizes snaps at each
-        // integer column boundary partway through an otherwise smooth zoom.
-        const float icon = state.zoomAnimating ? state.zoomToIconPx : state.iconPx;
-        const float font = state.zoomAnimating ? state.zoomToFontPx : state.fontPx;
-        const float checkboxSpace = (TileLayout(state) || state.layoutNativeMode==FVM_SMALLICON) ? SelectionCheckboxSpace(state,true) : 0.f;
-        // ExplorerFrame collection.smallicons: ItemGridLayout columnwidth
-        // 308rp and itemspacing 1rp. The checkbox lives inside that column.
-        const bool small = state.layoutNativeMode == FVM_SMALLICON;
-        const float smallPitch = float(Scale96(308,dpi) + Scale96(1,dpi));
-        const float minimum = (small ? 0.f : checkboxSpace) + (TileLayout(state) ?
-            std::max(Scale96(280, dpi) * font / std::max(1.f, static_cast<float>(Scale96(16, dpi))),
-                icon + font * 12.f + Scale96(24, dpi)) :
-            small ? std::max(smallPitch, checkboxSpace + icon + font * 6.f) :
-            std::max(static_cast<float>(GetSystemMetricsForDpi(SM_CXICONSPACING,dpi)), icon + Scale96(16, dpi)));
-        float width = std::max(1.f, client.right - 2.f * EdgeMarginPx(state));
-        auto extent = [&](int columns) {
-            const auto lines = [columns](int n) { return (n + columns - 1) / columns; };
-            const float row = state.zoomAnimating ? state.zoomToRowPx : state.rowPx;
-            const float heading = state.zoomAnimating ?
-                std::max(float(Scale96(24, ViewDpi(state))), font*1.5f+Scale96(8, ViewDpi(state))) :
-                GroupHeadingHeight(state);
-            if (state.sections.empty()) return lines(state.total) * row;
-            float height = 0.f;
-            for (const auto& s : state.sections)
-                height += heading + (lines(s.end-s.first) * row + heading) * s.fraction;
-            return height;
-        };
-        state.itemsPerRow = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
-        if (g_scrollbar.load(std::memory_order_relaxed) &&
-            extent(state.itemsPerRow) > std::max(0.f, client.bottom - state.headerPx)) {
-            width = std::max(1.f, width - VerticalScrollbarClearance(dpi));
-            state.itemsPerRow = std::max(1, static_cast<int>(width / std::max(1.f, minimum)));
-        }
-        state.itemWidth = small ? std::min(width,minimum) : width / state.itemsPerRow;
+        if (!packing) packing=PackGrid(state,state.zoomAnimating ? state.zoomToRowPx : state.rowPx,
+            state.zoomAnimating ? state.zoomToFontPx : state.fontPx,state.zoomAnimating ? state.zoomToIconPx : state.iconPx,state.headerPx);
+        state.itemsPerRow=packing->columns;
+        state.itemWidth=packing->width;
     }
     float y = state.presentationOnly && !state.presentationEntries && !state.sections.empty() ? state.sections.front().documentTop : 0.f;
+    const float heading = GroupHeadingHeight(state);
+    const float gap = DefaultGroupHeadingHeight(state.gridView,ViewDpi(state),state.rowPx,state.fontPx);
     for (auto& section : state.sections) {
         section.documentTop = y;
         // An empty list row separates sections. Grid headings use their
         // compact height, so large thumbnails do not create enormous gaps.
         // The spacing belongs to the body and collapses with its items.
-        y += GroupHeadingHeight(state) + (state.rowPx *
-            ItemLineCount(state, section.end-section.first) + GroupHeadingHeight(state)) * section.fraction;
+        y += heading + (state.rowPx *
+            ItemLineCount(state, section.end-section.first) + gap) * section.fraction;
         section.documentEnd = y;
     }
 }
@@ -5755,6 +6091,48 @@ bool DisplayedRow(const ViewState& state, int index) {
     }
     return DisplayRowHeight(state, index) > .01f;
 }
+// A grafted row of an expanded inline folder. It is drawn and hit tested like
+// any row, but the native view can't hold it, so it never becomes selected.
+bool TreeChildRow(const ViewState& state, int index) {
+    if (index < 0 || index >= state.total) return false;
+    if (!state.presentationOnly && static_cast<size_t>(index) >= state.entries.size()) return false;
+    return ModelEntry(state, index).treeDepth > 0;
+}
+bool InlineSelectionDetached(const ViewState& state);
+void QueueInlineSelectionNotice(ViewState& state);
+void RenameInlineSelection(ViewState& state, const std::wstring& text);
+// Rows the native view mirrors: the open folder's own rows. Inline children
+// belong to other folders and stay GPU-selected only; Explorer's own readers of
+// a selection that includes them get the whole selection from the selection
+// bridge (InstallSelectionBridge) instead.
+bool NativeMirrorsRow(const ViewState& state, size_t row) {
+    return row < state.entries.size() && !state.entries[row].treeDepth;
+}
+// Every shown row takes part in selection, including inline children. The
+// native view mirrors only its own rows; commands on a selection that holds
+// children use the items' Shell objects instead (InlineSelectionDetached).
+bool SelectableRow(const ViewState& state, int index) {
+    return DisplayedRow(state, index);
+}
+// Inline folders exist only in the Details list; List/grid modes keep their
+// own layouts. Grouping belongs to the open folder (the one the native view
+// shows): children sit under their folder inside its group, ungrouped.
+// Layout: the tree's geometry (the arrow's space, indentation, child depth),
+// also while the Details columns are still animating in, so a grid-to-Details
+// morph targets the final icon and arrow positions.
+bool InlineTreeLayout(const ViewState& state) {
+    return g_expandableFolders.load(std::memory_order_relaxed) && state.columnsView &&
+        !state.gridView && !state.thisPcGpu;
+}
+// Active: rows can be grafted and toggled, once that layout has settled.
+bool InlineTreeActive(const ViewState& state) {
+    return InlineTreeLayout(state) && !state.columnModeTransition;
+}
+// Filesystem folders only in this stage; namespace rows and archives keep
+// their native behaviour.
+bool InlineTreeExpandable(const Entry& e) {
+    return e.folder && !e.path.empty() && !e.path.starts_with(L"windhawk:");
+}
 int GroupAtDocument(const ViewState& state, float documentY) {
     if (state.sections.empty() || documentY < 0.f ||
         documentY >= state.sections.back().documentEnd) return -1;
@@ -5848,6 +6226,30 @@ float UiTransitionProgress(const ViewState& state, LARGE_INTEGER started,
         static_cast<double>(std::max<ULONGLONG>(1, durationMs))), 0.f, 1.f);
 }
 
+// Inline folder chevron: 0 pointing at the name, 1 turned down. A toggle turns
+// it from wherever it is, on the same clock and easing as group headings.
+float InlineTreeChevronTurn(const ViewState& state, const std::wstring& path, bool expanded,
+                            LARGE_INTEGER sampled = {}) {
+    for (const auto& chevron : state.inlineTreeChevrons)
+        if (_wcsicmp(chevron.path.c_str(), path.c_str()) == 0) {
+            const float to = chevron.expanded ? 1.f : 0.f;
+            return chevron.from + (to - chevron.from) *
+                EaseOutCubic(UiTransitionProgress(state, chevron.started, kUiTransitionDurationMs, sampled));
+        }
+    return expanded ? 1.f : 0.f;
+}
+const ViewState::InlineTreeSpinner* InlineTreeSpinnerFor(const ViewState& state, const std::wstring& path) {
+    for (const auto& spinner : state.inlineTreeSpinners)
+        if (_wcsicmp(spinner.path.c_str(), path.c_str()) == 0) return &spinner;
+    return nullptr;
+}
+bool InlineTreeAnimating(const ViewState& state) {
+    if (!state.inlineTreeSpinners.empty()) return true;
+    for (const auto& chevron : state.inlineTreeChevrons)
+        if (UiTransitionProgress(state, chevron.started) < 1.f) return true;
+    return false;
+}
+
 // How much of Content's line layout the list presents: 1 in Content, 0 in
 // List/Details, and in between while a zoom carries one into the other.
 float ContentReveal(const ViewState& state) {
@@ -5929,6 +6331,12 @@ float LayoutTransitionProgress(const ViewState& state, bool active, LARGE_INTEGE
         kUiTransitionDurationMs,sampled)) : 0.f;
 }
 
+float RowTransitionScrollDelta(const ViewState& state) {
+    // Animated zoom already moves the viewport and the destination together.
+    // Its captured source poses are in window coordinates.
+    return state.zoomLayoutTransition ? 0.f : state.scrollNow-state.rowTransitionOldScroll;
+}
+
 float CurrentRowProgress(const ViewState& state) {
     if (!state.rowTransitionActive) return 1.f;
     return (state.presenter || (state.modeComposition.rows && state.modeComposition.published)) && state.rowTransitionStartedQpc.QuadPart ?
@@ -5945,7 +6353,7 @@ RowVisual LayoutGroupHeader(const ViewState& state, size_t section, float progre
             state.groupHeaderMotion.end(), static_cast<int>(section),
             [](const GroupHeaderMotion& motion, int id) { return motion.sectionIndex < id; });
         if (it != state.groupHeaderMotion.end() && it->sectionIndex == static_cast<int>(section)) {
-            const float from = it->oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float from = it->oldTop - RowTransitionScrollDelta(state);
             visual.top = from + (visual.top - from) * progress;
             if(it->oldHeight>=0.f) {
                 visual.height=it->oldHeight+(visual.height-it->oldHeight)*progress;
@@ -5985,8 +6393,8 @@ std::vector<CapturedGroupHeader> CaptureVisibleGroupHeaders(const ViewState& sta
         const auto& section = state.sections[i];
         if (section.documentTop > to) break;
         if (section.documentTop + GroupHeadingHeight(state) < from && static_cast<int>(i) != pinned) continue;
-        headers.push_back({section.key, section.title,
-            LayoutGroupHeader(state, i, progress, false).top, section.collapsed});
+        const auto visual=LayoutGroupHeader(state,i,progress,false);
+        headers.push_back({section.key,section.title,visual.top,section.collapsed,visual.height,visual.opacity});
     }
     return headers;
 }
@@ -6089,6 +6497,8 @@ bool NeedsAnimationPaint(const ViewState& state, bool includeEnrichment = true, 
         (SortChevronFlipping(state) && state.columnsView && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (SelectionCheckboxRevealMoving(state) && state.visible && state.inScope && state.detailsViewActive &&
+            PresentationVisible(state) && !PresentationMinimized(state)) ||
+        (InlineTreeAnimating(state) && state.columnsView && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
         (state.itemOpacityAnimating && state.visible && state.inScope && state.detailsViewActive &&
             PresentationVisible(state) && !PresentationMinimized(state)) ||
@@ -7061,6 +7471,8 @@ HRESULT WINAPI RaiseStructureEventHook(IRawElementProviderSimple* provider,Struc
 }
 
 RECT CurrentNativeViewportBounds(ViewState::NativeViewportOwnership& viewport);
+void EnsureOverlayTop(ViewState& state);
+static HWND FolderContentHost(HWND native);
 
 LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                     UINT_PTR id, DWORD_PTR owner) {
@@ -7139,11 +7551,31 @@ LRESULT CALLBACK NativeHostSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     // final values while USER is still inside the pre-layout transaction.
     constrain();
     if (msg == WM_WINDOWPOSCHANGED && lp &&
-        (reinterpret_cast<WINDOWPOS*>(lp)->flags & (SWP_NOSIZE | SWP_NOMOVE)) != (SWP_NOSIZE | SWP_NOMOVE) &&
-        !GetPropW(hwnd, kNativeLayoutQueuedProperty)) {
-        SetPropW(hwnd, kNativeLayoutQueuedProperty, reinterpret_cast<HANDLE>(1));
-        if (!PostMessageW(reinterpret_cast<HWND>(owner), kMsgEnsureTop, 0, reinterpret_cast<LPARAM>(hwnd)))
-            RemovePropW(hwnd, kNativeLayoutQueuedProperty);
+        (reinterpret_cast<WINDOWPOS*>(lp)->flags & (SWP_NOSIZE | SWP_NOMOVE)) != (SWP_NOSIZE | SWP_NOMOVE)) {
+        // Follow a resize of the bound view's geometry host inside Explorer's
+        // own layout pass (pane toggles, splitter drags, frame sizing), so DWM
+        // never composes the resized host beside the old overlay bounds.
+        // Moves are not followed here: a navigation lays the replacement view
+        // out through transient positions (e.g. x=0 over the navigation
+        // pane) before its final one, and a view still being bound is not
+        // this overlay's geometry yet. Those keep the posted follow-up, which
+        // runs after the whole pass and also repairs suppression/stacking.
+        static thread_local bool following = false;
+        const UINT flags = reinterpret_cast<WINDOWPOS*>(lp)->flags;
+        if (auto* state = State(reinterpret_cast<HWND>(owner)); state && !following &&
+            (flags & SWP_NOMOVE) && !state->nativePresentationPending &&
+            (!state->pendingShellView || state->pendingShellView == state->nativeHwnd) &&
+            hwnd == (FolderContentHost(state->nativeHwnd) ? FolderContentHost(state->nativeHwnd) : state->nativeHwnd) &&
+            GetWindowThreadProcessId(state->hwnd, nullptr) == GetCurrentThreadId()) {
+            following = true; // Suppression may reposition this host again.
+            EnsureOverlayTop(*state);
+            following = false;
+        }
+        if (!GetPropW(hwnd, kNativeLayoutQueuedProperty)) {
+            SetPropW(hwnd, kNativeLayoutQueuedProperty, reinterpret_cast<HANDLE>(1));
+            if (!PostMessageW(reinterpret_cast<HWND>(owner), kMsgEnsureTop, 0, reinterpret_cast<LPARAM>(hwnd)))
+                RemovePropW(hwnd, kNativeLayoutQueuedProperty);
+        }
     }
     return result;
 }
@@ -7746,7 +8178,7 @@ D2D1_COLOR_F Packed(unsigned rgb, float alpha = 1.f) {
 // the title-bar glass color: with an automatic accent it is a darkened, blended
 // variant (and it lags manual changes), so it is only a last resort. The last
 // accent read on a WinRT-capable thread is kept for threads that cannot
-// activate UISettings (settings load), never replaced by a guess.
+// activate UISettings, including workers serving newly opened tabs.
 std::atomic<COLORREF> g_systemAccent{CLR_INVALID};
 bool ReadSystemAccent(COLORREF& accent) {
     using namespace ABI::Windows::UI::ViewManagement;
@@ -7758,49 +8190,59 @@ bool ReadSystemAccent(COLORREF& accent) {
         FAILED(RoActivateInstance(className, &instance)) || FAILED(instance.As(&colors)) ||
         FAILED(colors->GetColorValue(UIColorType_Accent, &value)) || value.A != 255) return false;
     accent = RGB(value.R, value.G, value.B);
-    g_systemAccent.store(accent, std::memory_order_relaxed);
+    g_systemAccent.store(accent,std::memory_order_relaxed);
     return true;
 }
 
-// queryAccent=false reuses the accent a tab's palette refresh just read with
-// its own UISettings activation, so a color event costs one activation per tab.
-void RefreshThemeColor(bool queryAccent = true) {
+// Find the least opaque ink
+// that meets the requested contrast against the resting surface.
+ContrastPalette::Ink ContrastInk(COLORREF surface,double ratio=4.5,unsigned steps=255,
+                                 std::optional<COLORREF> foreground=std::nullopt) {
+    const unsigned ink=foreground ? *foreground : ReadableForeground(surface,{});
+    unsigned low=0,high=steps;
+    while(low<high) {
+        const unsigned mid=(low+high)/2;
+        const auto channel=[&](BYTE c){return (c*(steps-mid)+GetRValue(ink)*mid)/steps;};
+        const auto blended=RGB(channel(GetRValue(surface)),channel(GetGValue(surface)),channel(GetBValue(surface)));
+        if(ColorContrast(blended,surface)>=ratio) high=mid; else low=mid+1;
+    }
+    // If the target is unreachable, the search saturates at full opacity.
+    return {ink,float(high)/steps};
+}
+unsigned long long ReadAccentPalette(bool highContrast,unsigned long long previous) {
     DWORD dwm = 0; BOOL opaque = FALSE;
     COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     if (!ValidRgb(accent)) accent = RGB(0,120,215);
     COLORREF system = CLR_INVALID;
-    if ((queryAccent && ReadSystemAccent(system)) ||
-        ValidRgb(system = g_systemAccent.load(std::memory_order_relaxed)))
+    const bool haveSystem=ReadSystemAccent(system) ||
+        ValidRgb(system = g_systemAccent.load(std::memory_order_relaxed));
+    if (haveSystem)
         accent = system;
     else if (SUCCEEDED(DwmGetColorizationColor(&dwm, &opaque)) && (dwm >> 24))
         accent = RGB((dwm>>16)&255,(dwm>>8)&255,dwm&255);
-    HIGHCONTRASTW contrast{sizeof(contrast)};
-    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
-        (contrast.dwFlags&HCF_HIGHCONTRASTON);
     if(highContrast) accent=GetSysColor(COLOR_HIGHLIGHT);
-    if (g_dynamicAccent.load(std::memory_order_relaxed)) g_selectionRgb.store(accent);
     COLORREF foreground=highContrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : 0;
-    const auto previous=g_swipePalette.load(std::memory_order_relaxed);
     const auto key=(1ull<<63) | (highContrast ? 1ull<<62 : 0) | accent;
     if((previous & ((3ull<<62)|0xFFFFFF))==key &&
-        (!highContrast || COLORREF((previous>>24)&0xFFFFFF)==foreground)) return;
+        (!highContrast || COLORREF((previous>>24)&0xFFFFFF)==foreground)) return previous;
     unsigned alpha=255;
     if(!highContrast) {
-        foreground=ColorContrast(RGB(0,0,0),accent)>=ColorContrast(RGB(255,255,255),accent) ? RGB(0,0,0):RGB(255,255,255);
-        // Minimum translucent black/white that retains 4.5:1 contrast on the
-        // opaque accent surface. Compute only when the cached accent changes.
-        unsigned low=0,high=255;
-        while(low<high) {
-            const unsigned mid=(low+high)/2;
-            const COLORREF blended=RGB((GetRValue(accent)*(255-mid)+GetRValue(foreground)*mid)/255,
-                (GetGValue(accent)*(255-mid)+GetGValue(foreground)*mid)/255,
-                (GetBValue(accent)*(255-mid)+GetBValue(foreground)*mid)/255);
-            if(ColorContrast(blended,accent)>=4.5) high=mid; else low=mid+1;
-        }
-        alpha=high;
+        const auto ink=ContrastInk(accent);
+        foreground=ink.rgb;
+        alpha=unsigned(std::lround(ink.alpha*255));
     }
-    g_swipePalette.store(key | (static_cast<unsigned long long>(foreground)<<24) |
-        (static_cast<unsigned long long>(alpha)<<48),std::memory_order_relaxed);
+    return key | (static_cast<unsigned long long>(foreground)<<24) |
+        (static_cast<unsigned long long>(alpha)<<48);
+}
+
+// Retained for callers that explicitly refresh the standalone accent defaults.
+[[maybe_unused]] void RefreshThemeColor() {
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool highContrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0) &&
+        (contrast.dwFlags&HCF_HIGHCONTRASTON);
+    const auto palette=ReadAccentPalette(highContrast,g_swipePalette.load());
+    g_swipePalette.store(palette,std::memory_order_relaxed);
+    if(g_dynamicAccent.load()) g_selectionRgb.store(COLORREF(palette&0xffffff));
 }
 
 // Convert COLORREF (0x00BBGGRR) to the Direct2D 0x00RRGGBB convention.
@@ -7898,6 +8340,173 @@ void OptIntoDarkMode(HWND hwnd, bool allow) {
 void RefreshItemTipPalette(ViewState& state, bool highContrast);
 void RefreshViewTogglePalette(ViewState& state);
 
+DWORD WINAPI DirectoryWorkerProc(LPVOID context);
+std::array<float,3> HighlightOpacities(const Theme::Document* theme,Theme::Mode mode);
+void QueueContrastPalette(ViewState& state,bool tooltipOnly=false) {
+    if (!state.hwnd || state.presentationOnly || !state.background) return;
+    auto& work=*state.background;
+    if (!work.hwnd) work.hwnd=state.hwnd;
+    if (!StartTabWorker(state.background,work.palette,DirectoryWorkerProc,THREAD_PRIORITY_BELOW_NORMAL)) return;
+    {
+        ExclusiveSrwLock lock(work.directoryLock);
+        const auto theme=state.themeHighContrast ? nullptr : state.themeSnapshot;
+        const auto base=tooltipOnly && state.contrastPalette && state.contrastPalette->theme==theme &&
+            state.contrastPalette->mode==state.themeMode && state.contrastPalette->revision==state.paletteRevision ?
+            state.contrastPalette : nullptr;
+        const auto cachedAccent=state.contrastPalette && !state.themeHighContrast ? state.contrastPalette->accent : 0;
+        work.paletteJob=PaletteRequest{theme,state.themeMode,state.nativeEditBackground,state.nativeTextColor,
+            state.tipBaseBackground,state.tipBaseForeground,g_selectionRgb.load(),
+            HighlightOpacities(theme.get(),state.themeMode),++state.paletteRevision,cachedAccent,
+            g_dynamicAccent.load(),state.themeHighContrast,base};
+    }
+    SetEvent(work.palette.wake);
+}
+
+const auto& HighlightStyles(const Theme::Document* theme, Theme::Mode mode) {
+    static const std::array<Theme::SurfaceStyle,3> defaults{};
+    return theme ? theme->highlights[static_cast<size_t>(mode)] : defaults;
+}
+std::array<float,3> HighlightOpacities(const Theme::Document* theme,Theme::Mode mode) {
+    const auto& styles=HighlightStyles(theme,mode);
+    return {styles[0].highlightOpacity.value_or(g_selectionAlpha.load()/100.f),
+        styles[1].highlightOpacity.value_or(g_hoverAlpha.load()/100.f),
+        styles[2].highlightOpacity.value_or(g_bothAlpha.load()/100.f)};
+}
+const ContrastPalette* HighlightPalette(const ViewState& state) {
+    return state.themeHighContrast ? nullptr : state.contrastPalette.get();
+}
+const Theme::Document* PaintedHighlightTheme(const ViewState& state) {
+    const auto* palette=HighlightPalette(state);
+    return palette ? palette->theme.get() : nullptr;
+}
+Theme::Mode PaintedHighlightMode(const ViewState& state) {
+    const auto* palette=HighlightPalette(state);
+    return palette ? palette->mode : state.themeMode;
+}
+auto HighlightOpacities(const ViewState& state) {
+    const auto* palette=HighlightPalette(state);
+    return palette ? palette->opacity : HighlightOpacities(nullptr,state.themeMode);
+}
+unsigned long long AccentPalette(const ViewState& state) {
+    return state.contrastPalette ? state.contrastPalette->accent : g_swipePalette.load(std::memory_order_relaxed);
+}
+COLORREF SelectionColor(const ViewState& state) {
+    return state.contrastPalette ? state.contrastPalette->selection : g_selectionRgb.load(std::memory_order_relaxed);
+}
+// Existing brush helpers run in the scope of one immutable draw palette.
+thread_local unsigned long long drawingAccent=0;
+struct AccentDrawScope {
+    unsigned long long previous;
+    explicit AccentDrawScope(unsigned long long accent) : previous(std::exchange(drawingAccent,accent)) {}
+    ~AccentDrawScope() { drawingAccent=previous; }
+};
+unsigned long long DrawingAccent() {
+    return drawingAccent ? drawingAccent : g_swipePalette.load(std::memory_order_relaxed);
+}
+D2D1_COLOR_F HighlightColor(const Theme::Color& color,COLORREF accent);
+ContrastPalette::Ink ResolveForeground(const ContrastPalette* palette,const Theme::SurfaceStyle* backdrop,
+    unsigned fallback,const Theme::Color* explicitColor=nullptr) {
+    if(explicitColor) {
+        const auto ink=HighlightColor(*explicitColor,COLORREF(DrawingAccent()&0xffffff));
+        return {ThemeRgb(RGB(std::lround(ink.r*255),std::lround(ink.g*255),std::lround(ink.b*255))),ink.a};
+    }
+    return palette ? palette->Foreground(backdrop,{fallback}) : ContrastPalette::Ink{fallback};
+}
+std::shared_ptr<const ContrastPalette> ResolveContrastPalette(const PaletteRequest& job,unsigned long long accentPalette) {
+    const COLORREF accent=COLORREF(accentPalette&0xffffff);
+    const auto mode=static_cast<size_t>(job.mode);
+    auto palette=job.tooltipBase ? std::make_shared<ContrastPalette>(*job.tooltipBase) : std::make_shared<ContrastPalette>();
+    palette->revision=job.revision;
+
+    const auto composite=[&](const Theme::Paint& paint,COLORREF fallback,float opacity,COLORREF base) {
+        COLORREF rgb=fallback;
+        if(paint.kind!=Theme::Paint::Kind::Default) {
+            const auto& color=paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color;
+            const auto resolved=HighlightColor(color,accent);
+            rgb=RGB(std::lround(resolved.r*255.f),std::lround(resolved.g*255.f),std::lround(resolved.b*255.f));
+            opacity*=resolved.a;
+        }
+        const auto blend=[&](BYTE b,BYTE c){return std::lround(b+(int(c)-int(b))*opacity);};
+        return RGB(blend(GetRValue(base),GetRValue(rgb)),blend(GetGValue(base),GetGValue(rgb)),blend(GetBValue(base),GetBValue(rgb)));
+    };
+    const auto resolveTooltip=[&] {
+        if(!job.theme || !ValidRgb(job.tipBackground)) return;
+        const auto& style=job.theme->tooltips[mode];
+        if(style.background.kind==Theme::Paint::Kind::Default) return;
+        palette->tipBackground=composite(style.background,accent,1.f,job.tipBackground);
+        palette->foregrounds.insert_or_assign(&style,ContrastPalette::Ink{
+            ThemeRgb(ReadableForeground(palette->tipBackground,{job.tipForeground}))});
+    };
+    if(job.tooltipBase) {
+        resolveTooltip();
+        return palette;
+    }
+    palette->mode=job.mode;
+    palette->background=job.background;
+    palette->foreground=job.foreground;
+    palette->accent=accentPalette;
+    palette->selection=job.dynamicAccent ? accent : job.selection;
+    palette->opacity=job.opacity;
+    palette->surfaceRevision=job.revision;
+    palette->theme=job.theme;
+    const auto addTextSurface=[&](const Theme::SurfaceStyle* style,COLORREF surface) {
+        // Prefer light text on midtone fills when it meets the polarity cutoff.
+        // The separate contrast targets still control how opaque the ink is.
+        constexpr double lightTextCutoff=3.8;
+        const COLORREF foreground=ColorContrast(RGB(255,255,255),surface)>=lightTextCutoff ?
+            RGB(255,255,255) : RGB(0,0,0);
+        auto ink=ContrastInk(surface,7.,255,foreground);
+        // Preserve the softened look, including when neither target is attainable.
+        ink.alpha=std::min(ink.alpha,.98f);
+        ink.minimumAlpha=std::min(ink.alpha,ContrastInk(surface,4.5,255,foreground).alpha);
+        palette->foregrounds.emplace(style,ink);
+    };
+    const auto& opacity=job.opacity;
+    const auto& highlights=HighlightStyles(job.theme.get(),job.mode);
+    // Declare the foreground owner and the surface painted under it for each
+    // supported state. The theme compiler has already applied mode and state
+    // inheritance. Several owners can share one contrast calculation.
+    struct TextState {
+        const Theme::SurfaceStyle* owner;
+        const Theme::SurfaceStyle* background;
+        float opacity;
+        bool defaultAuto;
+    };
+    std::vector<TextState> states;
+    const auto* groupStyle=job.theme ? &job.theme->groupHeadings[mode] : &Theme::defaultGroupHeading;
+    if(job.theme)
+        states.push_back({&job.theme->columnHeaders[mode].header,nullptr,0,false});
+    states.push_back({groupStyle,nullptr,0,false});
+    for(size_t i=0;i<highlights.size();++i) {
+        states.push_back({&highlights[i],&highlights[i],opacity[i],true});
+        states.push_back({groupStyle,&highlights[i],opacity[i],false});
+    }
+    const auto selectionColor=palette->selection;
+    for(const auto& state:states) {
+        if(state.owner->textColor || !(state.defaultAuto || state.owner->autoTextColor) ||
+            palette->foregrounds.contains(state.background)) continue;
+        addTextSurface(state.background,state.background ?
+            composite(state.background->background,selectionColor,state.opacity,job.background) : job.background);
+    }
+    if(job.theme) {
+        const auto addMark=[&](const Theme::SurfaceStyle& style,bool unchecked=false) {
+            const bool plain=unchecked && style.background.kind==Theme::Paint::Kind::Default;
+            auto ink=ContrastInk(composite(style.background,plain ? job.foreground : accent,
+                plain ? .08f : 1.f,job.background),3.,100);
+            ink.alpha=std::min(.95f,ink.alpha);
+            palette->foregrounds.emplace(&style,ink);
+        };
+        if(job.theme->checkboxEnabled[mode]) {
+            const auto& styles=job.theme->checkboxes[mode];
+            for(size_t i=0;i<styles.size();++i) addMark(styles[i],i<3);
+        }
+        if(job.theme->elements.contains(L"PaintGroupBadge")) addMark(job.theme->groupBadges[mode][0]);
+        if(job.theme->elements.contains(L"DrawSwipeIndicator")) addMark(job.theme->swipeIndicators[mode][0]);
+    }
+    resolveTooltip();
+    return palette;
+}
+
 bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
     // Resolve WinRT only at attachment/theme/settings changes. Maintenance
     // probes reuse this tab's copied values, without activating a COM provider.
@@ -7916,14 +8525,6 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
                 state.nativeAppBackground = RGB(bg.R,bg.G,bg.B);
             if (SUCCEEDED(colors->GetColorValue(UIColorType_Foreground, &fg)) && fg.A == 255)
                 state.nativeAppForeground = RGB(fg.R,fg.G,fg.B);
-            // Explorer's UI thread can always read the accent; refresh it here,
-            // so a settings-load thread without WinRT never leaves the
-            // selection on another source's color.
-            ABI::Windows::UI::Color accent{};
-            if (SUCCEEDED(colors->GetColorValue(UIColorType_Accent, &accent)) && accent.A == 255 &&
-                g_systemAccent.exchange(RGB(accent.R,accent.G,accent.B),std::memory_order_relaxed) !=
-                    RGB(accent.R,accent.G,accent.B))
-                RefreshThemeColor(false);
         }
     }
     HIGHCONTRASTW contrast{sizeof(contrast)};
@@ -7984,6 +8585,7 @@ bool RefreshNativePalette(ViewState& state, bool refreshAppPalette = false) {
         state.nativeAppBackground : GetSysColor(COLOR_WINDOW);
     state.nativeEditForeground = highContrast ? systemText :
         ReadableForeground(state.nativeEditBackground, {text, state.nativeAppForeground, systemText});
+    if (!state.paletteRevision || refreshAppPalette || changed) QueueContrastPalette(state);
     RefreshRenamePalette(state);
     RefreshItemTipPalette(state, highContrast);
     if (state.viewTogglePaletteDirty && IsWindow(state.viewToggle)) RefreshViewTogglePalette(state);
@@ -8180,6 +8782,7 @@ bool LoadSettings() {
     g_scrollbar.store(intSetting(L"Navigation.showScrollbar") != 0);
     g_instantScrub.store(intSetting(L"Navigation.instantScrollbarScrub") != 0);
     g_autoRefitColumns.store(intSetting(L"Columns.autoRefitColumns") != 0);
+    g_expandableFolders.store(intSetting(L"Columns.expandableFolders") != 0);
     g_secondaryOpacity.store(std::clamp(intSetting(L"Appearance.secondaryTextOpacity"), 0, 100));
     g_dimDotFiles.store(intSetting(L"Appearance.dimDotFiles") != 0);
     g_edgeMargin96.store(std::clamp(intSetting(L"Appearance.edgeMargin"), 0, 400));
@@ -8190,7 +8793,6 @@ bool LoadSettings() {
     g_pipelineTracing.store(logging);
     g_uiTransitionLogging.store(logging);
     g_gpuMemoryLogging.store(logging);
-    RefreshThemeColor();
     const bool changed = observed != previous;
     previous.swap(observed);
     return changed;
@@ -9771,11 +10373,89 @@ void SortEntriesByIndex(std::vector<Entry>& entries, Less&& less) {
 enum class FolderSizeSource { Off, Recorded, Fresh };
 void ResolveFolderContentSizes(std::vector<Entry>& entries, TabBackground& work,
                                unsigned long long token, FolderSizeSource source);
+// A local day number stays consistent across daylight-saving transitions.
+struct RelativeCalendarDate {
+    SYSTEMTIME local{};
+    long long day = 0;
+    bool Read(const FILETIME& stamp, const DYNAMIC_TIME_ZONE_INFORMATION* zone = nullptr) {
+        SYSTEMTIME utc{};
+        if ((!stamp.dwHighDateTime && !stamp.dwLowDateTime) ||
+            !FileTimeToSystemTime(&stamp, &utc) ||
+            !SystemTimeToTzSpecificLocalTimeEx(zone, &utc, &local)) return false;
+        SYSTEMTIME midnight = local;
+        midnight.wHour = midnight.wMinute = midnight.wSecond = midnight.wMilliseconds = 0;
+        FILETIME ft{};
+        if (!SystemTimeToFileTime(&midnight, &ft)) return false;
+        day = ((ULONGLONG(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) / 864000000000ULL;
+        return true;
+    }
+};
+
+struct RelativeDateGroups {
+    RelativeCalendarDate today;
+    long long weekStart;
+    bool valid;
+    std::wstring titles[13];
+    bool missing[13]{};
+    RelativeDateGroups() {
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        valid = today.Read(now);
+        wchar_t first[4]{};
+        GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IFIRSTDAYOFWEEK, first, ARRAYSIZE(first));
+        weekStart = today.day - (today.local.wDayOfWeek + 13 - _wtoi(first)) % 7;
+    }
+    void Assign(Entry& entry, const FILETIME& stamp) {
+        RelativeCalendarDate date;
+        entry.groupKey.clear();
+        entry.groupTitle.clear();
+        if (!valid || !date.Read(stamp)) return;
+        const auto days = date.day - today.day;
+        const bool sameYear = date.local.wYear == today.local.wYear;
+        const bool sameMonth = sameYear && date.local.wMonth == today.local.wMonth;
+        int rank;
+        if (days < -1) {
+            if (date.day >= weekStart) rank = 4;
+            else if (date.day >= weekStart - 7) rank = 3;
+            else if (sameMonth) rank = 2;
+            else rank = sameYear ? 1 : 0;
+        } else if (days <= 1) rank = 6 + static_cast<int>(days);
+        else if (date.day < weekStart + 7) rank = 8;
+        else if (date.day < weekStart + 14) rank = 9;
+        else if (sameMonth) rank = 10;
+        else rank = sameYear ? 11 : 12;
+
+        // Property System date group strings in chronological order.
+        static constexpr UINT resources[] = {100,101,102,104,103,105,106,107,108,109,110,111,112};
+        auto& title = titles[rank];
+        if (title.empty() && !missing[rank]) {
+            wchar_t label[128]{};
+            const auto module = GetModuleHandleW(L"propsys.dll");
+            if (module && LoadStringW(module,resources[rank],label,ARRAYSIZE(label))) title=label;
+            else {
+                missing[rank]=true;
+                if (DiagnosticsEnabled()) Wh_Log(L"[GPU groups] missing propsys date label %u",resources[rank]);
+            }
+        }
+        if (missing[rank]) {
+            wchar_t dateLabel[128]{};
+            GetDateFormatEx(LOCALE_NAME_USER_DEFAULT,DATE_SHORTDATE,&date.local,nullptr,dateLabel,ARRAYSIZE(dateLabel),nullptr);
+            entry.groupTitle=dateLabel;
+            entry.groupKey=std::to_wstring(rank)+L"/"+std::to_wstring(date.day);
+            return;
+        }
+        entry.groupTitle = title;
+        entry.groupKey = std::to_wstring(rank);
+    }
+};
 void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& group,
                             std::map<std::wstring, std::wstring>& typeCache,
                             TabBackground& work, unsigned long long token) {
     if (!group.enabled) return;
     const SortKind kind = ClassifySort(group.key);
+    std::optional<RelativeDateGroups> dates;
+    if (kind == SortKind::Modified || kind == SortKind::Created || kind == SortKind::Accessed)
+        dates.emplace();
     if (kind == SortKind::Size) ResolveFolderContentSizes(entries, work, token, FolderSizeSource::Fresh);
     for (size_t i = 0; i < entries.size(); ++i) {
         if (!DirectoryJobCurrent(work, token)) return;
@@ -9826,19 +10506,7 @@ void ResolveDirectoryGroups(std::vector<Entry>& entries, const ShellGroupSpec& g
         case SortKind::Accessed: {
             const FILETIME& stamp = kind == SortKind::Modified ? e.lastWrite :
                 kind == SortKind::Created ? e.created : e.accessed;
-            if (!stamp.dwLowDateTime && !stamp.dwHighDateTime) break;
-            FILETIME local{}; SYSTEMTIME date{};
-            if (FileTimeToLocalFileTime(&stamp, &local) &&
-                FileTimeToSystemTime(&local, &date) && date.wYear) {
-                wchar_t key[32]{};
-                swprintf_s(key, ARRAYSIZE(key), L"%04u-%02u",
-                           date.wYear, date.wMonth);
-                e.groupKey = key;
-                wchar_t title[100]{};
-                if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &date,
-                    L"MMMM yyyy", title, ARRAYSIZE(title), nullptr))
-                    e.groupTitle = title;
-            }
+            dates->Assign(e, stamp);
             break;
         }
         case SortKind::ShellProperty: {
@@ -10690,22 +11358,13 @@ constinit SystemRelativeTime g_systemRelativeTime;
 struct ItemTipRelativeOffset {double value=0; SystemRelativeTime::Unit unit=SystemRelativeTime::Second;};
 std::optional<ItemTipRelativeOffset> ItemTipDateOffset(const FILETIME& time,const FILETIME& now,
     const DYNAMIC_TIME_ZONE_INFORMATION* zone=nullptr) {
-    if(!time.dwLowDateTime && !time.dwHighDateTime) return {};
-    SYSTEMTIME utc{},utcNow{},local{},localNow{};
-    if(!FileTimeToSystemTime(&time,&utc) || !FileTimeToSystemTime(&now,&utcNow) ||
-        !SystemTimeToTzSpecificLocalTimeEx(zone,&utc,&local) ||
-        !SystemTimeToTzSpecificLocalTimeEx(zone,&utcNow,&localNow)) return {};
+    RelativeCalendarDate date, current;
+    if (!date.Read(time, zone) || !current.Read(now, zone)) return {};
+    const auto& local = date.local;
+    const auto& localNow = current.local;
     const auto ticks=[](const FILETIME& value) {return (ULONGLONG(value.dwHighDateTime)<<32)|value.dwLowDateTime;};
     const double seconds=(double(ticks(time))-double(ticks(now)))/10000000.;
-    // Local calendar dates, represented at fictitious UTC midnight: a day
-    // remains a calendar day through 23/25-hour daylight-saving transitions.
-    const auto midnight=[](SYSTEMTIME value,FILETIME& result) {
-        value.wHour=value.wMinute=value.wSecond=value.wMilliseconds=0;
-        return SystemTimeToFileTime(&value,&result)!=FALSE;
-    };
-    FILETIME day{},dayNow{};
-    if(!midnight(local,day) || !midnight(localNow,dayNow)) return {};
-    const double days=std::round((double(ticks(day))-double(ticks(dayNow)))/864000000000.);
+    const double days = static_cast<double>(date.day - current.day);
     if(days==0) {
         if(std::abs(seconds)<60.) return ItemTipRelativeOffset{std::trunc(seconds),SystemRelativeTime::Second};
         if(std::abs(seconds)<3600.) return ItemTipRelativeOffset{std::trunc(seconds/60.),SystemRelativeTime::Minute};
@@ -11773,6 +12432,68 @@ bool RefreshSortCheckIdentity(Entry& entry) {
     return true;
 }
 
+// Lists one expanded inline folder on the names lane, with the same visibility
+// filter, label policy and sort as the tab's own folder. Returns false when
+// the node was collapsed (or the tab stopped) and nothing should be published.
+bool EnumerateInlineTreeFolder(TabBackground& work, TabBackground::Worker& lane,
+                               InlineTreeJob& job, InlineTreeResult& result) {
+    const auto current = [&] {
+        return !work.stopping.load(std::memory_order_acquire) &&
+            !job.cancelled->load(std::memory_order_acquire);
+    };
+    if (!current()) return false;
+    PipelineScope timing(work, L"tree.inline.enumerate", job.request);
+    result.path = job.path;
+    result.request = job.request;
+    if (lane.hiddenExtensionsShowAll != job.visibility.showExtensions) {
+        lane.hiddenExtensions.clear();
+        lane.hiddenExtensionsShowAll = job.visibility.showExtensions;
+    }
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileExW(JoinPath(job.path, L"*").c_str(), FindExInfoBasic,
+        &data, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        result.error = error == ERROR_FILE_NOT_FOUND || error == ERROR_NO_MORE_FILES ? ERROR_SUCCESS : error;
+        return current();
+    }
+    size_t visited = 0;
+    do {
+        if ((visited++ & 31u) == 0 && !current()) break;
+        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0 ||
+            !ShellItemVisible(data.dwFileAttributes, job.visibility, data.cFileName)) continue;
+        Entry e;
+        e.name = data.cFileName;
+        e.path = JoinPath(job.path, e.name);
+        e.folder = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        e.attributes = data.dwFileAttributes;
+        e.lastWrite = data.ftLastWriteTime;
+        e.created = data.ftCreationTime;
+        e.accessed = data.ftLastAccessTime;
+        e.byteSize = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+        e.byteSizeKnown = true;
+        e.treeDepth = job.depth;
+        ResolveShellFileLabel(e, lane.hiddenExtensions);
+        result.entries.push_back(std::move(e));
+    } while (FindNextFileW(find, &data));
+    const DWORD enumerationError = GetLastError();
+    FindClose(find);
+    if (!current()) return false;
+    if (enumerationError != ERROR_NO_MORE_FILES) result.error = enumerationError;
+    // The shared sort observes the tab's directory generation. If the tab's
+    // own folder was re-requested meanwhile, list this node again afterwards
+    // rather than publishing a partially keyed order.
+    const auto generation = work.directoryGeneration.load(std::memory_order_acquire);
+    SortDirectoryEntries(result.entries, job.sort, lane.typeNames, work, generation);
+    if (!current()) return false;
+    if (work.directoryGeneration.load(std::memory_order_acquire) != generation) {
+        ExclusiveSrwLock lock(work.directoryLock);
+        work.treeJobs.push_back(std::move(job));
+        return false;
+    }
+    return true;
+}
+
 DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
     auto& lane = *static_cast<TabBackground::Worker*>(context);
     auto& work = *lane.owner;
@@ -11821,8 +12542,10 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
         DetailJob detail;
         DirectoryWatchJob watch;
         ColumnCatalogJob catalog;
+        std::optional<PaletteRequest> palette;
         std::optional<StatusButtonSnapshot> statusButtons;
         std::optional<ItemTipJob> itemTip;
+        std::optional<InlineTreeJob> treeJob;
         bool haveCatalog = false, haveTypeSearchUnicode=false;
         bool haveDirectory = false, haveDetail = false, haveWatch = false;
         TabBackground::RetiredPayload retired;
@@ -11832,10 +12555,17 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
                 directory = std::move(work.directoryJobs.back());
                 work.directoryJobs.pop_back();
                 haveDirectory = true;
+            } else if (namesLane && !work.treeJobs.empty()) {
+                // The tab's own folder always comes first; expanded folders
+                // follow in the order they were opened.
+                treeJob = std::move(work.treeJobs.front());
+                work.treeJobs.pop_front();
             } else if (layoutLane && !work.layoutJobs.empty()) {
                 directory = std::move(work.layoutJobs.back());
                 work.layoutJobs.pop_back();
                 haveDirectory = true;
+            } else if (lane.lane==TabBackground::Lane::Palette && work.paletteJob) {
+                palette=std::exchange(work.paletteJob,{});
             } else if (columnsLane && work.itemTipJob) {
                 itemTip=std::exchange(work.itemTipJob,{}); // Hover feedback precedes chrome probes.
             } else if (columnsLane && work.typeSearchUnicodeJob) {
@@ -11882,9 +12612,39 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             const auto listing = work.itemTipListing.load(std::memory_order_acquire);
             if (!listing || sizeBinding.token != listing) sizeBinding.Reset();
         }
+        if(palette) {
+            const auto accent=palette->tooltipBase ? palette->tooltipBase->accent :
+                ReadAccentPalette(palette->highContrast,palette->cachedAccent);
+            auto colors=ResolveContrastPalette(*palette,accent);
+            {
+                ExclusiveSrwLock lock(work.directoryLock);
+                if(work.paletteJob || work.stopping.load()) continue;
+                work.paletteResult=std::move(colors);
+            }
+            PostMessageW(work.hwnd,kMsgPaletteReady,WPARAM(work.notificationLifetime),0);
+            continue;
+        }
         if(haveTypeSearchUnicode) {
             g_systemRelativeTime.Initialize();
             PostMessageW(work.hwnd,kMsgTypeSearchReady,WPARAM(work.notificationLifetime),0);
+            continue;
+        }
+        if(treeJob) {
+            InlineTreeResult result;
+            if (EnumerateInlineTreeFolder(work, lane, *treeJob, result)) {
+                bool notify = false;
+                {
+                    ExclusiveSrwLock lock(work.directoryLock);
+                    if (!treeJob->cancelled->load(std::memory_order_acquire) && !work.stopping.load()) {
+                        work.treeResults.push_back(std::move(result));
+                        notify = !std::exchange(work.treeNotificationQueued, true);
+                    }
+                }
+                if (notify && !PostMessageW(work.hwnd,kMsgInlineTreeReady,WPARAM(work.notificationLifetime),0)) {
+                    ExclusiveSrwLock lock(work.directoryLock);
+                    work.treeNotificationQueued = false;
+                }
+            }
             continue;
         }
         if(itemTip) {
@@ -12024,12 +12784,14 @@ DWORD WINAPI DirectoryWorkerProc(LPVOID context) {
             if (SUCCEEDED(observed) && pidl) {
                 // Subscribe to child-file Shell hints. The callback filters
                 // direct rows; filesystem interrupt watching stays nonrecursive.
+                // UPDATEDIR (refresh, coalesced bursts) re-lists an expanded
+                // inline folder; the open filesystem folder keeps its own watch.
                 SHChangeNotifyEntry entry{pidl, TRUE};
                 result.watch->registration = SHChangeNotifyRegister(work.hwnd,
                     SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
                     SHCNE_MKDIR | SHCNE_CREATE | SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES |
                     SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER |
-                    (namespaceFolder ? SHCNE_UPDATEDIR : 0),
+                    SHCNE_UPDATEDIR,
                     kMsgShellItemCreated, 1, &entry);
             }
             if (pidl) CoTaskMemFree(pidl);
@@ -12994,9 +13756,15 @@ bool CachedFolderSort(const ViewState& state,
     return true;
 }
 
+void ClearInlineTree(ViewState& state, bool present);
+void RestoreInlineTreeExpansion(ViewState& state);
+void RegraftInlineTree(ViewState& state, bool present);
+void RevealInlineTreeReturn(ViewState& state);
 void CacheDepartingFolder(ViewState& state) {
     state.zebraExtentAnimating = false;
     StopRowTransition(state);
+    // The cache holds the native folder's rows only.
+    ClearInlineTree(state, false);
     // A complete visible snapshot remains reusable even while a revalidation
     // worker is pending. Reject ONLY incomplete 48-row previews/missing data.
     if (!state.loaded || state.namesPreview || !state.inScope) {
@@ -13012,6 +13780,7 @@ void CacheDepartingFolder(ViewState& state) {
     snapshot.folderIdentity = state.directoryFolderIdentity;
     snapshot.sort = state.displayedSort;
     snapshot.grouping = state.displayedGrouping;
+    snapshot.calendarStamp=state.calendarStamp;
     snapshot.visibility = state.visibility;
     snapshot.viewMode = {state.layoutNativeMode,state.layoutIconSize};
     snapshot.entries = std::move(state.entries);
@@ -13160,10 +13929,12 @@ bool RestoreCachedFolder(ViewState& state) {
     state.displayedMetadataHash = snapshot.metadataHash;
     const SortSpec restoredSort = snapshot.sort;
     state.grouping = snapshot.grouping;
+    state.requestedCalendarStamp=state.calendarStamp=snapshot.calendarStamp;
     cache.usedBytes -= snapshot.estimatedBytes;
     --cache.snapshotCount;
     cache.folders.erase(it);
     state.total = static_cast<int>(state.entries.size());
+    state.rootTotal = state.total; // Cached snapshots never hold inline children.
     state.namesPreview = false;
     RebuildGroupSections(state);
     ReconcileColumnViewportAfterRowCount(state);
@@ -13186,6 +13957,15 @@ bool RestoreCachedFolder(ViewState& state) {
         Wh_Log(L"[GPU overlay] centralized folder cache hit: %s (%d rows, %u other folders)",
                state.folderPath.c_str(), state.total,
                static_cast<unsigned>(cache.snapshotCount));
+    // Expanded folders reopen with their remembered listings in this same
+    // frame, and the folder we came back from is selected directly.
+    if (InlineTreeActive(state) && state.inlineTree.empty()) {
+        RestoreInlineTreeExpansion(state);
+        if (!state.inlineTree.empty()) {
+            RegraftInlineTree(state, false);
+            RevealInlineTreeReturn(state);
+        }
+    }
     Redraw(state);
     return true;
 }
@@ -13305,6 +14085,15 @@ bool SortReadDefersNames(const ViewState& state) {
         state.sortReadUnavailableToken!=state.token;
 }
 
+unsigned long long DateGroupingStamp(const ViewState& state) {
+    if (!state.grouping.enabled || state.thisPcGpu) return 0;
+    const auto kind=ClassifySort(state.grouping.key);
+    if (kind!=SortKind::Modified && kind!=SortKind::Created && kind!=SortKind::Accessed) return 0;
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    return (static_cast<unsigned long long>(state.calendarRevision)<<32) |
+        (unsigned(now.wYear)<<9) | (unsigned(now.wMonth)<<5) | now.wDay;
+}
+
 void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
                            bool preserveViewport = false, bool verifyNamespace = false) {
     PipelineScope pipeline(state.background,L"directory.request",replacePending,verifyNamespace);
@@ -13410,6 +14199,7 @@ void QueueDirectoryRefresh(ViewState& state, bool replacePending = false,
     // Keep the previous list visible during same-folder refreshes. During
     // navigation, the new view starts with an empty names-only surface.
     state.directoryPending = true;
+    state.requestedCalendarStamp=DateGroupingStamp(state);
     state.directoryRequestedAt = GetTickCount64();
     CancelNativeCatalog(state);
     state.directoryToken = g_nextToken.fetch_add(1);
@@ -14412,6 +15202,672 @@ float RestoredViewportAnchorTarget(const ViewState& state, int index,
     return DocumentRowTop(state, index) + offset;
 }
 
+// ---- Inline folder tree (expandable folders in Details) ----
+// The worker and the folder cache only ever see the native folder's rows.
+// Expanded children are grafted into the presented rows on the UI thread,
+// bounded by what the user expanded, and stripped again before any capture.
+ViewState::InlineTreeNode* FindInlineTreeNode(ViewState& state, const std::wstring& path) {
+    for (auto& node : state.inlineTree)
+        if (_wcsicmp(node.path.c_str(), path.c_str()) == 0) return &node;
+    return nullptr;
+}
+bool InlineTreeWithin(const std::wstring& path, const std::wstring& ancestor) {
+    if (path.size() <= ancestor.size() || ancestor.empty() ||
+        _wcsnicmp(path.c_str(), ancestor.c_str(), ancestor.size()) != 0) return false;
+    return path[ancestor.size()] == L'\\' || ancestor.back() == L'\\';
+}
+void CancelInlineTreeNode(ViewState::InlineTreeNode& node) {
+    if (node.cancelled) node.cancelled->store(true, std::memory_order_release);
+}
+// Remembers the departing folder's expansion before its nodes are cleared.
+// Memory for folders the folder cache has since evicted is dropped here.
+void HarvestInlineTreeRows(ViewState& state);
+void ForgetInlineTreeMemory(ViewState& state, std::vector<ViewState::InlineTreeNode>& nodes) {
+    for (auto& node : nodes) RetireCachedEntries(state, node.children);
+    nodes.clear();
+}
+void RememberInlineTreeExpansion(ViewState& state) {
+    if (state.inlineTreeFolder.empty()) return;
+    const std::wstring folder = state.inlineTreeFolder;
+    for (auto it = state.inlineTreeMemory.begin(); it != state.inlineTreeMemory.end();) {
+        if (_wcsicmp(it->first.c_str(), folder.c_str()) != 0 && !state.folderCache.folders.contains(it->first)) {
+            ForgetInlineTreeMemory(state, it->second);
+            it = state.inlineTreeMemory.erase(it);
+        } else ++it;
+    }
+    if (state.inlineTree.empty()) {
+        if (const auto it = state.inlineTreeMemory.find(folder); it != state.inlineTreeMemory.end()) {
+            ForgetInlineTreeMemory(state, it->second);
+            state.inlineTreeMemory.erase(it);
+        }
+        return;
+    }
+    // Presented children carry resolved icons and details back to the nodes.
+    if (_wcsicmp(folder.c_str(), state.folderPath.c_str()) == 0) HarvestInlineTreeRows(state);
+    auto& saved = state.inlineTreeMemory[folder];
+    ForgetInlineTreeMemory(state, saved);
+    for (auto& node : state.inlineTree) {
+        CancelInlineTreeNode(node);
+        ViewState::InlineTreeNode kept;
+        kept.path = node.path;
+        kept.depth = node.depth;
+        kept.sort = node.sort;
+        kept.error = node.error;
+        kept.loaded = node.loaded || node.deferred.has_value();
+        kept.children = node.deferred ? std::move(*node.deferred) : std::move(node.children);
+        node.deferred.reset();
+        saved.push_back(std::move(kept));
+    }
+}
+void RequestInlineTreeNode(ViewState& state, ViewState::InlineTreeNode& node);
+// Reopens what was expanded when this tab last left the presented folder,
+// with the listings it had then, and lists each folder again to refresh them.
+void RestoreInlineTreeExpansion(ViewState& state) {
+    if (!state.inlineTree.empty() || state.folderPath.empty()) return;
+    const auto it = state.inlineTreeMemory.find(state.folderPath);
+    if (it == state.inlineTreeMemory.end()) return;
+    state.inlineTree = std::move(it->second);
+    state.inlineTreeMemory.erase(it);
+    state.inlineTreeFolder = state.folderPath;
+    for (auto& node : state.inlineTree) RequestInlineTreeNode(state, node);
+}
+void RegraftInlineTree(ViewState& state, bool present);
+void QueueVisibleDetails(ViewState& state);
+void RequestVisibleIcons(ViewState& state);
+// A layout that can show the tree again (Details after a grid or Content)
+// reopens what was expanded when it left, with the listings it had.
+// `present`: the rows unfold as insertions (after an animated layout change).
+void ReopenInlineTree(ViewState& state, bool present = false) {
+    if (!InlineTreeActive(state) || !state.inlineTree.empty() || !state.loaded || state.namesPreview) return;
+    RestoreInlineTreeExpansion(state);
+    if (state.inlineTree.empty()) return;
+    RegraftInlineTree(state, present);
+    QueueVisibleDetails(state);
+    RequestVisibleIcons(state);
+}
+void ClearInlineTreeNodes(ViewState& state) {
+    RememberInlineTreeExpansion(state);
+    for (auto& node : state.inlineTree) {
+        CancelInlineTreeNode(node);
+        RetireCachedEntries(state, node.children);
+        if (node.deferred) RetireCachedEntries(state, *node.deferred);
+    }
+    state.inlineTree.clear();
+    state.inlineTreeFolder.clear();
+    state.inlineTreeChevrons.clear();
+    state.inlineTreeSpinners.clear();
+    if (state.hwnd) KillTimer(state.hwnd, kInlineTreeBusyTimerId);
+}
+double InlineTreeElapsedMs(ViewState& state, LARGE_INTEGER from, LARGE_INTEGER now) {
+    if (state.qpcFrequency <= 0.) {
+        LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+        state.qpcFrequency = static_cast<double>(frequency.QuadPart);
+    }
+    return (now.QuadPart - from.QuadPart) * 1000. / state.qpcFrequency;
+}
+// The presented indicators follow the nodes: shown, and still listing (or
+// holding a finished listing for the indicator's minimum time).
+void SyncInlineTreeSpinners(ViewState& state) {
+    state.inlineTreeSpinners.clear();
+    for (const auto& node : state.inlineTree)
+        if (node.spinnerQpc.QuadPart && !node.loaded)
+            state.inlineTreeSpinners.push_back({node.path, node.spinnerQpc});
+}
+// One timer serves every node, armed for whichever deadline comes first.
+void ScheduleInlineTreeBusy(ViewState& state) {
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    std::optional<double> next;
+    for (auto& node : state.inlineTree) {
+        std::optional<double> due;
+        if (!node.loaded && node.requestedQpc.QuadPart && !node.spinnerQpc.QuadPart)
+            due = static_cast<double>(kInlineTreeBusyDelayMs) - InlineTreeElapsedMs(state, node.requestedQpc, now);
+        else if (node.deferred && node.spinnerQpc.QuadPart)
+            due = static_cast<double>(kInlineTreeBusyMinimumMs) - InlineTreeElapsedMs(state, node.spinnerQpc, now);
+        if (due && (!next || *due < *next)) next = due;
+    }
+    if (!next) KillTimer(state.hwnd, kInlineTreeBusyTimerId);
+    else SetTimer(state.hwnd, kInlineTreeBusyTimerId, static_cast<UINT>(std::ceil(std::max(*next, 1.))), nullptr);
+}
+void RegraftInlineTree(ViewState& state, bool present);
+void InlineTreeBusyTick(ViewState& state) {
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    bool shown = false, committed = false;
+    for (auto& node : state.inlineTree) {
+        if (!node.loaded && node.requestedQpc.QuadPart && !node.spinnerQpc.QuadPart &&
+            InlineTreeElapsedMs(state, node.requestedQpc, now) >= static_cast<double>(kInlineTreeBusyDelayMs)) {
+            node.spinnerQpc = now;
+            shown = true;
+        }
+        if (node.deferred && InlineTreeElapsedMs(state, node.spinnerQpc, now) >= static_cast<double>(kInlineTreeBusyMinimumMs)) {
+            RetireCachedEntries(state, node.children);
+            node.children = std::move(*node.deferred);
+            node.deferred.reset();
+            node.loaded = true;
+            committed = true;
+        }
+    }
+    SyncInlineTreeSpinners(state);
+    if (committed) RegraftInlineTree(state, true);
+    else if (shown) { RegisterViewAnimation(state); Redraw(state); }
+    ScheduleInlineTreeBusy(state);
+}
+void RequestInlineTreeNode(ViewState& state, ViewState::InlineTreeNode& node) {
+    CancelInlineTreeNode(node);
+    node.cancelled = std::make_shared<std::atomic<bool>>(false);
+    node.request = ++state.inlineTreeRequest;
+    node.sort = state.sort;
+    if (!node.loaded && !node.requestedQpc.QuadPart) {
+        // Only a first listing can show the busy indicator; a re-sort keeps
+        // the current rows until the new order arrives.
+        QueryPerformanceCounter(&node.requestedQpc);
+        ScheduleInlineTreeBusy(state);
+    }
+    if (!state.background || !EnsureDirectoryWorker(state)) return;
+    InlineTreeJob job;
+    job.path = node.path;
+    job.request = node.request;
+    job.cancelled = node.cancelled;
+    job.sort = state.sort;
+    job.visibility = state.visibility;
+    job.depth = node.depth;
+    {
+        ExclusiveSrwLock lock(state.background->directoryLock);
+        state.background->treeJobs.push_back(std::move(job));
+    }
+    SetEvent(state.background->directory.wake);
+}
+// Keeps the tree only while it belongs to the presented folder and the view
+// can show it; a sort change lists every expanded folder again in the new order.
+bool PrepareInlineTreeForFolder(ViewState& state) {
+    if (state.inlineTree.empty()) return false;
+    if (!InlineTreeActive(state) || _wcsicmp(state.inlineTreeFolder.c_str(), state.folderPath.c_str()) != 0) {
+        ClearInlineTreeNodes(state);
+        return false;
+    }
+    for (auto& node : state.inlineTree)
+        if (!SameSort(node.sort, state.sort)) RequestInlineTreeNode(state, node);
+    return true;
+}
+// Returns presented child rows to their nodes, so resolved details and icon
+// state survive the next graft. Copies; the presented rows stay intact.
+void HarvestInlineTreeRows(ViewState& state) {
+    if (state.inlineTree.empty() || state.rootTotal == state.total) return;
+    std::unordered_map<const ViewState::InlineTreeNode*, size_t> cursors;
+    std::wstring parent;
+    for (const Entry& row : state.entries) {
+        if (!row.treeDepth) continue;
+        const size_t slash = row.path.find_last_of(L'\\');
+        if (slash == std::wstring::npos) continue;
+        parent.assign(row.path, 0, slash == 2 && row.path[1] == L':' ? slash + 1 : slash);
+        auto* node = FindInlineTreeNode(state, parent);
+        if (!node || !node->loaded) continue;
+        size_t& at = cursors[node];
+        // Presented children keep their node's order; walk forward once.
+        for (size_t probe = at; probe < node->children.size(); ++probe)
+            if (_wcsicmp(node->children[probe].path.c_str(), row.path.c_str()) == 0) {
+                node->children[probe] = row;
+                at = probe + 1;
+                break;
+            }
+    }
+}
+// Children are never grouped themselves: in a grouped folder they take their
+// top-level folder's group, so they stay directly under it inside its section
+// (sections are runs of equal keys) and collapse with that group.
+void AppendInlineTreeChildren(ViewState& state, std::vector<Entry>& out, const std::wstring& path, int level,
+                              const std::wstring& groupKey, const std::wstring& groupTitle) {
+    const auto* node = FindInlineTreeNode(state, path);
+    if (!node || !node->loaded || level > 64) return;
+    for (const Entry& child : node->children) {
+        out.push_back(child);
+        Entry& row = out.back();
+        row.groupKey = groupKey;
+        row.groupTitle = groupTitle;
+        const auto* childNode = InlineTreeExpandable(row) ? FindInlineTreeNode(state, row.path) : nullptr;
+        row.treeExpanded = childNode != nullptr;
+        row.treeEmpty = childNode && childNode->loaded && childNode->children.empty();
+        row.treeError = row.treeEmpty ? childNode->error : 0;
+        if (row.treeExpanded) {
+            const std::wstring childPath = row.path; // out may reallocate below.
+            AppendInlineTreeChildren(state, out, childPath, level + 1, groupKey, groupTitle);
+        }
+    }
+}
+// rows holds only native-folder rows on entry; rootMap[i] receives the
+// presented index of root row i.
+void GraftInlineTree(ViewState& state, std::vector<Entry>& rows, std::vector<int>& rootMap) {
+    rootMap.resize(rows.size());
+    size_t extra = 0;
+    for (const auto& node : state.inlineTree) extra += node.children.size();
+    std::vector<Entry> out;
+    out.reserve(rows.size() + extra);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        Entry& root = rows[i];
+        root.treeDepth = 0;
+        const auto* rootNode = InlineTreeExpandable(root) ? FindInlineTreeNode(state, root.path) : nullptr;
+        root.treeExpanded = rootNode != nullptr;
+        root.treeEmpty = rootNode && rootNode->loaded && rootNode->children.empty();
+        root.treeError = root.treeEmpty ? rootNode->error : 0;
+        rootMap[i] = static_cast<int>(out.size());
+        const bool expanded = root.treeExpanded;
+        std::wstring path = expanded ? root.path : std::wstring();
+        out.push_back(std::move(root));
+        if (expanded) {
+            const Entry& owner = out.back();
+            AppendInlineTreeChildren(state, out, path, 1, std::wstring(owner.groupKey), std::wstring(owner.groupTitle));
+        }
+    }
+    rows.swap(out);
+    RetireCachedEntries(state, out);
+}
+// Root rows keep their worker-built lookups at their new positions; grafted
+// children are added. map(i) returns the new index of indexed row i, or -1.
+template <class Map>
+void RemapInlineTreeLookups(const std::vector<Entry>& rows, EntryPathIndex& index, EntryPathUpdates* updates, Map map) {
+    EntryPathIndex next;
+    next.reserve(rows.size());
+    for (const auto& [hash, row] : index)
+        if (const int mapped = map(row); mapped >= 0) next.emplace_back(hash, mapped);
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].treeDepth) next.emplace_back(SelectionPathHash(rows[i].path), static_cast<int>(i));
+    std::sort(next.begin(), next.end());
+    index.swap(next);
+    if (!updates) return;
+    EntryPathUpdates remapped;
+    for (const auto& [hash, rows] : *updates)
+        for (int row : rows)
+            if (const int mapped = map(row); mapped >= 0) remapped[hash].insert(mapped);
+    updates->swap(remapped);
+}
+int GpuRowForNativePath(const ViewState& state, const std::wstring& path);
+void Select(ViewState& state, int index, bool keyboardNavigation);
+// Rebuilds the presented rows after an expand, collapse, listing or option
+// change. Selection, caret and lookups follow their items; rows that appear
+// or disappear use the same insertion/deletion motion as a folder change.
+void RegraftInlineTree(ViewState& state, bool present = true) {
+    if (!state.loaded || state.namesPreview || state.presentationOnly) return;
+    // An open rename field keeps its rows: the rebuild waits for the field to
+    // close, exactly as the open folder's re-list does (ObserveDirectoryWatch).
+    // The edited item's own removal closes the field first (the Shell change
+    // handler), so it is never kept over a vanished item.
+    if (state.rename.editor) {
+        state.inlineTreeRegraftDeferred = true;
+        if (g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU rename] inline folder rows rebuild held while renaming: %s", state.rename.path.c_str());
+        return;
+    }
+    state.inlineTreeRegraftDeferred = false;
+    const bool active = PrepareInlineTreeForFolder(state);
+    if (!active && state.rootTotal == state.total) return; // Nothing presented, nothing to add.
+    HarvestInlineTreeRows(state);
+    std::vector<CapturedRow> captures;
+    const float oldRowPx = state.rowPx, oldScroll = state.scrollNow;
+    if (present && state.visible && state.inScope && state.detailsViewActive && !state.rename.editor &&
+        !state.marqueeActive && !state.marqueePossible && !state.optimisticStartedAt && state.rowPx > 0) {
+        // The presented image, including motion already in flight, is where
+        // the moving rows start from.
+        const float progress = CurrentRowProgress(state);
+        for (int i : VisibleItemRows(state, static_cast<float>(kRowTransitionOverscan))) {
+            if (i < 0 || static_cast<size_t>(i) >= state.entries.size()) continue;
+            CapturedRow capture;
+            capture.oldIndex = i;
+            const RowVisual visual = LayoutRowVisual(state, i, progress);
+            capture.oldTop = visual.top;
+            capture.oldLeft = visual.left;
+            capture.oldWidth = visual.width;
+            capture.oldHeight = visual.height;
+            capture.oldOpacity = visual.opacity;
+            capture.entry = state.entries[size_t(i)];
+            capture.selected = ModelSelected(state, i);
+            captures.push_back(std::move(capture));
+        }
+    }
+    StopRowTransition(state);
+    const float oldHeader = state.headerPx;
+    // Old positions of child rows by path, so rows that come into view after
+    // the change start from where they really were, even off screen.
+    std::unordered_map<std::wstring, int> oldChildRows;
+    if (!captures.empty())
+        for (size_t i = 0; i < state.entries.size(); ++i)
+            if (state.entries[i].treeDepth) oldChildRows.emplace(state.entries[i].path, static_cast<int>(i));
+    std::vector<std::wstring> selectedChildren;
+    std::wstring focusedChild;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.entries[i].treeDepth && state.selectedFlags[i]) selectedChildren.push_back(state.entries[i].path);
+    if (state.selected >= 0 && static_cast<size_t>(state.selected) < state.entries.size() &&
+        state.entries[size_t(state.selected)].treeDepth) focusedChild = state.entries[size_t(state.selected)].path;
+    std::vector<int> oldToRoot(state.entries.size(), -1);
+    std::vector<Entry> roots;
+    roots.reserve(static_cast<size_t>(std::max(0, state.rootTotal)));
+    for (size_t i = 0; i < state.entries.size(); ++i) {
+        if (state.entries[i].treeDepth) continue;
+        oldToRoot[i] = static_cast<int>(roots.size());
+        roots.push_back(std::move(state.entries[i]));
+    }
+    std::vector<bool> selectedRoots(roots.size(), false);
+    for (size_t i = 0; i < oldToRoot.size() && i < state.selectedFlags.size(); ++i)
+        if (oldToRoot[i] >= 0 && state.selectedFlags[i]) selectedRoots[size_t(oldToRoot[i])] = true;
+    const auto rootOf = [&](int row) {
+        return row >= 0 && static_cast<size_t>(row) < oldToRoot.size() ? oldToRoot[size_t(row)] : -1;
+    };
+    const int selectedRoot = rootOf(state.selected), anchorRoot = rootOf(state.anchor);
+    const bool indexed = state.entryPathIndex.size() == state.entries.size();
+    std::vector<int> rootMap;
+    GraftInlineTree(state, roots, rootMap);
+    state.typeSearchCandidates.Reset();
+    state.entries.swap(roots);
+    state.inlineSelectionCache.failed = false; // Rows rebuilt: identities are asked again.
+    RetireCachedEntries(state, roots);
+    state.total = static_cast<int>(state.entries.size());
+    state.rootTotal = static_cast<int>(rootMap.size());
+    const auto moved = [&](int row) {
+        const int root = rootOf(row);
+        return root >= 0 && static_cast<size_t>(root) < rootMap.size() ? rootMap[size_t(root)] : -1;
+    };
+    if (indexed) RemapInlineTreeLookups(state.entries, state.entryPathIndex, &state.entryPathUpdates, moved);
+    else state.entryPathUpdates.clear();
+    // Child rows are found again by path; bounded by the expanded listings.
+    std::unordered_map<std::wstring, int> childRows;
+    for (size_t i = 0; i < state.entries.size(); ++i)
+        if (state.entries[i].treeDepth) childRows.emplace(state.entries[i].path, static_cast<int>(i));
+    const auto childRow = [&](const std::wstring& path) {
+        const auto found = childRows.find(path);
+        return found == childRows.end() ? -1 : found->second;
+    };
+    state.selectedFlags.assign(state.entries.size(), 0);
+    for (size_t i = 0; i < selectedRoots.size(); ++i)
+        if (selectedRoots[i]) state.selectedFlags[size_t(rootMap[i])] = 1;
+    for (const auto& path : selectedChildren)
+        if (const int row = childRow(path); row >= 0) state.selectedFlags[size_t(row)] = 1;
+    state.selected = selectedRoot >= 0 ? rootMap[size_t(selectedRoot)] :
+        !focusedChild.empty() ? childRow(focusedChild) : -1;
+    state.anchor = anchorRoot >= 0 ? rootMap[size_t(anchorRoot)] : state.selected;
+    // A collapsed folder takes over the focus of an item that went inside it.
+    int collapsedOwner = -1;
+    if (!focusedChild.empty() && state.selected < 0) {
+        std::wstring parent = focusedChild;
+        while (collapsedOwner < 0) {
+            const size_t slash = parent.find_last_of(L'\\');
+            if (slash == std::wstring::npos || slash < 3) break;
+            parent.resize(slash);
+            collapsedOwner = childRow(parent);
+            if (collapsedOwner < 0) collapsedOwner = GpuRowForNativePath(state, parent);
+        }
+    }
+    state.vacantKeyboardRow = state.restoredKeyboardRow = -1;
+    StopHoverAnimation(state);
+    ItemTipHoverMoved(state, -1);
+    state.hovered = -1;
+    state.measuredNameIndex = -1;
+    state.widthCache.clear();
+    // The worker's model describes the native folder's rows only.
+    RetireCachedEntries(state, state.presentationEntries);
+    state.presentationEntries.reset();
+    RebuildGroupSections(state);
+    ReconcileColumnViewportAfterRowCount(state);
+    // Selected children may have left with a collapse: Explorer's command bar
+    // and status bar re-read the selection.
+    QueueInlineSelectionNotice(state);
+    if (!present) return;
+    ClampScroll(state);
+    if (!captures.empty()) {
+        for (auto& capture : captures)
+            capture.newIndex = capture.entry.treeDepth ? childRow(capture.entry.path) : moved(capture.oldIndex);
+        // A whole listing can move rows by many screens. Give every row that is
+        // visible afterwards its real starting point: survivors slide from
+        // their old place (also from off screen), and new children unfold from
+        // the row above them, as an insertion. Disappearing rows collapse.
+        std::vector<int> oldRootRow(rootMap.size(), -1);
+        for (size_t i = 0; i < oldToRoot.size(); ++i)
+            if (oldToRoot[i] >= 0) oldRootRow[size_t(oldToRoot[i])] = static_cast<int>(i);
+        std::vector<int> newToRoot(state.entries.size(), -1);
+        for (size_t root = 0; root < rootMap.size(); ++root) newToRoot[size_t(rootMap[root])] = static_cast<int>(root);
+        const auto oldIndexOf = [&](int row) {
+            if (row < 0 || static_cast<size_t>(row) >= state.entries.size()) return -1;
+            if (const int root = newToRoot[size_t(row)]; root >= 0) return oldRootRow[size_t(root)];
+            const auto found = oldChildRows.find(state.entries[size_t(row)].path);
+            return found == oldChildRows.end() ? -1 : found->second;
+        };
+        const auto oldTopOf = [&](int oldIndex) { return oldHeader + oldIndex * oldRowPx - oldScroll; };
+        std::unordered_set<int> placed;
+        for (const auto& capture : captures) if (capture.newIndex >= 0) placed.insert(capture.newIndex);
+        const auto rows = VisibleItemRows(state, static_cast<float>(kRowTransitionOverscan));
+        float lastBottom = oldHeader - oldScroll;
+        if (!rows.empty())
+            for (int i = rows.front() - 1; i >= 0; --i)
+                if (const int old = oldIndexOf(i); old >= 0) { lastBottom = oldTopOf(old) + oldRowPx; break; }
+        for (int row : rows) {
+            const int old = oldIndexOf(row);
+            if (old >= 0) lastBottom = oldTopOf(old) + oldRowPx;
+            if (placed.contains(row)) continue;
+            CapturedRow capture;
+            capture.newIndex = row;
+            capture.entry = state.entries[size_t(row)];
+            capture.oldWidth = state.itemWidth;
+            if (old >= 0) {
+                capture.oldIndex = old;
+                capture.oldTop = oldTopOf(old);
+                capture.oldHeight = oldRowPx;
+            } else {
+                capture.oldTop = lastBottom; // Grows out of the boundary above it.
+                capture.oldHeight = capture.oldOpacity = 0.f;
+            }
+            captures.push_back(std::move(capture));
+        }
+        // Sparse motion keeps every mover drawn until it leaves the viewport.
+        StartGroupingTransition(state, std::move(captures), {}, oldRowPx, false, true);
+    }
+    if (collapsedOwner >= 0) Select(state, collapsedOwner, false);
+    QueueVisibleDetails(state);
+    RequestVisibleIcons(state);
+    Redraw(state);
+}
+// Removes the tree from the presented rows. A departing folder only strips
+// its rows for the cache; nothing is requested or drawn for it.
+void ClearInlineTree(ViewState& state, bool present = true) {
+    if (state.inlineTree.empty() && state.rootTotal == state.total) return;
+    ClearInlineTreeNodes(state);
+    RegraftInlineTree(state, present);
+}
+void ToggleInlineFolder(ViewState& state, int index) {
+    state.inlineTreeReturnPath.clear();
+    if (!InlineTreeActive(state) || !state.loaded || state.namesPreview || index < 0 ||
+        index >= state.total || static_cast<size_t>(index) >= state.entries.size()) return;
+    const Entry& e = state.entries[size_t(index)];
+    if (!InlineTreeExpandable(e)) return;
+    if (_wcsicmp(state.inlineTreeFolder.c_str(), state.folderPath.c_str()) != 0) {
+        ClearInlineTreeNodes(state);
+        state.inlineTreeFolder = state.folderPath;
+    }
+    const std::wstring path = e.path;
+    const bool expanding = !FindInlineTreeNode(state, path);
+    // While its busy indicator shows, a folder ignores toggles: clicks queued
+    // behind a slow listing must not collapse it once the rows finally arrive.
+    if (const auto* node = expanding ? nullptr : FindInlineTreeNode(state, path);
+        node && !node->loaded && node->spinnerQpc.QuadPart) return;
+    // The chevron turns from where it is now, so a quick second toggle
+    // reverses it smoothly instead of jumping.
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    const float from = InlineTreeChevronTurn(state, path, !expanding, now);
+    std::erase_if(state.inlineTreeChevrons, [&](const ViewState::InlineTreeChevron& chevron) {
+        return _wcsicmp(chevron.path.c_str(), path.c_str()) == 0 || UiTransitionProgress(state, chevron.started, kUiTransitionDurationMs, now) >= 1.f;
+    });
+    state.inlineTreeChevrons.push_back({path, now, from, expanding});
+    RegisterViewAnimation(state);
+    if (!expanding) {
+        // Collapsing also forgets expanded descendants, as in Dolphin.
+        for (auto it = state.inlineTree.begin(); it != state.inlineTree.end();) {
+            if (_wcsicmp(it->path.c_str(), path.c_str()) == 0 || InlineTreeWithin(it->path, path)) {
+                CancelInlineTreeNode(*it);
+                RetireCachedEntries(state, it->children);
+                if (it->deferred) RetireCachedEntries(state, *it->deferred);
+                it = state.inlineTree.erase(it);
+            } else ++it;
+        }
+        SyncInlineTreeSpinners(state);
+        ScheduleInlineTreeBusy(state);
+    } else {
+        ViewState::InlineTreeNode node;
+        node.path = path;
+        node.depth = static_cast<unsigned short>(std::min<int>(e.treeDepth + 1, 0xFFFF));
+        state.inlineTree.push_back(std::move(node));
+        RequestInlineTreeNode(state, state.inlineTree.back());
+    }
+    RegraftInlineTree(state);
+}
+// After a return into an ancestor: select and centre the deepest presented
+// row on the way to the folder we came from, as restored listings arrive.
+// Stops once that folder's row is shown, its chain finished loading, or the
+// user selected something off that chain.
+void RevealInlineTreeReturn(ViewState& state) {
+    const std::wstring& target = state.inlineTreeReturnPath;
+    if (target.empty() || !state.loaded || state.namesPreview) return;
+    const auto onChain = [&](const std::wstring& path) {
+        return _wcsicmp(path.c_str(), target.c_str()) == 0 || InlineTreeWithin(target, path);
+    };
+    int selectedCount = 0;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.selectedFlags[i] && (++selectedCount > 1 || !onChain(state.entries[i].path))) {
+            state.inlineTreeReturnPath.clear();
+            return;
+        }
+    int best = -1;
+    for (size_t i = 0; i < state.entries.size(); ++i)
+        if (state.entries[i].treeDepth && onChain(state.entries[i].path) &&
+            (best < 0 || state.entries[i].path.size() > state.entries[size_t(best)].path.size()))
+            best = static_cast<int>(i);
+    bool loading = false;
+    for (const auto& node : state.inlineTree) loading |= !node.loaded && onChain(node.path);
+    if (best >= 0 && best != state.selected) {
+        // The native view holds no child row; it must not reselect the root.
+        state.lastFolderNativePending.clear();
+        state.lastFolderNativePendingPath.clear();
+        // The ordinary single selection: caret, native mirror (which clears
+        // the root Explorer restored) and feedback stay consistent.
+        Select(state, best, false);
+        if (state.selected == best) CenterRow(state, best);
+    }
+    if (!loading || (best >= 0 && _wcsicmp(state.entries[size_t(best)].path.c_str(), target.c_str()) == 0))
+        state.inlineTreeReturnPath.clear();
+}
+// A Shell change below an expanded folder (the tab's notifications are
+// recursive): that folder is listed again, latest request wins. An expanded
+// folder that was deleted or renamed away is forgotten with its descendants;
+// its own row leaves through its parent's listing (or the tab's own folder's).
+void NoteInlineTreeChange(ViewState& state, const std::wstring& path, const std::wstring& renamed, bool gone) {
+    if (state.inlineTree.empty() || _wcsicmp(state.inlineTreeFolder.c_str(), state.folderPath.c_str()) != 0) return;
+    const auto parentOf = [](const std::wstring& item) {
+        const size_t slash = item.find_last_of(L'\\');
+        return slash == std::wstring::npos ? std::wstring() :
+            item.substr(0, slash == 2 && item.size() > 1 && item[1] == L':' ? slash + 1 : slash);
+    };
+    bool removed = false;
+    if (gone)
+        for (auto it = state.inlineTree.begin(); it != state.inlineTree.end();) {
+            if (_wcsicmp(it->path.c_str(), path.c_str()) == 0 || InlineTreeWithin(it->path, path)) {
+                CancelInlineTreeNode(*it);
+                RetireCachedEntries(state, it->children);
+                if (it->deferred) RetireCachedEntries(state, *it->deferred);
+                it = state.inlineTree.erase(it);
+                removed = true;
+            } else ++it;
+        }
+    // A deleted item leaves its folder's listing at once, as an open folder's
+    // own rows do; the re-list below still confirms the folder. A rename keeps
+    // its row until the re-list publishes the new name (no gap).
+    if (gone && renamed.empty())
+        if (auto* node = FindInlineTreeNode(state, parentOf(path))) {
+            auto& children = node->children;
+            const auto end = std::remove_if(children.begin(), children.end(), [&](const Entry& child) {
+                return _wcsicmp(child.path.c_str(), path.c_str()) == 0;
+            });
+            if (end != children.end()) {
+                std::vector<Entry> retired(std::make_move_iterator(end), std::make_move_iterator(children.end()));
+                children.erase(end, children.end());
+                RetireCachedEntries(state, retired);
+                removed = true;
+            }
+        }
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU tree] Shell change gone=%d removed=%d: %s", gone, removed, path.c_str());
+    for (const auto* item : {&path, &renamed})
+        if (!item->empty())
+            if (auto* node = FindInlineTreeNode(state, parentOf(*item))) RequestInlineTreeNode(state, *node);
+    if (removed) {
+        SyncInlineTreeSpinners(state);
+        ScheduleInlineTreeBusy(state);
+        RegraftInlineTree(state);
+    }
+}
+// A committed rename of an inline child: its folder's stored listing (and,
+// for an expanded folder, its own node and every node below it) take the new
+// identity at once, so a re-list of the open folder before the child folder's
+// own re-list keeps the row, its selection and its expansion.
+void RenameInlineTreeItem(ViewState& state, const std::wstring& oldPath, const std::wstring& newPath,
+                          const std::wstring& name, const std::wstring& label) {
+    if (state.inlineTree.empty() || oldPath.empty() || newPath.empty()) return;
+    for (auto& node : state.inlineTree) {
+        bool renamedHere = false;
+        for (auto& child : node.children)
+            if (_wcsicmp(child.path.c_str(), oldPath.c_str()) == 0) {
+                child.path = newPath; child.name = name; child.label = label;
+                renamedHere = true;
+            }
+        bool moved = true;
+        if (_wcsicmp(node.path.c_str(), oldPath.c_str()) == 0) node.path = newPath;
+        else if (InlineTreeWithin(node.path, oldPath)) node.path = newPath + node.path.substr(oldPath.size());
+        else moved = false;
+        if (moved)
+            for (auto& child : node.children)
+                if (InlineTreeWithin(child.path, oldPath)) child.path = newPath + child.path.substr(oldPath.size());
+        // A listing still in flight was taken before the rename reached the
+        // disk (requested by an earlier Shell report): it would bring the old
+        // name back over this row. List again from now; the older result is
+        // then superseded and dropped.
+        if (renamedHere || moved) RequestInlineTreeNode(state, node);
+    }
+}
+void ReceiveInlineTreeResults(ViewState& state) {
+    if (!state.background) return;
+    std::deque<InlineTreeResult> results;
+    {
+        ExclusiveSrwLock lock(state.background->directoryLock);
+        results.swap(state.background->treeResults);
+        state.background->treeNotificationQueued = false;
+    }
+    bool changed = false;
+    for (auto& result : results) {
+        auto* node = FindInlineTreeNode(state, result.path);
+        if (!node || node->request != result.request) { RetireCachedEntries(state, result.entries); continue; }
+        if (result.error != ERROR_SUCCESS && g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU tree] listing failed (%lu): %s", result.error, result.path.c_str());
+        node->error = result.error;
+        node->received = result.request;
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        if (!node->loaded && node->spinnerQpc.QuadPart &&
+            InlineTreeElapsedMs(state, node->spinnerQpc, now) < static_cast<double>(kInlineTreeBusyMinimumMs)) {
+            // A just-shown indicator stays for its minimum time; the rows
+            // follow when it ends.
+            if (node->deferred) RetireCachedEntries(state, *node->deferred);
+            node->deferred = std::move(result.entries);
+            continue;
+        }
+        RetireCachedEntries(state, node->children);
+        node->children = std::move(result.entries);
+        node->loaded = true;
+        if (node->children.empty() && g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU tree] listing is empty: %s", node->path.c_str());
+        changed = true;
+    }
+    SyncInlineTreeSpinners(state);
+    ScheduleInlineTreeBusy(state);
+    // Also a rebuild held back while a rename field was open (now closed).
+    if (state.inlineTreeRegraftDeferred && !state.rename.editor) changed = true;
+    if (changed) RegraftInlineTree(state);
+    // A held rebuild reveals once it runs (the rows are not there yet).
+    if (changed && !state.inlineTreeRegraftDeferred) RevealInlineTreeReturn(state);
+}
+
 bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
                          EntryPathIndex&& incomingIndex, bool complete, DWORD error, int lastFolderIndex,
                          int viewportAnchorIndex, float viewportScrollFraction,
@@ -14439,7 +15895,34 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         return false;
     }
     const ULONGLONG durationMs = GetTickCount64() - state.directoryRequestedAt;
+    // The worker delivered the native folder's rows only. Graft expanded
+    // inline folders before anything maps indices, so every index below
+    // (selection, caret, viewport anchor, row motion, lookups) is presented.
+    const int incomingRoots = static_cast<int>(incoming.size());
+    bool grafted = false;
+    if (complete && error == ERROR_SUCCESS && InlineTreeActive(state))
+        RestoreInlineTreeExpansion(state); // After Back/Forward to a folder left expanded.
+    if (complete && error == ERROR_SUCCESS && state.loaded && PrepareInlineTreeForFolder(state)) {
+        HarvestInlineTreeRows(state);
+        std::vector<int> rootMap;
+        GraftInlineTree(state, incoming, rootMap);
+        const auto mapped = [&rootMap](int root) {
+            return root >= 0 && static_cast<size_t>(root) < rootMap.size() ? rootMap[size_t(root)] : -1;
+        };
+        lastFolderIndex = mapped(lastFolderIndex);
+        viewportAnchorIndex = mapped(viewportAnchorIndex);
+        keyboardRestoreIndex = mapped(keyboardRestoreIndex);
+        sortRevealIndex = mapped(sortRevealIndex);
+        // Child rows have no identity in the worker's result; they are grafted
+        // in place instead of animating out and back in.
+        std::erase_if(oldViewport, [](const CapturedRow& row) { return row.entry.treeDepth != 0; });
+        for (auto& row : oldViewport) row.newIndex = mapped(row.newIndex);
+        if (incomingIndex.size() == static_cast<size_t>(incomingRoots))
+            RemapInlineTreeLookups(incoming, incomingIndex, nullptr, mapped);
+        grafted = true;
+    }
     if (complete && state.loaded && state.total == static_cast<int>(incoming.size()) &&
+        state.rootTotal == incomingRoots &&
         state.displayedOrderHash && state.displayedOrderHash == orderHash &&
         SameSort(state.displayedSort, state.sort) &&
         !groupingChanged && SameShellGroup(state.displayedGrouping, state.grouping) &&
@@ -14537,6 +16020,8 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     else if (!state.namesPreview) state.namesPreviewLatencyMs = durationMs;
     // A new sorted snapshot can change row indices. Do not leave a live
     // editor positioned over a different filename after an external refresh.
+    if (state.rename.editor && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] closing: the open folder was listed again");
     if (state.rename.editor) CancelRename(state);
     // A directory worker maps identities, not presentation time. Once motion
     // has reached a frame, sample its current clock for every subsequent diff,
@@ -14565,7 +16050,7 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
         // Keep still-visible ghosts from the preceding batch. They already
         // have no logical row; retaining them cannot resurrect selection.
         for (auto& old : state.disappearingRows) {
-            old.oldTop -= state.scrollNow - state.rowTransitionOldScroll;
+            old.oldTop -= RowTransitionScrollDelta(state);
             old.oldHeight *= 1.f - capturedProgress;
             old.oldOpacity *= 1.f - capturedProgress;
             old.oldIndex = -1;
@@ -14588,6 +16073,11 @@ bool ApplyDirectoryNames(ViewState& state, std::vector<Entry>&& incoming,
     RetireCachedEntries(state, state.entryPathUpdates);
     RetireCachedEntries(state, incoming);
     state.total = static_cast<int>(state.entries.size());
+    state.rootTotal = grafted ? incomingRoots : state.total;
+    if (grafted) {
+        RetireCachedEntries(state, state.presentationEntries);
+        state.presentationEntries.reset(); // The worker's model has no children.
+    }
     state.namesPreview = !complete;
     RebuildGroupSections(state);
     ReconcileColumnViewportAfterRowCount(state);
@@ -15010,6 +16500,7 @@ bool ReceiveDirectoryResults(ViewState& state, DirectoryDelivery delivery = Dire
                 state.namespaceIdentities = std::move(result.namespaceIdentities);
             }
             if (result.kind == DirectoryResult::Complete && result.error == ERROR_SUCCESS) {
+                state.calendarStamp=state.requestedCalendarStamp;
                 state.validatedFolderStamp = result.changeStamp;
                 state.validatedFolderRevision = result.changeRevision;
                 if (result.observerId) {
@@ -15141,11 +16632,64 @@ float ContentTextHeight(float font, int dpi) {
     return ItemTextLinePitch(font) * 2.f + float(Scale96(2, dpi));
 }
 
-void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
-    state.zebraExtentAnimating = false;
+float SelectionCheckboxSize(const ViewState& state);
+
+const Theme::Document::ColumnHeaderStyle* ColumnHeaderTheme(const ViewState& state) {
+    return state.themeSnapshot && !state.themeHighContrast ?
+        &state.themeSnapshot->columnHeaders[static_cast<size_t>(state.themeMode)] : nullptr;
+}
+
+std::optional<float> ColumnHeaderFontSize(const ViewState& state, int dpi) {
+    const auto* style = ColumnHeaderTheme(state);
+    return ThemedHeadingFontSize(style ? &style->header : nullptr,dpi,state.gridView,state.rowPx,state.fontPx);
+}
+
+float ColumnHeaderDividerWidth(const Theme::SurfaceStyle* style, int dpi) {
+    if (!style) return 1.f;
+    if (style->borderStyle==Theme::BorderStyle::None || style->borderOpacity==0.f ||
+        (style->borderColorDefined && style->borderColor.alpha==0.f)) return 0.f;
+    if (style->borderWidth < 0.f) return 1.f;
+    return static_cast<float>(std::round(std::min(style->borderWidth*(dpi/96.0),
+        double(kPlatformImageDimension))));
+}
+
+float ColumnHeaderTargetHeight(const ViewState& state, int dpi, float compact) {
+    const float normal = static_cast<float>(Scale96(kHeader96,dpi));
+    const auto* style = ColumnHeaderTheme(state);
+    const auto height = style ? style->header.height : std::nullopt;
+    const auto fontSize = ColumnHeaderFontSize(state,dpi);
+    const bool autoHeight = height && *height < 0.f && !state.gridView;
+    const bool fixedHeight = height && *height >= 0.f;
+    if (!fixedHeight && !autoHeight && !fontSize && compact <= 0.f) return normal;
+
+    const float lineHeight = fontSize ?
+        *fontSize * std::max(1.f,state.headerTextHeight96/std::max(1.f,state.headerFontSize96)) :
+        state.headerTextHeight96*dpi/96.f;
+    const float content = std::max(SelectionCheckboxSize(state),lineHeight);
+    const float minimum = std::ceil(content)+2.f*Scale96(2,dpi);
+    if (autoHeight) return std::max(minimum,state.rowPx);
+    if (fixedHeight) {
+        RECT client{};
+        ViewClientRect(state,&client);
+        const float maximum = std::max({normal,minimum,static_cast<float>(client.bottom)});
+        return std::clamp(std::round(std::min(*height,maximum*96.f/dpi)*dpi/96.f),minimum,maximum);
+    }
+    const float trimmed = std::clamp(static_cast<float>(Scale96(kCompactHeader96,dpi)),
+        std::min(normal,minimum),normal);
+    const float requested = std::lerp(normal,trimmed,compact);
+    return fontSize ? std::max(minimum,requested) : requested;
+}
+
+void UpdateColumnHeaderHeight(ViewState& state, float compact) {
+    const float height = state.columnsView ? ColumnHeaderTargetHeight(state,ViewDpi(state),compact) : 0.f;
+    if (state.columnModeTransition) state.columnHeaderTo = height;
+    else state.headerPx = height;
+}
+
+struct ItemMetrics { float row,font,icon; };
+ItemMetrics TargetItemMetrics(const ViewState& state,int height96,double precise) {
     int dpi = ViewDpi(state);
-    const int height96 = ZoomHeight96(state);
-    const double precise = state.preciseRowHeight96[state.gridView];
+
     const bool direct = precise > 0. && std::llround(precise) == height96;
     const double size96 = direct ? precise : height96;
     // Grid zoom grows the image independently of its caption. Bound font
@@ -15190,6 +16734,11 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
         state.layoutNativeMode == FVM_SMALLICON ?
             std::max(static_cast<float>(icon), font * 1.5f) + Scale96(10, dpi) :
             icon + 2.f * ItemTextLinePitch(font) + 3.f * GridCaptionInset(dpi);
+    return {row,font,icon};
+}
+void ApplyItemMetrics(ViewState& state,ItemMetrics metrics,float zoomProgress,std::optional<GridPacking> packing={}) {
+    const auto [row,font,icon]=metrics;
+    state.zebraExtentAnimating=false;
     state.zoomToIconPx = static_cast<float>(icon);
     state.zoomToFontPx = static_cast<float>(font);
     state.zoomToRowPx = row;
@@ -15200,16 +16749,19 @@ void UpdateMetrics(ViewState& state, float zoomProgress = 1.f) {
     state.iconPx = state.zoomAnimating ? state.zoomFromIconPx +
         (icon - state.zoomFromIconPx) * zoomProgress : static_cast<float>(icon);
     if (!state.gridView) state.listIconPx = state.iconPx;
-    const float header = state.columnsView ? static_cast<float>(Scale96(kHeader96, dpi)) : 0.f;
-    if (state.columnModeTransition) state.columnHeaderTo = header;
-    else state.headerPx = header;
-    LayoutGroupSections(state);
+    const float compact = state.compactRows && !state.gridView ? 1.f : 0.f;
+    UpdateColumnHeaderHeight(state,state.zoomAnimating ? std::lerp(state.zoomFromCompact,compact,zoomProgress) : compact);
+    LayoutGroupSections(state,packing);
     // An ordinary metrics refresh (DPI, settings, resize, activation) settles
     // the pending zoom instead of leaving an old anchor/timestamp alive.
     if (state.zoomAnimating && zoomProgress >= 1.f) {
         state.zoomAnimating = false;
         UnregisterAnimationWhenIdle(state);
     }
+}
+
+void UpdateMetrics(ViewState& state,float zoomProgress=1.f) {
+    ApplyItemMetrics(state,TargetItemMetrics(state,ZoomHeight96(state),state.preciseRowHeight96[state.gridView]),zoomProgress);
 }
 
 // Icon and text geometry scale together when Ctrl+wheel adjusts row height.
@@ -15225,11 +16777,15 @@ bool ColumnsPresented(const ViewState& state) {
 }
 
 float ColumnModeVisibility(const ViewState& state, int dpi = 0) {
-    const float full = static_cast<float>(Scale96(kHeader96, dpi ? dpi : ViewDpi(state)));
-    return state.columnModeTransition ?
-        std::clamp((state.modeComposition.painting ? state.modeComposition.logicalHeader : state.headerPx) /
-            std::max(1.f, full), 0.f, 1.f) :
-        (state.columnsView ? 1.f : 0.f);
+    if (!state.columnModeTransition) return state.columnsView ? 1.f : 0.f;
+    const float full = ColumnHeaderTargetHeight(state,dpi ? dpi : ViewDpi(state),CompactReveal(state));
+    return std::clamp((state.modeComposition.painting ? state.modeComposition.logicalHeader : state.headerPx) /
+        std::max(1.f,full),0.f,1.f);
+}
+
+float ColumnHeaderPaintHeight(const ViewState& state, int dpi) {
+    return state.columnModeTransition && !state.modeComposition.painting ?
+        ColumnHeaderTargetHeight(state,dpi,CompactReveal(state)) : state.headerPx;
 }
 
 float ColumnHeaderOffset(const ViewState& state, int dpi) {
@@ -15317,10 +16873,97 @@ float SelectionCheckboxSpace(const ViewState& state, bool settled) {
 }
 // The Name text ends this far before its cell (and the list) ends.
 float NameTrailingGap(const ViewState& state) { return static_cast<float>(Scale96(8, ViewDpi(state))); }
-float NameTextOrigin(const ViewState& state, bool header = false) {
+// Inline depth of a presented row, or -1 when no tree is presented.
+int InlineTreeRowDepth(const ViewState& state, int index) {
+    if (!InlineTreeLayout(state) || index < 0 || index >= state.total ||
+        (!state.presentationOnly && static_cast<size_t>(index) >= state.entries.size())) return -1;
+    return ModelEntry(state, index).treeDepth;
+}
+// The face a text format resolves to, with its design metrics. Shared by
+// ink-extent and cap-height measurements.
+bool FormatFontFace(IDWriteTextFormat* format, ComPtr<IDWriteFontFace>& face, DWRITE_FONT_METRICS& metrics) {
+    if (!format || !g_writeFactory) return false;
+    ComPtr<IDWriteFontCollection> collection;
+    std::wstring family(format->GetFontFamilyNameLength() + 1, L'\0');
+    UINT32 index = 0; BOOL exists = FALSE;
+    ComPtr<IDWriteFontFamily> fonts; ComPtr<IDWriteFont> font;
+    if (FAILED(format->GetFontCollection(&collection)) || !collection) g_writeFactory->GetSystemFontCollection(&collection);
+    if (!collection || FAILED(format->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
+        FAILED(collection->FindFamilyName(family.c_str(), &index, &exists)) || !exists ||
+        FAILED(collection->GetFontFamily(index, &fonts)) ||
+        FAILED(fonts->GetFirstMatchingFont(format->GetFontWeight(), format->GetFontStretch(), format->GetFontStyle(), &font)) ||
+        FAILED(font->CreateFontFace(&face))) return false;
+    face->GetMetrics(&metrics);
+    return metrics.designUnitsPerEm != 0;
+}
+// Disclosure chevrons (group headings and inline folders) are as tall as the
+// cap height of the text beside them, so they follow text size and zoom.
+// unit is half the chevron's height; its width is one unit. gap separates the
+// chevron from what follows it (icon or heading text), one cap height, as in
+// Finder's list view.
+struct DisclosureChevronMetrics { float unit = 0.f, gap = 0.f, thickness = 1.f; };
+DisclosureChevronMetrics DisclosureChevron(const ViewState& state, float fontSize) {
+    if (state.bodyCapRatio == 0.f) {
+        ComPtr<IDWriteFontFace> face; DWRITE_FONT_METRICS metrics{};
+        state.bodyCapRatio = FormatFontFace(state.textFormat.Get(), face, metrics) && metrics.capHeight ?
+            static_cast<float>(metrics.capHeight) / metrics.designUnitsPerEm : -1.f;
+        if (state.bodyCapRatio < 0.f && g_perf.load(std::memory_order_relaxed))
+            Wh_Log(L"[GPU overlay] body font cap height unavailable; chevrons keep their fixed size");
+    }
     const int dpi = ViewDpi(state);
+    const float cap = state.bodyCapRatio > 0.f ? state.bodyCapRatio * fontSize : static_cast<float>(Scale96(8, dpi));
+    DisclosureChevronMetrics result;
+    result.unit = cap * .5f;
+    result.gap = cap;
+    // The stroke grows with the chevron, about a regular text stem (an eighth
+    // of the cap height), so zoom keeps its weight beside the text.
+    result.thickness = std::max(static_cast<float>(Scale96(1, dpi)), cap * .125f);
+    return result;
+}
+// Width of the chevron's box: the open (down) chevron, stroke included.
+float InlineTreeChevronBox(const ViewState& state) {
+    const auto chevron = DisclosureChevron(state, state.fontPx);
+    return chevron.unit * 2.f + chevron.thickness;
+}
+// One indentation level: the chevron's box plus Finder's chevron-to-icon gap,
+// so a child's chevron sits under its parent's icon, as in Finder. It follows
+// text and icon size, so zoom rescales the tree together with the rows.
+float InlineTreeLevelWidth(const ViewState& state) {
+    return InlineTreeChevronBox(state) + IconPixelSize(state) * .42f;
+}
+// Left of an inline folder's chevron slot, from the left of its icon
+// (logical). Finder's list view, measured against its folder icon: the
+// chevron's box ends 0.42 icon widths before the icon.
+float InlineTreeChevronSlot(const ViewState& state, float iconLeft) {
+    return iconLeft - IconPixelSize(state) * .42f - InlineTreeChevronBox(state);
+}
+// Centre shared by the chevron in every direction and by the spinner that
+// stands in for it: the middle of a box as wide as the open (down) chevron,
+// stroke included, starting at the slot. Everything turns in place and lines
+// up across rows, and the box keeps the space before a row constant.
+float InlineTreeChevronCenter(const ViewState& state, float iconLeft) {
+    const auto chevron = DisclosureChevron(state, state.fontPx);
+    return InlineTreeChevronSlot(state, iconLeft) + chevron.thickness * .5f + chevron.unit;
+}
+// A list row's leading edge: one DPI-only gap before each leading control,
+// so the edge-to-checkbox and checkbox-to-chevron (or icon) spaces match and
+// zoom never moves where a row starts.
+float ListLeadingGap(const ViewState& state) { return static_cast<float>(Scale96(16, ViewDpi(state))); }
+float ListCheckboxSpace(const ViewState& state) {
+    return (SelectionCheckboxSize(state) + ListLeadingGap(state)) * SelectionCheckboxReveal(state);
+}
+// Left of a list row's icon at an inline depth (0 for the folder's own rows).
+float ListIconLeft(const ViewState& state, int depth, bool header = false) {
     const float start = ColumnsPresented(state) ? NameColumnStart(state) : ListStartX(state);
-    return start + SelectionCheckboxSpace(state) + Scale96(16, dpi) + IconPixelSize(state, header) + Scale96(10, dpi);
+    float x = start + ListLeadingGap(state) + ListCheckboxSpace(state);
+    if (InlineTreeLayout(state)) {
+        x += InlineTreeChevronBox(state) + IconPixelSize(state, header) * .42f +
+            std::max(0, depth) * InlineTreeLevelWidth(state);
+    }
+    return x;
+}
+float NameTextOrigin(const ViewState& state, bool header = false) {
+    return ListIconLeft(state, 0, header) + IconPixelSize(state, header) + Scale96(10, ViewDpi(state));
 }
 
 // One item layout feeds drawing, selection, rename and pointer geometry.
@@ -15389,13 +17032,15 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
             }
         }
     } else {
-        const float iconX = (ColumnsPresented(state) ? NameColumnStart(state) : start) +
-            Scale96(16, dpi) + SelectionCheckboxSpace(state);
+        // Every row reserves the chevron; children add one level each.
+        const bool tree = InlineTreeLayout(state);
+        const float nested = tree && visual.treeDepth > 0 ? InlineTreeLevelWidth(state) * visual.treeDepth : 0.f;
+        const float iconX = ListIconLeft(state, visual.treeDepth);
         const float iconY = visual.top + (state.rowPx-side)*.5f;
         g.icon = D2D1::RectF(iconX, iconY, iconX+side, iconY+side);
-        g.text = D2D1::RectF(NameTextOrigin(state), visual.top,
-            NameContentEnd(state)-NameTrailingGap(state),
-            visual.top+state.rowPx);
+        const float textRight = NameContentEnd(state)-NameTrailingGap(state);
+        g.text = D2D1::RectF(std::min(NameTextOrigin(state) + nested, textRight), visual.top,
+            textRight, visual.top+state.rowPx);
         if (const float reveal = ContentReveal(state); reveal > 0.f) {
             // Name over type on the leading side; date over size in a second
             // text column. Icon and text share one top edge, as in tiles, and
@@ -15448,9 +17093,11 @@ ItemGeometry LayoutItem(ViewState& state, const RowVisual& visual) {
     }
     if (const float reveal = SelectionCheckboxReveal(state); reveal > 0.f) {
         // Boxes slide with the band they lead, like the section badges.
-        const float slide = SelectionCheckboxBand(state)*(1.f-reveal);
+        // A list row's box keeps the shared leading gap (ListIconLeft).
+        const float slide = (state.gridView ? SelectionCheckboxBand(state) :
+            SelectionCheckboxSize(state) + ListLeadingGap(state))*(1.f-reveal);
         const bool corner = state.gridView && !TileLayout(state) && state.layoutNativeMode != FVM_SMALLICON;
-        const float leading = CheckboxMetric(corner ? 7 : 18,dpi);
+        const float leading = state.gridView ? CheckboxMetric(corner ? 7 : 18,dpi) : ListLeadingGap(state);
         const float inset = state.gridView ? std::min(leading,std::max(0.f,g.cell.right-g.cell.left)*.125f) : leading;
         const float available = state.gridView ? std::max(0.f,(g.cell.right-g.cell.left)*.5f-inset) : SelectionCheckboxSize(state);
         const float topInset = corner ? CheckboxMetric(4,dpi) : 0.f;
@@ -15493,7 +17140,7 @@ D2D1_RECT_F HeaderSelectionCheckbox(ViewState& state) {
     const float left = NameColumnStart(state) + CheckboxMetric(18,ViewDpi(state)) -
         SelectionCheckboxBand(state)*(1.f-SelectionCheckboxReveal(state));
     const float top = ColumnHeaderOffset(state,ViewDpi(state)) +
-        (Scale96(kHeader96,ViewDpi(state))-size)*.5f;
+        (ColumnHeaderPaintHeight(state,ViewDpi(state))-size)*.5f;
     return D2D1::RectF(left,top,left+size,top+size);
 }
 
@@ -15857,6 +17504,10 @@ void StartGroupingTransition(ViewState& state,
                     g.title == section.title; });
             if (old != oldHeaders.end()) {
                 motion.oldTop = old->oldTop;
+                if (reflow) {
+                    motion.oldHeight = old->oldHeight;
+                    motion.oldOpacity = old->oldOpacity;
+                }
             } else {
                 motion.entering = true;
                 motion.oldTop = h + section.documentTop - state.scrollNow + row * .35f;
@@ -15887,7 +17538,22 @@ void StartGroupingTransition(ViewState& state,
     RegisterViewAnimation(state);
 }
 
+RowVisual LayoutRowMotionVisual(const ViewState& state, int index, float progress);
 RowVisual LayoutRowVisual(const ViewState& state, int index,
+                          float progress) {
+    RowVisual visual = LayoutRowMotionVisual(state, index, progress);
+    if (InlineTreeLayout(state) && index >= 0 && index < state.total &&
+        (state.presentationOnly || static_cast<size_t>(index) < state.entries.size()))
+        visual.treeDepth = ModelEntry(state, index).treeDepth;
+    return visual;
+}
+// A disappearing row keeps its own indentation while it collapses away.
+RowVisual GhostRowVisual(const ViewState& state, const CapturedRow& old, float top, float height, float opacity) {
+    RowVisual visual{top, height, opacity, old.oldLeft, old.oldWidth};
+    if (InlineTreeLayout(state)) visual.treeDepth = old.entry.treeDepth;
+    return visual;
+}
+RowVisual LayoutRowMotionVisual(const ViewState& state, int index,
                           float progress) {
     const float row = static_cast<float>(state.rowPx);
     const float targetTop = state.headerPx + DocumentRowTop(state, index) - state.scrollNow;
@@ -15913,7 +17579,7 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
     const RowMotion& motion = *motionPtr;
     // Movement belongs to document space. Scroll translates BOTH endpoints
     // by the full viewport delta, independently of the collapse's progress.
-    const float fromTop = motion.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+    const float fromTop = motion.oldTop - RowTransitionScrollDelta(state);
     const float top = fromTop + (targetTop - fromTop) * progress;
     const float oldHeight = motion.entering ? 0.f : motion.oldHeight;
     const float opacity = state.groupingLayoutTransition ?
@@ -15943,7 +17609,8 @@ RowVisual LayoutRowVisual(const ViewState& state, int index,
 // so a retargeted layout always starts from the image on screen.
 // A list/grid switch (shapes) also captures list rows, as wide as the list,
 // with each item's presented icon and name for the morph to start from.
-std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes = false) {
+std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes = false,
+                                                  float sampledProgress = -1.f) {
     // Retargeting zoom/resize must retain a travelling icon/name, even when
     // the caller only requested cell geometry for an ordinary reflow.
     shapes |= state.rowTransitionActive && std::any_of(state.rowMotion.begin(),state.rowMotion.end(),
@@ -15956,7 +17623,7 @@ std::vector<CapturedRow> CapturePresentedGridCells(ViewState& state, bool shapes
         for (const auto& motion : state.rowMotion) rows.push_back(motion.newIndex);
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-    const float progress = LayoutTransitionProgress(state,
+    const float progress = sampledProgress>=0.f ? sampledProgress : LayoutTransitionProgress(state,
         state.rowTransitionActive, state.rowTransitionStartedQpc);
     const float pad = kRowTransitionOverscan * state.rowPx;
     for (int index : rows) {
@@ -16347,13 +18014,21 @@ void ReconcileColumnViewportAfterRowCount(ViewState& state) {
 // and resize call UpdateColumns directly and never start this transition.
 void StopColumnTransition(ViewState& state) {
     if (!state.columnTransitionActive) return;
-    if (state.columnModeTransition) state.headerPx = state.columnHeaderTo;
+    const bool viewMode = state.columnModeTransition;
+    if (viewMode) state.headerPx = state.columnHeaderTo;
     state.columnModeTransition = false;
     state.columnTransitionActive = false;
     state.columnMotion.clear();
     state.disappearingColumns.clear();
     for (auto& column : state.columns) column.opacity = 1.f;
     UnregisterAnimationWhenIdle(state);
+    // Every end of a change into Details (finished, interrupted or settled):
+    // the folders expanded before it unfold again. Posted, not called: this
+    // runs inside other operations (a new mode change, column settling), and
+    // the continuation re-checks that Details is still the settled layout.
+    if (viewMode && !state.inlineTreeReopenQueued && IsWindow(state.hwnd) && !state.presentationOnly)
+        state.inlineTreeReopenQueued = PostMessageW(state.hwnd, kMsgInlineTreeReopen,
+            WPARAM(state.lifetimeToken), 0) != FALSE;
 }
 
 // A restrained overshoot makes displaced columns settle organically without
@@ -16370,11 +18045,12 @@ void StartColumnTransition(ViewState& state,
     PipelineScope pipeline(state.background,L"columns.transition",previous.size(),state.columns.size());
     const float headerFrom = state.headerPx;
     StopColumnTransition(state);
+    state.scrollbarLayoutMotion.columnMode = false;
     if (state.startupAnimationsSuppressed || !state.visible || !state.detailsViewActive ||
         (!state.columnsView && !viewMode) ||
         (!viewMode && (previous.empty() || state.columns.empty()))) return;
     const float headerTo = state.columnsView ?
-        static_cast<float>(Scale96(kHeader96, ViewDpi(state))) : 0.f;
+        ColumnHeaderTargetHeight(state,ViewDpi(state),CompactReveal(state)) : 0.f;
     state.columnMotion.reserve(state.columns.size());
     // The same short, DPI-scaled displacement applies to every column width.
     // Logical reading order automatically mirrors it for RTL.
@@ -16534,7 +18210,7 @@ void SetColumnViewMode(ViewState& state, bool details, bool animate = true) {
     StopRowTransition(state);
     state.columnsView = details;
     state.columnModeEntrancePending = animate && details;
-    state.headerPx = details ? static_cast<float>(Scale96(kHeader96, ViewDpi(state))) : 0.f;
+    UpdateColumnHeaderHeight(state,CompactReveal(state));
     UpdateColumns(state);
     if (animate && state.visible && state.detailsViewActive) {
         if (!details) state.columnContentWidth = previousExtent;
@@ -16934,9 +18610,18 @@ size_t GlyphCacheBytes(const ViewState& state) {
     return bytes;
 }
 
+TextLayoutCache& TextCache(ViewState& state, bool header, bool sorted, bool wrapped,
+                           std::optional<float> groupFontSize) {
+    if (groupFontSize) return state.textLayouts[4];
+    if (wrapped) return state.textLayouts[3];
+    if (!header) return state.textLayouts[0];
+    return state.textLayouts[sorted ? 2 : 1];
+}
+
 IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     float width, float height, bool header = false, bool sortedHeader = false,
-    float* naturalWidth = nullptr, bool wrapped = false, bool filename = false) {
+    float* naturalWidth = nullptr, bool wrapped = false, bool filename = false,
+    std::optional<float> groupFontSize = std::nullopt) {
     auto format = !header ? state.textFormat.Get() :
         (sortedHeader && state.sortedHeaderFormat ?
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
@@ -16945,7 +18630,7 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
     // made wrapped labels alternate sizes while scrolling or crossing columns.
     width = roundf(width); height = roundf(height);
     if (!format || !g_writeFactory || width <= 0.f || height <= 0.f) return nullptr;
-    auto& cache = state.textLayouts[wrapped ? 3 : !header ? 0 : sortedHeader ? 2 : 1];
+    auto& cache = TextCache(state,header,sortedHeader,wrapped,groupFontSize);
     const auto alignment = format->GetTextAlignment();
     if (cache.format.Get() != format || cache.alignment != alignment) {
         // Readiness belongs to the value, not a particular font. Keep the
@@ -16957,11 +18642,13 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         cache.format = format;
         cache.alignment = alignment;
     }
-    const bool middleTrim = filename && ViewOptionEnabled(state,g_middleEllipsis);
+    const bool middleTrim = MiddleTrimmedText(state, filename, !header && !groupFontSize);
+    const float fontSize = header ? ColumnHeaderFontSize(state,ViewDpi(state)).value_or(format->GetFontSize()) :
+        groupFontSize.value_or(format->GetFontSize());
     auto it = cache.layouts.find(text);
     float previousSize=0.f;
     const bool fontChanged=it==cache.layouts.end() ||
-        FAILED(it->second.text->GetFontSize(0,&previousSize)) || previousSize!=format->GetFontSize();
+        FAILED(it->second.text->GetFontSize(0,&previousSize)) || previousSize!=fontSize;
     bool geometryChanged = false;
     if (it == cache.layouts.end() || it->second.generation != cache.generation ||
         fontChanged || (!naturalWidth && it->second.middleTrim != middleTrim)) {
@@ -16976,43 +18663,19 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
             DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
             if(SUCCEEDED(format->GetTrimming(&trimming,&sign)) &&
                 SUCCEEDED(textLayout->SetInlineObject(nullptr,{0,static_cast<UINT32>(text.size())})) &&
-                SUCCEEDED(textLayout->SetFontSize(format->GetFontSize(),{0,static_cast<UINT32>(text.size())})) &&
+                SUCCEEDED(textLayout->SetFontSize(fontSize,{0,static_cast<UINT32>(text.size())})) &&
                 SUCCEEDED(textLayout->SetMaxWidth(width)) && SUCCEEDED(textLayout->SetMaxHeight(height)) &&
                 SUCCEEDED(textLayout->SetTrimming(&trimming,sign.Get()))) layout=it->second.text;
         }
-        if (!layout && FAILED(g_writeFactory->CreateTextLayout(text.c_str(),
-            static_cast<UINT32>(text.size()), format, width, height,
-            layout.GetAddressOf()))) return nullptr;
+        if (!layout) {
+            const auto length=static_cast<UINT32>(text.size());
+            if (FAILED(g_writeFactory->CreateTextLayout(text.c_str(),length,format,width,height,&layout)) ||
+                (fontSize!=format->GetFontSize() && FAILED(layout->SetFontSize(fontSize,{0,length})))) return nullptr;
+        }
         if (wrapped) {
             layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
             layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        }
-        if (middleTrim && !wrapped && text.size() > 1) {
-            // Native trimming retains the suffix without rewriting the name,
-            // so search hit tests, selection and shaping keep original indices.
-            // Preserve an extension; extensionless/leading-dot names retain
-            // up to eight trailing characters instead. Work runs once per shape.
-            size_t suffix = text.find_last_of(L'.');
-            if (suffix == std::wstring::npos || !suffix || suffix+1 == text.size())
-                suffix = text.size()-std::min<size_t>(8,std::max<size_t>(1,text.size()/3));
-            if ((text[suffix] & 0xFC00) == 0xDC00 && suffix) --suffix;
-            const auto scalar = [&](size_t position) -> UINT32 {
-                const UINT32 first = text[position];
-                return (first & 0xFC00) == 0xD800 && position+1 < text.size() &&
-                    (text[position+1] & 0xFC00) == 0xDC00 ?
-                    0x10000+((first-0xD800)<<10)+(text[position+1]-0xDC00) : first;
-            };
-            DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
-            if (SUCCEEDED(layout->GetTrimming(&trimming,&sign))) {
-                trimming.delimiter = scalar(suffix); trimming.delimiterCount = 0;
-                for (size_t i=suffix;i<text.size();) {
-                    const UINT32 codepoint = scalar(i);
-                    if (codepoint == trimming.delimiter) ++trimming.delimiterCount;
-                    i += codepoint > 0xFFFF ? 2 : 1;
-                }
-                layout->SetTrimming(&trimming,sign.Get());
-            }
         }
         if (it == cache.layouts.end()) {
             TrimShapedLayouts(state);
@@ -17059,57 +18722,53 @@ IDWriteTextLayout* ResolveTextLayout(ViewState& state, const std::wstring& text,
         layout.filenameSelectionReady = false;
         geometryChanged = true;
     }
-    if (wrapped && middleTrim && geometryChanged && text.size() > 1) {
-        // DirectWrite's delimiter trimming is single-line. For wrapped labels,
-        // replace the omitted range with its standard inline ellipsis instead.
-        // Original UTF-16 indices survive; fit once per geometry, using shaped
-        // clusters/line breaks rather than repeated substring measurements.
+    if (middleTrim && geometryChanged && text.size() > 1) {
+        // Dolphin's middle mode delegates to Qt::ElideMiddle: consume one unit
+        // from each end per step. Use DirectWrite shaped clusters and retain
+        // original indices for selection, search highlighting and hit testing.
         DWRITE_TRIMMING trimming{}; ComPtr<IDWriteInlineObject> sign;
         layout.text->GetTrimming(&trimming,&sign);
         layout.text->SetInlineObject(nullptr,{0,static_cast<UINT32>(text.size())});
         DWRITE_TRIMMING untrimmed{DWRITE_TRIMMING_GRANULARITY_NONE,0,0};
         layout.text->SetTrimming(&untrimmed,nullptr);
-        UINT32 count=0;
-        layout.text->GetLineMetrics(nullptr,0,&count);
-        std::vector<DWRITE_LINE_METRICS> lines(count);
-        if (count && SUCCEEDED(layout.text->GetLineMetrics(lines.data(),count,&count))) {
-            float bottom=0; UINT32 start=0; size_t visible=0;
-            while (visible<lines.size() && bottom+lines[visible].height<=height+.1f) {
-                bottom+=lines[visible].height; start+=lines[visible++].length;
+        UINT32 lineStart=0;
+        bool fit=!wrapped;
+        if (wrapped) {
+            UINT32 count=0;
+            layout.text->GetLineMetrics(nullptr,0,&count);
+            std::vector<DWRITE_LINE_METRICS> lines(count);
+            if (count && SUCCEEDED(layout.text->GetLineMetrics(lines.data(),count,&count))) {
+                float bottom=0;
+                UINT32 start=0;
+                for (UINT32 i=0;i<count && bottom+lines[i].height<=height+.1f;++i) {
+                    lineStart=start;
+                    start+=lines[i].length;
+                    bottom+=lines[i].height;
+                    fit=i+1<count;
+                }
             }
-            if (visible && visible<lines.size() && sign) {
-                const UINT32 lineStart=start-lines[visible-1].length;
-                size_t suffix=text.find_last_of(L'.');
-                if (suffix==std::wstring::npos || !suffix || suffix+1==text.size())
-                    suffix=text.size()-std::min<size_t>(8,std::max<size_t>(1,text.size()/3));
-                UINT32 clustersCount=0;
-                layout.text->GetClusterMetrics(nullptr,0,&clustersCount);
-                std::vector<DWRITE_CLUSTER_METRICS> clusters(clustersCount);
-                DWRITE_INLINE_OBJECT_METRICS ellipsis{};
-                if (clustersCount && SUCCEEDED(sign->GetMetrics(&ellipsis)) &&
-                    SUCCEEDED(layout.text->GetClusterMetrics(clusters.data(),clustersCount,&clustersCount))) {
-                    size_t first=0,tail=0; UINT32 position=0;
-                    for(size_t i=0;i<clusters.size();++i) {
-                        if(position<lineStart) first=i+1;
-                        if(position<suffix) tail=i+1;
-                        position+=clusters[i].length;
+        }
+        if (fit && sign) {
+            UINT32 count=0;
+            layout.text->GetClusterMetrics(nullptr,0,&count);
+            std::vector<DWRITE_CLUSTER_METRICS> clusters(count);
+            DWRITE_INLINE_OBJECT_METRICS mark{};
+            if (count && SUCCEEDED(sign->GetMetrics(&mark)) &&
+                SUCCEEDED(layout.text->GetClusterMetrics(clusters.data(),count,&count))) {
+                UINT32 left=0, right=count, begin=0, end=static_cast<UINT32>(text.size());
+                while (left<right && begin<lineStart) begin+=clusters[left++].length;
+                float total=0;
+                for (UINT32 i=left;i<right;++i) total+=clusters[i].width;
+                if (total>width || wrapped) {
+                    float used=mark.width;
+                    while (right-left>2) {
+                        used+=clusters[left].width+clusters[right-1].width;
+                        if (used>=width) break;
+                        begin+=clusters[left++].length;
+                        end-=clusters[--right].length;
                     }
-                    tail=std::min(tail,clusters.size()-1);
-                    float tailWidth=0;
-                    for(size_t i=tail;i<clusters.size();++i) tailWidth+=clusters[i].width;
-                    while(tail+1<clusters.size() && tailWidth+ellipsis.width>width)
-                        tailWidth-=clusters[tail++].width;
-                    UINT32 cut=0,tailPosition=0; float used=0;
-                    for(size_t i=0;i<tail;++i) {
-                        if(i<first || used+clusters[i].width+ellipsis.width+tailWidth<=width) {
-                            cut+=clusters[i].length;
-                            if(i>=first) used+=clusters[i].width;
-                        } else break;
-                    }
-                    // Compute suffix identity independently of the fitted prefix.
-                    for(size_t i=0;i<tail;++i) tailPosition+=clusters[i].length;
-                    if(cut<tailPosition && tailWidth+ellipsis.width<=width)
-                        layout.text->SetInlineObject(sign.Get(),{cut,tailPosition-cut});
+                    if (begin<end && mark.width<=width)
+                        layout.text->SetInlineObject(sign.Get(),{begin,end-begin});
                 }
             }
         }
@@ -17200,7 +18859,7 @@ D2D1_RECT_F ColumnTextBounds(ViewState& state, size_t columnIndex, bool header,
     return D2D1::RectF(from + leading,
         headerOffset,
         to - trailing,
-        header ? headerOffset + Scale96(kHeader96,dpi) : state.rowPx);
+        header ? headerOffset + ColumnHeaderPaintHeight(state,dpi) : state.rowPx);
 }
 
 // Both the initial width fit and its deferred metadata completion use the
@@ -18323,6 +19982,7 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
             ConfigureTextFormat(format.Get(), state.rtlLayout, true);
             if(previous->GetReadingDirection()!=format->GetReadingDirection()) ++state.textFaceSerial;
             state.textFormat = std::move(format);
+            state.bodyCapRatio = 0.f;
             state.textFormatsDirty=false;
             return true;
         }
@@ -18372,8 +20032,20 @@ bool MakeTextFormats(ViewState& state, bool bodyOnly = false) {
         if (SUCCEEDED(g_writeFactory->CreateTextFormat(family, nullptr, sortedWeight, style, stretch,
                 uiFontSize, L"", &sorted))) ConfigureTextFormat(sorted.Get(), state.rtlLayout, false);
         else sorted = header;
+        // Measure the actual normal and sorted faces once when they change.
+        float lineHeight=uiFontSize;
+        for (auto* format : {header.Get(),sorted.Get()}) {
+            ComPtr<IDWriteTextLayout> sample;
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(g_writeFactory->CreateTextLayout(L"Ag",2,format,uiFontSize*4.f,uiFontSize*4.f,&sample)) &&
+                SUCCEEDED(sample->GetMetrics(&metrics))) lineHeight=std::max(lineHeight,metrics.height);
+        }
+        state.headerTextHeight96=lineHeight*96.f/dpi;
+        state.headerFontSize96=uiFontSize*96.f/dpi;
+        UpdateColumnHeaderHeight(state,CompactReveal(state));
         // Commit a complete set only. Failed refreshes retain usable formats.
         state.textFormat = std::move(body);
+        state.bodyCapRatio = 0.f;
         state.headerFormat = std::move(header);
         state.sortedHeaderFormat = std::move(sorted);
         state.textFormatDpi = dpi;
@@ -18552,7 +20224,9 @@ __attribute__((noinline)) void DropTarget(ViewState& state) { // noinline: RELEA
     state.graphicsStandby=state.graphicsStandbyPending=false;
     state.graphicsStandbyTrimmed=false;
     state.graphicsPaintSerial=0;
+    state.acceptedScrollbarToken.reset();
     state.lastAcceptedPaint=0;
+    state.lastAcceptedPresentationModel=0;
     state.presentationContentAccepted=false;
     ClearModeComposition(state);
     state.dragComposition={};
@@ -18674,6 +20348,31 @@ bool FrameSizing(const ViewState& state) {
         GetPropW(state.frameHwnd,kFrameSizingProperty) != nullptr;
 }
 
+// Replacing the swap chain makes DWM recompose the whole scene for a frame,
+// which shows as a flicker of everything the overlay draws. While the view is
+// on screen, the presentation lane therefore never replaces it for a smaller
+// viewport (pane toggles, splitter drags, window resizes). Buffers only grow,
+// and Paint leaves the excess transparent outside the window. Off screen
+// (AdvanceStandbyGraphics) they return to the frame reach, where the rebuild
+// is invisible. The lane-less path keeps its WM_EXITSIZEMOVE exact request.
+bool GrowOnlyBuffers(const ViewState& state) {
+    return FrameSizing(state) || (state.presentationOnly && !state.exactBuffersRequested);
+}
+
+// Explorer's side panes and splitters only redistribute the frame's client
+// width, so lane buffers as wide as it never need replacing for those. The
+// list's height is set by the frame and its fixed chrome (command bar, address
+// bar, status bar), not by panes, so buffers keep the viewport's own height.
+// Buffers are created, grown and trimmed to this reach; only a larger frame
+// (maximize, edge drags, a bigger monitor) needs more.
+void ExtendToFrameReach(const ViewState& state, UINT& width, UINT&) {
+    if (!state.presentationOnly || !state.target) return;
+    RECT frame{};
+    if (!GetClientRect(state.frameHwnd,&frame)) return; // Thread-safe read; no message is sent.
+    const UINT limit = state.target->GetMaximumBitmapSize();
+    width = std::max(width,std::min(UINT(std::max<LONG>(0,frame.right)),limit));
+}
+
 bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if(state.presenter && !state.presentationOnly) { Redraw(state); return true; }
     GraphicsContinuation continuation(state);
@@ -18685,20 +20384,22 @@ bool ResizeTarget(ViewState& state, UINT width, UINT height) {
     if (width == 0 || height == 0) return true;
     const auto current = state.backbuffer ? state.backbuffer->GetPixelSize() : D2D1_SIZE_U{};
     if (current.width == width && current.height == height) {state.resizeDeferred=false; return true;}
-    // While the user drags a frame edge, buffers only grow, and a growing
-    // axis extends to the monitor's work area at once. Paint clears the whole
-    // buffer and draws only the client, so the excess stays transparent and
-    // outside the window. WM_EXITSIZEMOVE requests the exact size again.
-    if (FrameSizing(state) && current.width && current.height) {
+    // A growing axis allocates, once, the largest extent the viewport can
+    // reach before the next rebuild would be needed: the monitor's work area
+    // while the user drags a frame edge, otherwise the frame reach. Any later
+    // step within it reuses the buffers.
+    if (GrowOnlyBuffers(state) && current.width && current.height) {
         if (current.width >= width && current.height >= height) {state.resizeDeferred=false; return true;}
-        MONITORINFO monitor{sizeof(monitor)};
-        if (GetMonitorInfoW(MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST),&monitor)) {
-            const UINT limit = state.target->GetMaximumBitmapSize();
-            const UINT workWidth = UINT(std::max<LONG>(0,monitor.rcWork.right-monitor.rcWork.left));
-            const UINT workHeight = UINT(std::max<LONG>(0,monitor.rcWork.bottom-monitor.rcWork.top));
-            if (width > current.width) width = std::max(width,std::min(workWidth,limit));
-            if (height > current.height) height = std::max(height,std::min(workHeight,limit));
-        }
+        if (FrameSizing(state)) {
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetMonitorInfoW(MonitorFromWindow(state.hwnd,MONITOR_DEFAULTTONEAREST),&monitor)) {
+                const UINT limit = state.target->GetMaximumBitmapSize();
+                const UINT workWidth = UINT(std::max<LONG>(0,monitor.rcWork.right-monitor.rcWork.left));
+                const UINT workHeight = UINT(std::max<LONG>(0,monitor.rcWork.bottom-monitor.rcWork.top));
+                if (width > current.width) width = std::max(width,std::min(workWidth,limit));
+                if (height > current.height) height = std::max(height,std::min(workHeight,limit));
+            }
+        } else ExtendToFrameReach(state,width,height);
         width = std::max(width,current.width); height = std::max(height,current.height);
     }
     // Shell view replacement/top-order repairs can send WM_SIZE during a
@@ -18791,7 +20492,11 @@ bool EnsureTarget(ViewState& state) {
     state.imageTextureLimit=std::min(kPlatformImageDimension,state.target->GetMaximumBitmapSize());
     {
         state.graphicsFailureStage=3;
-        hr=CreatePresentationBuffers(state,width,height);
+        // Nothing is on screen yet, so allocating the frame reach now costs no
+        // visible rebuild later when a pane closes or a splitter widens the view.
+        UINT bufferWidth=width, bufferHeight=height;
+        ExtendToFrameReach(state,bufferWidth,bufferHeight);
+        hr=CreatePresentationBuffers(state,bufferWidth,bufferHeight);
         if(FAILED(hr)) goto failed;
     }
     state.graphicsFailureStage=4;
@@ -18896,6 +20601,8 @@ void StrokeLine(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F b,ID2D1SolidColor
 // A chevron's two pixel-snapped strokes meet at one tip point, closed by a
 // disc of the stroke's width: a round join, so the tip is one continuous
 // corner instead of two square line ends with a notch between them.
+// (A translucent chevron shows the overlap brighter: see
+// docs/1.1.22-chevron-overlap.md before changing this.)
 void StrokeChevron(ViewState& state,D2D1_POINT_2F a,D2D1_POINT_2F tip,D2D1_POINT_2F b,
                    ID2D1SolidColorBrush* brush,float width=1.f) {
     if(!brush || !VisibleOpacity(brush->GetColor().a*brush->GetOpacity())) return;
@@ -19094,14 +20801,15 @@ HRESULT ReserveGlyphSlot(ViewState& state, UINT width, UINT height,
 // Wrapped/trimmed text keeps exact bounds. Direct drawing uses the same box,
 // so right-aligned/centered values never shift when their mask takes over.
 bool IntrinsicTextBox(ViewState& state, const std::wstring& text, IDWriteTextLayout* layout,
-                      float& x, float& width, float height, bool header, bool sorted, bool wrapped, bool filename) {
+                      float& x, float& width, float height, bool header, bool sorted, bool wrapped, bool filename,
+                      std::optional<float> groupFontSize) {
     if (wrapped) return false;
-    auto& shaped = state.textLayouts[!header ? 0 : sorted ? 2 : 1].layouts.at(text);
+    auto& shaped = TextCache(state,header,sorted,wrapped,groupFontSize).layouts.at(text);
     const float cellWidth=width;
     if (shaped.naturalWidth < 0.f) {
         float natural=0.f;
-        ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename);
-        ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename);
+        ResolveTextLayout(state,text,8192.f,height,header,sorted,&natural,false,filename,groupFontSize);
+        ResolveTextLayout(state,text,cellWidth,height,header,sorted,nullptr,false,filename,groupFontSize);
     }
     const float glyphWidth=ceilf(shaped.naturalWidth)+1.f;
     if (shaped.naturalWidth < 0.f || glyphWidth > cellWidth) return false;
@@ -19119,10 +20827,10 @@ bool IntrinsicTextBox(ViewState& state, const std::wstring& text, IDWriteTextLay
 // precolored BGRA bitmap changes translucent glyph coverage on composition.
 bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayout* layout,
                     float x, float y, float width, float height, unsigned color,
-                    float opacity, bool header, bool sorted, bool wrapped, bool deferCold = false,
-                    bool filename = false) {
+                    float opacity, bool header, bool sorted, bool wrapped, bool deferCold,
+                    bool filename, std::optional<float> groupFontSize) {
     if(!VisibleOpacity(opacity)) return true;
-    auto& cache = state.textLayouts[wrapped ? 3 : !header ? 0 : sorted ? 2 : 1];
+    auto& cache = TextCache(state,header,sorted,wrapped,groupFontSize);
     auto& shaped = cache.layouts.at(text);
     BOOL underline = FALSE; layout->GetUnderline(0,&underline);
     // Deferral is for newly exposed values. A mask miss at different bounds
@@ -19130,7 +20838,7 @@ bool DrawTextRaster(ViewState& state, const std::wstring& text, IDWriteTextLayou
     deferCold = deferCold && !shaped.displayed;
     auto& p = state.frameProfile;
     const float cellWidth=width;
-    const bool intrinsic=IntrinsicTextBox(state,text,layout,x,width,height,header,sorted,wrapped,filename);
+    const bool intrinsic=IntrinsicTextBox(state,text,layout,x,width,height,header,sorted,wrapped,filename,groupFontSize);
     const auto draw = [&](const TextLayoutCache::Raster& raster) {
         shaped.displayed = true;
         ID2D1Bitmap1* bitmap=raster.bitmap.Get();
@@ -19363,7 +21071,7 @@ bool DrawScaledTextRaster(ViewState& state, const std::wstring& text, float l, f
     const bool sameFace = cache.format.Get() == format ||
         (cache.faceSerial == state.textFaceSerial && cache.alignment == format->GetTextAlignment());
     if (!sameFace || shaped.generation != cache.generation || !shaped.text ||
-        shaped.middleTrim != (filename && ViewOptionEnabled(state,g_middleEllipsis))) return false;
+        shaped.middleTrim != MiddleTrimmedText(state, filename, true)) return false;
     TextLayoutCache::Raster* raster = nullptr;
     for (auto& candidate : shaped.rasters)
         if (candidate.fontSize > 0.f && candidate.bitmap && candidate.rendering == state.textRenderingSerial &&
@@ -19443,9 +21151,13 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
           float r, float b, unsigned hex, bool header=false, float opacity=1.f,
           bool sortedHeader=false, bool wrapped=false,
           const std::vector<DWRITE_TEXT_RANGE>* highlight=nullptr, bool deferCold=false,
-          bool filename=false, bool underline=false, float textCenter=-1.f, float textVertical=.5f) {
+          bool filename=false, bool underline=false, float textCenter=-1.f, float textVertical=.5f,
+          std::optional<float> groupFontSize=std::nullopt) {
     if (highlight && highlight->empty()) highlight = nullptr;
-    if (header && !sortedHeader) opacity *= kMutedHeaderOpacity;
+    if (header && !sortedHeader) {
+        const auto* theme=PaintedHighlightTheme(state);
+        if(!theme || !theme->columnHeaders[size_t(PaintedHighlightMode(state))].header.autoTextColor) opacity*=kMutedHeaderOpacity;
+    }
     if (text.empty() || r <= l || b <= t || !VisibleOpacity(opacity)) return;
     RefreshTextRendering(state);
     ConfigureTextTarget(state,state.target.Get());
@@ -19466,7 +21178,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
         (sortedHeader && state.sortedHeaderFormat ?
             state.sortedHeaderFormat.Get() : state.headerFormat.Get());
     if (!fmt) return;
-    if (!header && !highlight && state.zoomAnimating &&
+    if (!header && !groupFontSize && !highlight && state.zoomAnimating &&
         DrawScaledTextRaster(state,text,l,t,r,b,hex,opacity,wrapped,filename,underline,textCenter,textVertical)) return;
     // Changes to font/trimming geometry retain immediate drawing during their
     // animation. With stable geometry, don't even shape a new deferred value
@@ -19474,7 +21186,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
     deferCold = deferCold && state.textRasterPainting && !state.textRasterUnavailable &&
         !state.zoomAnimating && (!state.columnTransitionActive || state.modeComposition.painting) && state.dragDivider < 0 &&
         !state.horizontalAnimating && !state.draggingHorizontal && !state.columnDragActive;
-    auto& cache=state.textLayouts[wrapped ? 3 : !header ? 0 : sortedHeader ? 2 : 1];
+    auto& cache=TextCache(state,header,sortedHeader,wrapped,groupFontSize);
     if (deferCold && state.qpcFrequency > 0. && state.textRasterBuildTicks >= state.qpcFrequency*.001) {
         const auto found=cache.layouts.find(text);
         if (found==cache.layouts.end() || !found->second.displayed) {
@@ -19483,7 +21195,7 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             return;
         }
     }
-    if (auto layout = ResolveTextLayout(state, text, r-l, b-t, header, sortedHeader, nullptr, wrapped,filename)) {
+    if (auto layout = ResolveTextLayout(state, text, r-l, b-t, header, sortedHeader, nullptr, wrapped,filename,groupFontSize)) {
         auto& shaped = cache.layouts.at(text);
         const auto offset = TextAlignmentOffset(shaped,r-l,b-t,textCenter,textVertical);
         l+=offset.x; r+=offset.x; t+=offset.y; b+=offset.y;
@@ -19525,10 +21237,10 @@ void Text(ViewState& state, const std::wstring& text, float l, float t,
             state.target->PopAxisAlignedClip();
             state.brush->SetColor(Packed(hex, opacity));
         }
-        if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename)) {
+        if (!DrawTextRaster(state,text,layout,l,t,r-l,b-t,hex,opacity,header,sortedHeader,wrapped,deferCold,filename,groupFontSize)) {
             // Same canonical box and whole-pixel origin as the cached mask.
             float boxLeft=l, boxWidth=r-l;
-            const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename);
+            const bool intrinsic=IntrinsicTextBox(state,text,layout,boxLeft,boxWidth,b-t,header,sortedHeader,wrapped,filename,groupFontSize);
             const auto origin=SnapDrawPoint(state.target.Get(),D2D1::Point2F(boxLeft,t));
             if (intrinsic) layout->SetMaxWidth(boxWidth);
             // A translucent brush changes Direct2D's grayscale text alpha
@@ -19597,7 +21309,7 @@ void DrawHeaderSortChevron(ViewState& state, float logicalColumnEnd,
     float cx = logicalColumnEnd - static_cast<float>(Scale96(17, dpi));
     if (state.rtlLayout) cx = state.paintWidth - cx;
     const float cy = ColumnHeaderOffset(state,dpi) +
-        static_cast<float>(Scale96(kHeader96, dpi)) * .5f;
+        ColumnHeaderPaintHeight(state,dpi) * .5f;
     // Match the expanded section chevron's 2:1 width/height, retaining the bold sort stroke.
     const float halfWidth = static_cast<float>(Scale96(4, dpi));
     // A reversal folds the chevron through flat about its own center.
@@ -20231,7 +21943,8 @@ D2D1_INTERPOLATION_MODE IconInterpolation(float width, float height,
 
 bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
                     float opacity = 1.f, float angle = 0.f, D2D1_RECT_F* drawn = nullptr,
-                    IconRecord* overlay = nullptr, float itemHeight = 0.f) {
+                    IconRecord* overlay = nullptr, float itemHeight = 0.f,
+                    std::optional<float> drawnSide = std::nullopt) {
     if(!VisibleOpacity(opacity)) return true;
     if (!icon.bitmap) return false;
     if (state.iconDemandStartedAt && (!state.iconFirstDrawLogged ||
@@ -20242,7 +21955,7 @@ bool DrawCachedIcon(ViewState& state, IconRecord& icon, float x, float y,
         state.iconFirstDrawLogged = true;
         if (!icon.association) state.iconFirstSpecificDrawLogged = true;
     }
-    const float side = static_cast<float>(IconPixelSize(state));
+    const float side = drawnSide.value_or(IconPixelSize(state));
     const auto pixels = icon.bitmap->GetSize();
     const auto& artwork=icon.bitmapPixels.Ready() && icon.bitmapPixels.data.Identity()!=icon.pixels.data.Identity() ?
         icon.bitmapPixels : icon.pixels;
@@ -20411,7 +22124,8 @@ void RecordClipboardDamage(ViewState& state, const D2D1_RECT_F& icon) {
 }
 
 void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
-                    float opacity = 1.f, float itemHeight = 0.f) {
+                    float opacity = 1.f, float itemHeight = 0.f,
+                    std::optional<float> drawnSide = std::nullopt) {
     if(!VisibleOpacity(opacity)) return;
     const bool pending = state.clipboardPaths.contains(e.path);
     const float angle = pending && !state.startupAnimationsSuppressed ? ClipboardIconWiggleAngle(state.clipboardIconSize96,
@@ -20419,7 +22133,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     auto* overlay = OverlayArtwork(state, e, true);
     const auto draw = [&](IconRecord& icon, bool association) {
         D2D1_RECT_F drawn{};
-        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay,itemHeight);
+        const bool ready = DrawCachedIcon(state,icon,x,y,opacity,angle,pending ? &drawn : nullptr,overlay,itemHeight,drawnSide);
         if (ready && pending && drawn.right>drawn.left && drawn.bottom>drawn.top) RecordClipboardDamage(state,drawn);
         if (ready) icon.painted=state.graphicsPaintSerial;
         if (state.uiTraceDrawItem)
@@ -20427,7 +22141,7 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
                 .a=state.uiTraceItem,.b=reinterpret_cast<ULONG_PTR>(icon.bitmap.Get()),
                 .v={opacity,double(icon.requestedSize),double(icon.pixels.width),double(association)}},true);
         const auto& clip = state.clipboardIconViewport;
-        const float side = IconPixelSize(state);
+        const float side = drawnSide.value_or(IconPixelSize(state));
         if (ready && pending && opacity > 0.f && x+side > clip.left && x < clip.right &&
             y+side > clip.top && y < clip.bottom) state.clipboardIconsVisible = true;
         return ready;
@@ -20451,20 +22165,11 @@ void DrawActualIcon(ViewState& state, const Entry& e, float x, float y,
     if (state.uiTraceDrawItem)
         PipelineEvent(*state.background,{.operation=L"ui.icon.missing[opacity,side,grid,thumbs]",
             .a=state.uiTraceItem,.b=state.token,
-            .v={opacity,double(IconPixelSize(state)),double(state.gridView),double(g_listThumbnails.load())}},true);
+            .v={opacity,double(drawnSide.value_or(IconPixelSize(state))),double(state.gridView),double(g_listThumbnails.load())}},true);
 }
 
 // One scrollbar model for both axes. Placement is axis-specific; thumb
 // sizing, mapping, hit testing and painting are not duplicated.
-enum class ScrollAxis { Vertical, Horizontal };
-struct ScrollbarGeometry {
-    float left = 0.f, right = 0.f, top = 0.f, bottom = 0.f;
-    float thumbStart = 0.f, thumbLength = 0.f, travel = 0.f;
-    float scrollRange = 0.f;
-    ScrollAxis axis = ScrollAxis::Vertical;
-    bool usable = false;
-};
-
 ScrollbarGeometry MakeScrollbarGeometry(ScrollAxis axis, float left, float right,
                                        float top, float bottom, float content,
                                        float viewport, float offset,
@@ -20567,16 +22272,20 @@ ScrollbarGeometry Scrollbar(ViewState& state, bool touchTarget = false) {
         std::max(static_cast<float>(Scale96(24, dpi)), barWidth));
 }
 
+bool HorizontalScrollbarGeometryPending(const ViewState& state) {
+    if (state.presentationOnly) return state.presentationScrollbarGeometryPending;
+    return state.zoomAnimating || state.autoRefitPending || state.columnFitPendingEpoch ||
+        (state.folderView && (state.initialModePending || state.nativeColumnsDirty ||
+            state.deferColumnProviders || state.directoryPending || state.namesPreview));
+}
+
 bool UpdateHorizontalScrollbarVisibility(ViewState& state) {
     if (state.presentationOnly) return false;
     // Column discovery, fitting and the accepted final animation image already
     // provide readiness events. Do not turn provisional overflow into chrome,
     // add a settling timer, or withhold content/vertical scrolling for it.
     const bool settling = state.columnTransitionActive || state.columnModeTransition ||
-        state.columnPresentationPending || state.zoomAnimating || state.autoRefitPending ||
-        state.columnFitPendingEpoch || (state.folderView &&
-            (state.initialModePending || state.nativeColumnsDirty || state.deferColumnProviders ||
-             state.directoryPending || state.namesPreview));
+        state.columnPresentationPending || HorizontalScrollbarGeometryPending(state);
     const bool needed = state.horizontalScroll > 0.f || state.horizontalAnimating || state.draggingHorizontal;
     const bool previous = state.horizontalScrollbarAdmitted;
     if (!settling || needed)
@@ -20605,12 +22314,8 @@ void PublishHorizontalScrollbar(ViewState& state) {
     state.horizontalScrollbarPublished |= state.horizontalScrollbarAdmitted;
 }
 
-ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
-    // An absent bar still owns its axis: painting it must never reset the
-    // visible vertical bar's hover/press animation.
-    UpdateHorizontalScrollbarVisibility(state);
-    if (!state.horizontalScrollbarAdmitted || !ColumnsPresented(state) || !HorizontalHeight(state))
-        return {.axis = ScrollAxis::Horizontal};
+ScrollbarGeometry HorizontalBarGeometry(ViewState& state, bool touchTarget) {
+    if (!HorizontalHeight(state)) return {.axis = ScrollAxis::Horizontal};
     RECT rect{}; ViewClientRect(state, &rect);
     const int dpi = ViewDpi(state);
     const float margin = static_cast<float>(Scale96(kScrollbarInset96, dpi));
@@ -20626,6 +22331,69 @@ ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
         std::max(static_cast<float>(Scale96(24, dpi)), ScrollbarBreadth(state, true, touchTarget)), 1.f);
 }
 
+ScrollbarGeometry HorizontalBar(ViewState& state, bool touchTarget = false) {
+    UpdateHorizontalScrollbarVisibility(state);
+    // Keep the axis even when absent so paint resets only its own hover state.
+    return state.horizontalScrollbarAdmitted ? HorizontalBarGeometry(state,touchTarget) :
+        ScrollbarGeometry{.axis = ScrollAxis::Horizontal};
+}
+
+std::array<ScrollbarGeometry,2> PresentedScrollbars(ViewState& state) {
+    std::array<ScrollbarGeometry,2> bars{Scrollbar(state), HorizontalBar(state)};
+    const auto& motion=state.scrollbarLayoutMotion;
+    const bool rows=state.rowTransitionActive && motion.rowRevision==state.rowSceneRevision;
+    const bool columns=state.columnModeTransition && motion.columnMode;
+    const bool awaitingAdmission=motion.columnMode && state.columnPresentationPending &&
+        state.columnsView && !HorizontalScrollbarGeometryPending(state);
+    if ((!rows && !columns && !awaitingAdmission) || !g_scrollbar.load(std::memory_order_relaxed)) return bars;
+
+    const float progress = rows ?
+        LayoutTransitionProgress(state,true,state.rowTransitionStartedQpc) :
+        columns && !motion.rowRevision ?
+            EaseOutCubic(UiTransitionProgress(state,state.columnTransitionStartedQpc)) : 1.f;
+
+    // Use the settled viewport for the destination, even while the column
+    // header is still sliding. Reuse the live scroll offsets and touch widths.
+    auto destination=bars;
+    if (state.columnModeTransition) {
+        const float header=state.headerPx;
+        state.headerPx=state.columnHeaderTo;
+        {
+            const ScopedFlag settled(state.columnModeTransition,false);
+            destination[0]=Scrollbar(state);
+            destination[1]=(state.horizontalScrollbarAdmitted || !HorizontalScrollbarGeometryPending(state)) ?
+                HorizontalBarGeometry(state,false) : ScrollbarGeometry{.axis=ScrollAxis::Horizontal};
+        }
+        state.headerPx=header;
+    } else if (awaitingAdmission || (rows && !HorizontalScrollbarGeometryPending(state))) {
+        destination[1]=HorizontalBarGeometry(state,false);
+    }
+    for (size_t i=0;i<bars.size();++i) {
+        if (i==0 ? state.draggingScrollbar : state.draggingHorizontal) continue;
+        auto from=motion.from[i];
+        auto to=destination[i];
+        if (!from.usable && !to.usable) { bars[i]=to; continue; }
+        const auto collapsed=[](ScrollbarGeometry bar) {
+            if (bar.axis==ScrollAxis::Horizontal) bar.top=bar.bottom;
+            else bar.left=bar.right;
+            return bar;
+        };
+        if (!from.usable) from=collapsed(to);
+        if (!to.usable) to=collapsed(from);
+        auto& bar=bars[i];
+        bar=to;
+        bar.left=std::lerp(from.left,to.left,progress);
+        bar.right=std::lerp(from.right,to.right,progress);
+        bar.top=std::lerp(from.top,to.top,progress);
+        bar.bottom=std::lerp(from.bottom,to.bottom,progress);
+        bar.thumbStart=std::lerp(from.thumbStart,to.thumbStart,progress);
+        bar.thumbLength=std::lerp(from.thumbLength,to.thumbLength,progress);
+        bar.travel=std::max(0.f,(i ? bar.right-bar.left : bar.bottom-bar.top)-bar.thumbLength);
+        bar.usable=bar.right>bar.left && bar.bottom>bar.top;
+    }
+    return bars;
+}
+
 bool HitScrollbar(const ScrollbarGeometry& bar, float x, float y, float tolerance) {
     if (!bar.usable) return false;
     if (bar.axis == ScrollAxis::Horizontal)
@@ -20639,8 +22407,27 @@ bool HitScrollbarThumb(const ScrollbarGeometry& bar, float pointer) {
     return bar.usable && pointer >= bar.thumbStart && pointer <= bar.thumbStart + bar.thumbLength;
 }
 
+ScrollbarGeometry InputScrollbar(ViewState& state,bool horizontal,bool touch) {
+    const auto& motion=state.scrollbarLayoutMotion;
+    const bool morph=(state.rowTransitionActive && motion.rowRevision==state.rowSceneRevision) ||
+        (motion.columnMode && (state.columnModeTransition || state.columnPresentationPending));
+    if (!morph || !g_scrollbar.load()) return horizontal ? HorizontalBar(state,touch) : Scrollbar(state,touch);
+    auto bar=state.acceptedScrollbarToken==state.token ? state.acceptedScrollbars[horizontal] : motion.from[horizontal];
+    if (!bar.usable || !touch) return bar;
+    const float breadth=ScrollbarBreadth(state,horizontal,true);
+    if (horizontal) bar.top=std::min(bar.top,bar.bottom-breadth);
+    else bar.left=std::min(bar.left,bar.right-breadth);
+    const float span=horizontal ? bar.right-bar.left : bar.bottom-bar.top;
+    const float origin=horizontal ? bar.left : bar.top;
+    const float fraction=bar.travel>0.f ? std::clamp((bar.thumbStart-origin)/bar.travel,0.f,1.f) : 0.f;
+    bar.thumbLength=std::min(span,std::max(breadth,bar.thumbLength));
+    bar.travel=span-bar.thumbLength;
+    bar.thumbStart=origin+fraction*bar.travel;
+    return bar;
+}
+
 bool OnHorizontalBar(ViewState& state, int x, int y) {
-    return HitScrollbar(HorizontalBar(state, state.pointingDevice == PointingDevice::Touch),
+    return HitScrollbar(InputScrollbar(state,true,state.pointingDevice==PointingDevice::Touch),
         static_cast<float>(LogicalX(state, x)), static_cast<float>(y),
         static_cast<float>(Scale96(kScrollbarHitTolerance96, ViewDpi(state))));
 }
@@ -20655,7 +22442,7 @@ float ScrollFractionAt(const ScrollbarGeometry& bar, float pointer, float grab) 
 }
 
 bool OnScrollbar(ViewState& state, int x, int y) {
-    return HitScrollbar(Scrollbar(state, state.pointingDevice == PointingDevice::Touch),
+    return HitScrollbar(InputScrollbar(state,false,state.pointingDevice==PointingDevice::Touch),
         static_cast<float>(LogicalX(state, x)), static_cast<float>(y),
         static_cast<float>(Scale96(kScrollbarHitTolerance96, ViewDpi(state))));
 }
@@ -20717,8 +22504,19 @@ void DrawScrollbar(ViewState& state, const ScrollbarGeometry& bar,
     const float inset = breadth * (.32f - .20f * std::max(hot, TouchScrollbarAmount(state, horizontal)));
     const size_t interaction = dragging ? 2 : active ? 1 : 0;
     const auto surface = [&](D2D1_RECT_F bounds, float alpha, float radius, size_t part) {
-        if (!DrawScrollbarSurface(state, bounds, color, alpha, radius, part, interaction))
-            Fill(state, bounds.left, bounds.top, bounds.right, bounds.bottom, color, alpha, radius);
+        if (DrawScrollbarSurface(state, bounds, color, alpha, radius, part, interaction)) return;
+        unsigned fill = color;
+        if (part == 0 && !state.themeHighContrast) {
+            // The measured native gray is the drag endpoint. Each interaction
+            // increases contrast by one shade on the existing animation clock.
+            const bool dark = state.themeMode == Theme::Mode::Dark;
+            const float nativeGray = dark ? 149.f : 133.f;
+            const float step = dark ? 16.f : -16.f;
+            const BYTE gray = static_cast<BYTE>(std::lround(nativeGray + step * (hot + pressed - 2.f)));
+            fill = RGB(gray, gray, gray);
+            alpha = 1.f;
+        }
+        Fill(state, bounds.left, bounds.top, bounds.right, bounds.bottom, fill, alpha, radius);
     };
     surface(D2D1::RectF(bar.left, bar.top, bar.right, bar.bottom),
         .09f*hot + .08f*pressed, breadth * .5f, 1);
@@ -20854,12 +22652,18 @@ void ScrubScrollbar(ViewState& state, float mouseY) {
 // instantScrollbarScrub; horizontal dragging is always direct. Track clicks
 // animate to a centered target (or jump if smooth scrolling is off).
 bool BeginScrollbarInteraction(ViewState& state, int x, int y) {
-    const bool horizontal = OnHorizontalBar(state, x, y);
-    const bool vertical = !horizontal && OnScrollbar(state, x, y);
-    if (!horizontal && !vertical) return false;
-    AdvanceRowHeight(state, true);
-    const bool touch = state.touch.control && state.pointingDevice == PointingDevice::Touch;
-    const ScrollbarGeometry bar = horizontal ? HorizontalBar(state, touch) : Scrollbar(state, touch);
+    const bool touch=state.pointingDevice==PointingDevice::Touch;
+    const float logicalX=float(LogicalX(state,x)), tolerance=float(Scale96(kScrollbarHitTolerance96,ViewDpi(state)));
+    auto bar=InputScrollbar(state,true,touch);
+    const bool horizontal=HitScrollbar(bar,logicalX,float(y),tolerance);
+    if (!horizontal) {
+        bar=InputScrollbar(state,false,touch);
+        if (!HitScrollbar(bar,logicalX,float(y),tolerance)) return false;
+    }
+    const bool vertical=!horizontal;
+    AdvanceRowHeight(state,true);
+    const auto live=horizontal ? HorizontalBar(state) : Scrollbar(state);
+    if (!live.usable) return true; // An outgoing bar has no destination range to scrub.
     const float pointer = horizontal ? static_cast<float>(LogicalX(state, x)) :
                                        static_cast<float>(y);
     const bool thumb = HitScrollbarThumb(bar, pointer);
@@ -20868,21 +22672,17 @@ bool BeginScrollbarInteraction(ViewState& state, int x, int y) {
     state.draggingHorizontal = horizontal;
     state.draggingScrollbar = vertical;
     if (thumb) {
-        // The hit target can already be enlarged while the drawn thumb is
-        // still small. Anchor the grab to the drawn pose so DOWN cannot scroll
-        // the list just because the touch minimum thumb length is larger.
-        const auto visual = horizontal ? HorizontalBar(state) : Scrollbar(state);
-        state.capturedPointer.reset();
-        state.scrollbarGrabLength[horizontal ? 1 : 0] = visual.thumbLength;
-        const float grab = pointer - visual.thumbStart;
+        // Preserve the offset at DOWN. Subsequent pointer deltas map to the live
+        // track even if the thumb was moving or enlarged for touch at contact.
+        state.capturedPointer=POINT{x,y};
+        state.scrollbarGrabLength[horizontal ? 1 : 0]=live.thumbLength;
+        const float grab=pointer-live.thumbStart;
         if (horizontal) {
-            state.horizontalAnimating = false;
-            state.horizontalGrabOffset = grab;
-            ScrubHorizontal(state, x);
+            state.horizontalAnimating=false;
+            state.horizontalGrabOffset=grab;
         } else {
             StopScrollAnimation(state);
-            state.scrollbarGrabY = grab;
-            ScrubScrollbar(state, pointer);
+            state.scrollbarGrabY=grab;
         }
     } else {
         state.capturedPointer = POINT{x, y};
@@ -20955,6 +22755,90 @@ float FilenameSelectionPadding(const ViewState& state) {
 }
 
 // All normal and moving selection backgrounds use the SAME bounds and fill.
+SelectionShape GridFilenameShape(ViewState& state,const ItemGeometry& geometry,const std::wstring& label) {
+    const auto& text = geometry.text;
+    auto* layout = ResolveTextLayout(state,label,text.right-text.left,
+        text.bottom-text.top,false,false,nullptr,geometry.wrapped,true);
+    if (!layout) return {};
+    auto& cached = state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(label);
+    if (!cached.filenameSelectionReady) {
+        cached.filenameSelection = {};
+        cached.filenameSelectionReady = true;
+        DWRITE_LINE_METRICS lines[512]{};
+        UINT32 count = 0, position = 0;
+        const float pad = static_cast<float>(Scale96(3,ViewDpi(state)));
+        if (SUCCEEDED(layout->GetLineMetrics(lines,ARRAYSIZE(lines),&count))) {
+            for (UINT32 i=0; i<count && cached.filenameSelection.count <
+                    cached.filenameSelection.lines.size(); ++i) {
+                const auto& line = lines[i];
+                const UINT32 length = line.length-line.trailingWhitespaceLength;
+                DWRITE_HIT_TEST_METRICS runs[256]{};
+                UINT32 runCount = 0;
+                D2D1_RECT_F rc{cached.width,cached.height,0,0};
+                if (length && SUCCEEDED(layout->HitTestTextRange(position,length,0,0,
+                    runs,ARRAYSIZE(runs),&runCount))) {
+                    for (UINT32 j=0;j<runCount;++j) {
+                        const auto& m=runs[j];
+                        if (m.width<=0 || m.height<=0 || m.top>=cached.height ||
+                            m.top+m.height<=0) continue;
+                        rc.left=std::min(rc.left,m.left); rc.top=std::min(rc.top,m.top);
+                        rc.right=std::max(rc.right,m.left+m.width);
+                        rc.bottom=std::max(rc.bottom,m.top+m.height);
+                    }
+                }
+                position += line.length;
+                if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
+                // Pad symmetrically within the layout box (a rename EDIT
+                // covers exactly that box). Clamping each side separately
+                // removed only the leading inset when the caption starts
+                // at the box edge (Small icons), leaving a lopsided pill.
+                const float inset=std::clamp(std::min(rc.left,cached.width-rc.right),0.f,pad);
+                rc.left-=inset; rc.right+=inset;
+                rc.top=std::max(0.f,rc.top); rc.bottom=std::min(cached.height,rc.bottom);
+                // DirectWrite describes physical glyph positions. Fill
+                // mirrors logical rectangles, so convert the shaped run.
+                if (state.rtlLayout) {
+                    const float left=rc.left;
+                    rc.left=cached.width-rc.right; rc.right=cached.width-left;
+                }
+                cached.filenameSelection.lines[cached.filenameSelection.count++]=rc;
+            }
+        }
+    }
+    SelectionShape result;
+    // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
+    const float origin = state.rtlLayout ? state.paintWidth-
+        roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
+    const float padding = FilenameSelectionPadding(state);
+    for (unsigned i=0;i<cached.filenameSelection.count;++i) {
+        auto rc=cached.filenameSelection.lines[i];
+        rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
+        rc.right=std::min(geometry.cell.right,rc.right+origin+padding);
+        rc.top=std::max(geometry.cell.top,rc.top+roundf(text.top)-padding);
+        rc.bottom=std::min(geometry.cell.bottom,rc.bottom+roundf(text.top)+padding);
+        if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
+        // Wrapped lines overlap in their interior padding. Give the overlap
+        // to the wider line (its descenders/ascenders extend past the
+        // narrower line), so the union is unchanged but translucent fills
+        // never double up. Meet on a whole pixel: two antialiased edges at
+        // a fractional row would leave a faint line through the highlight.
+        if (result.count && rc.top<result.lines[result.count-1].bottom) {
+            auto& previous=result.lines[result.count-1];
+            const bool previousWider=previous.right-previous.left>=rc.right-rc.left;
+            previous.bottom=rc.top=roundf(previousWider ? previous.bottom : rc.top);
+        }
+        if (!result.count) result.bounds=rc;
+        else {
+            result.bounds.left=std::min(result.bounds.left,rc.left);
+            result.bounds.right=std::max(result.bounds.right,rc.right);
+            result.bounds.top=std::min(result.bounds.top,rc.top);
+            result.bounds.bottom=std::max(result.bounds.bottom,rc.bottom);
+        }
+        result.lines[result.count++]=rc;
+    }
+    return result;
+}
+
 // Interpolating this rectangle also handles filename-only pills with different
 // text widths, rather than jumping to the next filename's width.
 // `filenameText` requests the filename-only shape regardless of the option
@@ -20973,90 +22857,14 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
         if (!entry && index >= 0 && index < state.total)
             entry = &ModelEntry(state,index);
         if (!entry || EntryLabel(*entry).empty()) return {};
-        const auto& text = geometry.text;
-        auto* layout = ResolveTextLayout(state,EntryLabel(*entry),text.right-text.left,
-            text.bottom-text.top,false,false,nullptr,geometry.wrapped,true);
-        if (!layout) return {};
-        auto& cached = state.textLayouts[geometry.wrapped ? 3 : 0].layouts.at(EntryLabel(*entry));
-        if (!cached.filenameSelectionReady) {
-            cached.filenameSelection = {};
-            cached.filenameSelectionReady = true;
-            DWRITE_LINE_METRICS lines[512]{};
-            UINT32 count = 0, position = 0;
-            const float pad = static_cast<float>(Scale96(3,ViewDpi(state)));
-            if (SUCCEEDED(layout->GetLineMetrics(lines,ARRAYSIZE(lines),&count))) {
-                for (UINT32 i=0; i<count && cached.filenameSelection.count <
-                        cached.filenameSelection.lines.size(); ++i) {
-                    const auto& line = lines[i];
-                    const UINT32 length = line.length-line.trailingWhitespaceLength;
-                    DWRITE_HIT_TEST_METRICS runs[256]{};
-                    UINT32 runCount = 0;
-                    D2D1_RECT_F rc{cached.width,cached.height,0,0};
-                    if (length && SUCCEEDED(layout->HitTestTextRange(position,length,0,0,
-                        runs,ARRAYSIZE(runs),&runCount))) {
-                        for (UINT32 j=0;j<runCount;++j) {
-                            const auto& m=runs[j];
-                            if (m.width<=0 || m.height<=0 || m.top>=cached.height ||
-                                m.top+m.height<=0) continue;
-                            rc.left=std::min(rc.left,m.left); rc.top=std::min(rc.top,m.top);
-                            rc.right=std::max(rc.right,m.left+m.width);
-                            rc.bottom=std::max(rc.bottom,m.top+m.height);
-                        }
-                    }
-                    position += line.length;
-                    if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-                    // Pad symmetrically within the layout box (a rename EDIT
-                    // covers exactly that box). Clamping each side separately
-                    // removed only the leading inset when the caption starts
-                    // at the box edge (Small icons), leaving a lopsided pill.
-                    const float inset=std::clamp(std::min(rc.left,cached.width-rc.right),0.f,pad);
-                    rc.left-=inset; rc.right+=inset;
-                    rc.top=std::max(0.f,rc.top); rc.bottom=std::min(cached.height,rc.bottom);
-                    // DirectWrite describes physical glyph positions. Fill
-                    // mirrors logical rectangles, so convert the shaped run.
-                    if (state.rtlLayout) {
-                        const float left=rc.left;
-                        rc.left=cached.width-rc.right; rc.right=cached.width-left;
-                    }
-                    cached.filenameSelection.lines[cached.filenameSelection.count++]=rc;
-                }
-            }
-        }
-        SelectionShape result;
-        // Match Text's rounded PHYSICAL origin, including RTL/fractional reflow.
-        const float origin = state.rtlLayout ? state.paintWidth-
-            roundf(state.paintWidth-text.right)-cached.width : roundf(text.left);
-        const float padding = FilenameSelectionPadding(state);
-        for (unsigned i=0;i<cached.filenameSelection.count;++i) {
-            auto rc=cached.filenameSelection.lines[i];
-            rc.left=std::max(geometry.cell.left,rc.left+origin-padding);
-            rc.right=std::min(geometry.cell.right,rc.right+origin+padding);
-            rc.top=std::max(geometry.cell.top,rc.top+roundf(text.top)-padding);
-            rc.bottom=std::min(geometry.cell.bottom,rc.bottom+roundf(text.top)+padding);
-            if (rc.right<=rc.left || rc.bottom<=rc.top) continue;
-            // Wrapped lines overlap in their interior padding. Give the overlap
-            // to the wider line (its descenders/ascenders extend past the
-            // narrower line), so the union is unchanged but translucent fills
-            // never double up. Meet on a whole pixel: two antialiased edges at
-            // a fractional row would leave a faint line through the highlight.
-            if (result.count && rc.top<result.lines[result.count-1].bottom) {
-                auto& previous=result.lines[result.count-1];
-                const bool previousWider=previous.right-previous.left>=rc.right-rc.left;
-                previous.bottom=rc.top=roundf(previousWider ? previous.bottom : rc.top);
-            }
-            if (!result.count) result.bounds=rc;
-            else {
-                result.bounds.left=std::min(result.bounds.left,rc.left);
-                result.bounds.right=std::max(result.bounds.right,rc.right);
-                result.bounds.top=std::min(result.bounds.top,rc.top);
-                result.bounds.bottom=std::max(result.bounds.bottom,rc.bottom);
-            }
-            result.lines[result.count++]=rc;
-        }
+        const auto result=GridFilenameShape(state,geometry,EntryLabel(*entry));
         if (shape) *shape=result;
         return result.bounds;
     }
     D2D1_RECT_F rc = RowHighlightRect(state, top, row);
+    // An inline child's name starts one level further in per depth.
+    if (const int depth = InlineTreeRowDepth(state, index); depth > 0)
+        nameLeft = std::min(nameRight, nameLeft + InlineTreeLevelWidth(state) * depth);
     if (filenameOnly) {
         const auto usage=LayoutDriveBar(state,index,LayoutItem(state,{top,row,1.f}));
         if (usage.visible) nameRight=std::min(nameRight,usage.labelRight);
@@ -21071,12 +22879,12 @@ D2D1_RECT_F SelectionRect(ViewState& state, int index, float top, float row,
 }
 
 bool ThemedHighlights(const ViewState& state) {
-    return state.themeSnapshot && !state.themeHighContrast &&
-        state.themeSnapshot->highlightEnabled[static_cast<size_t>(state.themeMode)];
+    const auto* theme=PaintedHighlightTheme(state);
+    return theme && theme->highlightEnabled[static_cast<size_t>(PaintedHighlightMode(state))];
 }
-D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
+D2D1_COLOR_F HighlightColor(const Theme::Color& color,COLORREF accentColor) {
     if(!color.accent && color.accentWeight<0.f) return Packed(color.rgb,color.alpha);
-    const auto accent=Packed(ThemeRgb(COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF)));
+    const auto accent=Packed(ThemeRgb(accentColor));
     auto result=color.accent ? accent:Packed(color.rgb);
     if(color.accentWeight>=0.f) {
         result.r+=(accent.r-result.r)*color.accentWeight;
@@ -21084,6 +22892,9 @@ D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
         result.b+=(accent.b-result.b)*color.accentWeight;
     }
     result.a=color.alpha; return result;
+}
+D2D1_COLOR_F HighlightColor(const Theme::Color& color) {
+    return HighlightColor(color,COLORREF(DrawingAccent()&0xffffff));
 }
 struct ThemeGradientLine {
     D2D1_POINT_2F direction, start, end;
@@ -21113,16 +22924,15 @@ ComPtr<ID2D1LinearGradientBrush> NativeThemeGradient(ID2D1RenderTarget* target,c
 }
 void PrepareHighlightBrushes(ViewState& state) {
     auto& resources = state.highlightResources;
-    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
-    const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
-    const std::array<int, 3> opacity{g_selectionAlpha.load(std::memory_order_relaxed),
-        g_hoverAlpha.load(std::memory_order_relaxed), g_bothAlpha.load(std::memory_order_relaxed)};
-    if (resources.snapshot == snapshot && resources.mode == state.themeMode && resources.accent == accent &&
+    const COLORREF accent = COLORREF(DrawingAccent()&0xFFFFFF);
+    const auto snapshot=PaintedHighlightTheme(state) ? state.contrastPalette->theme : nullptr;
+    const auto opacity=HighlightOpacities(state);
+    if (resources.snapshot == snapshot && resources.mode == PaintedHighlightMode(state) && resources.accent == accent &&
         resources.opacity == opacity) return;
-    resources = {}; resources.snapshot = snapshot; resources.mode = state.themeMode; resources.accent = accent;
+    resources = {}; resources.snapshot = snapshot; resources.mode = PaintedHighlightMode(state); resources.accent = accent;
     resources.opacity = opacity;
     if (!snapshot) return;
-    const auto& styles = snapshot->highlights[static_cast<size_t>(state.themeMode)];
+    const auto& styles = snapshot->highlights[static_cast<size_t>(PaintedHighlightMode(state))];
     for (size_t i = 0; i < styles.size(); ++i) {
         const auto& paint = styles[i].background;
         if (paint.kind != Theme::Paint::Kind::Linear) continue;
@@ -21236,15 +23046,15 @@ void DrawHighlightSurface(ViewState& state, D2D1_RECT_F part, D2D1_RECT_F bounds
                           float radius, float alpha, Theme::Highlight kind) {
     const size_t index = static_cast<size_t>(kind);
     DrawThemeSurface(state, part, bounds, radius, alpha,
-        state.themeSnapshot->highlights[static_cast<size_t>(state.themeMode)][index],
+        PaintedHighlightTheme(state)->highlights[static_cast<size_t>(PaintedHighlightMode(state))][index],
         state.highlightResources.gradients[index], state.highlightResources.ramps[index],
-        state.highlightResources.opacity[index]/100.f, ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)));
+        state.highlightResources.opacity[index], ThemeRgb(SelectionColor(state)));
 }
 bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
                           float alpha, float radius, size_t part, size_t interaction) {
     const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
     auto& resources = state.scrollbarResources;
-    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
+    const COLORREF accent = COLORREF(DrawingAccent()&0xFFFFFF);
     if (resources.snapshot != snapshot || resources.mode != state.themeMode || resources.accent != accent) {
         resources = {}; resources.snapshot = snapshot; resources.mode = state.themeMode; resources.accent = accent;
         if (snapshot) {
@@ -21273,7 +23083,7 @@ bool DrawScrollbarSurface(ViewState& state, D2D1_RECT_F bounds, unsigned color,
 bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
     const auto snapshot = state.themeHighContrast ? nullptr : state.themeSnapshot;
     auto& resources = state.marqueeResources;
-    const COLORREF accent = COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xFFFFFF);
+    const COLORREF accent = COLORREF(DrawingAccent()&0xFFFFFF);
     const int configuredOpacity = g_marqueeAlpha.load(std::memory_order_relaxed);
     if (resources.snapshot != snapshot || resources.mode != state.themeMode ||
         resources.accent != accent || resources.opacity != configuredOpacity) {
@@ -21305,7 +23115,7 @@ bool DrawMarquee(ViewState& state, D2D1_RECT_F physical, float opacity) {
         physical.left = state.paintWidth-physical.right; physical.right = state.paintWidth-left;
     }
     DrawThemeSurface(state,physical,physical,radius,opacity,style,resources.gradient,resources.ramps,
-        configuredOpacity/100.f,ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),std::min(1.f,opacity*2.3f));
+        configuredOpacity/100.f,ThemeRgb(SelectionColor(state)),std::min(1.f,opacity*2.3f));
     return true;
 }
 bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fraction,
@@ -21318,7 +23128,7 @@ bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fracti
     }
     const auto& drive=snapshot->driveBars[mode][part];
     if(!drive.enabled) return false;
-    const COLORREF accent=COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xffffff);
+    const COLORREF accent=COLORREF(DrawingAccent()&0xffffff);
     if(!state.driveBarResources || state.driveBarResources->snapshot!=snapshot ||
         state.driveBarResources->mode!=state.themeMode || state.driveBarResources->accent!=accent) {
         state.driveBarResources=std::make_unique<ViewState::DriveBarResources>();
@@ -21344,12 +23154,19 @@ bool DrawDriveBar(ViewState& state, size_t part, D2D1_RECT_F track, float fracti
         resources.gradient,resources.ramps,1.f,fallbackColor,contentOpacity,512,&paint);
     return true;
 }
+float FeedbackAlpha(const ViewState& state,Theme::Highlight kind,float opacity) {
+    if(!ThemedHighlights(state)) return opacity;
+    const auto& paint=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state))[static_cast<size_t>(kind)].background;
+    if(paint.kind==Theme::Paint::Kind::Default) return opacity;
+    return opacity*(paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color.alpha : paint.color.alpha);
+}
 void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                        const SelectionShape* shape = nullptr, bool outline = false,
-                       Theme::Highlight kind = Theme::Highlight::Selected, float combinedWeight = 0.f) {
-    if (rc.right <= rc.left + 1.f || rc.bottom <= rc.top || alpha <= 0.f)
+                       Theme::Highlight kind = Theme::Highlight::Selected, float combinedWeight = 0.f,
+                       PaintedFeedback* feedback=nullptr) {
+    if (rc.right <= rc.left + 1.f || rc.bottom <= rc.top || !VisibleOpacity(alpha))
         return;
-    const unsigned rgb = ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed));
+    const unsigned rgb = ThemeRgb(SelectionColor(state));
     const bool shaped = shape && shape->count && shape->bounds.right>shape->bounds.left &&
         shape->bounds.bottom>shape->bounds.top;
     for (unsigned i=0;i<(shaped ? shape->count : 1);++i) {
@@ -21364,14 +23181,22 @@ void FillSelectionRect(ViewState& state, const D2D1_RECT_F& rc, float alpha,
                 rc.top+(line.bottom-shape->bounds.top)*sy);
         }
         const float radius=SelectionRadius(state,part.right-part.left,part.bottom-part.top);
-        if (!outline && ThemedHighlights(state)) {
-            // Crossfade paint contributions without an offscreen layer. At rest
-            // this is one brush/fill; an in-flight hover can mix two styles.
+        if(feedback && !outline && feedback->count<feedback->parts.size())
+            feedback->parts[feedback->count++]={part,radius};
+        if (!outline) {
+            // Keep the state contributions even when both styles use the same
+            // accent brush and can be painted with one fill.
             const float top = std::clamp(combinedWeight, 0.f, 1.f)*alpha;
             const float bottom = (alpha-top)/std::max(.000001f, 1.f-top);
-            DrawHighlightSurface(state, part, rc, radius, bottom, kind);
-            if (top > 0.f) DrawHighlightSurface(state, part, rc, radius, top, Theme::Highlight::SelectedHover);
-        } else if (!outline) Fill(state,part.left,part.top,part.right,part.bottom,rgb,alpha,radius);
+            if(feedback) {
+                feedback->base=FeedbackAlpha(state,kind,bottom);
+                feedback->combined=FeedbackAlpha(state,Theme::Highlight::SelectedHover,top);
+            }
+            if (ThemedHighlights(state)) {
+                if (bottom > 0.f) DrawHighlightSurface(state, part, rc, radius, bottom, kind);
+                if (top > 0.f) DrawHighlightSurface(state, part, rc, radius, top, Theme::Highlight::SelectedHover);
+            } else Fill(state,part.left,part.top,part.right,part.bottom,rgb,alpha,radius);
+        }
         else {
             if (state.rtlLayout) {
                 const float left=part.left;
@@ -21461,6 +23286,90 @@ int RowFromPoint(ViewState& state, int y, int x);
 // The slow-click rename target is the filename text itself: the shape that
 // Selection.filenameOnlySelection highlights (wrapped grid labels per line),
 // not Explorer's whole Name column. `point` is in client pixels.
+// Expander band before the icon; logical (LTR) coordinates like LayoutItem.
+D2D1_RECT_F InlineTreeExpanderRect(ViewState& state, const ItemGeometry& geometry) {
+    const float level = InlineTreeLevelWidth(state);
+    return D2D1::RectF(geometry.icon.left - level, geometry.cell.top, geometry.icon.left, geometry.cell.bottom);
+}
+bool InlineTreeExpanderHit(ViewState& state, int index, POINT point) {
+    if (!InlineTreeActive(state) || index < 0 || index >= state.total ||
+        static_cast<size_t>(index) >= state.entries.size() ||
+        !InlineTreeExpandable(state.entries[size_t(index)]) ||
+        !InsideListX(state, point.x) || RowFromPoint(state, point.y, point.x) != index) return false;
+    // The whole height of the row is the arrow's target, not just the glyph.
+    const RowVisual visual = LayoutRowVisual(state, index, CurrentRowProgress(state));
+    const auto geometry = LayoutItem(state, visual);
+    auto rect = InlineTreeExpanderRect(state, geometry);
+    // A finger is wider than the arrow: on touch, the folder's icon toggles
+    // too. (Finder's list view keeps icon clicks for selection, so a mouse
+    // keeps that.)
+    if (state.pointingDevice == PointingDevice::Touch) rect.right = geometry.icon.right;
+    const float x = static_cast<float>(LogicalX(state, point.x)), y = static_cast<float>(point.y);
+    return x >= rect.left && x < rect.right && y >= visual.top && y < visual.top + visual.height;
+}
+// The expanded folder whose branch line is under the point: a row's band for
+// depth A (A below the row's own depth) belongs to its ancestor at depth A.
+int InlineTreeBranchAt(ViewState& state, POINT point, int* depthOut = nullptr) {
+    if (depthOut) *depthOut = -1;
+    if (!InlineTreeActive(state) || point.y < state.headerPx || !InsideListX(state, point.x)) return -1;
+    const int row = RowFromPoint(state, point.y, point.x);
+    if (row < 0 || static_cast<size_t>(row) >= state.entries.size()) return -1;
+    const int depth = state.entries[size_t(row)].treeDepth;
+    if (depth <= 0) return -1;
+    const RowVisual visual = LayoutRowVisual(state, row, CurrentRowProgress(state));
+    const auto geometry = LayoutItem(state, visual);
+    const float level = InlineTreeLevelWidth(state);
+    const float base = geometry.icon.left - (depth + 1) * level;
+    const float x = static_cast<float>(LogicalX(state, point.x));
+    if (x < base || level <= 0.f) return -1;
+    // Guides run under each ancestor's chevron; the nearest one within half a
+    // level owns the point.
+    const float offset = InlineTreeChevronCenter(state, base + level) - base;
+    const int ancestor = static_cast<int>(std::floor((x - base - offset) / level + .5f));
+    if (ancestor < 0) return -1;
+    if (ancestor >= depth) return -1;
+    for (int i = row - 1; i >= 0; --i) {
+        const int d = state.entries[size_t(i)].treeDepth;
+        if (d == ancestor) { if (depthOut) *depthOut = ancestor; return i; }
+        if (d < ancestor) break;
+    }
+    return -1;
+}
+// Hover feedback for branch lines; cleared with any other hover target.
+void UpdateInlineTreeBranchHover(ViewState& state, POINT point, bool inside = true) {
+    int depth = -1;
+    const int owner = inside ? InlineTreeBranchAt(state, point, &depth) : -1;
+    const std::wstring path = owner >= 0 ? state.entries[size_t(owner)].path : std::wstring();
+    if (path == state.inlineGuideHotPath && depth == state.inlineGuideHotDepth) return;
+    if (state.itemTip.item.starts_with(kInlineGuideTipKey) &&
+        state.itemTip.item.compare(wcslen(kInlineGuideTipKey), std::wstring::npos, path) != 0) HideItemTip(state);
+    state.inlineGuideHotPath = path;
+    state.inlineGuideHotDepth = owner >= 0 ? depth : -1;
+    Redraw(state);
+}
+// Child rows are read-only in this stage: folders navigate into themselves,
+// files run their default verb through the Shell, as a double-click would.
+void OpenInlineTreeRow(ViewState& state, int index) {
+    if (index < 0 || static_cast<size_t>(index) >= state.entries.size() ||
+        !TreeChildRow(state, index) || state.optimisticStartedAt || !TabOwnsActiveView(state)) return;
+    const Entry& e = state.entries[size_t(index)];
+    PIDLIST_ABSOLUTE raw = nullptr;
+    if (FAILED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr)) || !raw) return;
+    OwnedPidl item(raw);
+    if (e.folder && state.shellBrowser) {
+        const HRESULT hr = state.shellBrowser->BrowseObject(item.get(), SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+        if (FAILED(hr)) Wh_Log(L"[GPU tree] browse failed hr=0x%08X", static_cast<unsigned>(hr));
+        return;
+    }
+    SHELLEXECUTEINFOW info{sizeof(info)};
+    info.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_LOG_USAGE;
+    info.hwnd = state.frameHwnd;
+    info.lpIDList = item.get();
+    info.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&info))
+        Wh_Log(L"[GPU tree] open failed error=%lu", GetLastError());
+}
+
 bool PointOnFilenameText(ViewState& state, int index, POINT point) {
     if (index < 0 || index >= state.total || static_cast<size_t>(index) >= state.entries.size() ||
         !InsideListX(state, point.x) || RowFromPoint(state, point.y, point.x) != index) return false;
@@ -21480,8 +23389,9 @@ bool PointOnFilenameText(ViewState& state, int index, POINT point) {
 bool PointOnItemDragContent(ViewState& state, int index, POINT point) {
     if(index<0 || index>=state.total || size_t(index)>=state.entries.size() ||
         !InsideListX(state,point.x) || RowFromPoint(state,point.y,point.x)!=index) return false;
-    const RowVisual visual{state.headerPx+DocumentRowTop(state,index)-state.scrollNow,
+    RowVisual visual{state.headerPx+DocumentRowTop(state,index)-state.scrollNow,
         DisplayRowHeight(state,index),1.f,DocumentRowLeft(state,index),state.itemWidth};
+    visual.treeDepth = InlineTreeRowDepth(state,index); // Grab the child's indented icon and name.
     const auto item=LayoutItem(state,visual);
     const float x=float(LogicalX(state,point.x)), y=float(point.y);
     const auto inside=[&](const D2D1_RECT_F& rc) {
@@ -21573,7 +23483,8 @@ D2D1_RECT_F GroupHoverRect(ViewState& state, int section, const RowVisual& visua
         const float available = std::max(0.f, text.right-text.left);
         float width = 0.f;
         if (auto* layout = ResolveTextLayout(state,state.sections[size_t(section)].title,
-                available,visual.height)) {
+                available,visual.height,false,false,nullptr,false,false,
+                ThemedHeadingFontSize(GroupHeadingTheme(state),ViewDpi(state),state.gridView,state.rowPx,state.fontPx))) {
             DWRITE_TEXT_METRICS metrics{};
             if (SUCCEEDED(layout->GetMetrics(&metrics))) width = std::clamp(metrics.width,0.f,available);
         }
@@ -21673,21 +23584,15 @@ void BeginHoverTransition(ViewState& state, int nextRow, bool animate, int nextS
 // alone cannot subtract alpha. Both resting and moving selections use this.
 float SelectionBaseOpacity(const ViewState& state, const HoverVisual& hover,
                            float visualRow, float left, float right) {
-    const float base = g_selectionAlpha.load(std::memory_order_relaxed) / 100.f;
-    const float combined = g_bothAlpha.load(std::memory_order_relaxed) / 100.f;
+    const auto [base,unusedHover,combined]=HighlightOpacities(state);
     const float horizontal = !state.gridView ? 1.f : std::clamp(
         (std::min(right, hover.right)-std::max(left, hover.left)) /
         std::max(1.f, std::min(right-left, hover.right-hover.left)), 0.f, 1.f);
     const float overlap = std::clamp(1.f - fabsf(hover.row - visualRow), 0.f, 1.f) *
         hover.strength * horizontal;
-    if (ThemedHighlights(state)) {
-        if (state.rename.editor && state.hovered == state.rename.index) return base;
-        // The combined state is a complete surface, not an accent overpaint.
-        // Retire the selected contribution as that surface arrives, including
-        // when combined opacity is lower than selection opacity.
-        return base*(1.f-overlap)/std::max(.000001f, 1.f-combined*overlap);
-    }
-    return base + std::min(0.f, combined - base) * overlap;
+    if (state.rename.editor && state.hovered == state.rename.index) return base;
+    // Retire the selected contribution as the combined surface arrives.
+    return base*(1.f-overlap)/std::max(.000001f, 1.f-combined*overlap);
 }
 
 // Overpainting the base selection should yield the configured combined
@@ -21740,17 +23645,11 @@ float HoverOverlayOpacity(ViewState& state, const HoverVisual& hover,
         }
     }
     selectedWeight = std::clamp(selectedWeight, 0.f, 1.f);
-    const float hoverAlpha = g_hoverAlpha.load(std::memory_order_relaxed) / 100.f;
-    const float base = g_selectionAlpha.load(std::memory_order_relaxed) / 100.f;
-    const float combined = g_bothAlpha.load(std::memory_order_relaxed) / 100.f;
-    if (ThemedHighlights(state)) {
-        const float alpha = hoverAlpha*(1.f-selectedWeight)+combined*selectedWeight;
-        if (combinedWeight) *combinedWeight = alpha > 0.f ? combined*selectedWeight/alpha : 0.f;
-        return alpha;
-    }
-    const float selectedExtra = std::clamp(
-        (combined - base) / std::max(0.001f, 1.f - base), 0.f, 1.f);
-    return hoverAlpha + (selectedExtra - hoverAlpha) * selectedWeight;
+    const auto opacity=HighlightOpacities(state);
+    const float combined=opacity[size_t(Theme::Highlight::SelectedHover)]*selectedWeight;
+    const float alpha=opacity[size_t(Theme::Highlight::Hover)]*(1.f-selectedWeight)+combined;
+    if (combinedWeight) *combinedWeight=alpha>0.f ? combined/alpha : 0.f;
+    return alpha;
 }
 
 // The highlight's visual motion is isolated from logical selection. Native
@@ -21829,32 +23728,25 @@ template<size_t N> void ReleaseContrastSurfaces(ThemeContrastResources<N>& cache
 }
 // The same cached, translucent contrasting ink serves checks, chip counts and swipe chevrons.
 template<size_t N> void PrepareContrastSurfaces(ViewState& state,ThemeContrastResources<N>& cache,
-    const std::array<Theme::SurfaceStyle,N>& styles,bool checkbox=false) {
-    const auto snapshot=state.themeSnapshot;
-    const COLORREF accent=COLORREF(g_swipePalette.load(std::memory_order_relaxed)&0xffffff);
-    const COLORREF bg=state.nativeEditBackground;
-    const COLORREF fg=state.nativeTextColor==CLR_INVALID ? RGB(128,128,128):state.nativeTextColor;
-    if(cache.snapshot!=snapshot || cache.mode!=state.themeMode || cache.accent!=accent ||
+    const std::array<Theme::SurfaceStyle,N>& styles) {
+    const auto& snapshot=state.contrastPalette->theme;
+    const COLORREF accent=COLORREF(DrawingAccent()&0xffffff);
+    const COLORREF bg=state.contrastPalette->background;
+    const COLORREF fg=state.contrastPalette->foreground==CLR_INVALID ? RGB(128,128,128):state.contrastPalette->foreground;
+    if(cache.snapshot!=snapshot || cache.mode!=PaintedHighlightMode(state) || cache.accent!=accent ||
        cache.background!=bg || cache.foreground!=fg) {
-        cache={}; cache.snapshot=snapshot; cache.mode=state.themeMode; cache.accent=accent;
+        cache={}; cache.snapshot=snapshot; cache.mode=PaintedHighlightMode(state); cache.accent=accent;
         cache.background=bg; cache.foreground=fg;
         for(size_t i=0;i<styles.size();++i) {
             const auto& paint=styles[i].background;
             if(paint.kind==Theme::Paint::Kind::Linear)
                 cache.gradients[i]=NativeThemeGradient(state.target.Get(),paint);
-            auto color=paint.kind==Theme::Paint::Kind::Default ?
-                Packed(ThemeRgb((!checkbox || i>=3) ? accent:fg),(!checkbox || i>=3) ? 1.f:.08f):
-                HighlightColor(paint.kind==Theme::Paint::Kind::Linear ? paint.stops.front().color:paint.color);
-            const COLORREF rgb=RGB(std::lround(color.r*255),std::lround(color.g*255),std::lround(color.b*255));
-            const COLORREF fill=BlendColor(bg,rgb,int(std::lround(color.a*100)));
-            const COLORREF ink=ColorContrast(RGB(0,0,0),fill)>ColorContrast(RGB(255,255,255),fill) ? RGB(0,0,0):RGB(255,255,255);
-            int low=0,high=100;
-            while(low<high) {
-                const int mid=(low+high)/2;
-                if(ColorContrast(BlendColor(fill,ink,mid),fill)>=3.) high=mid; else low=mid+1;
-            }
-            cache.marks[i]=Packed(ThemeRgb(ink),std::min(.95f,low/100.f));
         }
+    } else if(cache.markRevision==state.contrastPalette->surfaceRevision) return;
+    cache.markRevision=state.contrastPalette->surfaceRevision;
+    for(size_t i=0;i<N;++i) {
+        const auto ink=ResolveForeground(HighlightPalette(state),&styles[i],ThemeRgb(fg));
+        cache.marks[i]=Packed(ink.rgb,ink.alpha);
     }
 }
 
@@ -21893,14 +23785,14 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
         }
         return rect;
     };
-    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const auto palette = DrawingAccent();
     const auto pill = mirror(badge.pill);
     float radius = (pill.bottom-pill.top)*.5f;
-    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const auto snapshot=PaintedHighlightTheme(state);
     const bool themed=snapshot && snapshot->elements.contains(L"PaintGroupBadge");
     D2D1_COLOR_F ink{};
     if(themed) {
-        const auto& styles=snapshot->groupBadges[static_cast<size_t>(state.themeMode)];
+        const auto& styles=snapshot->groupBadges[static_cast<size_t>(PaintedHighlightMode(state))];
         auto& cache=state.groupBadgeResources; PrepareContrastSurfaces(state,cache,styles);
         radius=ThemeBorderRadius(styles[0],pill,ViewDpi(state));
         DrawThemeSurface(state,pill,pill,radius,alpha,styles[0],cache.gradients[0],cache.ramps[0],
@@ -21936,25 +23828,194 @@ void PaintGroupBadge(ViewState& state, const GroupBadgeLayout& badge, float opac
         badge.textLeft+badge.textWidth+1.f, badge.pill.bottom, foreground, false, foregroundAlpha);
 }
 
-// Group headings use the SAME body text format as file rows, so pinch and
-// Ctrl+wheel zoom affect their glyph size as well as their row geometry.
-// The themed group-heading color and standard Fill/Text path are unchanged.
+ContrastPalette::Ink TextForeground(const ViewState& state,const Theme::SurfaceStyle* style,
+    const Theme::SurfaceStyle* backdrop,unsigned fallback,bool defaultAuto=false) {
+    const bool useAuto=defaultAuto || (style && style->autoTextColor);
+    return ResolveForeground(useAuto ? HighlightPalette(state) : nullptr,backdrop,fallback,
+        style && style->textColor ? &*style->textColor : nullptr);
+}
+struct ForegroundFeedback {
+    PaintedFeedback focus;
+    const PaintedFeedback* selectedRow=nullptr;
+    const PaintedFeedback* moving=nullptr;
+    const PaintedFeedback* hover=nullptr;
+    std::optional<Theme::Highlight> StateAt(float x,float y) const {
+        const bool selected=(focus.base>0.f && focus.Covers(x,y)) ||
+            (selectedRow && selectedRow->base>0.f && selectedRow->Covers(x,y)) ||
+            (moving && moving->base>0.f && moving->Covers(x,y));
+        if(hover && hover->Covers(x,y)) {
+            if(hover->combined>0.f && hover->combined>=hover->base*(1.f-hover->combined))
+                return Theme::Highlight::SelectedHover;
+            if(hover->base>0.f) return selected ? Theme::Highlight::SelectedHover : Theme::Highlight::Hover;
+        }
+        return selected ? std::optional{Theme::Highlight::Selected} : std::nullopt;
+    }
+    std::optional<Theme::Highlight> CaptionState(ViewState& state,const ItemGeometry& geometry,const std::wstring& label) const {
+        const auto& box=geometry.text;
+        if (!geometry.wrapped) return StateAt(box.left+.5f,(box.top+box.bottom)*.5f);
+        const auto overlaps=[&](const PaintedFeedback* paint) {
+            if (!paint || (paint->base<=0.f && paint->combined<=0.f)) return false;
+            for (unsigned i=0;i<paint->count;++i) {
+                const auto& r=paint->parts[i].bounds;
+                if (r.left<box.right && r.right>box.left && r.top<box.bottom && r.bottom>box.top) return true;
+            }
+            return false;
+        };
+        if (!overlaps(selectedRow) && !overlaps(moving) && !overlaps(hover)) return {};
+        const auto glyphs=GridFilenameShape(state,geometry,label);
+        std::array<float,4> coverage{};
+        for (unsigned i=0;i<glyphs.count;++i) {
+            const auto& line=glyphs.lines[i];
+            const auto kind=StateAt((line.left+line.right)*.5f,(line.top+line.bottom)*.5f);
+            coverage[kind ? size_t(*kind) : 3]+=line.right-line.left;
+        }
+        const size_t best=std::max_element(coverage.begin(),coverage.end())-coverage.begin();
+        return best<3 && coverage[best]>0.f ? std::optional{static_cast<Theme::Highlight>(best)} : std::nullopt;
+    }
+    const Theme::SurfaceStyle* At(const std::array<Theme::SurfaceStyle,3>& styles,float x,float y) const {
+        const auto kind=StateAt(x,y);
+        return kind ? &styles[static_cast<size_t>(*kind)] : nullptr;
+    }
+};
+// The inline folder arrow uses the group heading's chevron: pointing toward
+// the name when collapsed, turned down when expanded, mirrored in RTL.
+void DrawInlineTreeExpander(ViewState& state, float centerXLogical, float centerY, float turn,
+                            unsigned color, float opacity, float windowWidth) {
+    if (!state.brush || opacity <= .01f) return;
+    const auto chevron = DisclosureChevron(state, state.fontPx);
+    const float centerX = state.rtlLayout ? windowWidth - centerXLogical : centerXLogical;
+    const float direction = state.rtlLayout ? -1.f : 1.f;
+    const float unit = chevron.unit;
+    const float angle = std::clamp(turn, 0.f, 1.f) * 1.57079632679f;
+    const float cosine = std::cos(angle), sine = std::sin(angle);
+    const auto rotate = [&](float x, float y) {
+        return D2D1::Point2F(centerX + direction * unit * (x * cosine - y * sine),
+            centerY + unit * (x * sine + y * cosine));
+    };
+    state.brush->SetColor(Packed(color, .75f * opacity));
+    StrokeChevron(state, rotate(-.5f, -1.f), rotate(.5f, 0.f), rotate(-.5f, 1.f), state.brush.Get(),
+        chevron.thickness);
+}
+// The system's localized text for a failed inline listing (FormatMessageW,
+// owner: the system message table), cached once per error for every tab and
+// painting thread. Module-scoped (not thread_local) so no destructor of this
+// DLL runs on an Explorer thread after unload. Map nodes never move, so the
+// returned text stays valid. Without a message the row shows nothing and the
+// condition is logged.
+SRWLOCK g_inlineTreeErrorLock = SRWLOCK_INIT;
+std::unordered_map<DWORD, std::wstring> g_inlineTreeErrorCaptions;
+const std::wstring* InlineTreeErrorCaption(DWORD error) {
+    {
+        AcquireSRWLockShared(&g_inlineTreeErrorLock);
+        const auto it = g_inlineTreeErrorCaptions.find(error);
+        const std::wstring* cached = it != g_inlineTreeErrorCaptions.end() ? &it->second : nullptr;
+        ReleaseSRWLockShared(&g_inlineTreeErrorLock);
+        if (cached) return cached;
+    }
+    wchar_t* buffer = nullptr;
+    const DWORD length = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, error, 0, reinterpret_cast<wchar_t*>(&buffer), 0, nullptr);
+    std::wstring text = length && buffer ? std::wstring(buffer, length) : std::wstring();
+    if (buffer) LocalFree(buffer);
+    while (!text.empty() && iswspace(text.back())) text.pop_back();
+    if (text.empty() && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU tree] no system message for listing error %lu", error);
+    ExclusiveSrwLock lock(g_inlineTreeErrorLock);
+    return &g_inlineTreeErrorCaptions.try_emplace(error, std::move(text)).first->second;
+}
+// Indent guides as modern tree views draw them: one thin vertical line under
+// each expanded folder's arrow, through all of its contents, with no tee or
+// elbow connectors. All guides share one faint opacity, independent of the
+// row's hidden/cut dimming (a guide belongs to its folder, not the row); the
+// guide under the pointer (a click collapses that folder) is drawn brighter
+// at the same thickness.
+// Guides stop short only where a folder's contents begin and end.
+void DrawInlineTreeBranches(ViewState& state, int index, const Entry& e, const ItemGeometry& geometry,
+                            float top, float height, unsigned color, float opacity, float windowWidth) {
+    const int depth = e.treeDepth;
+    if (depth <= 0 || !state.brush || opacity <= .01f || height <= 0.f) return;
+    const int dpi = ViewDpi(state);
+    const float level = InlineTreeLevelWidth(state);
+    const float base = geometry.icon.left - (depth + 1) * level;
+    const float thickness = std::max(1.f, static_cast<float>(Scale96(1, dpi)));
+    const float gap = static_cast<float>(Scale96(2, dpi));
+    const auto x = [&](float logical) { return state.rtlLayout ? windowWidth - logical : logical; };
+    // Neighbours come from the model the painter owns: the presentation lane
+    // paints from its snapshot, where state.entries is not the row list.
+    const auto depthAt = [&](int row) {
+        return row >= 0 && row < state.total ? ModelEntry(state, row).treeDepth : 0;
+    };
+    const int previous = depthAt(index - 1), next = depthAt(index + 1);
+    const bool hotSubtree = state.inlineGuideHotDepth >= 0 && state.inlineGuideHotDepth < depth &&
+        InlineTreeWithin(e.path, state.inlineGuideHotPath);
+    for (int ancestor = 0; ancestor < depth && ancestor < 64; ++ancestor) {
+        const bool hot = hotSubtree && ancestor == state.inlineGuideHotDepth;
+        const float y0 = top + (previous > ancestor ? 0.f : gap);
+        const float y1 = top + height - (next > ancestor ? 0.f : gap);
+        if (y1 <= y0) continue;
+        const float lx = x(InlineTreeChevronCenter(state, base + (ancestor + 1) * level));
+        state.brush->SetColor(Packed(color, opacity * (hot ? .8f : .14f)));
+        StrokeLine(state, D2D1::Point2F(lx, y0), D2D1::Point2F(lx, y1), state.brush.Get(),
+                   thickness);
+    }
+}
+// Busy indicator in the chevron's place: a ring of strokes whose brightness
+// travels around it. It fades in from the moment it was shown.
+// As wide as the open chevron, so both fill the same box.
+float InlineTreeSpinnerRadius(const ViewState& state) {
+    const auto chevron = DisclosureChevron(state, state.fontPx);
+    return chevron.unit + chevron.thickness * .5f;
+}
+// Same place and height as the chevron it stands in for.
+void DrawInlineTreeSpinner(ViewState& state, float centerXLogical, float centerY, LARGE_INTEGER shown,
+                           unsigned color, float opacity, float windowWidth) {
+    if (!state.brush || opacity <= .01f || state.qpcFrequency <= 0.) return;
+    const float centerX = state.rtlLayout ? windowWidth - centerXLogical : centerXLogical;
+    const float outer = InlineTreeSpinnerRadius(state);
+    const float inner = outer * .45f;
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    const double seconds = (now.QuadPart - shown.QuadPart) / state.qpcFrequency;
+    const float fade = EaseOutCubic(static_cast<float>(seconds * 1000. / static_cast<double>(kUiTransitionDurationMs)));
+    constexpr int kSpokes = 8;
+    const float head = static_cast<float>(std::fmod(seconds * 1.25, 1.0)) * kSpokes; // 1.25 turns per second.
+    const float direction = state.rtlLayout ? -1.f : 1.f;
+    const float thickness = DisclosureChevron(state, state.fontPx).thickness; // The chevron's own stroke.
+    for (int i = 0; i < kSpokes; ++i) {
+        const float behind = std::fmod(head - i + kSpokes, static_cast<float>(kSpokes)) / kSpokes;
+        const float angle = 6.28318530718f * i / kSpokes;
+        const float dx = direction * std::sin(angle), dy = -std::cos(angle);
+        state.brush->SetColor(Packed(color, opacity * fade * (.2f + .8f * (1.f - behind))));
+        StrokeLine(state, D2D1::Point2F(centerX + dx * inner, centerY + dy * inner),
+            D2D1::Point2F(centerX + dx * outer, centerY + dy * outer), state.brush.Get(), thickness);
+    }
+}
 void PaintGroupHeading(ViewState& state, const std::wstring& title,
                        bool collapsed, float top, float height,
                        float opacity, float listEnd, float windowWidth,
-                       unsigned headerColor, const ViewState::GroupSection* section = nullptr) {
+                       unsigned headerColor, const ViewState::GroupSection* section = nullptr,
+                       const ForegroundFeedback& feedback={}) {
     if (height <= .01f || opacity <= .01f) return;
     const int dpi = ViewDpi(state);
-    const float leading = static_cast<float>(Scale96(14, dpi));
-    const float centerXLogical = ListStartX(state) + leading +
-        static_cast<float>(Scale96(6, dpi));
+    // The shared disclosure chevron: as tall as the heading text's capitals,
+    // one cap height before the title, like the inline-folder chevrons.
+    const auto chevron = DisclosureChevron(state,
+        ThemedHeadingFontSize(GroupHeadingTheme(state),dpi,state.gridView,state.rowPx,state.fontPx).value_or(state.fontPx));
+    const float centerXLogical = std::max(ListStartX(state) + chevron.unit,
+        GroupHeadingTextRect(state,top,height,listEnd).left - chevron.gap - chevron.unit * .5f);
     const float centerX = state.rtlLayout ? windowWidth - centerXLogical : centerXLogical;
     const float arrowDirection = state.rtlLayout ? -1.f : 1.f;
     const float centerY = top + height * .5f;
-    const float unit = static_cast<float>(Scale96(4, dpi)) *
+    const float unit = chevron.unit *
         std::clamp(height / std::max(1.f, GroupHeadingHeight(state)), 0.f, 1.f);
-    state.brush->SetColor(Packed(headerColor, .75f * opacity));
-    const float thickness = std::max(1.f, static_cast<float>(Scale96(1, dpi)));
+    const auto* theme=PaintedHighlightTheme(state);
+    const auto* style=state.themeHighContrast ? nullptr : theme ? &theme->groupHeadings[size_t(PaintedHighlightMode(state))] : &Theme::defaultGroupHeading;
+    const auto& highlights=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state));
+    if(style && style->autoTextColor) {
+        const auto arrow=TextForeground(state,style,feedback.At(highlights,centerXLogical,centerY),headerColor);
+        state.brush->SetColor(Packed(arrow.rgb,arrow.Opacity(opacity,.75f*opacity)));
+    }
+    else state.brush->SetColor(Packed(headerColor,.75f*opacity));
+    const float thickness = chevron.thickness;
     // Follow the existing section expansion, including interrupted/reversed
     // toggles. Mirror after rotation so RTL opens downward too.
     const float expanded = section ? std::clamp(section->fraction,0.f,1.f) : (collapsed ? 0.f : 1.f);
@@ -21976,8 +24037,11 @@ void PaintGroupHeading(ViewState& state, const std::wstring& title,
         state.sectionBadgeAnimating = true;
     PaintGroupBadge(state,badge,opacity);
     text.left += badge.shift;
+    const auto ink=TextForeground(state,style,feedback.At(highlights,text.left,centerY),headerColor);
+
     Text(state, title, text.left, text.top, text.right, text.bottom,
-        headerColor, false, .9f * opacity);
+        ink.rgb, false, ink.Opacity(opacity,.9f*opacity), false, false, nullptr, false,
+        false, false, -1.f, .5f, ThemedHeadingFontSize(GroupHeadingTheme(state),dpi,state.gridView,state.rowPx,state.fontPx));
 }
 
 UINT32 TypeSearchPrefixLength(const std::wstring& name,const std::wstring& prefix);
@@ -22215,13 +24279,13 @@ bool CheckboxVisualPressed(const ViewState& state,int id) {
 void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, float opacity,
                            bool hot=false,bool pressed=false) {
     if (!VisibleOpacity(opacity) || rect.right <= rect.left || rect.bottom <= rect.top) return;
-    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
-    const size_t mode=static_cast<size_t>(state.themeMode);
+    const auto snapshot=PaintedHighlightTheme(state);
+    const size_t mode=static_cast<size_t>(PaintedHighlightMode(state));
     const bool themed=snapshot && snapshot->checkboxEnabled[mode];
     D2D1_COLOR_F mark{};
     if(themed) {
         auto& cache=state.checkboxResources;
-        PrepareContrastSurfaces(state,cache,snapshot->checkboxes[mode],true);
+        PrepareContrastSurfaces(state,cache,snapshot->checkboxes[mode]);
         const auto& styles=snapshot->checkboxes[mode];
         const size_t index=(checked ? 3:0)+(pressed ? 2:hot ? 1:0);
         const auto& style=styles[index];
@@ -22243,7 +24307,7 @@ void DrawSelectionCheckbox(ViewState& state, D2D1_RECT_F rect, bool checked, flo
     const float border = SelectionCheckboxBorder(rect.right-rect.left);
     const auto shape = D2D1::RoundedRect(D2D1::RectF(rect.left+border*.5f,rect.top+border*.5f,
         rect.right-border*.5f,rect.bottom-border*.5f),3.f*unit,3.f*unit);
-    const auto palette = g_swipePalette.load(std::memory_order_relaxed);
+    const auto palette = DrawingAccent();
     const unsigned foreground = ThemeRgb(state.nativeTextColor == CLR_INVALID ? RGB(128,128,128) : state.nativeTextColor);
     if (!themed) {
     state.brush->SetColor(Packed(checked ? ThemeRgb(COLORREF(palette&0xFFFFFF)) : foreground,
@@ -22423,7 +24487,8 @@ bool PrepareRowComposition(ViewState& state) {
     if (mode.rows && mode.root && mode.rowRevision==state.rowSceneRevision &&
         mode.started.QuadPart==state.rowTransitionStartedQpc.QuadPart &&
         mode.scroll==state.scrollNow && mode.horizontal==state.horizontalScroll &&
-        mode.size.cx==client.right && mode.size.cy==client.bottom && mode.rtl==state.rtlLayout) return true;
+        mode.size.cx==client.right && mode.size.cy==client.bottom && mode.rtl==state.rtlLayout &&
+        mode.header==state.headerPx) return true;
     // Reuse packed storage across commits/scrolling. Updating the surfaces and
     // replacing their visuals is one DComp transaction; no stale source is
     // exposed, and streamed filesystem results do not churn GPU allocations.
@@ -22481,7 +24546,7 @@ bool PrepareRowComposition(ViewState& state) {
         add(mode.items,i,LayoutRowVisual(state,i,0.f),LayoutRowVisual(state,i,1.f));
     for (size_t i=0;i<state.disappearingRows.size();++i) {
         const auto& old=state.disappearingRows[i];
-        RowVisual from{old.oldTop-(state.scrollNow-state.rowTransitionOldScroll),old.oldHeight,
+        RowVisual from{old.oldTop-RowTransitionScrollDelta(state),old.oldHeight,
             old.oldOpacity,old.oldLeft,old.oldWidth};
         auto to=from; to.height=to.opacity=0.f;
         add(mode.items,-int(i)-1,from,to);
@@ -22493,7 +24558,7 @@ bool PrepareRowComposition(ViewState& state) {
     }
     for(size_t i=0;i<state.disappearingHeaders.size();++i) {
         const auto& old=state.disappearingHeaders[i];
-        RowVisual from{old.oldTop-(state.scrollNow-state.rowTransitionOldScroll),GroupHeadingHeight(state),1.f};
+        RowVisual from{old.oldTop-RowTransitionScrollDelta(state),GroupHeadingHeight(state),1.f};
         auto to=from; to.height=to.opacity=0.f;
         add(mode.headings,-int(i)-1,from,to,true);
     }
@@ -22541,9 +24606,11 @@ bool PrepareRowComposition(ViewState& state) {
 bool PrepareModeComposition(ViewState& state) {
     if (state.rowTransitionActive) return PrepareRowComposition(state);
     auto& mode = state.modeComposition;
+    const auto* headerStyle=ColumnHeaderTheme(state);
     const bool widths=state.columnTransitionActive && !state.columnModeTransition && !state.columnTransitionSpring &&
         state.columnsView && !state.gridView && !state.thisPcGpu &&
-        !ViewOptionEnabled(state,g_filenameOnly) && state.disappearingColumns.empty();
+        !ViewOptionEnabled(state,g_filenameOnly) && state.disappearingColumns.empty() &&
+        ColumnHeaderDividerWidth(headerStyle ? &headerStyle->vertical : nullptr,ViewDpi(state))<=1.f;
     if ((!state.columnModeTransition && !widths) || !state.composition || !state.compTarget ||
         !state.backbuffer || !state.swapChain || state.rename.editor || state.rowTransitionActive ||
         state.horizontalAnimating || state.zoomAnimating || PointerDragActive(state) || state.manipulationFrameActive) return false;
@@ -22551,7 +24618,8 @@ bool PrepareModeComposition(ViewState& state) {
     if (state.rejectedColumnComposition==state.columnTransitionStartedQpc.QuadPart &&
         state.rejectedColumnCompositionSize.cx==client.right && state.rejectedColumnCompositionSize.cy==client.bottom)
         return false;
-    if (!mode.rows && mode.started.QuadPart == state.columnTransitionStartedQpc.QuadPart &&
+    const float headerHeight=ColumnHeaderPaintHeight(state,ViewDpi(state));
+    if (!mode.rows && mode.started.QuadPart == state.columnTransitionStartedQpc.QuadPart && mode.header==headerHeight &&
         mode.size.cx==client.right && mode.size.cy==client.bottom &&
         mode.columns.size()==state.columns.size() && mode.grid==state.gridView &&
         mode.rtl==state.rtlLayout && mode.horizontal==state.horizontalScroll) return mode.root != nullptr;
@@ -22562,11 +24630,11 @@ bool PrepareModeComposition(ViewState& state) {
     // Buffers grown during interactive sizing are wider than the client;
     // planes still match the client. Otherwise a mismatch is a pending resize.
     const UINT clientWidth = static_cast<UINT>(std::max<LONG>(0,client.right));
-    if (!clientWidth || !size.width || !size.height || size.width<clientWidth || (size.width!=clientWidth && !FrameSizing(state)) ||
+    if (!clientWidth || !size.width || !size.height || size.width<clientWidth || (size.width!=clientWidth && !GrowOnlyBuffers(state)) ||
         state.columns.size() != state.columnMotion.size()) return false;
     size.width = clientWidth;
     mode.started = state.columnTransitionStartedQpc;
-    mode.header = static_cast<float>(Scale96(kHeader96,ViewDpi(state)));
+    mode.header = headerHeight;
     mode.size = {client.right,client.bottom};
     mode.horizontal=state.horizontalScroll; mode.grid=state.gridView; mode.rtl=state.rtlLayout; mode.widths=widths;
     // Only temporary planes need overscan. The ordinary swap chain stays
@@ -22793,7 +24861,7 @@ bool PublishRowScene(ViewState& state) {
                 item.from={from.top+(to.top-from.top)*p-(mode.scroll-mode.previousScroll),
                     from.height+(to.height-from.height)*p,from.opacity+(to.opacity-from.opacity)*p,
                     from.left+(to.left-from.left)*p,from.width+(to.width-from.width)*p};
-                const float ownerTop=item.from.top+state.scrollNow-state.rowTransitionOldScroll;
+                const float ownerTop=item.from.top+RowTransitionScrollDelta(state);
                 if(headings) {
                     if(item.key>=0) {
                         auto motion=std::lower_bound(state.groupHeaderMotion.begin(),state.groupHeaderMotion.end(),item.key,
@@ -23740,10 +25808,10 @@ void DrawSwipeIndicator(ViewState& state,const SwipeIndicator& motion,LARGE_INTE
     const auto [alpha,scale,w,h,l,r,cy,edge,farRadius,dx,dy,left]=
         LayoutSwipeIndicator(state,motion,now,width,top,bottom,compositorOpacity);
     if(alpha<=0.f || w<=0.f || h<=0.f) return;
-    const auto colors=g_swipePalette.load(std::memory_order_relaxed);
-    const auto snapshot=state.themeHighContrast ? nullptr:state.themeSnapshot;
+    const auto colors=DrawingAccent();
+    const auto snapshot=PaintedHighlightTheme(state);
     const bool themed=snapshot && snapshot->elements.contains(L"DrawSwipeIndicator");
-    if(themed) PrepareContrastSurfaces(state,state.swipeResources,snapshot->swipeIndicators[static_cast<size_t>(state.themeMode)]);
+    if(themed) PrepareContrastSurfaces(state,state.swipeResources,snapshot->swipeIndicators[static_cast<size_t>(PaintedHighlightMode(state))]);
     else ReleaseContrastSurfaces(state.swipeResources);
     state.brush->SetColor(Packed(ThemeRgb(COLORREF(colors&0xFFFFFF)),alpha));
     // Clip each half of the rounded surface to retain independent edge/far
@@ -23754,7 +25822,7 @@ void DrawSwipeIndicator(ViewState& state,const SwipeIndicator& motion,LARGE_INTE
         if(themed) {
             auto& cache=state.swipeResources;
             const auto bounds=D2D1::RectF(l,cy-h*.5f,r,cy+h*.5f);
-            DrawThemeSurface(state,bounds,bounds,radius,alpha,snapshot->swipeIndicators[static_cast<size_t>(state.themeMode)][0],
+            DrawThemeSurface(state,bounds,bounds,radius,alpha,snapshot->swipeIndicators[static_cast<size_t>(PaintedHighlightMode(state))][0],
                 cache.gradients[0],cache.ramps[0],1.f,ThemeRgb(COLORREF(colors&0xffffff)),alpha,256,nullptr,true);
         } else state.target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(l,cy-h*.5f,r,cy+h*.5f),radius,radius),state.brush.Get());
         state.target->PopAxisAlignedClip();
@@ -23786,6 +25854,7 @@ float SwipeCompositionOpacity(const ViewState& state,const ViewState::SwipeCompo
 }
 
 bool RenderSwipeFeedback(ViewState& state) {
+    AccentDrawScope accentScope(AccentPalette(state));
     if(!state.swipeIndicator.direction && !state.swipeOutgoingIndicator.direction &&
         !state.swipeComposition[0].visual && !state.swipeComposition[1].visual) return true;
     const auto checked=[&](HRESULT result,const wchar_t* operation,int layer=-1) {
@@ -23823,9 +25892,10 @@ bool RenderSwipeFeedback(ViewState& state) {
         const bool sameIntent=layer.visual && layer.revision==state.swipeFeedbackRevision && layer.origin.QuadPart==motion.origin.QuadPart;
         const bool sameViewport=layer.viewport.width==UINT(client.right) && layer.viewport.height==UINT(client.bottom) &&
             layer.dpi==dpi && layer.rtl==state.rtlLayout;
-        const bool sameAppearance=layer.theme==state.themeSnapshot && layer.themeMode==state.themeMode &&
-            layer.highContrast==state.themeHighContrast && layer.palette==g_swipePalette.load(std::memory_order_relaxed) &&
-            layer.background==state.nativeEditBackground && layer.foreground==state.nativeTextColor;
+        const auto* palette=HighlightPalette(state);
+        const auto surfaceRevision=palette ? palette->surfaceRevision : 0;
+        const bool sameAppearance=layer.contrastRevision==surfaceRevision &&
+            layer.highContrast==state.themeHighContrast && layer.palette==DrawingAccent();
         if(sameIntent && sameViewport && sameAppearance &&
             ((motion.committed && layer.fade) || (!motion.moving && !layer.moving))) continue;
         const float top=sameIntent ? layer.top*float(dpi)/layer.dpi:state.headerPx;
@@ -23892,9 +25962,9 @@ bool RenderSwipeFeedback(ViewState& state) {
                 if(!checked(layer.visual->SetEffect(nullptr),L"swipe.failure.setEffect",i)) return false;
             }
         }
-        layer.theme=state.themeSnapshot; layer.themeMode=state.themeMode; layer.highContrast=state.themeHighContrast;
-        layer.palette=g_swipePalette.load(std::memory_order_relaxed); layer.background=state.nativeEditBackground;
-        layer.foreground=state.nativeTextColor;
+        layer.highContrast=state.themeHighContrast;
+        layer.contrastRevision=surfaceRevision;
+        layer.palette=DrawingAccent();
         layer.revision=state.swipeFeedbackRevision; layer.origin=motion.origin;
         layer.viewport={UINT(client.right),UINT(client.bottom)}; layer.dpi=dpi; layer.rtl=state.rtlLayout; layer.top=top;
         layer.bounds=bounds; layer.moving=motion.moving; layer.visible=true;
@@ -23925,6 +25995,7 @@ void Paint(ViewState& state) {
     // A cold navigation has no replacement names yet. Keep the accepted image;
     // confirmed empty folders (loaded=true) still replace it immediately.
     if(!state.loaded && !state.total) return;
+    AccentDrawScope accentScope(AccentPalette(state));
     PublishHorizontalScrollbar(state);
     GraphicsContinuation continuation(state);
     // D3D/DComp creation may dispatch nested window messages. A nested paint
@@ -24015,7 +26086,7 @@ void Paint(ViewState& state) {
     const float header = static_cast<float>(state.headerPx);
     const float columnHeader = static_cast<float>(ColumnHeaderHeight(state));
     const float headerOffset = ColumnHeaderOffset(state,dpi);
-    const float headerBottom = headerOffset + Scale96(kHeader96,dpi);
+    const float headerBottom = headerOffset + ColumnHeaderPaintHeight(state,dpi);
     const float modeOpacity = compositionFrame.active ? 1.f : ColumnModeVisibility(state,dpi);
     const float row = static_cast<float>(state.rowPx);
     const float xName = static_cast<float>(NameTextOrigin(state));
@@ -24041,9 +26112,19 @@ void Paint(ViewState& state) {
         ? state.nativeTextColor : GetSysColor(COLOR_WINDOWTEXT));
     const unsigned headerColor = ThemeRgb(state.nativeHeaderTextColor != CLR_INVALID
         ? state.nativeHeaderTextColor : GetSysColor(COLOR_WINDOWTEXT));
-    // Keep divider contrast near the native navigation-pane separator while
-    // compositing the active theme foreground over Explorer's real surface.
-    constexpr float headerDividerOpacity = 1.f / 15.f;
+    const auto* headerStyle=ColumnHeaderTheme(state);
+    const auto* paintedTheme=PaintedHighlightTheme(state);
+    const auto* captionStyle=paintedTheme ? &paintedTheme->columnHeaders[size_t(PaintedHighlightMode(state))].header : nullptr;
+    const auto captionInk=TextForeground(state,captionStyle,nullptr,headerColor);
+    const auto captionColor=captionInk.rgb;
+    const auto captionOpacity=captionInk.alpha;
+    const auto rule=[&](const Theme::SurfaceStyle* style, float defaultOpacity) {
+        const auto ink=ResolveForeground(nullptr,nullptr,headerColor,style && style->borderColorDefined ? &style->borderColor : nullptr);
+        const float opacity=style ? style->borderOpacity.value_or(defaultOpacity) : defaultOpacity;
+        return std::tuple{ColumnHeaderDividerWidth(style,dpi),ink.rgb,ink.alpha*opacity};
+    };
+    const auto [dividerWidth,dividerColor,dividerAlpha]=rule(headerStyle ? &headerStyle->vertical : nullptr,1.f/15.f);
+    const auto [bottomWidth,bottomColor,bottomAlpha]=rule(headerStyle ? &headerStyle->horizontal : nullptr,.12f);
     // Secondary columns are simply the same native text color with the
     // configured opacity: never invent a second dark/light RGB value.
     state.target->BeginDraw();
@@ -24122,14 +26203,14 @@ void Paint(ViewState& state) {
                 }
                 if (caption.right > caption.left)
                     Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
-                         headerColor, true, fade, sorted);
+                         captionColor, true, fade*captionOpacity, sorted);
                 if (compositionFrame.Widths()) compositionFrame.Column(columnIndex,true);
                 if (sorted && to - from >= arrowRoom)
                     DrawHeaderSortChevron(state, to,
-                        state.sort.direction == SORT_DESCENDING, headerColor, fade);
-                if (compositionFrame.Widths() || to <= listEnd)
-                    Fill(state, to - .5f, headerOffset, to + .5f, headerBottom, headerColor,
-                         headerDividerOpacity * fade);
+                        state.sort.direction == SORT_DESCENDING, captionColor, fade*captionOpacity);
+                if (dividerWidth>0.f && (compositionFrame.Widths() || to <= listEnd))
+                    Fill(state, to-dividerWidth*.5f, headerOffset, to+dividerWidth*.5f, headerBottom,
+                        dividerColor,dividerAlpha*fade);
             }
             if (compositionFrame.Widths()) compositionFrame.Background();
             // The grabbed header is painted LAST, above the moving neighbors.
@@ -24146,28 +26227,31 @@ void Paint(ViewState& state) {
                     const auto caption = ColumnTextBounds(state, static_cast<size_t>(floatingIndex), true, listStart, dpi);
                     if (caption.right > caption.left)
                         Text(state, col.title, caption.left, caption.top, caption.right, caption.bottom,
-                             headerColor, true, 1.f, sorted);
+                             captionColor, true, captionOpacity, sorted);
                     if (sorted && right - left >= arrowRoom)
                         DrawHeaderSortChevron(state, right,
-                            state.sort.direction == SORT_DESCENDING, headerColor, 1.f);
+                            state.sort.direction == SORT_DESCENDING, captionColor, captionOpacity);
                 }
             }
             // Hover-only button: occupies the unused Name icon gutter, not the
             // trailing end of the header; nothing is painted when not hovered.
         }
         state.target->PopAxisAlignedClip(); // header captions / column hit zone
-        if (details && columnHeader > 0.f) {
+        const bool outerDivider=dividerWidth>0.f && bar.usable && w>=1.f;
+        if (details && columnHeader > 0.f && (bottomWidth>0.f || outerDivider)) {
             state.target->PushAxisAlignedClip(D2D1::RectF(0.f,0.f,w,columnHeader),D2D1_ANTIALIAS_MODE_ALIASED);
             // Full-width header rules, including the left/right edgeMargin areas.
             // These are paint-only and never expand file/header hit targets.
-            Fill(state, 0.f, headerBottom - 1.f, w, headerBottom,
-                 headerColor, .12f * modeOpacity);
+            if (bottomWidth>0.f)
+                Fill(state, 0.f, std::max(headerOffset,headerBottom-bottomWidth), w, headerBottom,
+                    bottomColor,bottomAlpha*modeOpacity);
             // The scrollbar gap separates this outer rule from the last column
             // divider. Without a vertical scrollbar the two can overlap and form
             // an unnaturally bright double line, so only paint the outer rule
             // when the scrollbar is actually present.
-            if (bar.usable && w >= 1.f)
-                Fill(state, w - 1.f, headerOffset, w, headerBottom, headerColor, headerDividerOpacity * modeOpacity);
+            if (outerDivider)
+                Fill(state, std::max(0.f,w-dividerWidth), headerOffset, w, headerBottom,
+                    dividerColor, dividerAlpha * modeOpacity);
             state.target->PopAxisAlignedClip();
         }
         state.textRasterBuildTicks+=bodyRasterTicks;
@@ -24317,7 +26401,7 @@ void Paint(ViewState& state) {
             blank.emplace_back(top,top+visual.height);
         }
         if(state.groupingLayoutTransition) for(const auto& old:state.disappearingHeaders) {
-            const float top=old.oldTop+state.rowTransitionOldScroll-header;
+            const float top=old.oldTop-RowTransitionScrollDelta(state)+state.scrollNow-header;
             blank.emplace_back(top,top+heading*(1.f-headerProgress));
         }
         std::sort(blank.begin(),blank.end());
@@ -24363,7 +26447,12 @@ void Paint(ViewState& state) {
         typeSearchNow - state.lastTyped <= kTypeSearchTimeoutMs;
     // One shared visual geometry for backgrounds, selection, icons, and text.
     // Actual row indices and Shell selection have already been committed.
-    if (state.selectionFeedbackVisible) for (int i : visibleItems) {
+    auto& selectedPaint=state.selectionPaintScratch;
+    selectedPaint.clear();
+    auto& ghostPaint=state.ghostPaintScratch;
+    ghostPaint.clear();
+    if (state.selectionFeedbackVisible) for (size_t slot=0;slot<visibleItems.size();++slot) {
+        const int i=visibleItems[slot];
         RowVisual v = LayoutRowVisual(state, i, layoutProgress);
         if(compositionFrame.Rows()) { v.opacity=1.f; v.height=std::max(row,v.height); }
         if (!compositionFrame.Rows() && (v.top >= contentBottom || v.top + v.height <= header)) continue;
@@ -24380,13 +26469,14 @@ void Paint(ViewState& state) {
         // The opaque native editor covers the filename; retain the item's
         // selection behind it, including its icon and the rest of the row.
         if (alpha > 0.f)
-            FillSelectionRect(state, selection, alpha * v.opacity,&shape);
+            FillSelectionRect(state,selection,alpha*v.opacity,&shape,false,Theme::Highlight::Selected,0.f,&selectedPaint.emplace_back(slot,PaintedFeedback{}).second);
     }
     // Deleted rows exist only as a tiny, bounded painting snapshot, not in
     // Shell state. Their shrinking height and opacity close the old gaps.
     if (state.selectionFeedbackVisible && state.rowTransitionActive) {
+        ghostPaint.resize(state.disappearingRows.size());
         for (const auto& old : state.disappearingRows) {
-            const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
             const float opacity = compositionFrame.Rows() ? 1.f : old.oldOpacity * (1.f - layoutProgress);
             if (height <= 0.f || (!compositionFrame.Rows() && (top >= contentBottom || top + height <= header)))
@@ -24406,13 +26496,15 @@ void Paint(ViewState& state) {
                         xName + old.selectedNameWidth + pad, listEnd});
                 }
                 FillSelectionRect(state, selection,
-                    g_selectionAlpha.load() / 100.f * opacity,&shape);
+                    HighlightOpacities(state)[0]*opacity,&shape,false,Theme::Highlight::Selected,0.f,
+                    &ghostPaint[&old-state.disappearingRows.data()]);
             }
         }
     }
     D2D1_RECT_F movingSelectionRect{};
     SelectionShape movingSelectionShape;
     float movingSelectionOpacity=0.f;
+    PaintedFeedback movingFeedback, hoverFeedback;
     if (state.selectionFeedbackVisible && state.keyboardSelectionAnimating &&
         state.keyboardSelectionTo == state.selected &&
         state.selected >= 0 && state.selected < state.total) {
@@ -24430,7 +26522,7 @@ void Paint(ViewState& state) {
         InterpolateSelectionBounds(state, rc, progress);
         movingSelectionRect=rc; movingSelectionShape=shape;
         movingSelectionOpacity=SelectionBaseOpacity(state,hover,visualRow,rc.left,rc.right);
-        FillSelectionRect(state,rc,movingSelectionOpacity,&shape);
+        FillSelectionRect(state,rc,movingSelectionOpacity,&shape,false,Theme::Highlight::Selected,0.f,&movingFeedback);
     }
     // Windows-style focus-only caret for Ctrl+arrow navigation. Reuse the
     // selection geometry and brush; no separate text layout or frame worker.
@@ -24479,11 +26571,11 @@ void Paint(ViewState& state) {
         // A header has no selected Shell item underneath its own hover.
         // Atlas item geometry may overlap its source band during reflow.
         hoverOverlayOpacity=(sectionHover && KeyboardFocusedSection(state)<0 && !state.keyboardSelectionAnimating ?
-            g_hoverAlpha.load(std::memory_order_relaxed)/100.f : HoverOverlayOpacity(state,hover,visibleItems,&hoverCombinedWeight))*opacity;
+            HighlightOpacities(state)[1] : HoverOverlayOpacity(state,hover,visibleItems,&hoverCombinedWeight))*opacity;
         if (!compositionFrame.Rows() || !sectionHover) {
             RowSourceScope source(state,index,0);
             FillSelectionRect(state, hoverRect,
-                hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight);
+                hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight,&hoverFeedback);
         }
     }
     // The decorative passes above may cross the edge margins in square mode,
@@ -24497,7 +26589,7 @@ void Paint(ViewState& state) {
     // collapsing row; there is no stale hit target or resurrected selection.
     if (state.rowTransitionActive) {
         for (const auto& old : state.disappearingRows) {
-            const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
             const float opacity = compositionFrame.Rows() ? 1.f : old.oldOpacity * (1.f - layoutProgress);
             if (height <= 0.f || (!compositionFrame.Rows() && (top >= contentBottom || top + height <= header)))
@@ -24505,7 +26597,7 @@ void Paint(ViewState& state) {
             RowSourceScope source(state,-int(&old-state.disappearingRows.data())-1,1);
             state.target->PushAxisAlignedClip(D2D1::RectF(0.f, top,
                 w, top + height), D2D1_ANTIALIAS_MODE_ALIASED);
-            const auto geometry = LayoutItem(state, {top, height, opacity, old.oldLeft, old.oldWidth});
+            const auto geometry = LayoutItem(state, GhostRowVisual(state, old, top, height, opacity));
             const float contentOpacity = opacity * ItemContentOpacity(state, old.entry);
             DrawActualIcon(state, old.entry, geometry.icon.left, geometry.icon.top, contentOpacity, height);
             state.target->PopAxisAlignedClip();
@@ -24514,14 +26606,15 @@ void Paint(ViewState& state) {
     // All icon/thumbnail/drive-bar pixels precede every label. Cache this
     // viewport's shared geometry and alpha once for the following text pass.
     struct PaintedItem {
-        int index; RowVisual visual; ItemGeometry geometry; DriveBarGeometry usage; float opacity;
+        int index; RowVisual visual; ItemGeometry geometry; DriveBarGeometry usage; float opacity; size_t slot;
     };
     std::vector<PaintedItem> paintedItems;
     paintedItems.reserve(visibleItems.size());
     std::optional<PipelineScope> contentTrace;
     contentTrace.emplace(state.background,L"render.items");
     bool uiComparisonRow=true;
-    for (int i : visibleItems) {
+    for (size_t slot=0;slot<visibleItems.size();++slot) {
+        const int i=visibleItems[slot];
         const Entry& e = ModelEntry(state,i);
         RowVisual v = LayoutRowVisual(state, i, layoutProgress);
         if(compositionFrame.Rows()) { v.opacity=1.f; v.height=std::max(row,v.height); }
@@ -24557,16 +26650,26 @@ void Paint(ViewState& state) {
             PipelineEvent(*state.background,{.operation=L"ui.drive.track[x,y,w,h]",.a=state.uiTraceItem,.b=state.token,
                 .v={usage.track.left,usage.track.top,usage.track.right-usage.track.left,
                     usage.track.bottom-usage.track.top}},true);
-        paintedItems.push_back({i,v,geometry,usage,contentOpacity});
+        paintedItems.push_back({i,v,geometry,usage,contentOpacity,slot});
         if (compositionFrame.Widths()) compositionFrame.Column(static_cast<size_t>(state.modeComposition.nameIndex));
         else if (compositionFrame.active && !compositionFrame.Rows()) state.target->SetTarget(state.modeComposition.names.bitmap.Get());
-        if (v.morph < 1.f) {
-            // A morphing icon is drawn at its travelling size.
-            const float side = state.iconPx;
-            state.iconPx = geometry.icon.right - geometry.icon.left;
-            DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity, v.height);
-            state.iconPx = side;
-        } else DrawActualIcon(state, e, geometry.icon.left, geometry.icon.top, contentOpacity, v.height);
+        // A travelling icon changes its draw bounds, while cache lookups use
+        // the same tier as the published artwork and upload working set.
+        const auto drawnSide=v.morph<1.f ?
+            std::optional<float>(geometry.icon.right-geometry.icon.left) : std::nullopt;
+        DrawActualIcon(state,e,geometry.icon.left,geometry.icon.top,contentOpacity,v.height,drawnSide);
+        if (v.treeDepth > 0)
+            DrawInlineTreeBranches(state,i,e,geometry,v.top,v.height,headerColor,v.opacity,w);
+        if (v.treeDepth >= 0 && InlineTreeExpandable(e)) {
+            const float chevronY = (geometry.cell.top + geometry.cell.bottom) * .5f;
+            if (const auto* spinner = InlineTreeSpinnerFor(state,e.path))
+                DrawInlineTreeSpinner(state,InlineTreeChevronCenter(state,geometry.icon.left),chevronY,spinner->shown,headerColor,contentOpacity,w);
+            else {
+                const float turn = InlineTreeChevronTurn(state,e.path,e.treeExpanded,state.itemOpacityNow);
+                DrawInlineTreeExpander(state,InlineTreeChevronCenter(state,geometry.icon.left),chevronY,
+                    turn,headerColor,contentOpacity,w);
+            }
+        }
         const bool checked = size_t(i)<state.selectedFlags.size() && state.selectedFlags[size_t(i)];
         const float checkboxReveal = SelectionCheckboxReveal(state);
         if (checkboxReveal > 0.f && (checked || state.hovered==i || state.pointingDevice==PointingDevice::Touch)) {
@@ -24592,10 +26695,10 @@ void Paint(ViewState& state) {
                     nameColor, .18f * contentOpacity, radius);
             const auto& fill=usage.fill;
             if (fraction > 0.f && fill.bottom>fill.top && !DrawDriveBar(state,0,fill,fraction,
-                ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),contentOpacity,&bar))
+                ThemeRgb(SelectionColor(state)),contentOpacity,&bar))
                 Fill(state, fill.left, fill.top,
                     fill.left + width * fraction, fill.bottom,
-                    ThemeRgb(g_selectionRgb.load(std::memory_order_relaxed)),
+                    ThemeRgb(SelectionColor(state)),
                     .82f * contentOpacity, (fill.bottom-fill.top)*.5f);
         }
         if (compositionFrame.active && !compositionFrame.Rows()) compositionFrame.Background();
@@ -24603,11 +26706,15 @@ void Paint(ViewState& state) {
         if (growing) state.target->PopAxisAlignedClip();
     }
     contentTrace.reset();
+    const auto& highlightStyles=HighlightStyles(PaintedHighlightTheme(state),PaintedHighlightMode(state));
+    std::array<ContrastPalette::Ink,3> highlightInk;
+    for(size_t i=0;i<highlightInk.size();++i)
+        highlightInk[i]=TextForeground(state,state.themeHighContrast ? nullptr : &highlightStyles[i],&highlightStyles[i],nameColor,true);
     // Old ghosts draw behind surviving/new items. The contents clip to their
     // collapsing row; there is no stale hit target or resurrected selection.
     if (state.rowTransitionActive) {
         for (const auto& old : state.disappearingRows) {
-            const float top = old.oldTop - (state.scrollNow - state.rowTransitionOldScroll);
+            const float top = old.oldTop - RowTransitionScrollDelta(state);
             const float height = compositionFrame.Rows() ? std::max(row,old.oldHeight) : old.oldHeight * (1.f - ghostProgress);
             const float opacity = compositionFrame.Rows() ? 1.f : old.oldOpacity * (1.f - layoutProgress);
             if (height <= 0.f || (!compositionFrame.Rows() && (top >= contentBottom || top + height <= header)))
@@ -24615,11 +26722,15 @@ void Paint(ViewState& state) {
             RowSourceScope source(state,-int(&old-state.disappearingRows.data())-1,2);
             state.target->PushAxisAlignedClip(D2D1::RectF(0.f, top,
                 w, top + height), D2D1_ANTIALIAS_MODE_ALIASED);
-            const auto geometry = LayoutItem(state, {top, height, opacity, old.oldLeft, old.oldWidth});
+            const auto geometry = LayoutItem(state, GhostRowVisual(state, old, top, height, opacity));
             const float contentOpacity = opacity * ItemContentOpacity(state, old.entry);
+            ForegroundFeedback feedback;
+            if (!ghostPaint.empty()) feedback.selectedRow=&ghostPaint[&old-state.disappearingRows.data()];
+            const auto kind=state.themeHighContrast ? std::nullopt : feedback.CaptionState(state,geometry,EntryLabel(old.entry));
+            const auto ghostInk=kind ? highlightInk[size_t(*kind)] : ContrastPalette::Ink{nameColor,1.f};
             Text(state, EntryLabel(old.entry), geometry.text.left, geometry.text.top,
                  geometry.text.right, geometry.text.bottom,
-                 nameColor, false, contentOpacity, false, geometry.wrapped,0,false,true);
+                 ghostInk.rgb, false, ghostInk.Opacity(opacity,contentOpacity), false, geometry.wrapped,0,false,true);
             state.target->PopAxisAlignedClip();
         }
     }
@@ -24660,6 +26771,9 @@ void Paint(ViewState& state) {
     uiComparisonRow=true;
     std::vector<DWRITE_TEXT_RANGE> highlightRanges; // Reused by every painted name.
     contentTrace.emplace(state.background,L"render.labels");
+    const ContrastPalette::Ink nativeInk{nameColor,1.f};
+    const bool filenameHighlight=ViewOptionEnabled(state,g_filenameOnly);
+    size_t selectedSlot=0;
     for (const auto& item:paintedItems) {
         const int i=item.index;
         RowSourceScope source(state,i,2);
@@ -24667,7 +26781,18 @@ void Paint(ViewState& state) {
         const auto& v=item.visual;
         const auto& geometry=item.geometry;
         const auto& usage=item.usage;
-        const float contentOpacity=item.opacity;
+        ForegroundFeedback feedback;
+        while (selectedSlot<selectedPaint.size() && selectedPaint[selectedSlot].first<item.slot) ++selectedSlot;
+        if (selectedSlot<selectedPaint.size() && selectedPaint[selectedSlot].first==item.slot)
+            feedback.selectedRow=&selectedPaint[selectedSlot].second;
+        feedback.moving=&movingFeedback;
+        feedback.hover=&hoverFeedback;
+        auto ink=nativeInk;
+        if(const auto kind=state.themeHighContrast ? std::nullopt : feedback.CaptionState(state,geometry,EntryLabel(e)); kind)
+            ink=highlightInk[static_cast<size_t>(*kind)];
+        const auto detailInk=filenameHighlight ? nativeInk : ink;
+        // Apply the user's metadata opacity after resolving foreground contrast.
+        const float detailOpacity=detailInk.Opacity(v.opacity,item.opacity)*detailsAlpha;
         const bool growing=v.height<row-.1f;
         if (growing) state.target->PushAxisAlignedClip(D2D1::RectF(0.f,v.top,w,v.top+v.height),D2D1_ANTIALIAS_MODE_ALIASED);
         state.uiTraceDrawItem=state.uiTracePaint && (i==state.selected || uiComparisonRow);
@@ -24684,18 +26809,31 @@ void Paint(ViewState& state) {
         else CachedSearchHighlightRanges(state, EntryLabel(e), highlightRanges);
         if (!(state.rename.editor && i == state.rename.index))
             Text(state, EntryLabel(e), geometry.text.left, geometry.text.top,
-                nameTextRight, geometry.text.bottom, nameColor, false, contentOpacity,
+                nameTextRight, geometry.text.bottom, ink.rgb, false, ink.Opacity(v.opacity,item.opacity),
                 false, geometry.wrapped, &highlightRanges,false,true,
                 state.clickPolicy.singleClick && (state.clickPolicy.underlineCold ||
                     (state.clickPolicy.underlineHot && (state.hovered==i || TouchHotRow(state)==i))),
                 v.morph < 1.f ? geometry.textCenter : -1.f, geometry.textVertical);
+        // An expanded folder with nothing inside says so after its name, in
+        // secondary text, using Explorer's own localized empty-folder caption.
+        // A failed listing shows the system's own text for its error instead.
+        const std::wstring* treeCaption = !e.treeEmpty ? nullptr :
+            e.treeError ? InlineTreeErrorCaption(e.treeError) : &g_emptyFolderCaption;
+        if (treeCaption && !treeCaption->empty() && e.treeDepth >= 0 && InlineTreeLayout(state) &&
+            !(state.rename.editor && i == state.rename.index) && !geometry.wrapped) {
+            const float gap = static_cast<float>(Scale96(12, ViewDpi(state)));
+            const float left = geometry.text.left + ColumnTextWidth(state, EntryLabel(e), false) + gap;
+            if (nameTextRight - left > gap)
+                Text(state, *treeCaption, left, geometry.text.top, nameTextRight, geometry.text.bottom,
+                    detailInk.rgb, false, detailOpacity);
+        }
         if (usage.visible && DriveTiles(state)) {
                 const auto* caption = ColumnCellText(e, PKEY_Computer_DecoratedFreeSpace,
                     state.columnEpoch, state.propertyEpoch);
                 if (caption && !caption->empty())
                     Text(state, *caption, usage.caption.left, usage.caption.top,
-                        usage.caption.right, usage.caption.bottom, nameColor, false,
-                        contentOpacity * detailsAlpha);
+                        usage.caption.right, usage.caption.bottom, detailInk.rgb, false,
+                        detailOpacity);
             }
         if (TileLayout(state) && !DriveTiles(state)) {
             // Tile details use the same secondary text as Details columns.
@@ -24703,8 +26841,8 @@ void Paint(ViewState& state) {
             for (int line = 0; line < 2; ++line)
                 if (!lines[line]->empty())
                     Text(state, *lines[line], geometry.detail[line].left, geometry.detail[line].top,
-                        geometry.detail[line].right, geometry.detail[line].bottom, nameColor, false,
-                        contentOpacity * detailsAlpha, false, false, nullptr, true);
+                        geometry.detail[line].right, geometry.detail[line].bottom, detailInk.rgb, false,
+                        detailOpacity, false, false, nullptr, true);
         }
         if (const float reveal = ContentReveal(state); reveal > 0.f) {
             // Content lines use the same secondary text as tile lines. Date
@@ -24712,8 +26850,8 @@ void Paint(ViewState& state) {
             // fade with the zoom that enters or leaves Content.
             if (!e.type.empty())
                 Text(state, e.type, geometry.detail[0].left, geometry.detail[0].top,
-                    geometry.detail[0].right, geometry.detail[0].bottom, nameColor, false,
-                    contentOpacity * detailsAlpha * reveal, false, false, nullptr, true);
+                    geometry.detail[0].right, geometry.detail[0].bottom, detailInk.rgb, false,
+                    detailOpacity * reveal, false, false, nullptr, true);
             const std::wstring* aside[] = {&e.date, &e.size};
             for (int line = 0; line < 2; ++line) {
                 if (aside[line]->empty()) continue;
@@ -24724,8 +26862,8 @@ void Paint(ViewState& state) {
                 else { shown.assign(label); shown.append(L": "); shown.append(*aside[line]); }
                 Text(state, shown,
                     geometry.aside[line].left, geometry.aside[line].top,
-                    geometry.aside[line].right, geometry.aside[line].bottom, nameColor, false,
-                    contentOpacity * detailsAlpha * reveal, false, false, nullptr, true);
+                    geometry.aside[line].right, geometry.aside[line].bottom, detailInk.rgb, false,
+                    detailOpacity * reveal, false, false, nullptr, true);
             }
         }
         if (details && !state.gridView) {
@@ -24745,9 +26883,9 @@ void Paint(ViewState& state) {
                     const float fade = state.columnModeTransition ? modeOpacity : col.opacity;
                     // A device/upload failure retains the complete text fallback.
                     if ((!icons || !DrawStatusIcons(state, *icons, left, v.top + cell.top,
-                            right, v.top + cell.bottom, fade * contentOpacity)) && text)
+                            right, v.top + cell.bottom, fade * item.opacity)) && text)
                         Text(state, *text, left, v.top + cell.top, right, v.top + cell.bottom,
-                         nameColor, false, detailsAlpha * fade * contentOpacity, false, false, 0, true);
+                         detailInk.rgb, false, detailOpacity * fade, false, false, 0, true);
                 }
             }
         }
@@ -24764,6 +26902,7 @@ void Paint(ViewState& state) {
     struct HeadingPaint {
         const std::wstring* title; bool collapsed; RowVisual visual; int key=0;
         const ViewState::GroupSection* section=nullptr; // Outgoing headings carry no badge.
+        ForegroundFeedback feedback;
     };
     std::vector<HeadingPaint> headings;
     // Outgoing headings stay behind current headings. Reserve every displayed
@@ -24771,7 +26910,7 @@ void Paint(ViewState& state) {
     if (state.groupingLayoutTransition) for (const auto& old:state.disappearingHeaders) {
         const float opacity=1.f-headerProgress;
         const float height=GroupHeadingHeight(state)*opacity;
-        const float top=old.oldTop-(state.scrollNow-state.rowTransitionOldScroll);
+        const float top=old.oldTop-RowTransitionScrollDelta(state);
         if (height>.01f && top<contentBottom && top+height>header)
             headings.push_back({&old.title,old.collapsed,{top,height,opacity},-int(&old-state.disappearingHeaders.data())-1});
     }
@@ -24810,17 +26949,22 @@ void Paint(ViewState& state) {
     // ClearBodyBand reserves transparent space above items for sticky headings.
     // Restore shared input feedback after masking item contents. Header bands
     // must not cut holes into a selection/hover moving between ordinary rows.
-    for (const auto& heading:headings) {
+    PaintedFeedback sectionHoverFeedback;
+    for (auto& heading:headings) {
         RowSourceScope source(state,heading.key,0,true);
+        heading.feedback.moving=&movingFeedback;
         state.target->PushAxisAlignedClip(D2D1::RectF(0.f,heading.visual.top,w,
             heading.visual.top+heading.visual.height),D2D1_ANTIALIAS_MODE_ALIASED);
         FillSelectionRect(state,movingSelectionRect,movingSelectionOpacity,&movingSelectionShape);
         if(heading.section && state.keyboardSectionKey && heading.section->key==*state.keyboardSectionKey && state.inputFocusIndicators) {
             const auto focus=GroupHoverRect(state,heading.key,heading.visual);
             const float visualRow=(heading.visual.top-header+state.scrollNow)/std::max(1.f,row);
-            FillSelectionRect(state,focus,SelectionBaseOpacity(state,hover,visualRow,focus.left,focus.right)*heading.visual.opacity);
+            FillSelectionRect(state,focus,SelectionBaseOpacity(state,hover,visualRow,focus.left,focus.right)*heading.visual.opacity,
+                nullptr,false,Theme::Highlight::Selected,0.f,&heading.feedback.focus);
         }
-        FillSelectionRect(state,hoverRect,hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight);
+        FillSelectionRect(state,hoverRect,hoverOverlayOpacity,&hoverShape,false,Theme::Highlight::Hover,hoverCombinedWeight,
+            sectionHoverFeedback.count ? nullptr : &sectionHoverFeedback);
+        heading.feedback.hover=&sectionHoverFeedback;
         state.target->PopAxisAlignedClip();
     }
     state.target->PopAxisAlignedClip(); // group hover background margins
@@ -24830,7 +26974,7 @@ void Paint(ViewState& state) {
     for (const auto& heading:headings) {
         RowSourceScope source(state,heading.key,2,true);
         PaintGroupHeading(state,*heading.title,heading.collapsed,heading.visual.top,
-            heading.visual.height,heading.visual.opacity,listEnd,w,headerColor,heading.section);
+            heading.visual.height,heading.visual.opacity,listEnd,w,headerColor,heading.section,heading.feedback);
     }
     state.target->PopAxisAlignedClip(); // group feedback below all group text
     ClearBodyBand(state,frameTarget,0.f,columnHeader);
@@ -24865,7 +27009,7 @@ void Paint(ViewState& state) {
                 state.marqueeEndTick - now : 0ULL) / kUiTransitionDurationMs, 0.f, 1.f);
         }
         if ((right > left || bottom > top) && opacity > 0.f) {
-            const COLORREF c = g_selectionRgb.load(std::memory_order_relaxed);
+            const COLORREF c = SelectionColor(state);
             const unsigned rgb = ThemeRgb(c);
             const D2D1_RECT_F rc = D2D1::RectF(left, top, right, bottom);
             if (!DrawMarquee(state, rc, opacity)) {
@@ -24886,9 +27030,10 @@ void Paint(ViewState& state) {
         state.target->PopAxisAlignedClip();
     }
     // Scrollbars and persistent navigation feedback remain above the marquee.
-    DrawScrollbar(state, compositionFrame.active ? Scrollbar(state) : bar, nameColor,
+    const auto scrollbars=PresentedScrollbars(state);
+    DrawScrollbar(state, scrollbars[0], nameColor,
         state.verticalScrollbarHot || state.draggingScrollbar, state.draggingScrollbar);
-    DrawScrollbar(state, HorizontalBar(state), nameColor,
+    DrawScrollbar(state, scrollbars[1], nameColor,
         state.horizontalScrollbarHot || state.draggingHorizontal, state.draggingHorizontal);
     // Foreground visuals belong to the persistent composition root, never to
     // this repaint or to a temporary row/column transition's chrome plane.
@@ -24972,6 +27117,10 @@ void Paint(ViewState& state) {
         }
         PipelineEvent(*state.background,{.operation=L"render.present[pos,target]",.a=static_cast<unsigned>(present),
             .b=PipelineFlags(state),.v={state.scrollNow,state.scrollTarget}});
+        if (LiveLayoutTransition(state))
+            PipelineEvent(*state.background,{.operation=L"grid.reflow.present[progress,columns,poses,scrollDelta]",
+                .a=state.rowSceneRevision,.b=static_cast<unsigned>(present),
+                .v={presentedLayoutProgress,double(state.itemsPerRow),double(state.rowMotion.size()),RowTransitionScrollDelta(state)}});
         state.presentPending = present == DXGI_ERROR_WAS_STILL_DRAWING;
         if (state.presentPending) QueryPerformanceCounter(&state.rejectedPresentQpc);
         else state.rejectedPresentQpc = {};
@@ -25031,7 +27180,12 @@ void Paint(ViewState& state) {
         }
     }
     if (submitted) {
+        if (!clipboardPartial) {
+            state.acceptedScrollbars=scrollbars;
+            state.acceptedScrollbarToken=state.token;
+        }
         state.lastAcceptedPaint=state.graphicsPaintSerial;
+        state.lastAcceptedPresentationModel=state.presentationSequence;
         if (state.presentObserverId) {
             LARGE_INTEGER at{}, frequency{};
             QueryPerformanceCounter(&at); QueryPerformanceFrequency(&frequency);
@@ -25187,6 +27341,37 @@ void AdvanceStandbyGraphics(ViewState& state) {
         if (!state.graphicsStandby || !InactiveGraphics(state)) return;
         if (state.modeRootAttached || state.modeComposition.started.QuadPart) {
             RegisterViewAnimation(state); return; // Present backpressure: retry on the next real frame wake.
+        }
+    }
+    // Buffers grown on screen beyond the frame reach (edge drags to the work
+    // area, a frame that has since shrunk) return to it only where replacing
+    // the chain cannot be seen: a hidden overlay. A standby image still
+    // covering a tab handoff keeps its buffers. The reach is kept, not the
+    // exact viewport, so pane toggles after the tab returns never rebuild.
+    // A minimized frame has no client area to measure and is left alone.
+    // Paint publishes the replacement before trimming, so the old chain is
+    // released. Only a tab that already shows an image has one to replace.
+    RECT frame{};
+    if (state.presentationOnly && state.backbuffer && state.presentedSwapChain &&
+        !IsWindowVisible(state.hwnd) && GetClientRect(state.frameHwnd,&frame) &&
+        frame.right>0 && frame.bottom>0) {
+        RECT client{}; ViewClientRect(state,&client);
+        UINT width=UINT(std::max<LONG>(1,client.right)), height=UINT(std::max<LONG>(1,client.bottom));
+        ExtendToFrameReach(state,width,height);
+        const auto size=state.backbuffer->GetPixelSize();
+        const bool oversized=size.width>width || size.height>height;
+        if (oversized || state.presentedSwapChain!=state.swapChain) {
+            {
+                ScopedFlag exact(state.exactBuffersRequested);
+                if (oversized && !ResizeTarget(state,width,height)) return;
+                Paint(state);
+            }
+            if (!state.graphicsReady) return;
+            if (!state.graphicsStandby || !InactiveGraphics(state)) return;
+            if (state.presentedSwapChain!=state.swapChain) {
+                RegisterViewAnimation(state); return; // Present backpressure: retry on the next real frame wake.
+            }
+            ProfileGpuMemory(state,L"standby.frame-buffers",true);
         }
     }
     if (!state.graphicsStandbyTrimmed) {
@@ -25486,8 +27671,13 @@ DWORD WINAPI SelectionWorkerProc(LPVOID context) {
 }
 
 bool GpuSelectionMatches(const ViewState& state, const PreparedNativeSelection& selection) {
+    size_t selected = state.selectedFlags.Count(0,state.selectedFlags.size());
+    if (state.rootTotal != state.total) { // Only mirrored rows are ever prepared.
+        for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+            if (state.selectedFlags[i] && !NativeMirrorsRow(state, i)) --selected;
+    }
     if (state.token != selection.viewToken || state.directoryToken != selection.directoryToken || state.nativeHwnd != selection.native ||
-        state.selectedFlags.Count(0,state.selectedFlags.size()) != selection.entries.size()) return false;
+        selected != selection.entries.size()) return false;
     for (const Entry& entry : selection.entries) {
         const int row = GpuRowForNativePath(state, entry.path);
         if (row < 0 || static_cast<size_t>(row) >= state.selectedFlags.size() ||
@@ -25545,6 +27735,9 @@ bool CollectSelectedPidls(ViewState& state, PidlSelection& pidls) {
         if (i >= static_cast<int>(state.selectedFlags.size()) ||
             !state.selectedFlags[static_cast<size_t>(i)]) continue;
         if (static_cast<size_t>(i) >= state.entries.size()) return false;
+        // Inline children belong to another folder; never offer them to the
+        // native view (it answers S_OK and selects nothing, see the probe).
+        if (!NativeMirrorsRow(state, size_t(i))) continue;
         PITEMID_CHILD child = nullptr;
         const HRESULT hr=EntryChildPidl(state, state.entries[static_cast<size_t>(i)], &child);
         OwnedPidl owned(child);
@@ -25771,7 +27964,7 @@ void ApplyImportedNativeSelection(ViewState& state,
     // filesystem snapshot includes it. Revalidate on the existing worker,
     // preserving the native selection while the new name becomes available.
     {
-        if (state.nativeSelectionAllPending && state.nativeSelectionAllCount!=state.total) {
+        if (state.nativeSelectionAllPending && state.nativeSelectionAllCount!=state.rootTotal) {
             // Native filters may omit a real filesystem entry (e.g. an Office
             // lock file). Read the actual selected identities on the existing
             // lane; refreshing the same GPU names cannot repair that mismatch.
@@ -25822,8 +28015,11 @@ void ApplyImportedNativeSelection(ViewState& state,
     // to the selected row if the user has since scrolled elsewhere.
     if (!state.nativeSelectionAllPending &&
         state.selectedFlags.size() == state.entries.size()) {
+        // The native view only ever holds the folder's own rows; selected
+        // inline children are not part of an echo and stay selected.
         size_t count = 0;
-        for (unsigned char flag : state.selectedFlags) count += flag != 0;
+        for (size_t i = 0; i < state.selectedFlags.size(); ++i)
+            count += state.selectedFlags[i] != 0 && NativeMirrorsRow(state, i);
         if (count == state.nativeSelectionPaths.size()) {
             bool same = true;
             int nativeFocus = -1;
@@ -25872,13 +28068,13 @@ void ApplyImportedNativeSelection(ViewState& state,
         // ItemCount(SVGIO_ALLVIEW) was compared with SVGIO_SELECTION at
         // capture time. Compare with the completed GPU snapshot here as well.
         // Any native/GPU filtering mismatch must retain Explorer's selection.
-        if (nativeTotal != state.total) {
+        if (nativeTotal != state.rootTotal) {
             RejectNativeSelectionImport(state, L"all rows differ",
-                state.total, nativeTotal);
+                state.rootTotal, nativeTotal);
             return;
         }
         ClearPostDeletionCaret(state);
-        state.selectedFlags.assign(state.entries.size(), 1);
+        state.selectedFlags.assign(state.entries.size(), 1); // Shown inline children too, as in Dolphin.
         state.selected = state.anchor = state.selected>=0 && state.selected<state.total ? state.selected : state.total ? 0 : -1;
         RememberVerifiedSelection(state);
         AnimateVisibleSelection(state, previousVisible);
@@ -26032,7 +28228,7 @@ bool CaptureNativeSelection(ViewState& state, bool eventDriven = true, bool comm
         int nativeTotal = -1;
         if (SUCCEEDED(state.folderView->ItemCount(SVGIO_ALLVIEW, &nativeTotal)) &&
             nativeTotal == nativeSelected) {
-            if (state.loaded && state.total!=nativeTotal)
+            if (state.loaded && state.rootTotal!=nativeTotal)
                 return QueueNativeSelectionPreparation(state,nativeSelected,false,true);
             state.nativeSelectionPaths.clear();
             state.nativeFocusedPath.clear();
@@ -26363,7 +28559,9 @@ bool QueueNativeSelectionPreparation(ViewState& state, int importCount, bool rev
     if (state.token!=job->viewToken || state.directoryToken!=job->directoryToken ||
         state.nativeHwnd!=job->native || state.folderView.Get()!=view.Get()) return false;
     for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i) {
-        if (!state.selectedFlags[i]) continue;
+        // Inline children belong to other folders; they stay GPU-selected and
+        // are not offered to the native view (they would come back rejected).
+        if (!state.selectedFlags[i] || !NativeMirrorsRow(state, i)) continue;
         if (static_cast<int>(i) == state.selected) job->focused = static_cast<int>(job->entries.size());
         Entry entry;
         entry.name = state.entries[i].name;
@@ -26510,12 +28708,22 @@ bool SyncNativeSelection(ViewState& state, std::shared_ptr<PreparedNativeSelecti
                 QueueNativeSelectionHint(*state);
         }
     } continuation{state.hwnd,state.lifetimeToken};
+    // After this commit (whatever path it takes), Explorer's selection
+    // listeners are told when the selection includes inline children.
+    struct InlineSelectionNotice {
+        HWND owner; unsigned long long lifetime;
+        ~InlineSelectionNotice() {
+            if (auto* live = State(owner); live && live->lifetimeToken == lifetime) QueueInlineSelectionNotice(*live);
+        }
+    } inlineNotice{state.hwnd, state.lifetimeToken};
     ScopedFlag committing(state.nativeSelectionCommitting);
     size_t desired = 0;
     std::vector<std::wstring> selectedPaths;
     selectedPaths.reserve(8);
     for (size_t i = 0; i < state.selectedFlags.size(); ++i) {
         if (!state.selectedFlags[i]) continue;
+        // A selected inline child is GPU-only; the native view gets none.
+        if (!NativeMirrorsRow(state, i)) continue;
         ++desired;
         if (desired <= kMaxDirectNativeSelectionItems &&
             i < state.entries.size())
@@ -26729,6 +28937,8 @@ void TrySyncLastFolderSelection(ViewState& state) {
 
 void Select(ViewState& state, int index, bool keyboardNavigation = false) {
     state.typeSearchWaiting=false;
+    // An inline child can be the single, GPU-only selection: the native view
+    // holds nothing then, so its file commands have no target.
     if (state.optimisticStartedAt || index < 0 || index >= state.total ||
         !DisplayedRow(state, index)) return;
     state.keyboardSectionKey.reset();
@@ -26820,7 +29030,7 @@ void SelectWithModifiers(ViewState& state, int index, bool control, bool shift) 
         const int begin = std::min(index, state.anchor);
         const int end = std::max(index, state.anchor);
         for (int i = begin; i <= end; ++i)
-            if (DisplayedRow(state, i)) state.selectedFlags[static_cast<size_t>(i)] = 1;
+            if (SelectableRow(state, i)) state.selectedFlags[static_cast<size_t>(i)] = 1;
     } else if (control) {
         auto flag = state.selectedFlags[static_cast<size_t>(index)];
         flag = flag ? 0 : 1;
@@ -26843,7 +29053,8 @@ void SelectWithModifiers(ViewState& state, int index, bool control, bool shift) 
 // only gestures for the GPU-rendered list are handled here.
 void SyncNativeKeyboardCaret(ViewState& state) {
     const int index = state.selected;
-    if (!state.folderView || index < 0 || index >= state.total || NativeSelectionHeldForRename(state)) return;
+    if (!state.folderView || index < 0 || index >= state.total || NativeSelectionHeldForRename(state) ||
+        TreeChildRow(state, index)) return; // The native view has no row for an inline child.
     constexpr DWORD flags = SVSI_FOCUSED | SVSI_SELECTIONMARK | SVSI_NOTAKEFOCUS;
     PITEMID_CHILD item = nullptr;
     if (SUCCEEDED(EntryChildPidl(state, state.entries[static_cast<size_t>(index)], &item)) && item) {
@@ -27004,6 +29215,31 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
             ToggleGroupSection(state, focusedSection);
         return;
     }
+    // With nothing focused, the first arrow keeps its usual behavior below.
+    if (!control && !shift && (key == VK_LEFT || key == VK_RIGHT) && InlineTreeActive(state) &&
+        state.selected >= 0) {
+        // Tree convention: Right expands the focused folder, Left collapses
+        // it. Repeats keep the requested state; other rows stay where they are.
+        // Right on an expanded folder moves to its first item; Left on an item
+        // that isn't expanded moves to the folder that holds it.
+        const bool expand = (key == VK_RIGHT) != state.rtlLayout;
+        const int row = state.selected;
+        if (row < 0 || static_cast<size_t>(row) >= state.entries.size()) return;
+        const Entry& e = state.entries[size_t(row)];
+        const bool expandable = InlineTreeExpandable(e);
+        if (expandable && e.treeExpanded != expand) {
+            ToggleInlineFolder(state, row);
+            return;
+        }
+        int target = -1;
+        if (expand && e.treeExpanded && size_t(row) + 1 < state.entries.size() &&
+            state.entries[size_t(row) + 1].treeDepth > e.treeDepth) target = row + 1;
+        if (!expand && e.treeDepth)
+            for (int i = row - 1; i >= 0; --i)
+                if (state.entries[size_t(i)].treeDepth < e.treeDepth) { target = i; break; }
+        if (target >= 0) Select(state, target, true);
+        return;
+    }
     const bool initialArrow = KeyboardFocusedSection(state) < 0 && state.selected < 0 &&
         state.restoredKeyboardRow < 0 && state.vacantKeyboardRow < 0 &&
         (key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN);
@@ -27074,7 +29310,7 @@ void NavigateKeyboardSelection(ViewState& state, UINT key,
         const int first = std::min(state.anchor, target);
         const int last = std::max(state.anchor, target);
         for (int row = first; row <= last; ++row)
-            if (DisplayedRow(state, row))
+            if (SelectableRow(state, row))
                 state.selectedFlags[static_cast<size_t>(row)] = 1;
         state.keyboardCaretVisible = false;
         state.selected = target;
@@ -27210,7 +29446,7 @@ void InvertKeyboardSelection(ViewState& state) {
     if (state.selectedFlags.size() != static_cast<size_t>(state.total))
         state.selectedFlags.resize(static_cast<size_t>(state.total), 0);
     for (int i = 0; i < state.total; ++i)
-        if (DisplayedRow(state, i)) state.selectedFlags[static_cast<size_t>(i)] ^= 1;
+        if (SelectableRow(state, i)) state.selectedFlags[static_cast<size_t>(i)] ^= 1;
     state.keyboardCaretVisible = false;
     ClearPostDeletionCaret(state);
     AnimateVisibleSelection(state, beforeSelection);
@@ -27469,7 +29705,7 @@ void UpdateMarquee(ViewState& state, POINT point) {
             const int column = state.gridView ? static_cast<int>(std::lround(
                 DocumentRowLeft(state, i) / std::max(1.f, state.itemWidth))) : 0;
             const unsigned char desired = static_cast<unsigned char>(
-                base != (inside && DisplayedRow(state, i) &&
+                base != (inside && SelectableRow(state, i) &&
                     column >= columnFirst && column < columnLast));
             if (state.selectedFlags[static_cast<size_t>(i)] != desired) {
                 state.selectedFlags[static_cast<size_t>(i)] = desired;
@@ -27808,8 +30044,10 @@ RECT RenameViewport(ViewState& state, bool frameCoordinates = true) {
 }
 
 ItemGeometry RenameItemGeometry(ViewState& state, int index) {
-    return LayoutItem(state, {state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
-        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)});
+    RowVisual visual{state.headerPx + DocumentRowTop(state, index) - state.scrollNow,
+        DisplayRowHeight(state, index), 1.f, DocumentRowLeft(state, index)};
+    visual.treeDepth = InlineTreeRowDepth(state, index);
+    return LayoutItem(state, visual);
 }
 
 SIZE RenameTextPadding(const ViewState& state) {
@@ -28013,6 +30251,10 @@ void FinalizeDestroyedRenameEditor(ViewState& state, HWND editor) {
     r.path.clear();
     r.folder.clear();
     r.tab = r.native = nullptr;
+    // Expanded rows held back while renaming are rebuilt after the rename
+    // transaction unwinds (posted: its completion still addresses rows).
+    if (state.inlineTreeRegraftDeferred && IsWindow(state.hwnd))
+        PostMessageW(state.hwnd, kMsgInlineTreeReady, WPARAM(state.lifetimeToken), 0);
     r.finishing = false;
     r.textLayoutDirty = false;
     r.requestedTextRectValid = false;
@@ -28090,6 +30332,8 @@ bool CloseRenameEditor(ViewState& state, bool restoreFocus = false) {
 
 void CancelRename(ViewState& state) {
     if (state.rename.finishing || !state.rename.editor) return;
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] cancelled: %s", state.rename.path.c_str());
     CloseRenameEditor(state);
 }
 
@@ -28618,6 +30862,11 @@ LRESULT CALLBACK RenameEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 // `multiple` accepts a larger selection containing `index`, as Explorer's F2
 // and Rename command do; the commit is then DefView's own (FinishRename).
 void BeginRename(ViewState& state, int index, bool createdItem = false, bool multiple = false) {
+    // An inline child is renamed through its own folder (FinishRename). A set
+    // that includes children renames together (RenameInlineSelection,
+    // Explorer's numbering), each item in its own folder, as Explorer renames
+    // a set chosen from search results.
+    const bool inlineSet = InlineSelectionDetached(state);
     if (state.thisPcGpu || IsRecycleBinLocation(state.folderPath) || state.rename.editor ||
         (!state.renamePreviewPath.empty() && state.renamePreviewToken == state.token) || !state.visible || !state.inScope ||
         !IsWindow(state.frameHwnd) || GetParent(state.hwnd) != state.frameHwnd ||
@@ -28658,7 +30907,8 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
         state.nativeHwnd != native || state.rename.editor || !state.visible || !state.inScope ||
         !TabOwnsActiveView(state) || index >= state.total || size_t(index) >= state.entries.size() ||
         state.entries[size_t(index)].path != path) return;
-    if (selectedCount > 1) {
+    // A native set reaches Explorer first; an inline set is the mod's own.
+    if (selectedCount > 1 && !inlineSet) {
         // A set over kMaxDirectNativeSelectionItems reaches Explorer through
         // the selection lane. Open the editor once Explorer holds the whole
         // set, so the commit never waits on (or races) that preparation.
@@ -28712,6 +30962,9 @@ void BeginRename(ViewState& state, int index, bool createdItem = false, bool mul
     // SetNameOf(SHGDN_INFOLDER) keeps that extension on commit.
     const bool labelled = !state.entries[static_cast<size_t>(index)].label.empty();
     const std::wstring name = EntryLabel(state.entries[static_cast<size_t>(index)]);
+    if (inlineSet && g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] starting for %zu item(s) with children selected: %s", selectedCount,
+            state.entries[size_t(index)].path.c_str());
     // Create HIDDEN: never expose an uninitialized EDIT or let the GPU overlay
     // paint above it while the edit is being configured.
     const bool wrapped = RenameItemGeometry(state, index).wrapped;
@@ -29238,7 +31491,17 @@ void FinishRename(ViewState& state, bool commit) {
         // the Shell change notifications publish them.
         if (!CloseRenameEditor(state) || !current()) return;
         if (state.presenter) SubmitPresentation(state);
-        if (changed) RenameSelectionNatively(state, newName);
+        // A set with children: each item renamed in its own folder.
+        if (changed) {
+            if (InlineSelectionDetached(state)) {
+                // The mod's own file operation: input returns to the list as
+                // after a single rename (DefView does this for its own set).
+                // Left on the frame, Explorer's accelerator chain would
+                // translate each key several times.
+                RenameInlineSelection(state, newName);
+                if (current() && returnInput) ReturnListInputFocus(state, editor);
+            } else RenameSelectionNatively(state, newName);
+        }
         else {
             if (valid) SyncNativeSelection(state);
             if (current() && returnInput) ReturnListInputFocus(state, editor);
@@ -29281,6 +31544,7 @@ void FinishRename(ViewState& state, bool commit) {
             entry.name = success ? name : oldName;
             entry.label = !success ? oldLabel : label != name ? label : L"";
             if (success) SetIndexedEntryPath(*live, row, path);
+            if (success && entry.treeDepth) RenameInlineTreeItem(*live, oldPath, path, entry.name, entry.label);
             live->selectedFlags.assign(live->entries.size(), 0);
             live->selectedFlags[size_t(row)] = 1;
             live->selected = live->anchor = row;
@@ -29324,10 +31588,29 @@ void FinishRename(ViewState& state, bool commit) {
     if (!GetFolderPath(view.Get(), actual, activeFolder) || !current() ||
         _wcsicmp(actual.c_str(), parent.c_str()) != 0 ||
         !IsTargetPath(actual)) { complete(false, L"", L""); return; }
+    // An inline child lives in its own folder: rename it there, with the same
+    // Shell call. The open folder above is still verified, so a navigation
+    // during the edit never commits into another view.
+    std::wstring itemFolder = parent;
+    if (TreeChildRow(state, index)) {
+        PIDLIST_ABSOLUTE absolute = nullptr;
+        ComPtr<IShellFolder> owning;
+        PCUITEMID_CHILD leaf = nullptr;
+        if (FAILED(SHParseDisplayName(oldPath.c_str(), nullptr, &absolute, 0, nullptr)) || !absolute ||
+            FAILED(SHBindToParent(absolute, IID_PPV_ARGS(&owning), &leaf)) || !owning) {
+            if (absolute) CoTaskMemFree(absolute);
+            complete(false, L"", L""); return;
+        }
+        CoTaskMemFree(absolute);
+        activeFolder = std::move(owning);
+        const size_t slash = oldPath.find_last_of(L'\\');
+        itemFolder = oldPath.substr(0, slash == 2 ? slash + 1 : slash);
+        if (!current()) return;
+    }
     // Shell handles extension rules and name validation. Only commit via
     // SetNameOf, never via a native hidden edit or fabricated keystrokes.
     std::wstring originalName = oldName;
-    std::wstring committedName = newName, committedPath = JoinPath(parent, newName);
+    std::wstring committedName = newName, committedPath = JoinPath(itemFolder, newName);
     ULONG eaten = 0;
     PITEMID_CHILD child = nullptr;
     HRESULT hr = activeFolder->ParseDisplayName(native,
@@ -29362,8 +31645,11 @@ void FinishRename(ViewState& state, bool commit) {
         complete(false, L"", L"");
         Wh_Log(L"[GPU rename] Shell rename failed hr=0x%08X: %s -> %s",
                static_cast<unsigned>(hr), oldPath.c_str(), newName.c_str());
-        if (current()) MessageBoxW(owner, L"Explorer could not rename this item.",
-                    L"Rename", MB_OK | MB_ICONWARNING);
+        // The same notice as a failed set (shell32's localized "Cannot rename"
+        // text and caption, shown from its own dispatch, never inside this
+        // rename transaction); a cancelled Shell prompt already informed the user.
+        if (current() && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+            ReportMultipleRenameFailure(state, L"the Shell did not rename the item", originalName, hr);
     }
 }
 
@@ -29387,8 +31673,615 @@ void BeginOptimisticNavigation(ViewState& state, const std::wstring& path,
 void MaybeDisplayImmediateBack(HWND overlay, const wchar_t* reason);
 void RollbackOptimisticNavigation(HWND overlay, const std::wstring& destination);
 
+// Explorer's command bar and status bar re-read the list's selection only when
+// the native view raises SelectionChanged, which a GPU-only change (a selection
+// that includes inline children) never does. Deliver that same documented
+// event (DShellFolderViewEvents) to the view's other listeners, so they ask
+// again and receive the whole selection (InlineSelectionViewOwner). Also once
+// when the selection stops including children, so they return to the native
+// answer. Coalesced and posted: never inside a selection commit.
+void QueueInlineSelectionNotice(ViewState& state) {
+    if (state.inlineSelectionNoticeQueued || state.presentationOnly || !IsWindow(state.hwnd)) return;
+    if (!InlineSelectionDetached(state) && !state.inlineSelectionWasDetached) return;
+    state.inlineSelectionNoticeQueued = PostMessageW(state.hwnd, kMsgInlineSelectionNotice,
+        WPARAM(state.lifetimeToken), 0) != FALSE;
+}
+void DeliverInlineSelectionNotice(ViewState& state) {
+    state.inlineSelectionNoticeQueued = false;
+    const bool detached = InlineSelectionDetached(state);
+    if (!detached && !state.inlineSelectionWasDetached) return;
+    state.inlineSelectionWasDetached = detached;
+    const auto connection = state.selectionEventConnection;
+    if (!connection) {
+        if (g_perf.load(std::memory_order_relaxed)) Wh_Log(L"[GPU selection] no selection event source to notify");
+        return;
+    }
+    ComPtr<IUnknown> own;
+    if (state.selectionEventSink) state.selectionEventSink.As(&own);
+    ComPtr<IEnumConnections> connections;
+    if (FAILED(connection->EnumConnections(&connections)) || !connections) return;
+    std::vector<ComPtr<IDispatch>> listeners;
+    CONNECTDATA data{};
+    while (connections->Next(1, &data, nullptr) == S_OK) {
+        ComPtr<IUnknown> sink; sink.Attach(data.pUnk);
+        ComPtr<IUnknown> identity; ComPtr<IDispatch> dispatch;
+        if (sink && SUCCEEDED(sink.As(&identity)) && identity != own && SUCCEEDED(sink.As(&dispatch)))
+            listeners.push_back(std::move(dispatch));
+    }
+    // A listener runs Explorer code: the tab may close while it does.
+    const HWND owner = state.hwnd;
+    const auto lifetime = state.lifetimeToken;
+    for (const auto& listener : listeners) {
+        if (auto* live = State(owner); live != &state || live->lifetimeToken != lifetime) return;
+        if (g_perf.load(std::memory_order_relaxed)) {
+            HMODULE module = nullptr; wchar_t name[MAX_PATH]{};
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCWSTR>((*reinterpret_cast<void***>(listener.Get()))[6]), &module);
+            if (module) GetModuleFileNameW(module, name, ARRAYSIZE(name));
+            Wh_Log(L"[GPU selection] SelectionChanged delivered to a listener in %s (children selected=%d)",
+                module ? PathFindFileNameW(name) : L"?", int(detached));
+        }
+        DISPPARAMS none{};
+        listener->Invoke(DISPID_SELECTIONCHANGED, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &none,
+            nullptr, nullptr, nullptr);
+    }
+}
+// Nonzero while the mod invokes its own inline-selection menu, so the
+// selection-menu hook never reroutes it (SelectionMenuInvokeHook).
+thread_local unsigned t_inlineMenuInvoking = 0;
+// A menu runs for the current Explorer window: its site is the tab's browser,
+// so commands that open folders (Open, Open in new tab) stay in this window.
+struct InlineMenuInvocation {
+    IContextMenu* menu;
+    InlineMenuInvocation(ViewState& state, IContextMenu* target) : menu(target) {
+        ++t_inlineMenuInvoking;
+        if (state.shellBrowser) IUnknown_SetSite(menu, state.shellBrowser.Get());
+    }
+    ~InlineMenuInvocation() { IUnknown_SetSite(menu, nullptr); --t_inlineMenuInvoking; }
+};
+// ---- Commands on selections that include inline children ----
+// The native view holds only its own rows, so such a selection is acted on
+// through its items' own Shell objects: the parent folder's UI objects when
+// every item shares one, otherwise the desktop's with absolute IDs (the same
+// objects Explorer's search results use, see the 1.1.3 probe).
+bool InlineSelectionDetached(const ViewState& state) {
+    if (state.rootTotal == state.total) return false;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.selectedFlags[i] && state.entries[i].treeDepth) return true;
+    return false;
+}
+// The selection's absolute Shell IDs, built once per selection (and row set)
+// and reused by every request: Explorer's listeners, the command bar, menus and
+// data objects ask many times per change. The open folder's rows come from its
+// bound folder; children are parsed through their own folder, bound once per
+// folder, instead of each path from the desktop.
+bool InlineSelectionPidls(ViewState& state, std::vector<OwnedPidl>& items) {
+    // Keyed on the selected items themselves (in row order), so a row renamed
+    // or replaced in place is never handed out with its old identity.
+    auto& cache = state.inlineSelectionCache;
+    std::vector<std::wstring> paths;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.selectedFlags[i]) paths.push_back(state.entries[i].path);
+    if (cache.failed && cache.directory == state.directoryToken && cache.paths == paths) return false;
+    if (!cache.items.empty() && cache.directory == state.directoryToken && cache.paths == paths) {
+        for (const auto& item : cache.items) items.emplace_back(ILCloneFull(item.get()));
+        return true;
+    }
+    LARGE_INTEGER started{}; QueryPerformanceCounter(&started);
+    std::vector<OwnedPidl> built;
+    OwnedPidl folder;
+    std::unordered_map<std::wstring, std::pair<OwnedPidl, ComPtr<IShellFolder>>> parents;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i) {
+        if (!state.selectedFlags[i]) continue;
+        const Entry& e = state.entries[i];
+        PIDLIST_ABSOLUTE raw = nullptr;
+        if (!e.treeDepth) {
+            // The open folder's own row: its bound folder and cached child ID.
+            if (!folder) {
+                PIDLIST_ABSOLUTE parent = state.directoryFolderIdentity ?
+                    ILCloneFull(state.directoryFolderIdentity.get()) : nullptr;
+                if (!parent && state.folder) SHGetIDListFromObject(state.folder.Get(), &parent);
+                folder.reset(parent);
+            }
+            PITEMID_CHILD child = nullptr;
+            if (folder && SUCCEEDED(EntryChildPidl(state, e, &child)) && child) {
+                raw = ILCombine(folder.get(), child);
+                CoTaskMemFree(child);
+            }
+            if (!raw && !e.path.starts_with(L"windhawk:") &&
+                FAILED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr))) raw = nullptr;
+        } else {
+            const size_t slash = e.path.find_last_of(L'\\');
+            if (slash != std::wstring::npos) {
+                const std::wstring parentPath = e.path.substr(0, slash == 2 ? slash + 1 : slash);
+                auto found = parents.find(parentPath);
+                if (found == parents.end()) {
+                    PIDLIST_ABSOLUTE parent = nullptr;
+                    ComPtr<IShellFolder> shell;
+                    if (SUCCEEDED(SHParseDisplayName(parentPath.c_str(), nullptr, &parent, 0, nullptr)) && parent)
+                        SHBindToObject(nullptr, parent, nullptr, IID_PPV_ARGS(&shell));
+                    found = parents.emplace(parentPath, std::make_pair(OwnedPidl(parent), std::move(shell))).first;
+                }
+                auto& [parentId, shell] = found->second;
+                if (parentId && shell) {
+                    std::wstring name = e.name;
+                    PIDLIST_RELATIVE child = nullptr;
+                    if (SUCCEEDED(shell->ParseDisplayName(nullptr, nullptr, name.data(), nullptr, &child, nullptr)) && child) {
+                        raw = ILCombine(parentId.get(), child);
+                        CoTaskMemFree(child);
+                    }
+                }
+            }
+            if (!raw && FAILED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr))) raw = nullptr;
+        }
+        if (!raw) {
+            // Explorer polls the selection while a deleted item's row still waits
+            // for its folder's re-list: remember the miss instead of parsing again.
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU tree] selected item has no Shell identity: %s", e.path.c_str());
+            cache.items.clear();
+            cache.paths = std::move(paths);
+            cache.directory = state.directoryToken;
+            cache.failed = true;
+            return false;
+        }
+        built.emplace_back(raw);
+    }
+    if (built.empty()) return false;
+    if (g_perf.load(std::memory_order_relaxed)) {
+        LARGE_INTEGER ended{}, frequency{}; QueryPerformanceCounter(&ended); QueryPerformanceFrequency(&frequency);
+        Wh_Log(L"[GPU tree] selection identities built: %zu items in %.2f ms", built.size(),
+            (ended.QuadPart - started.QuadPart) * 1000.0 / frequency.QuadPart);
+    }
+    for (const auto& item : built) items.emplace_back(ILCloneFull(item.get()));
+    cache.items = std::move(built);
+    cache.paths = std::move(paths);
+    cache.directory = state.directoryToken;
+    cache.failed = false;
+    return true;
+}
+// Several items (one folder or several, as in search results), renamed
+// together as Explorer renames a set: the typed name with " (1)", " (2)", ...
+// in row order, each item in its own folder and keeping its own extension.
+// One Shell file operation, so it is undoable in one step.
+// Records what the Shell actually named each item (collisions and policy can
+// change the requested name), so the renamed rows keep their selection.
+class InlineRenameSink final : public IFileOperationProgressSink {
+public:
+    struct Result { ComPtr<IShellItem> item; std::wstring leaf, label; };
+    std::vector<Result> results;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IFileOperationProgressSink)) {
+            *out = static_cast<IFileOperationProgressSink*>(this); AddRef(); return S_OK;
+        }
+        *out = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override { const ULONG left = --references; if (!left) delete this; return left; }
+    HRESULT STDMETHODCALLTYPE StartOperations() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE FinishOperations(HRESULT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreRenameItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostRenameItem(DWORD, IShellItem* item, LPCWSTR name, HRESULT hr, IShellItem* created) override {
+        if (FAILED(hr) || !item) return S_OK;
+        std::wstring leaf = name ? name : L"";
+        PWSTR parsed = nullptr;
+        if (created && SUCCEEDED(created->GetDisplayName(SIGDN_PARENTRELATIVEPARSING, &parsed)) && parsed) {
+            leaf = parsed; CoTaskMemFree(parsed);
+        }
+        std::wstring label;
+        if (created && SUCCEEDED(created->GetDisplayName(SIGDN_NORMALDISPLAY, &parsed)) && parsed) {
+            label = parsed; CoTaskMemFree(parsed);
+        }
+        if (label == leaf) label.clear();
+        if (!leaf.empty()) results.push_back({item, std::move(leaf), std::move(label)});
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE PreMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreDeleteItem(DWORD, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostDeleteItem(DWORD, IShellItem*, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PreNewItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PostNewItem(DWORD, IShellItem*, LPCWSTR, LPCWSTR, DWORD, HRESULT, IShellItem*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE UpdateProgress(UINT, UINT) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResetTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PauseTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResumeTimer() override { return S_OK; }
+private:
+    std::atomic<ULONG> references{1};
+};
+void RenameInlineSelection(ViewState& state, const std::wstring& text) {
+    std::vector<OwnedPidl> items;
+    std::vector<const Entry*> rows;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+        if (state.selectedFlags[i]) rows.push_back(&state.entries[i]);
+    if (!InlineSelectionPidls(state, items) || items.size() != rows.size()) {
+        ReportMultipleRenameFailure(state, L"the selected items have no Shell identity", text, E_FAIL);
+        return;
+    }
+    ComPtr<IFileOperation> operation;
+    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation));
+    if (SUCCEEDED(hr)) hr = operation->SetOwnerWindow(state.frameHwnd);
+    if (SUCCEEDED(hr)) hr = operation->SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR);
+    ComPtr<InlineRenameSink> sink;
+    sink.Attach(new InlineRenameSink());
+    DWORD cookie = 0;
+    if (SUCCEEDED(hr) && FAILED(operation->Advise(sink.Get(), &cookie))) cookie = 0;
+    std::vector<std::pair<ComPtr<IShellItem>, std::wstring>> queued; // Item and its old path.
+    for (size_t i = 0; SUCCEEDED(hr) && i < items.size(); ++i) {
+        const Entry& e = *rows[i];
+        const std::wstring extension = e.folder ? std::wstring() : std::wstring(PathFindExtensionW(e.name.c_str()));
+        std::wstring base = text;
+        // A typed extension equal to the item's own is not doubled.
+        if (!extension.empty() && base.size() > extension.size() &&
+            !_wcsicmp(base.c_str() + base.size() - extension.size(), extension.c_str()))
+            base.resize(base.size() - extension.size());
+        const std::wstring name = base + L" (" + std::to_wstring(i + 1) + L")" + extension;
+        ComPtr<IShellItem> item;
+        hr = SHCreateItemFromIDList(items[i].get(), IID_PPV_ARGS(&item));
+        if (SUCCEEDED(hr)) hr = operation->RenameItem(item.Get(), name.c_str(), nullptr);
+        if (SUCCEEDED(hr)) queued.emplace_back(item, e.path);
+    }
+    const HWND owner = state.hwnd, native = state.nativeHwnd;
+    const auto lifetime = state.lifetimeToken, token = state.token;
+    const std::wstring folder = state.folderPath;
+    if (SUCCEEDED(hr)) {
+        NativeFileCommandScope scope(&state);
+        hr = operation->PerformOperations();
+    }
+    if (cookie) operation->Unadvise(cookie);
+    // The operation is modal and reentrant: the tab may have navigated or closed.
+    auto* live = State(owner);
+    if (live != &state || live->lifetimeToken != lifetime || live->token != token ||
+        live->nativeHwnd != native || live->folderPath != folder || g_unloading.load(std::memory_order_acquire)) return;
+    // Renamed rows keep their identity, selection and focus, as a single
+    // rename does: the rows and inline nodes take the new paths before the
+    // Shell notifications re-list them, so the regraft finds the same rows.
+    // Otherwise the selection is lost and the keyboard resumes from a stale
+    // caret (Down skipped rows after the set was renamed).
+    bool renamed = false;
+    for (const auto& result : sink->results)
+        for (const auto& [item, oldPath] : queued) {
+            int order = 1;
+            if (FAILED(item->Compare(result.item.Get(), SICHINT_CANONICAL, &order)) || order) continue;
+            const size_t slash = oldPath.find_last_of(L'\\');
+            const int row = slash == std::wstring::npos ? -1 : GpuRowForNativePath(state, oldPath);
+            if (row >= 0) {
+                const std::wstring path = oldPath.substr(0, slash + 1) + result.leaf;
+                auto& entry = state.entries[size_t(row)];
+                entry.name = result.leaf; entry.label = result.label;
+                SetIndexedEntryPath(state, row, path);
+                if (entry.treeDepth) RenameInlineTreeItem(state, oldPath, path, entry.name, entry.label);
+                renamed = true;
+            }
+            break;
+        }
+    if (renamed) {
+        state.typeSearchCandidates.Reset();
+        ClearPostDeletionCaret(state);
+        Redraw(state);
+        if (state.presenter) SubmitPresentation(state);
+    }
+    BOOL aborted = FALSE;
+    if (operation) operation->GetAnyOperationsAborted(&aborted);
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED) && !aborted)
+        ReportMultipleRenameFailure(state, L"the Shell did not rename the set", text, hr);
+}
+// Switching to the native view: a selection that lies entirely inside one
+// expanded child folder opens that folder natively and selects the items
+// there. Mixed origins (or any root row) keep the current folder.
+bool PrepareNativeInlineReveal(ViewState& state) {
+    state.nativeRevealFolder.reset();
+    state.nativeRevealItems.clear();
+    if (!InlineTreeActive(state) || !InlineSelectionDetached(state) || !state.shellBrowser) return false;
+    std::wstring parent;
+    for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i) {
+        if (!state.selectedFlags[i]) continue;
+        const Entry& e = state.entries[i];
+        const size_t slash = e.path.find_last_of(L'\\');
+        if (!e.treeDepth || slash == std::wstring::npos) return false;
+        const std::wstring folder = e.path.substr(0, slash);
+        if (parent.empty()) parent = folder;
+        else if (_wcsicmp(parent.c_str(), folder.c_str()) != 0) return false;
+    }
+    std::vector<OwnedPidl> items;
+    if (parent.empty() || !InlineSelectionPidls(state, items)) return false;
+    OwnedPidl folder(ILCloneFull(items.front().get()));
+    if (!folder || !ILRemoveLastID(folder.get())) return false;
+    state.nativeRevealFolder = std::move(folder);
+    state.nativeRevealItems = std::move(items);
+    return true;
+}
+// Runs after the switch, so the GPU view no longer follows the navigation.
+void BrowseNativeToInlineSelection(ViewState& state) {
+    if (!state.nativeRevealFolder || !state.shellBrowser) return;
+    const HRESULT hr = state.shellBrowser->BrowseObject(state.nativeRevealFolder.get(), SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+    if (FAILED(hr)) {
+        Wh_Log(L"[GPU tree] native browse to selection folder failed hr=0x%08lx", hr);
+        state.nativeRevealFolder.reset();
+        state.nativeRevealItems.clear();
+    }
+}
+// Called on navigation signals: once the active native view shows the
+// pending folder, select the items there through the view's own SelectItem.
+void ApplyNativeInlineReveal(ViewState& state) {
+    if (!state.nativeRevealFolder || !state.shellBrowser) return;
+    ComPtr<IShellView> view;
+    ComPtr<IFolderView> folderView;
+    ComPtr<IPersistFolder2> persist;
+    PIDLIST_ABSOLUTE current = nullptr;
+    if (FAILED(state.shellBrowser->QueryActiveShellView(&view)) || !view ||
+        FAILED(view.As(&folderView)) || FAILED(folderView->GetFolder(IID_PPV_ARGS(&persist))) ||
+        FAILED(persist->GetCurFolder(&current)) || !current) return;
+    const OwnedPidl currentFolder(current);
+    if (!ILIsEqual(currentFolder.get(), state.nativeRevealFolder.get())) return;
+    // The view can exist before its items do; a refused first item means it
+    // is still enumerating, so a later navigation signal tries again.
+    UINT flags = SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_FOCUSED | SVSI_ENSUREVISIBLE;
+    for (const auto& item : state.nativeRevealItems) {
+        const HRESULT hr = view->SelectItem(ILFindLastID(item.get()), flags);
+        if (flags != SVSI_SELECT && FAILED(hr)) return;
+        flags = SVSI_SELECT;
+    }
+    state.nativeRevealFolder.reset();
+    state.nativeRevealItems.clear();
+}
+template <class T>
+HRESULT InlineSelectionObject(ViewState& state, const std::vector<OwnedPidl>& items, T** result) {
+    *result = nullptr;
+    // One shared parent gives that folder's own menu and verbs.
+    OwnedPidl parent(ILCloneFull(items.front().get()));
+    if (!parent || !ILRemoveLastID(parent.get())) return E_FAIL;
+    bool shared = true;
+    for (const auto& item : items) {
+        OwnedPidl other(ILCloneFull(item.get()));
+        if (!other || !ILRemoveLastID(other.get()) || !ILIsEqual(other.get(), parent.get())) { shared = false; break; }
+    }
+    ComPtr<IShellFolder> folder;
+    std::vector<PCUITEMID_CHILD> children;
+    if (shared) {
+        if (FAILED(SHBindToObject(nullptr, parent.get(), nullptr, IID_PPV_ARGS(&folder)))) shared = false;
+        else for (const auto& item : items) children.push_back(ILFindLastID(item.get()));
+    }
+    if (!shared) {
+        if (FAILED(SHGetDesktopFolder(&folder))) return E_FAIL;
+        children.clear();
+        for (const auto& item : items) children.push_back(reinterpret_cast<PCUITEMID_CHILD>(item.get()));
+    }
+    return folder->GetUIObjectOf(state.frameHwnd, static_cast<UINT>(children.size()), children.data(),
+        __uuidof(T), nullptr, reinterpret_cast<void**>(result));
+}
+bool InlineSelectionMenu(ViewState& state, ComPtr<IContextMenu>& menu) {
+    std::vector<OwnedPidl> items;
+    if (!InlineSelectionPidls(state, items)) return false;
+    OwnedPidl parent(ILCloneFull(items.front().get()));
+    bool shared = parent && ILRemoveLastID(parent.get());
+    for (const auto& item : items) {
+        if (!shared) break;
+        OwnedPidl other(ILCloneFull(item.get()));
+        shared = other && ILRemoveLastID(other.get()) && ILIsEqual(other.get(), parent.get());
+    }
+    HRESULT hr = E_FAIL;
+    if (!shared) {
+        // Items from several folders: the desktop's default menu over absolute
+        // IDs, with the first item's file associations, as Explorer builds it
+        // for search results. That registers Open with, Send to, Share and the
+        // handlers of the item types, not only the verbs every item supports.
+        ComPtr<IShellFolder> desktop, owner;
+        ComPtr<IQueryAssociations> associations;
+        PCUITEMID_CHILD leaf = nullptr;
+        if (SUCCEEDED(SHBindToParent(items.front().get(), IID_PPV_ARGS(&owner), &leaf)) && owner)
+            owner->GetUIObjectOf(state.frameHwnd, 1, &leaf, IID_IQueryAssociations, nullptr,
+                reinterpret_cast<void**>(associations.GetAddressOf()));
+        std::vector<PCUITEMID_CHILD> ids;
+        for (const auto& item : items) ids.push_back(reinterpret_cast<PCUITEMID_CHILD>(item.get()));
+        if (SUCCEEDED(SHGetDesktopFolder(&desktop))) {
+            DEFCONTEXTMENU definition{};
+            definition.hwnd = state.frameHwnd;
+            definition.psf = desktop.Get();
+            definition.cidl = static_cast<UINT>(ids.size());
+            definition.apidl = ids.data();
+            definition.punkAssociationInfo = associations.Get();
+            hr = SHCreateDefaultContextMenu(&definition, IID_PPV_ARGS(menu.ReleaseAndGetAddressOf()));
+        }
+    }
+    if (FAILED(hr)) hr = InlineSelectionObject(state, items, menu.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) Wh_Log(L"[GPU tree] selection menu unavailable hr=0x%08X", static_cast<unsigned>(hr));
+    return SUCCEEDED(hr) && menu;
+}
+ComPtr<IDataObject> InlineSelectionDataObject(ViewState& state, int* count) {
+    std::vector<OwnedPidl> items;
+    ComPtr<IDataObject> objects;
+    if (!InlineSelectionPidls(state, items)) return objects;
+    // The same object Explorer builds for these items: their shared folder's
+    // own, or the desktop's over absolute IDs (as for search results). Its
+    // property sheet and drop targets then see exactly the selected items.
+    if (FAILED(InlineSelectionObject(state, items, objects.ReleaseAndGetAddressOf()))) objects.Reset();
+    if (count) *count = static_cast<int>(items.size());
+    return objects;
+}
+// Runs a canonical verb (delete, copy, cut) or, with no verb, the default
+// command, exactly as the item's Shell menu would.
+bool InvokeInlineSelectionCommand(ViewState& state, const char* verb, DWORD modifiers = 0, POINT* at = nullptr) {
+    if (g_perf.load(std::memory_order_relaxed)) {
+        // The exact items a command acts on, for diagnosing what the Shell received.
+        size_t count = 0;
+        for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i)
+            if (state.selectedFlags[i]) {
+                ++count;
+                Wh_Log(L"[GPU tree] command '%S' item %zu: depth=%u folder=%d %s", verb ? verb : "default", count,
+                    unsigned(state.entries[i].treeDepth), int(state.entries[i].folder), state.entries[i].path.c_str());
+            }
+        Wh_Log(L"[GPU tree] command '%S' on %zu selected items (rows=%d, own rows=%d)", verb ? verb : "default",
+            count, state.total, state.rootTotal);
+    }
+    ComPtr<IContextMenu> menu;
+    if (!InlineSelectionMenu(state, menu)) return false;
+    HMENU popup = CreatePopupMenu();
+    if (!popup) return false;
+    constexpr UINT first = 1, last = 0x7FFF;
+    bool invoked = false;
+    if (SUCCEEDED(menu->QueryContextMenu(popup, 0, first, last, verb ? CMF_NORMAL : CMF_DEFAULTONLY))) {
+        CMINVOKECOMMANDINFOEX info{};
+        info.cbSize = sizeof(info);
+        info.fMask = CMIC_MASK_UNICODE | modifiers | (at ? CMIC_MASK_PTINVOKE : 0);
+        info.hwnd = state.frameHwnd;
+        info.nShow = SW_SHOWNORMAL;
+        if (at) info.ptInvoke = *at;
+        std::wstring wide;
+        UINT command = 0;
+        if (verb) {
+            wide.assign(verb, verb + strlen(verb));
+            info.lpVerb = verb;
+            info.lpVerbW = wide.c_str();
+        } else {
+            const UINT chosen = GetMenuDefaultItem(popup, FALSE, 0);
+            if (chosen != static_cast<UINT>(-1) && chosen >= first) command = chosen - first;
+            info.lpVerb = MAKEINTRESOURCEA(command);
+            info.lpVerbW = MAKEINTRESOURCEW(command);
+        }
+        if (verb || GetMenuDefaultItem(popup, FALSE, 0) != static_cast<UINT>(-1)) {
+            NativeFileCommandScope scope(&state);
+            InlineMenuInvocation invocation(state, menu.Get());
+            const HRESULT hr = menu->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
+            invoked = SUCCEEDED(hr);
+            if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+                Wh_Log(L"[GPU tree] command %S failed hr=0x%08X", verb ? verb : "default", static_cast<unsigned>(hr));
+        }
+    }
+    DestroyMenu(popup);
+    return invoked;
+}
+// Properties of a selection that includes inline children: the items' own
+// "properties" command, exactly as Explorer's menu runs it (their shared
+// folder's, or the desktop's for several folders, as in search results). The
+// sheet then summarizes the selected items as Explorer does. It opens
+// asynchronously, owned by the Shell.
+bool ShowInlineSelectionProperties(ViewState& state) {
+    return InvokeInlineSelectionCommand(state, "properties", CMIC_MASK_ASYNCOK);
+}
+// Rename of a selection that includes inline children, from any route (F2,
+// the context menu, Explorer's command bar): the mod's own rename session, for
+// one item or a set (each item in its own folder, as in search results). The
+// Shell's "rename" verb would only ask the native view to edit an item it
+// doesn't hold.
+bool BeginInlineSelectionRename(ViewState& state) {
+    int first = -1;
+    size_t count = 0;
+    for (size_t i = 0; i < state.selectedFlags.size() && i < state.entries.size(); ++i)
+        if (state.selectedFlags[i]) { ++count; if (first < 0) first = static_cast<int>(i); }
+    if (!count) return false;
+    const int target = state.selected >= 0 && static_cast<size_t>(state.selected) < state.selectedFlags.size() &&
+        state.selectedFlags[size_t(state.selected)] ? state.selected : first;
+    BeginRename(state, target, false, count > 1);
+    return state.rename.editor != nullptr;
+}
+// The selection's own Shell menu, hosted as a classic popup: the fallback when
+// Explorer's item menu is unavailable (InstallInlineNativeMenu found no symbols).
+void InlineSelectionContextMenu(ViewState& state, POINT screen, bool keyboard) {
+    ComPtr<IContextMenu> menu;
+    if (!InlineSelectionMenu(state, menu)) return;
+    HMENU popup = CreatePopupMenu();
+    if (!popup) return;
+    constexpr UINT first = 1, last = 0x7FFF;
+    // Asked as Explorer's own view asks: an item menu in an Explorer window
+    // (Open in new tab and other window verbs), sited on the tab's browser
+    // before handlers add their entries (some decide on it), and with Rename
+    // (any set renames, each item in its own folder). Without these the menu
+    // lacked Rename and window-dependent entries.
+    UINT flags = CMF_NORMAL | CMF_ITEMMENU | CMF_EXPLORE | CMF_CANRENAME;
+    if (GetKeyState(VK_SHIFT) & 0x8000) flags |= CMF_EXTENDEDVERBS;
+    if (state.shellBrowser) IUnknown_SetSite(menu.Get(), state.shellBrowser.Get());
+    if (SUCCEEDED(menu->QueryContextMenu(popup, 0, first, last, flags))) {
+        if (keyboard) {
+            // Open at the focused row, like a keyboard menu in the native list.
+            const int row = state.selected >= 0 ? state.selected : 0;
+            const RowVisual visual = LayoutRowVisual(state, row, CurrentRowProgress(state));
+            const auto item = LayoutItem(state, visual);
+            const float x = state.rtlLayout ? state.paintWidth - item.text.left : item.text.left;
+            screen = POINT{static_cast<LONG>(x), static_cast<LONG>(visual.top + visual.height)};
+            ClientToScreen(state.hwnd, &screen);
+        }
+        const HWND owner = state.hwnd;
+        const auto lifetime = state.lifetimeToken;
+        state.inlineMenu = menu;
+        const UINT chosen = static_cast<UINT>(TrackPopupMenuEx(popup,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | (state.rtlLayout ? TPM_LAYOUTRTL : 0),
+            screen.x, screen.y, owner, nullptr));
+        auto* live = State(owner);
+        if (live == &state && live->lifetimeToken == lifetime) {
+            state.inlineMenu.Reset();
+            wchar_t chosenVerb[64]{};
+            if (chosen >= first)
+                menu->GetCommandString(chosen - first, GCS_VERBW, nullptr, reinterpret_cast<LPSTR>(chosenVerb), ARRAYSIZE(chosenVerb));
+            if (chosen >= first && !_wcsicmp(chosenVerb, L"rename")) BeginInlineSelectionRename(state);
+            else if (chosen >= first) {
+                CMINVOKECOMMANDINFOEX info{};
+                info.cbSize = sizeof(info);
+                info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE | CMIC_MASK_ASYNCOK |
+                    ((GetKeyState(VK_CONTROL) & 0x8000) ? CMIC_MASK_CONTROL_DOWN : 0) |
+                    ((GetKeyState(VK_SHIFT) & 0x8000) ? CMIC_MASK_SHIFT_DOWN : 0);
+                info.hwnd = state.frameHwnd;
+                info.lpVerb = MAKEINTRESOURCEA(chosen - first);
+                info.lpVerbW = MAKEINTRESOURCEW(chosen - first);
+                info.nShow = SW_SHOWNORMAL;
+                info.ptInvoke = screen;
+                NativeFileCommandScope scope(&state);
+                InlineMenuInvocation invocation(state, menu.Get());
+                const HRESULT hr = menu->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
+                if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+                    Wh_Log(L"[GPU tree] menu command failed hr=0x%08X", static_cast<unsigned>(hr));
+            }
+        }
+    }
+    IUnknown_SetSite(menu.Get(), nullptr);
+    DestroyMenu(popup);
+}
+// Owner-drawn and lazily filled submenus (Send to, Open with) of that menu.
+bool ForwardInlineMenuMessage(ViewState& state, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT& result) {
+    if (!state.inlineMenu) return false;
+    switch (msg) {
+    case WM_INITMENUPOPUP: case WM_DRAWITEM: case WM_MEASUREITEM: case WM_MENUCHAR: case WM_MENUSELECT: break;
+    default: return false;
+    }
+    ComPtr<IContextMenu3> menu3;
+    if (SUCCEEDED(state.inlineMenu.As(&menu3)))
+        return SUCCEEDED(menu3->HandleMenuMsg2(msg, wParam, lParam, &result));
+    ComPtr<IContextMenu2> menu2;
+    if (msg != WM_MENUCHAR && SUCCEEDED(state.inlineMenu.As(&menu2))) {
+        result = 0;
+        return SUCCEEDED(menu2->HandleMenuMsg(msg, wParam, lParam));
+    }
+    return false;
+}
+
 void Open(ViewState& state, int index, bool newTab = false) {
     WindowCallbackGuard callback;
+    // Middle-click on the open folder's own row always takes the native path
+    // below (it selects that row alone), even while a selection with inline
+    // children is held.
+    if (TreeChildRow(state, index) || (!newTab && InlineSelectionDetached(state) && index >= 0 &&
+            static_cast<size_t>(index) < state.selectedFlags.size() && state.selectedFlags[size_t(index)])) {
+        if (newTab) {
+            // Middle-click on a child folder: Explorer's own "Open in new tab"
+            // verb on that folder (the native view can't select it).
+            if (!g_middleClickNewTab.load(std::memory_order_relaxed) ||
+                static_cast<size_t>(index) >= state.entries.size() || !state.entries[size_t(index)].folder) return;
+            Select(state, index);
+            if (!InvokeInlineSelectionCommand(state, "opennewtab"))
+                Wh_Log(L"[GPU tree] open in new tab unavailable: %s", state.entries[size_t(index)].path.c_str());
+            return;
+        }
+        if (!ModelSelected(state, index)) Select(state, index);
+        size_t selected = 0;
+        for (size_t i = 0; i < state.selectedFlags.size(); ++i) selected += state.selectedFlags[i] != 0;
+        // One folder navigates; anything else runs the default command.
+        if (selected == 1 && TreeChildRow(state, index)) OpenInlineTreeRow(state, index);
+        else InvokeInlineSelectionCommand(state, nullptr);
+        return;
+    }
     if (index < 0 || index >= state.total || size_t(index)>=state.entries.size() ||
         state.optimisticStartedAt || !state.visible || !state.inScope || !state.folderView ||
         !IsWindow(state.nativeHwnd) || !TabOwnsActiveView(state) || g_unloading.load(std::memory_order_acquire)) return;
@@ -29630,8 +32523,18 @@ void NativeContextMenu(ViewState& state, POINT screen, bool keyboard) {
     // entering its menu operation. Keyboard requests share the same session so
     // Show more options and later native commands see one consistent layout.
     SetNativeInputLayout(state, true);
-    SendMessageW(target, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(target),
-        keyboard ? static_cast<LPARAM>(-1) : MAKELPARAM(screen.x, screen.y));
+    {
+        // A selection with inline children: Explorer's item menu, built from
+        // the whole selection (DefViewGetItemsHook, DefViewBackgroundMenuHook).
+        struct Request {
+            InlineMenuRequest previous = t_inlineMenuRequest;
+            explicit Request(InlineMenuRequest request) { t_inlineMenuRequest = request; }
+            ~Request() { t_inlineMenuRequest = previous; }
+        } request(InlineSelectionDetached(state) && g_inlineNativeMenu.load(std::memory_order_acquire) ?
+            InlineMenuRequest{owner, lifetime} : InlineMenuRequest{});
+        SendMessageW(target, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(target),
+            keyboard ? static_cast<LPARAM>(-1) : MAKELPARAM(screen.x, screen.y));
+    }
     auto* live = State(owner);
     if (live != &state || live->lifetimeToken != lifetime) return;
     live->nativeContextMenuOpening = false;
@@ -29681,6 +32584,13 @@ void ContextMenu(ViewState& state, int index, POINT screen, bool keyboard = fals
     const bool clickedSelected = index < static_cast<int>(state.selectedFlags.size()) &&
         state.selectedFlags[static_cast<size_t>(index)] != 0;
     if (!clickedSelected) Select(state, index);
+    // A selection with inline children takes Explorer's own (modern) item menu
+    // through the same request below (InstallInlineNativeMenu). Without its
+    // symbols, the items' own Shell menu as a classic menu.
+    if (InlineSelectionDetached(state) && !g_inlineNativeMenu.load(std::memory_order_acquire)) {
+        InlineSelectionContextMenu(state, screen, keyboard);
+        return;
+    }
     const auto defer = [&] {
         state.pendingSelectionContextMenu = true;
         state.pendingSelectionContextPoint = MAKELPARAM(screen.x, screen.y);
@@ -29925,7 +32835,7 @@ void UpdateDirectory(ViewState& state) {
     }
 }
 
-void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr);
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab = nullptr, HWND expectedNative = nullptr);
 
 ViewState* State(HWND hwnd) {
     // A process-wide foreground/WinEvent can name another Explorer UI thread.
@@ -29955,7 +32865,8 @@ void QueueInputFocusUpdate(HWND overlay, HWND viewControl) {
     if (!state->inputFocusMessageQueued) state->viewControlFocusReturn=nullptr;
 }
 
-void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested = nullptr);
+void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested = nullptr,
+    std::optional<bool> compactRows = std::nullopt);
 
 // One GPU layout transaction for cached navigation, initial native mode and
 // explicit user changes. It never interrogates the Shell or publishes rows.
@@ -29985,11 +32896,21 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
     // Grid-to-grid icon size or mode changes, and list changes into or out of
     // Content's taller rows, zoom from the presented image exactly like
     // Ctrl+wheel, while packing and hit testing switch at once.
+    // Inline folders exist only in the Details list. A layout without it
+    // (grids, Tiles, Content, List) shows the folder's own items only: strip
+    // the grafted rows before anything captures the presented image, so no
+    // child is ever laid out as a cell. The expansion is kept in the tab's
+    // memory and returns with Details (ReopenInlineTree).
+    if (changed && !(columns && !grid) && state.rootTotal != state.total) ClearInlineTree(state, false);
     const bool zoom=changed && reflow && animate && state.gridView==grid &&
         (grid || linesBefore==2 || lineSet(grid,mode)==2) &&
         state.detailsViewActive && state.visible && state.inScope && state.loaded &&
         !state.optimisticStartedAt && !state.pendingNavigationPaint &&
         g_smooth.load(std::memory_order_relaxed);
+    std::optional<std::array<ScrollbarGeometry,2>> previousScrollbars;
+    if (!zoom && animate && state.visible && state.detailsViewActive &&
+        ((changed && reflow && state.gridView!=grid) || state.columnsView!=columns))
+        previousScrollbars=PresentedScrollbars(state);
     std::vector<CapturedRow> morphCells; std::vector<CapturedGroupHeader> morphHeadings; float morphRow=0.f;
     if (zoom) {
         TraceUiState(state,L"ui.layout.before[layout,native,header,selected]");
@@ -30006,7 +32927,9 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
             !state.optimisticStartedAt && !state.pendingNavigationPaint;
         AdvanceRowHeight(state);
         auto cells=morph ? CapturePresentedGridCells(state,true) : std::vector<CapturedRow>{};
-        auto headings=cells.empty() ? std::vector<CapturedGroupHeader>{} : CaptureVisibleGroupHeaders(state);
+        auto headings=cells.empty() ? std::vector<CapturedGroupHeader>{} :
+            CaptureVisibleGroupHeaders(state,LayoutTransitionProgress(state,
+                state.rowTransitionActive,state.rowTransitionStartedQpc));
         const float oldRow=state.rowPx;
         // The first item fully inside the old viewport keeps its screen top.
         const auto anchor=std::find_if(cells.begin(),cells.end(),
@@ -30041,8 +32964,18 @@ bool ApplyViewLayout(ViewState& state, FolderViewMode requested, bool animate = 
         SetColumnViewMode(state,columns,animate && supported && state.detailsViewActive && state.graphicsReady);
     }
     // After the column change: entering or leaving Details stops row motion.
-    if (!morphCells.empty()) StartGroupingTransition(state,std::move(morphCells),std::move(morphHeadings),morphRow,false,true);
+    const bool morphing=!morphCells.empty();
+    if (morphing) StartGroupingTransition(state,std::move(morphCells),std::move(morphHeadings),morphRow,false,true);
+    if (previousScrollbars) {
+        auto& motion=state.scrollbarLayoutMotion;
+        motion.from=*previousScrollbars;
+        motion.rowRevision=morphing && state.rowTransitionActive ?
+            std::optional<unsigned long long>(state.rowSceneRevision) : std::nullopt;
+        motion.columnMode=state.columnModeTransition;
+    }
     state.detailsViewActive=supported;
+    // Without an animated column change, Details is ready now.
+    if (changed && !state.columnModeTransition) ReopenInlineTree(state);
     if (enteringColumns) ArmAutoRefit(state);
     if (changed) TraceUiState(state,L"ui.layout.after[layout,native,header,selected]");
     return changed;
@@ -30245,7 +33178,7 @@ void SetActive(HWND hwnd, bool on) {
             if (changed) {
                 s->loaded = false;
                 s->entries.clear();
-                s->total = 0;
+                s->total = s->rootTotal = 0;
                 s->thisPcCapacities.clear();
                 s->thisPcSpaceRequestedPaths.clear();
                 BeginDirectoryViewMode(*s,true);
@@ -30388,10 +33321,10 @@ bool AdvanceRowHeight(ViewState& state, bool finish) {
     UpdateMetrics(state, progress);
     ReconcileColumnViewportAfterRowCount(state);
     const float anchored = ZoomScrollTarget(state);
-    // Grid cell positions and heights interpolate between the same endpoints.
-    // Interpolating their revealed viewports keeps a visible selection inside
-    // the viewport throughout reflow, rather than correcting it after zoom.
-    state.scrollNow = state.scrollTarget = state.gridView ?
+    // A grid morph already interpolates screen positions. Its destination
+    // uses the current packing and anchor; interpolating a document offset
+    // across two packings pulls those poses away from the visible viewport.
+    state.scrollNow = state.scrollTarget = state.gridView && !state.zoomLayoutTransition ?
         state.zoomFromScroll + (anchored-state.zoomFromScroll)*progress : anchored;
     ClampScroll(state);
     if (state.fontPx != beforeFont) {
@@ -30430,6 +33363,31 @@ public:
     }
 };
 
+void CapturePinchAnchor(ViewState& state, POINT contact) {
+    state.pinchAnchorRow=-1;
+    state.pinchAnchorPath.clear();
+    state.pinchAnchorToken=state.token;
+    const RECT viewport=ContentViewport(state,true);
+    const float x=float(LogicalX(state,contact.x))-ListStartX(state), y=float(contact.y);
+    const float progress=LayoutTransitionProgress(state,state.rowTransitionActive,state.rowTransitionStartedQpc);
+    float nearest=std::numeric_limits<float>::infinity();
+    for(int index:VisibleDemandRows(state,0.f)) {
+        if (!DisplayedRow(state,index)) continue;
+        const auto cell=LayoutRowVisual(state,index,progress);
+        if (cell.opacity<=0.f || cell.height<=0.f || cell.top>=viewport.bottom ||
+            cell.top+cell.height<=viewport.top) continue;
+        const float dx=state.gridView ? std::max({0.f,cell.left-x,x-cell.left-cell.width}) : 0.f;
+        const float dy=std::max({0.f,cell.top-y,y-cell.top-cell.height});
+        const float distance=dx*dx+dy*dy;
+        if (distance>=nearest) continue;
+        nearest=distance;
+        state.pinchAnchorRow=index;
+        state.pinchAnchorFraction=(y-cell.top)/cell.height;
+    }
+    if (state.pinchAnchorRow>=0)
+        state.pinchAnchorPath=state.entries[size_t(state.pinchAnchorRow)].path;
+}
+
 double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact = nullptr) {
     const int current = ZoomHeight96(state);
     if (!std::isfinite(requested96)) return current;
@@ -30466,23 +33424,35 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         // and fractional row under the midpoint through grid/group reflow,
         // except that a selection visible when the pinch began stays in
         // view; a distant selection must not pull the viewport from the hand.
-        const int oldColumns = state.itemsPerRow;
         const bool zoomLayout = state.zoomLayoutTransition;
         AdvanceRowHeight(state);
-        auto cells = CapturePresentedGridCells(state);
+        const int oldColumns = state.itemsPerRow;
+        const float oldScroll=state.scrollNow;
+        const int anchor=state.pinchAnchorRow;
+        if (state.pinchAnchorToken!=state.token || !DisplayedRow(state,anchor) ||
+            size_t(anchor)>=state.entries.size() || state.entries[size_t(anchor)].path!=state.pinchAnchorPath)
+            CapturePinchAnchor(state,*contact);
+        const float sampledProgress=state.presenter && state.rowTransitionActive ?
+            state.rowTransitionPresentedProgress : -1.f;
+        const auto metrics=TargetItemMetrics(state,height96,bounded96);
+        std::optional<GridPacking> packing;
+        if (state.gridView) packing=PackGrid(state,metrics.row,metrics.font,metrics.icon,state.columnModeTransition ? state.headerPx : 0.f);
+        const bool reflow=zoomLayout || (packing && packing->columns!=oldColumns);
+        auto cells=reflow ? CapturePresentedGridCells(state,false,sampledProgress) : std::vector<CapturedRow>{};
         auto headers = cells.empty() ? std::vector<CapturedGroupHeader>{} :
-            CaptureVisibleGroupHeaders(state);
+            CaptureVisibleGroupHeaders(state,sampledProgress);
         // Take over the current pose rather than finishing a wheel/trackpad
         // zoom at its endpoint before following the fingers.
         state.zoomAnimating = false;
         // A grid reflow already in flight keeps moving under later samples;
         // only a column change (or a finished wheel zoom) retargets it.
-        if (cells.empty() || zoomLayout) StopRowTransition(state);
-        const int index = RowFromPoint(state, contact->y, contact->x);
+        if (zoomLayout) StopRowTransition(state);
+        // Repacking can move the destination cell across the pinch point.
+        // Keep the same item and its fractional position for the whole gesture.
+        const int index = state.pinchAnchorRow;
         const float documentY = contact->y - state.headerPx + state.scrollNow;
-        const float fraction = index >= 0 ?
-            (documentY - DocumentRowTop(state, index)) / std::max(1.f, DisplayRowHeight(state, index)) :
-            documentY / std::max(1.f, state.rowPx);
+        const float fraction = index>=0 ? state.pinchAnchorFraction :
+            documentY/std::max(1.f,state.rowPx);
         StopScrollAnimation(state);
         StopHoverAnimation(state);
         StopKeyboardSelectionAnimation(state);
@@ -30490,15 +33460,25 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
         state.rowHeight96[state.gridView] = height96;
         if (IsWindow(state.activeTabHost))
             state.tabPresentations[state.activeTabHost].zoomHeight96[state.gridView] = height96;
-        UpdateMetrics(state);
+        ApplyItemMetrics(state,metrics,1.f,packing);
         ReconcileColumnViewportAfterRowCount(state);
         const float anchored = index >= 0 ? DocumentRowTop(state, index) +
             fraction * DisplayRowHeight(state, index) : fraction * state.rowPx;
         state.scrollNow = state.scrollTarget = anchored - (contact->y - state.headerPx);
         ClampScroll(state);
         KeepSelectionRevealed(state, state.pinchRevealRow);
-        if (state.itemsPerRow != oldColumns || zoomLayout)
-            BeginGridReflow(state, std::move(cells), std::move(headers));
+        if (state.rowTransitionActive && state.reflowLayoutTransition) {
+            // Only a genuine scroll translates the old poses. Zooming on a
+            // deep row can change its document Y by several viewports.
+            state.rowTransitionOldScroll+=state.scrollNow-oldScroll;
+        }
+        if (state.itemsPerRow != oldColumns || zoomLayout) {
+            const auto sourceCount=cells.size();
+            BeginGridReflow(state,std::move(cells),std::move(headers));
+            PipelineEvent(*state.background,{.operation=L"grid.pinch.reflow[oldColumns,newColumns,sourceCells,scrollDelta]",
+                .a=state.rowSceneRevision,.b=PipelineFlags(state),
+                .v={double(oldColumns),double(state.itemsPerRow),double(sourceCount),state.scrollNow-oldScroll}});
+        }
         state.measuredNameIndex = -1;
         state.widthCache.clear();
         if (state.target || state.presenter) MakeTextFormats(state,true); else state.textFormatsDirty=true;
@@ -30518,7 +33498,8 @@ double ApplyRowHeight(ViewState& state, double requested96, const POINT* contact
 // one zoom. The destination packs once for hit testing; metrics and cells
 // interpolate from the presented image on the zoom clock. A negative height
 // keeps the zoom preference: the caller already chose a new native layout.
-void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested) {
+void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* requested,
+    std::optional<bool> compactRows) {
     // Sample elapsed motion before capturing/retargeting, including input
     // arriving between paints. Repeated zoom must start at the current image.
     AdvanceRowHeight(state);
@@ -30543,6 +33524,7 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     state.zoomFromHeight96 = height;
     // Only now adopt the destination. All source geometry above belongs to
     // the applied layout, independently of an earlier Shell observation.
+    if (compactRows) state.compactRows = *compactRows;
     if (requested) {
         state.layoutNativeMode=requested->mode;
         if (state.gridView) state.nativeIconSize=requested->iconSize;
@@ -30572,6 +33554,10 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
     state.zoomAnimating = true;
     if (state.zoomLayoutTransition) state.rowTransitionStartedQpc = state.zoomStartedQpc;
     UpdateMetrics(state, 0.f);
+    if (state.zoomLayoutTransition) {
+        state.scrollNow=state.scrollTarget=ZoomScrollTarget(state);
+        ClampScroll(state);
+    }
     if (state.gridView) QueueVisibleDataFrame(state);
     if (state.visible && g_smooth.load(std::memory_order_relaxed))
         RegisterViewAnimation(state);
@@ -30584,14 +33570,12 @@ void BeginAnimatedZoom(ViewState& state, int height96, const FolderViewMode* req
 void ReconcileCompactRows(ViewState& state) {
     const bool compact = ReadCompactMode();
     if (compact == state.compactRows) return;
-    const float presented = CompactReveal(state);
-    state.compactRows = compact;
     if (!state.gridView && state.visible && state.inScope && state.detailsViewActive && state.loaded &&
         !state.startupAnimationsSuppressed && g_smooth.load(std::memory_order_relaxed)) {
         RenameZoomUpdate renameZoom(state);
-        BeginAnimatedZoom(state, -1);
-        state.zoomFromCompact = presented; // The flag changed before the zoom sampled it.
+        BeginAnimatedZoom(state, -1, nullptr, compact);
     } else {
+        state.compactRows = compact;
         UpdateMetrics(state); ClampScroll(state); RepositionRenameEdit(state);
     }
     QueueVisibleDataFrame(state);
@@ -30820,6 +33804,7 @@ void ApplyManipulationPinch(ViewState& state, float logDelta, const POINT* conta
         // Decided once per gesture: a cell outgrowing the viewport must not
         // lose its protection partway through the same pinch.
         state.pinchRevealRow = contact ? FullyVisibleSelection(state) : -1;
+        if (contact) CapturePinchAnchor(state,*contact);
         state.touchpadPinching = true;
         state.swipeHorizontal = state.swipeVertical = false;
         if (state.touch.panningFeedback) {
@@ -30877,6 +33862,9 @@ int SelectionCheckboxAt(ViewState& state, POINT point) {
             contains(HeaderSelectionCheckbox(state)) ? -2 : -1;
     const int row=RowFromPoint(state,point.y,point.x);
     if (row<0) return -1;
+    // The inline folder arrow owns its band, even where the checkbox's
+    // enlarged hit area reaches into it.
+    if (InlineTreeExpanderHit(state,row,point) || InlineTreeBranchAt(state,point)>=0) return -1;
     const auto visual=LayoutRowVisual(state,row,1.f);
     const auto item=LayoutItem(state,visual);
     return contains(SelectionCheckboxHitRect(state,item,visual)) ? row : -1;
@@ -30958,6 +33946,31 @@ class ShellDropBridge final : public IDropTarget {
     unsigned long long session_ = 0;
     GpuDragOrigin dragOrigin_;
     bool hasDragOrigin_ = false;
+    // Spring-loaded inline folders: holding a drag over a collapsed folder
+    // expands it, after the system's hover time.
+    int springRow_ = -1;
+    std::wstring springPath_, currentPath_;
+    ULONGLONG springStarted_ = 0;
+    void SpringLoad(ViewState& s, int row) {
+        if (row < 0 || !InlineTreeActive(s) || static_cast<size_t>(row) >= s.entries.size() ||
+            !InlineTreeExpandable(s.entries[size_t(row)]) || s.entries[size_t(row)].treeExpanded ||
+            IsSourceLocation(s, row)) {
+            springRow_ = -1; springPath_.clear();
+            return;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (row != springRow_ || springPath_ != s.entries[size_t(row)].path) {
+            springRow_ = row; springPath_ = s.entries[size_t(row)].path; springStarted_ = now;
+            return;
+        }
+        UINT hover = 0;
+        if (!SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, &hover, 0)) return;
+        if (now - springStarted_ < hover) return;
+        springRow_ = -1; springPath_.clear();
+        ToggleInlineFolder(s, row);
+        // Rows below moved; resolve the target under the pointer again.
+        if (currentRow_ != -2) currentRow_ = -3;
+    }
 
     // Only cancel a true self-drop. Other targets (including subfolders in the
     // same folder) must keep Explorer's original Shell IDropTarget behavior.
@@ -30998,6 +34011,25 @@ class ShellDropBridge final : public IDropTarget {
     }
     ComPtr<IDropTarget> Resolve(ViewState& s, int row) const {
         ComPtr<IDropTarget> target;
+        if (row >= 0 && static_cast<size_t>(row) < s.entries.size() && s.entries[size_t(row)].treeDepth) {
+            // An inline child belongs to its own folder, not the open one. A
+            // file without a drop handler takes the drop into that folder,
+            // which is where it appears to sit in the tree.
+            const Entry& e = s.entries[size_t(row)];
+            PIDLIST_ABSOLUTE raw = nullptr;
+            if (SUCCEEDED(SHParseDisplayName(e.path.c_str(), nullptr, &raw, 0, nullptr)) && raw) {
+                OwnedPidl item(raw);
+                ComPtr<IShellFolder> parent;
+                PCUITEMID_CHILD leaf = nullptr;
+                if (SUCCEEDED(SHBindToParent(item.get(), IID_PPV_ARGS(&parent), &leaf)) && parent) {
+                    parent->GetUIObjectOf(s.nativeHwnd, 1, &leaf, IID_IDropTarget, nullptr,
+                        reinterpret_cast<void**>(target.GetAddressOf()));
+                    if (!target && !e.folder)
+                        parent->CreateViewObject(s.nativeHwnd, IID_PPV_ARGS(&target));
+                }
+            }
+            return target;
+        }
         if (row >= 0 && s.folder) {
             PITEMID_CHILD child = nullptr;
             EntryChildPidl(s, s.entries[static_cast<size_t>(row)], &child);
@@ -31031,6 +34063,8 @@ class ShellDropBridge final : public IDropTarget {
         auto payload = std::move(data_);
         const bool imageEntered = std::exchange(dragImageEntered_, false);
         currentRow_ = -2;
+        currentPath_.clear();
+        springRow_ = -1; springPath_.clear();
         nativeAtEnter_ = nullptr;
         epochAtEnter_ = 0;
         allowedEffects_ = DROPEFFECT_NONE;
@@ -31059,6 +34093,7 @@ class ShellDropBridge final : public IDropTarget {
         if(hasDragOrigin_) ClearShellDropDescription(data_.Get());
         if (session != session_ || !CurrentSession()) { *effect = DROPEFFECT_NONE; return S_FALSE; }
         currentRow_ = row;
+        currentPath_ = row >= 0 && static_cast<size_t>(row) < s.entries.size() ? s.entries[size_t(row)].path : std::wstring();
         // Do not even enter Explorer's native drop target when this is a
         // no-op release over the source folder or one of the dragged rows.
         // Keep data_ so moving into a real subfolder later in the same drag
@@ -31135,7 +34170,8 @@ public:
         if (!hasDragOrigin_ && s->shellDragRunning) {
             hasDragOrigin_ = true;
             dragOrigin_.sourceOverlay = s->hwnd;
-            dragOrigin_.folder = s->folderPath;
+            // Items from expanded folders don't come from the open folder.
+            if (!InlineSelectionDetached(*s)) dragOrigin_.folder = s->folderPath;
         }
         nativeAtEnter_ = s->nativeHwnd;
         epochAtEnter_ = s->mouseFolderEpoch;
@@ -31162,6 +34198,14 @@ public:
             *effect = DROPEFFECT_NONE;
             return S_OK;
         }
+        // OLE keeps calling DragOver while the pointer rests, so the hold
+        // needs no timer of its own.
+        SpringLoad(*s, HitItem(*s, point));
+        if (CurrentView() != s) { Clear(true); *effect = DROPEFFECT_NONE; return S_OK; }
+        // Inline listings can arrive during the drag and move rows; a target
+        // always belongs to the item, not to its former index.
+        if (currentRow_ >= 0 && (static_cast<size_t>(currentRow_) >= s->entries.size() ||
+            s->entries[size_t(currentRow_)].path != currentPath_)) currentRow_ = -3;
         const int row = HitItem(*s, point);
         const auto session = session_;
         HRESULT hr = S_OK;
@@ -31353,7 +34397,8 @@ std::vector<int> DragPreviewRows(const ViewState& state,int front,int count) {
     for(size_t i=0;i<std::min(limit,state.nativeSelectionPaths.size());++i)
         add(GpuRowForNativePath(state,state.nativeSelectionPaths[i]));
     if(rows.size()<limit) for(int row:VisibleItemRows(state,0.f)) {add(row); if(rows.size()==limit) break;}
-    if(count==state.total) for(int row=0;row<std::min<int>(state.total,kDragPreviewImages);++row) add(row);
+    if(count==state.rootTotal) for(int row=0;row<std::min<int>(state.total,kDragPreviewImages);++row)
+        if(!state.entries[size_t(row)].treeDepth) add(row);
     return rows;
 }
 struct ShellDropText {std::wstring text; DWRITE_TEXT_RANGE insert{};};
@@ -31544,7 +34589,8 @@ public:
         preview->dpi=dpi; preview->count=count;
         preview->countLabel=FormatDragCount(count,state.rtlLayout);
         preview->rtl=state.rtlLayout; preview->background=state.nativeEditBackground;
-        preview->foreground=state.nativeEditForeground; preview->accent=g_selectionRgb.load(std::memory_order_relaxed);
+        preview->foreground=state.nativeEditForeground; preview->accent=SelectionColor(state);
+        preview->badgePalette=AccentPalette(state);
         BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0); preview->animate=animations!=FALSE;
         preview->token=ULONG_PTR(g_nextToken.fetch_add(1,std::memory_order_relaxed));
         POINT pointer{}; MONITORINFO monitor{sizeof(monitor)};
@@ -31695,8 +34741,8 @@ public:
         const auto text=effect ? ReadShellDropText(data_.Get(),effect):ShellDropText{};
         if(State(source_)!=live || live->lifetimeToken!=lifetime_ || live->dragPreview!=owned) return DRAGDROP_S_USEDEFAULTCURSORS;
         caption_=text;
-        const auto accent=g_selectionRgb.load(std::memory_order_relaxed);
-        const auto badgePalette=g_swipePalette.load(std::memory_order_relaxed);
+        const auto accent=SelectionColor(*live);
+        const auto badgePalette=AccentPalette(*live);
         const auto background=ValidRgb(live->itemTip.background) ? live->itemTip.background:live->nativeEditBackground;
         const auto foreground=ValidRgb(live->itemTip.foreground) ? live->itemTip.foreground:live->nativeEditForeground;
         if(preview.effect!=effect || preview.background!=background || preview.foreground!=foreground ||
@@ -31726,25 +34772,51 @@ void StartNativeShellDrag(ViewState& state, int row) {
     // GUI selection has already been committed by the ordinary click/marquee
     // path (or native Ctrl+A). Never construct an unbounded PIDL list here.
     int nativeCount = 0;
-    if (FAILED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount)) ||
-        nativeCount <= 0) return;
-    ComPtr<IShellView> native;
-    if (!state.shellBrowser || FAILED(state.shellBrowser->QueryActiveShellView(
-            native.GetAddressOf())) || !native) return;
-    HWND activeNative = nullptr;
-    if (FAILED(native->GetWindow(&activeNative)) ||
-        activeNative != state.nativeHwnd) return;
     ComPtr<IDataObject> objects;
-    const HRESULT get = native->GetItemObject(SVGIO_SELECTION,
-        IID_PPV_ARGS(&objects));
-    if (FAILED(get) || !objects) {
-        Wh_Log(L"[GPU dragdrop] Shell selection IDataObject unavailable hr=0x%08X",
-            (unsigned)get);
-        return;
+    if (InlineSelectionDetached(state)) {
+        // Inline children aren't in the native selection: drag the items'
+        // own Shell data object, with the same feedback and drop handling.
+        objects = InlineSelectionDataObject(state, &nativeCount);
+        if (!objects || nativeCount <= 0) {
+            Wh_Log(L"[GPU dragdrop] inline selection IDataObject unavailable");
+            return;
+        }
+    } else {
+        if (FAILED(state.folderView->ItemCount(SVGIO_SELECTION, &nativeCount)) ||
+            nativeCount <= 0) return;
+        ComPtr<IShellView> native;
+        if (!state.shellBrowser || FAILED(state.shellBrowser->QueryActiveShellView(
+                native.GetAddressOf())) || !native) return;
+        HWND activeNative = nullptr;
+        if (FAILED(native->GetWindow(&activeNative)) ||
+            activeNative != state.nativeHwnd) return;
+        const HRESULT get = native->GetItemObject(SVGIO_SELECTION,
+            IID_PPV_ARGS(&objects));
+        if (FAILED(get) || !objects) {
+            Wh_Log(L"[GPU dragdrop] Shell selection IDataObject unavailable hr=0x%08X",
+                (unsigned)get);
+            return;
+        }
     }
     const HWND hwnd = state.hwnd;
     ViewState* const sourceState = &state;
-    const auto originFolder=state.folderPath;
+    // A self-drop is a release over the folder the items came from. With
+    // inline children that is their shared parent; across several folders
+    // no single folder is the source, and the Shell decides per item.
+    std::wstring originFolder = state.folderPath;
+    if (InlineSelectionDetached(state)) {
+        originFolder.clear();
+        bool first = true;
+        for (size_t i = 0; i < state.entries.size() && i < state.selectedFlags.size(); ++i) {
+            if (!state.selectedFlags[i]) continue;
+            const auto& path = state.entries[i].path;
+            const size_t slash = path.find_last_of(L'\\');
+            const std::wstring parent = slash == std::wstring::npos ? std::wstring() :
+                path.substr(0, slash == 2 && path.size() > 1 && path[1] == L':' ? slash + 1 : slash);
+            if (first) { originFolder = parent; first = false; }
+            else if (_wcsicmp(parent.c_str(), originFolder.c_str()) != 0) { originFolder.clear(); break; }
+        }
+    }
     const auto originItem=state.entries[static_cast<size_t>(row)].path;
     state.shellDragRunning = true;
     NativeFileCommandScope command(&state);
@@ -31879,6 +34951,13 @@ void HideItemTip(ViewState& state, bool suppress) {
 
 void ItemTipHoverMoved(ViewState& state, int row) {
     auto& tip = state.itemTip;
+    // A guide's tip stays while the pointer moves along that folder's contents.
+    if (tip.item.starts_with(kInlineGuideTipKey)) {
+        const std::wstring owner = tip.item.substr(wcslen(kInlineGuideTipKey));
+        if (row < 0 || static_cast<size_t>(row) >= state.entries.size() ||
+            !InlineTreeWithin(state.entries[size_t(row)].path, owner)) HideItemTip(state);
+        return;
+    }
     const std::wstring* item = row >= 0 && static_cast<size_t>(row) < state.entries.size() ?
         &state.entries[static_cast<size_t>(row)].path : nullptr;
     if (!tip.item.empty() && (!item || *item != tip.item)) HideItemTip(state);
@@ -31907,6 +34986,7 @@ void ResolveItemTipPalette(ViewState& state) {
     auto& tip = state.itemTip;
     const bool highContrast = tip.highContrast;
     tip.paletteDirty = false;
+    tip.accentPalette=AccentPalette(state);
     COLORREF background = GetSysColor(COLOR_INFOBK), foreground = GetSysColor(COLOR_INFOTEXT);
     if (!highContrast) {
         if (HTHEME theme = OpenItemTipTheme(state, IsWindow(tip.hwnd) ? tip.hwnd : state.hwnd)) {
@@ -31944,13 +35024,21 @@ void ResolveItemTipPalette(ViewState& state) {
         (paint.kind == Theme::Paint::Kind::Solid ? paint.color.alpha == 1.f :
          std::all_of(paint.stops.begin(),paint.stops.end(),[](const auto& stop) { return stop.color.alpha == 1.f; }));
     if (paint.kind != Theme::Paint::Kind::Default) {
-        const auto reference = HighlightColor(paint.kind == Theme::Paint::Kind::Linear ? paint.stops.front().color : paint.color);
-        const COLORREF rgb = RGB(BYTE(std::clamp(roundf(reference.r*255.f),0.f,255.f)),
-            BYTE(std::clamp(roundf(reference.g*255.f),0.f,255.f)),BYTE(std::clamp(roundf(reference.b*255.f),0.f,255.f)));
-        // Transparency is estimated over the native tooltip surface; sampling
-        // the user's desktop behind a translucent popup would be expensive.
-        background = BlendColor(background,rgb,int(std::clamp(roundf(reference.a*100.f),0.f,100.f)));
-        foreground = ReadableForeground(background,{foreground});
+        if(state.tipBaseBackground!=background || state.tipBaseForeground!=foreground) {
+            state.tipBaseBackground=background; state.tipBaseForeground=foreground;
+            QueueContrastPalette(state,true);
+        }
+        if(state.contrastPalette && state.contrastPalette->revision==state.paletteRevision &&
+            state.contrastPalette->theme==state.themeSnapshot && state.contrastPalette->mode==state.themeMode &&
+            ValidRgb(state.contrastPalette->tipBackground)) {
+            background=state.contrastPalette->tipBackground;
+            const auto& style=state.themeSnapshot->tooltips[static_cast<size_t>(state.themeMode)];
+            const auto ink=ResolveForeground(state.contrastPalette.get(),&style,ThemeRgb(foreground));
+            foreground=RGB(ink.rgb>>16,ink.rgb>>8,ink.rgb);
+        } else {
+            tip.style.background={};
+            tip.opaqueBackground=true;
+        }
     }
     const COLORREF label = highContrast ? foreground : BlendColor(foreground, background, 35);
     tip.ClearSurface();
@@ -31999,19 +35087,9 @@ RECT ItemTipCursorBounds(const ViewState& state, POINT anchor) {
 // from the glyph outlines' design metrics; text-independent, so one tooltip
 // spacing fits every name.
 bool FontInkExtent(IDWriteTextFormat* format, float& above, float& below) {
-    ComPtr<IDWriteFontCollection> collection;
-    std::wstring family(format->GetFontFamilyNameLength() + 1, L'\0');
-    UINT32 index = 0; BOOL exists = FALSE;
-    ComPtr<IDWriteFontFamily> fonts; ComPtr<IDWriteFont> font; ComPtr<IDWriteFontFace> face;
-    if (FAILED(format->GetFontCollection(&collection)) || !collection) g_writeFactory->GetSystemFontCollection(&collection);
-    if (!collection || FAILED(format->GetFontFamilyName(family.data(), UINT32(family.size()))) ||
-        FAILED(collection->FindFamilyName(family.c_str(), &index, &exists)) || !exists ||
-        FAILED(collection->GetFontFamily(index, &fonts)) ||
-        FAILED(fonts->GetFirstMatchingFont(format->GetFontWeight(), format->GetFontStretch(), format->GetFontStyle(), &font)) ||
-        FAILED(font->CreateFontFace(&face))) return false;
+    ComPtr<IDWriteFontFace> face;
     DWRITE_FONT_METRICS metrics{};
-    face->GetMetrics(&metrics);
-    if (!metrics.designUnitsPerEm) return false;
+    if (!FormatFontFace(format, face, metrics)) return false;
     constexpr wchar_t tall[] = L"bdfhklHIKLMNT", deep[] = L"gjpqy";
     const auto extent = [&](const wchar_t* text, bool top, int fallback) {
         const UINT32 count = UINT32(wcslen(text));
@@ -32236,6 +35314,25 @@ void CaptureItemTipCells(const Entry& entry, ItemTipJob& facts) {
     }
 }
 
+// Hovering an inline folder's guide names that folder, relative to the open
+// folder: the path leading to it muted like property labels, its own name
+// in the normal text color (e.g. "project\tests"). Name only, no details.
+void ShowInlineGuideTip(ViewState& state, POINT client, int owner) {
+    if (!ItemTipEligible(state, state.hovered) || owner < 0 || static_cast<size_t>(owner) >= state.entries.size()) return;
+    auto& tip = state.itemTip;
+    const std::wstring& path = state.entries[size_t(owner)].path;
+    const std::wstring key = kInlineGuideTipKey + path;
+    if (key == tip.item || key == tip.suppressed || !InlineTreeWithin(path, state.folderPath)) return;
+    std::wstring relative = path.substr(state.folderPath.size() + (state.folderPath.back() == L'\\' ? 0 : 1));
+    HideItemTip(state);
+    tip.item = key;
+    tip.name = relative;
+    const size_t slash = relative.find_last_of(L'\\');
+    tip.mutedPrefix = slash == std::wstring::npos ? 0 : static_cast<UINT32>(slash + 1);
+    tip.anchor = client;
+    ClientToScreen(state.hwnd, &tip.anchor);
+    PresentItemTip(state, ItemTipJob{});
+}
 void ShowItemTip(ViewState& state, POINT client) {
     const int row = state.hovered;
     if (!ItemTipEligible(state, row)) return;
@@ -32244,6 +35341,7 @@ void ShowItemTip(ViewState& state, POINT client) {
     if (entry.path.empty() || entry.path == tip.suppressed || entry.path == tip.item) return;
     CacheRowDetails(state, entry, false); // Includes properties cached in another view mode.
     HideItemTip(state);
+    tip.mutedPrefix = 0;
     tip.item = entry.path;
     tip.name = EntryLabel(entry);
     tip.anchor = client;
@@ -32291,6 +35389,10 @@ void ShowItemTip(ViewState& state, POINT client) {
 void HandlePointerHover(ViewState& state, POINT at, WPARAM buttons) {
     if (buttons & (MK_LBUTTON|MK_RBUTTON|MK_MBUTTON|MK_XBUTTON1|MK_XBUTTON2)) return;
     const int row = InsideListX(state,at.x) ? RowFromPoint(state,at.y,at.x) : -1;
+    if (const int owner = InlineTreeBranchAt(state, at); owner >= 0) {
+        if (row >= 0 && row == state.hovered) ShowInlineGuideTip(state, at, owner);
+        return;
+    }
     if (row >= 0 && row == state.hovered && SelectionCheckboxAt(state,at)==-1) ShowItemTip(state,at);
 }
 
@@ -32399,6 +35501,7 @@ bool OpaqueItemTipText(const ItemTip& tip,float radius) {
 // One layered popup: body placement/layout stays fixed while its outer shadow
 // extends the window around it. Fixed theme lengths use logical 96-DPI pixels.
 void RenderItemTip(ItemTip& tip) {
+    AccentDrawScope accentScope(tip.accentPalette);
     if (!IsWindow(tip.hwnd) || !tip.nameLayout || tip.size.cx <= 0 || tip.size.cy <= 0) return;
     const int dpi = DpiOf(tip.hwnd);
     const float scale = dpi/96.f;
@@ -32489,6 +35592,7 @@ void RenderItemTip(ItemTip& tip) {
             // opaque interior; transparent corners and shadow keep their alpha.
             SetCompatibleTextRendering(tip.target.Get(),tip.textStyle.textRenderingParams.Get(),antialias);
             tip.target->SetTransform(D2D1::Matrix3x2F::Translation(float(margin), float(margin)));
+            if (tip.mutedPrefix) tip.nameLayout->SetDrawingEffect(label.Get(), DWRITE_TEXT_RANGE{0, tip.mutedPrefix});
             tip.target->DrawTextLayout(D2D1::Point2F(tip.padX, tip.nameTop), tip.nameLayout.Get(), text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             for (size_t i = 0; i < tip.rowLayouts.size() && i < tip.rowTops.size(); ++i) {
                 tip.target->DrawTextLayout(D2D1::Point2F(tip.labelX, tip.rowTops[i]), tip.rowLayouts[i].first.Get(), label.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -32979,8 +36083,10 @@ struct BootstrapPendingFrame {
 };
 struct BootstrapThreadHook {
     HHOOK hook = nullptr;
+    HHOOK paint = nullptr;
     HANDLE thread = nullptr;
     ~BootstrapThreadHook() {
+        if (paint) UnhookWindowsHookEx(paint);
         if (hook) UnhookWindowsHookEx(hook);
         if (thread) CloseHandle(thread);
     }
@@ -33009,6 +36115,41 @@ void HandleColdAttach(HWND frame, HWND requestedTab = nullptr) {
         if(target==ActiveExplorerTab(frame)) CheckOverlaySize(frame);
     }
     RemovePropW(key, kBootstrapQueuedProperty);
+}
+
+template<class Scan = decltype(&ScanShellWindow)>
+void AttachBeforeFirstNativePaint(HWND child, Scan scan = ScanShellWindow) {
+    if (!child || g_unloading.load(std::memory_order_relaxed) ||
+        !g_textRuntimeReady.load(std::memory_order_acquire)) return;
+    wchar_t cls[64]{};
+    if (!GetClassNameW(child,cls,ARRAYSIZE(cls))) return;
+    HWND native=child;
+    if (!_wcsicmp(cls,L"DirectUIHWND") || !_wcsicmp(cls,L"SysListView32")) {
+        native=GetParent(child);
+        if (!GetClassNameW(native,cls,ARRAYSIZE(cls))) return;
+    }
+    if (_wcsicmp(cls,L"SHELLDLL_DefView") || GetPropW(native,kColdAttachPaintCheckedProperty) ||
+        GetPropW(native,kColdAttachPaintPendingProperty) ||
+        !IsWindowVisible(native) || GetWindowThreadProcessId(native,nullptr)!=GetCurrentThreadId()) return;
+    const HWND frame=GetAncestor(native,GA_ROOT);
+    if (!IsExplorerFrame(frame) || IsIconic(frame) || GetPropW(frame,kShellScanProperty)) return;
+    const HWND tab=ActiveExplorerTab(frame);
+    if (!IsWindow(tab) || OverlayForTab(tab)) return;
+    // ScanShellWindow guards reentry. Rearm unresolved discovery on Shell readiness.
+    if (!SetPropW(native,kColdAttachPaintPendingProperty,reinterpret_cast<HANDLE>(1))) return;
+    scan(frame,tab,native);
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU startup] COLD_PREPAINT frame=%p tab=%p native=%p attached=%d",
+            frame,tab,native,OverlayForTab(tab)!=nullptr);
+}
+
+LRESULT CALLBACK ColdAttachPaintHook(int code, WPARAM wp, LPARAM lp) {
+    WindowCallbackGuard callback;
+    if (code>=0 && lp) {
+        const auto& msg=*reinterpret_cast<const CWPSTRUCT*>(lp);
+        if (msg.message==WM_PAINT) AttachBeforeFirstNativePaint(msg.hwnd);
+    }
+    return CallNextHookEx(nullptr,code,wp,lp);
 }
 
 // Explorer may consume a registered message before DispatchMessageW. Claim
@@ -33067,6 +36208,7 @@ bool QueueColdAttach(HWND frame, HWND source, HWND requestedTab = nullptr) {
                 thread, GetLastError());
             return false;
         }
+        subscription->paint=SetWindowsHookExW(WH_CALLWNDPROC,ColdAttachPaintHook,nullptr,thread);
         threads.emplace(thread, std::move(subscription));
     }
     auto& pending = t_bootstrapPending->pending;
@@ -33109,6 +36251,8 @@ void CALLBACK ColdAttachWinEvent(HWINEVENTHOOK, DWORD event, HWND changed,
                                      ARRAYSIZE(parentClass)) ||
             _wcsicmp(parentClass, L"SHELLDLL_DefView") != 0) return;
     }
+    if (viewEvent || contentEvent)
+        RemovePropW(viewEvent ? changed : GetParent(changed),kColdAttachPaintPendingProperty);
     const HWND frame = frameEvent ? changed : GetAncestor(changed, GA_ROOT);
     // New Shell tabs need their own startup request even while another tab
     // already has a renderer. CREATE is sufficient; retries retain this tab's
@@ -33198,7 +36342,10 @@ DWORD WINAPI ColdAttachObserverProc(LPVOID) {
         if (IsExplorerFrame(frame) && BelongsToThisProcess(frame)) {
             RemovePropW(frame,kColdAttachResolvedProperty);
             EnumChildWindows(frame,+[](HWND child,LPARAM)->BOOL {
-                RemovePropW(child,kColdAttachResolvedProperty); return TRUE;
+                RemovePropW(child,kColdAttachResolvedProperty);
+                RemovePropW(child,kColdAttachPaintCheckedProperty);
+                RemovePropW(child,kColdAttachPaintPendingProperty);
+                return TRUE;
             },0);
         }
         return TRUE;
@@ -33345,6 +36492,12 @@ LRESULT CALLBACK ExplorerFrameSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             }
     if (msg == WM_SIZE || msg == WM_WINDOWPOSCHANGED || msg == WM_DPICHANGED || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE)
         RefreshViewToggleForFrame(hwnd, true, msg != WM_WINDOWPOSCHANGED);
+    if (msg==WM_TIMECHANGE || (msg==WM_SETTINGCHANGE && lp &&
+        (!_wcsicmp(reinterpret_cast<LPCWSTR>(lp),L"intl") || !_wcsicmp(reinterpret_cast<LPCWSTR>(lp),L"TimeZoneInformation"))) ||
+        (msg==WM_POWERBROADCAST && (wp==PBT_APMRESUMEAUTOMATIC || wp==PBT_APMRESUMESUSPEND))) {
+        for (HWND overlay : FrameOverlays(hwnd))
+            if (auto* state=State(overlay)) ++state->calendarRevision;
+    }
     if (msg == WM_ACTIVATE || msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
         for (HWND overlay : FrameOverlays(hwnd)) QueueInputFocusUpdate(overlay);
     // A topmost item tooltip must not float over the app that took activation.
@@ -34026,6 +37179,7 @@ std::shared_ptr<const PresentationModel> CapturePresentationModel(ViewState& sta
     // drew it (ConsumePresentation). A superseded capture never counts.
     UpdateHorizontalScrollbarVisibility(state);
     auto model=std::make_shared<PresentationModel>();
+    model->scrollbarGeometryPending=HorizontalScrollbarGeometryPending(state);
 #define CAPTURE_PRESENTATION(name) model->name=state.name;
     PRESENTATION_MODEL_FIELDS(CAPTURE_PRESENTATION)
 #undef CAPTURE_PRESENTATION
@@ -34212,7 +37366,7 @@ void SynchronizePresentationGeneration(ViewState& state) {
 
 bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,const std::shared_ptr<PresentationLane>& lane) {
     ApplySwipeFeedback(state,model);
-    if (state.themeSnapshot != model.themeSnapshot || state.themeMode != model.themeMode ||
+    if (state.contrastPalette != model.contrastPalette || state.themeSnapshot != model.themeSnapshot || state.themeMode != model.themeMode ||
         state.themeHighContrast != model.themeHighContrast) {
         state.clipboardStaticBuffers = 0; state.clipboardWiggleOnly = false;
     }
@@ -34236,6 +37390,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     auto oldColumns=std::move(state.columns); auto oldDisappearingColumns=std::move(state.disappearingColumns);
     const float oldFont=state.fontPx,oldRow=state.rowPx; const bool oldRtl=state.rtlLayout,oldGrid=state.gridView;
     const int oldItemsPerRow=state.itemsPerRow;
+    const float oldGroupHeight=GroupHeadingHeight(state);
     const auto oldGroupingSpec=state.grouping;
     if(!sameFolder || !SameShellGroup(oldGroupingSpec,model.grouping)) state.sectionBadges.reset();
     const int oldDpi=state.presentationDpi;
@@ -34248,6 +37403,7 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
     state.presentationRowRevision=model.rowSceneRevision; state.presentationColumnOrigin=model.columnIntentOrigin;
     state.presentationClient=model.client; state.presentationDpi=model.dpi; state.presentationFont=model.font;
     state.presentationFrameSizing=model.frameSizing;
+    state.presentationScrollbarGeometryPending=model.scrollbarGeometryPending;
     state.presentationActive=model.active; state.inputFocusIndicators=model.inputFocus;
     state.selectionFeedbackVisible=model.selectionFeedback;
     state.rename.editor=model.renameEditor; state.rename.index=model.renameIndex;
@@ -34284,7 +37440,8 @@ bool ApplyPresentationModel(ViewState& state,const PresentationModel& model,cons
         const bool rebuild=oldDirectory!=model.directory || !SameShellGroup(oldGroupingSpec,state.grouping) ||
             (state.grouping.enabled && !state.namesPreview && state.rowGroup.size()!=size_t(state.total));
         badgeTopologyChanged=rebuild;
-        bool geometry=rebuild || oldRow!=state.rowPx || oldGrid!=state.gridView || oldItemsPerRow!=state.itemsPerRow;
+        bool geometry=rebuild || oldRow!=state.rowPx || oldGrid!=state.gridView ||
+            oldItemsPerRow!=state.itemsPerRow || oldGroupHeight!=GroupHeadingHeight(state);
         if(rebuild) {
             std::map<std::wstring,ViewState::GroupSection> previous;
             for(auto& section:state.sections) if(sameFolder && (section.collapsed || section.started.QuadPart))
@@ -34430,12 +37587,14 @@ void PublishPresentationReceipt(ViewState& state,const std::shared_ptr<Presentat
         if(SUCCEEDED(state.composition->GetFrameStatistics(&statistics))) receipt->compositionTime=statistics.currentTime;
     }
     receipt->ready=state.graphicsReady; receipt->accepted=!state.presentPending &&
+        state.lastAcceptedPresentationModel==state.presentationSequence &&
         state.lastAcceptedPaint==state.graphicsPaintSerial && state.lastAcceptedPaint;
     receipt->content=receipt->accepted && state.presentationContentAccepted;
     receipt->failed=failed; receipt->standby=state.graphicsStandby && !state.graphicsStandbyPending;
     receipt->failure=state.graphicsFailure; receipt->failureStage=state.graphicsFailureStage;
     receipt->standbyPending=state.graphicsStandbyPending;
     receipt->rowRevision=state.presentationRowRevision; receipt->rowOrigin=state.rowTransitionStartedQpc;
+    receipt->scrollbars=state.acceptedScrollbars;
     receipt->rowProgress=state.rowTransitionPresentedProgress; receipt->rows=state.rowTransitionActive;
     receipt->columnOrigin=state.presentationColumnOrigin; receipt->columns=state.columnTransitionActive;
     receipt->scrollOrigin=state.smoothStartedQpc; receipt->scroll=state.scrollNow;
@@ -34676,10 +37835,12 @@ DWORD WINAPI PresentationWorkerProc(LPVOID context) {
         const bool handoff=state.modeRootAttached && !state.rowTransitionActive && !state.columnTransitionActive;
         state.clipboardWiggleOnly=!model && !validated && !foregroundChanged && !handoff && state.graphicsReady &&
             state.clipboardIconsVisible && !NeedsAnimationPaint(state,true,true,false);
+        const bool zoomWasAnimating=state.zoomAnimating;
         AdvanceAnimationFrame(state,false);
         const auto previousPaint=state.graphicsPaintSerial;
         const auto previousForeground=state.swipeCompositionSerial;
-        const bool repaint=model || !state.graphicsReady || NeedsAnimationPaint(state,true,false) || handoff;
+        const bool repaint=model || !state.graphicsReady || zoomWasAnimating ||
+            NeedsAnimationPaint(state,true,false) || handoff;
         if(repaint) Paint(state);
         else if(!RenderSwipeFeedback(state) && state.d3d) {
             const HRESULT device=state.d3d->GetDeviceRemovedReason();
@@ -34807,6 +37968,8 @@ void ConsumePresentation(ViewState& state) {
     }
     if(InactiveGraphics(state)) standby();
     if(!receipt->accepted) return;
+    state.acceptedScrollbars=receipt->scrollbars;
+    state.acceptedScrollbarToken=receipt->token;
     state.presentationAcceptedSequence=std::max(state.presentationAcceptedSequence,receipt->sequence);
     // Every model since the run began admitted the bar, so the lane drew it.
     if(state.horizontalScrollbarAdmitted && state.horizontalScrollbarAdmittedSequence &&
@@ -35057,6 +38220,12 @@ HRESULT ConfigureTouchRecognizer(TouchRecognizer& session) {
 }
 
 bool StartTouchRecognizer(ViewState& state) {
+    // Input may arrive before rendering initializes the view clock.
+    if (!state.qpcFrequency) {
+        LARGE_INTEGER frequency{};
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0) return false;
+        state.qpcFrequency=static_cast<double>(frequency.QuadPart);
+    }
     if (state.touchRecognizer) return true;
     auto session = std::make_shared<TouchRecognizer>();
     HRESULT hr = CreateInteractionContext(&session->context);
@@ -35624,6 +38793,114 @@ void AdvanceTouchInertia(ViewState& state) {
     else { Wh_Log(L"[GPU touch] inertia failed hr=0x%08X",unsigned(hr)); StopTouch(state); }
 }
 
+// Touch jitter: a resting or rolling finger reports a few pixels of wobble,
+// which pans, swipes and drags showed as shivering. Every contact goes through
+// an adaptive low-pass (the "1 Euro" filter, Casiez et al. 2012) before
+// anything reads it: heavy smoothing while the finger is slow, next to none
+// once it really moves, so a pan or fling keeps its responsiveness and the
+// recognizer still measures the real release speed. DOWN stays raw (hit
+// tests, taps). Applied at this one boundary, so pan, pinch, swipe, marquee,
+// drag and the scrollbars all see the same contact.
+constexpr double kTouchJitterMinCutoffHz = 0.8;   // cutoff for a still finger
+constexpr double kTouchJitterCutoffPerSpeed = 25; // Hz added per DIP/ms
+constexpr double kTouchJitterSpeedCutoffHz = 5;   // smoothing of the speed itself
+constexpr double kTouchJitterMinGapMs = 1., kTouchJitterMaxGapMs = 50.;
+
+static double TouchLowPassAlpha(double cutoffHz, double dtMs) {
+    const double tauMs = 1000. / (2. * 3.14159265358979323846 * cutoffHz);
+    return dtMs / (dtMs + tauMs);
+}
+
+// The filter itself, on one frame (every contact of it, QPC-stamped).
+// Separate from the view so a regression can drive it with real numbers.
+using TouchContactFilters = std::vector<TouchRecognizer::ContactFilter>;
+static void SmoothTouchContacts(TouchContactFilters& filters, POINTER_INFO* frame, UINT32 pointers,
+                                double qpcFrequency, UINT dpi) {
+    const double dipPx = std::max(1u, dpi) / 96.;
+    // A frame lists every contact the device still has: a filter whose
+    // contact isn't in it lost its UP (capture moved, a canceled packet).
+    std::erase_if(filters, [&](const auto& f) {
+        return std::none_of(frame, frame + pointers, [&](const POINTER_INFO& p) {
+            return p.pointerType == PT_TOUCH && p.pointerId == f.id;
+        });
+    });
+    for (UINT32 p = 0; p < pointers; ++p) {
+        auto& info = frame[p];
+        if (info.pointerType != PT_TOUCH) continue;
+        auto it = std::find_if(filters.begin(), filters.end(),
+                               [&](const auto& f) { return f.id == info.pointerId; });
+        const double rawX = info.ptPixelLocation.x, rawY = info.ptPixelLocation.y;
+        if (info.pointerFlags & POINTER_FLAG_DOWN || it == filters.end()) {
+            // The DOWN point stays raw: hit tests and taps use it.
+            if (it == filters.end()) it = filters.emplace(filters.end());  // (not insert(end, {}): that inserts nothing)
+            *it = {info.pointerId, info.PerformanceCount, rawX, rawY, 0., 0.};
+            // Himetric is the device's own space (its origin isn't the
+            // screen's): moved by the pixel offset times the device's scale.
+            RECT device{}, display{};
+            if (GetPointerDeviceRects(info.sourceDevice, &device, &display) &&
+                display.right > display.left && display.bottom > display.top) {
+                it->himetricPerPixelX = double(device.right - device.left) / (display.right - display.left);
+                it->himetricPerPixelY = double(device.bottom - device.top) / (display.bottom - display.top);
+            }
+            if (info.pointerFlags & POINTER_FLAG_UP) filters.erase(it);
+            continue;
+        }
+        const bool timed = qpcFrequency > 0. && info.PerformanceCount > it->qpc;
+        const double dt = timed ? std::clamp((info.PerformanceCount - it->qpc) * 1000. / qpcFrequency,
+                                             kTouchJitterMinGapMs, kTouchJitterMaxGapMs)
+                                : kTouchJitterMinGapMs;
+        if (timed) {
+            // No time passed (a coalesced or repeated sample): the speed
+            // can't be measured, so it isn't (a 1 ms guess made a jump look
+            // like a fast flick and switched the smoothing off).
+            it->qpc = info.PerformanceCount;
+            const double aSpeed = TouchLowPassAlpha(kTouchJitterSpeedCutoffHz, dt);
+            it->vx += aSpeed * ((rawX - it->x) / dt - it->vx);
+            it->vy += aSpeed * ((rawY - it->y) / dt - it->vy);
+        }
+        const double speedDip = std::hypot(it->vx, it->vy) / dipPx;
+        const double a = TouchLowPassAlpha(
+            kTouchJitterMinCutoffHz + kTouchJitterCutoffPerSpeed * speedDip, dt);
+        it->x += a * (rawX - it->x);
+        it->y += a * (rawY - it->y);
+        const LONG sx = std::lround(it->x), sy = std::lround(it->y);
+        info.ptHimetricLocation.x += LONG(std::lround((sx - rawX) * it->himetricPerPixelX));
+        info.ptHimetricLocation.y += LONG(std::lround((sy - rawY) * it->himetricPerPixelY));
+        info.ptPixelLocation = {sx, sy};
+        if (info.pointerFlags & POINTER_FLAG_UP) filters.erase(it);
+    }
+}
+
+static void SmoothTouchFrame(const ViewState& state, TouchRecognizer& session,
+                             POINTER_INFO* frame, UINT32 pointers) {
+    // Windows recognizes gestures from physical displacement. Filtering a
+    // pending move can keep a real threshold crossing below system slop.
+    // Seed at the acquisition point before filtering subsequent motion.
+    if (!state.touch.active || state.touch.gesture==TouchGesture::Pending)
+        session.filters.clear();
+    // A pinch controls zoom by the physical distance between contacts.
+    // Smooth its translation as a pair so filtering cannot shrink that span.
+    const bool pinch=state.touch.gesture==TouchGesture::Pinch && pointers==2;
+    POINTER_INFO original[2]{};
+    if (pinch) std::copy_n(frame,2,original);
+    SmoothTouchContacts(session.filters, frame, pointers, state.qpcFrequency,
+                        GetDpiForWindow(state.hwnd));
+    if (pinch) {
+        const auto translate=[&](POINT POINTER_INFO::* field) {
+            const auto& a=original[0].*field;
+            const auto& b=original[1].*field;
+            const auto& u=frame[0].*field;
+            const auto& v=frame[1].*field;
+            const LONG dx=std::lround(((double(u.x)-a.x)+(double(v.x)-b.x))*.5);
+            const LONG dy=std::lround(((double(u.y)-a.y)+(double(v.y)-b.y))*.5);
+            frame[0].*field={a.x+dx,a.y+dy};
+            frame[1].*field={b.x+dx,b.y+dy};
+        };
+        translate(&POINTER_INFO::ptPixelLocation);
+        translate(&POINTER_INFO::ptHimetricLocation);
+    }
+}
+
 // Shared native-input boundary: packet history is oldest-first on the owner
 // STA. Recognition uses Windows' device calibration and system thresholds.
 void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& session,
@@ -35632,6 +38909,11 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
     auto* expected = &state;
     for (UINT32 e = entries; e-- > 0;) {
         const auto* frame = packets + size_t(e) * pointers;
+        // This frame's own copy (QPC-stamped, smoothed). Local, not the
+        // session's: the calls below pump messages, a nested touch message
+        // runs FeedTouchFrames again, and a shared buffer reassigned there
+        // left `frame` dangling here (access violation, Explorer restarted).
+        std::vector<POINTER_INFO> local;
         const auto& original = frame[0];
         const DWORD inputTime = original.PerformanceCount && state.qpcFrequency > 0. ?
             DWORD(original.PerformanceCount*1000./state.qpcFrequency) : original.dwTime;
@@ -35651,14 +38933,19 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
                 session->packetClockTick = GetTickCount64();
             }
             const auto now = LONGLONG(GetTickCount64());
-            session->normalized.assign(frame,frame+pointers);
-            for (auto& p : session->normalized) if (!p.PerformanceCount) {
+            local.assign(frame,frame+pointers);
+            for (auto& p : local) if (!p.PerformanceCount) {
                 const auto tick = now+LONG(p.dwTime-DWORD(now));
                 p.PerformanceCount = UINT64(session->packetClock.QuadPart+
                     std::llround((tick-LONGLONG(session->packetClockTick))*state.qpcFrequency/1000.));
             }
-            frame = session->normalized.data();
+            frame = local.data();
         }
+        if (frame != local.data()) {
+            local.assign(frame, frame + pointers);
+            frame = local.data();
+        }
+        SmoothTouchFrame(state, *session, local.data(), pointers);
         const auto& first = frame[0];
         bool canceled = false;
         for (UINT32 p = 0; p < pointers; ++p) canceled |= (frame[p].pointerFlags & POINTER_FLAG_CANCELED) != 0;
@@ -35774,7 +39061,8 @@ void FeedTouchFrames(ViewState& state, const std::shared_ptr<TouchRecognizer>& s
         double centerX=0.,centerY=0.; unsigned centerCount=0;
         for(UINT32 p=0;p<pointers;++p) if(frame[p].pointerType==PT_TOUCH &&
             (frame[p].pointerFlags&(POINTER_FLAG_INCONTACT|POINTER_FLAG_UP))) {
-            centerX+=frame[p].ptPixelLocation.x; centerY+=frame[p].ptPixelLocation.y; ++centerCount;
+            const auto& physical=packets[size_t(e)*pointers+p].ptPixelLocation;
+            centerX+=physical.x; centerY+=physical.y; ++centerCount;
         }
         if(centerCount && centerCount>=state.touch.contacts) {
             POINT center{LONG(std::lround(centerX/centerCount)),LONG(std::lround(centerY/centerCount))};
@@ -35909,6 +39197,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     WindowCallbackGuard callback;
     MessageProfileScope profileMessage(L"overlay",hwnd,msg,wParam);
     auto* s = State(hwnd);
+    if (s && s->inlineMenu) {
+        LRESULT handled = 0;
+        if (ForwardInlineMenuMessage(*s, msg, wParam, lParam, handled)) return handled;
+    }
     // Any newer press, double-click, key, wheel or menu request on this view
     // supersedes a pending slow-click rename (validated again when it fires).
     if (s && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN ||
@@ -36211,18 +39503,40 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         const bool updatedItem = (event & (SHCNE_UPDATEITEM | SHCNE_ATTRIBUTES)) != 0;
         const LONG structural = event & (SHCNE_CREATE | SHCNE_MKDIR | SHCNE_DELETE | SHCNE_RMDIR |
                                          SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER);
+        const bool inlineRefresh = s && (event & SHCNE_UPDATEDIR) && !s->inlineTree.empty();
         std::wstring created;
         // Clone only an applicable filesystem identity while holding the
         // notification's shared memory. Never activate a Shell item/provider
         // under that lock, especially during bursts of UPDATEITEM/CREATE.
         OwnedPidl identity, renamedIdentity;
         if (s && s->inScope && !s->thisPcGpu && pidls && pidls[0] &&
-            (namespaceChange || updatedItem || structural))
+            (namespaceChange || updatedItem || structural || inlineRefresh))
             identity.reset(ILCloneFull(pidls[0]));
         if (s && s->inScope && !s->thisPcGpu &&
             (event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) && pidls && pidls[1])
             renamedIdentity.reset(ILCloneFull(pidls[1]));
         SHChangeNotification_Unlock(lock);
+        // The edited item (or a folder containing it) was deleted, recycled
+        // or renamed away. Directory refresh is deferred while the editor
+        // owns its row, so dismiss the editor now; the latched change then
+        // removes the row without waiting for the user to end the edit.
+        if (s && s->rename.editor && !s->rename.finishing && identity && !s->rename.path.empty() &&
+            (event & (SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER))) {
+            auto removedStorage = std::make_unique<ShellPathStorage>();
+            auto& removed = removedStorage->value;
+            if (SHGetPathFromIDListEx(identity.get(), removed, ARRAYSIZE(removed), GPFIDL_DEFAULT)) {
+                const auto& edited = s->rename.path;
+                const size_t length = wcslen(removed);
+                const bool affected = length && _wcsnicmp(edited.c_str(), removed, length) == 0 &&
+                    (edited.size() == length || edited[length] == L'\\' || removed[length - 1] == L'\\');
+                if (affected) {
+                    if (g_perf.load(std::memory_order_relaxed))
+                        Wh_Log(L"[GPU rename] edited item removed event=0x%08X path=%s",
+                            event, edited.c_str());
+                    CloseRenameEditor(*s, true);
+                }
+            }
+        }
         if (namespaceChange) {
             if (updatedItem && identity) QueueShellItemUpdate(*s, NamespaceItemKey(identity.get()));
             const auto root = s->directoryFolderIdentity.get();
@@ -36249,6 +39563,26 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         if (s && updatedItem && !created.empty())
             QueueShellItemUpdate(*s, created);
+        // A refresh of an expanded folder lists it again, as the open folder
+        // re-lists on its own refresh. The graft honours the rename hold.
+        if (inlineRefresh) {
+            auto* node = !created.empty() && _wcsicmp(s->inlineTreeFolder.c_str(), s->folderPath.c_str()) == 0
+                ? FindInlineTreeNode(*s, created) : nullptr;
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU tree] Shell folder refresh event=0x%08X expanded=%d: %s",
+                    event, node != nullptr, created.c_str());
+            if (node) RequestInlineTreeNode(*s, *node);
+        }
+        if (s && structural && !created.empty() && !s->inlineTree.empty()) {
+            std::wstring renamed;
+            if (renamedIdentity) {
+                auto storage = std::make_unique<ShellPathStorage>();
+                if (SHGetPathFromIDListEx(renamedIdentity.get(), storage->value, ARRAYSIZE(storage->value), GPFIDL_DEFAULT))
+                    renamed = storage->value;
+            }
+            NoteInlineTreeChange(*s, created, renamed,
+                (event & (SHCNE_DELETE | SHCNE_RMDIR | SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) != 0);
+        }
         if (s && (structural || (event & SHCNE_UPDATEITEM)) && FolderSizesUsed(*s)) {
             // A change below a listed folder changes that row's contents and
             // provider-backed size, though not this folder's membership.
@@ -36363,11 +39697,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             if (!changes) return 0;
             HideItemTip(*s); // Its face, palette or Folder Options policy may change.
             if (changes & kStyleColors) {
-                // High contrast and the cached accent apply now; the palette
-                // refresh below reads a changed accent and reapplies it.
-                RefreshThemeColor(false);
                 s->viewTogglePaletteDirty=true;
+                const float groupHeight = GroupHeadingHeight(*s);
                 RefreshNativePalette(*s,true);
+                UpdateColumnHeaderHeight(*s,CompactReveal(*s));
+                const bool groupResized = groupHeight != GroupHeadingHeight(*s);
+                if (groupResized) LayoutGroupSections(*s);
+                ClampScroll(*s);
+                if (groupResized) RepositionRenameEdit(*s);
                 if (s->dragPreview) PublishDragPreview(*s);
             }
             if (changes & kStyleFontCollection) {
@@ -36414,9 +39751,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             int actual = -1, all = -1;
             s->folderView->ItemCount(SVGIO_ALLVIEW,&all);
             if (SUCCEEDED(s->folderView->ItemCount(SVGIO_SELECTION, &actual)) &&
-                actual >= 0 && actual == all && actual == s->total) {
+                actual >= 0 && actual == all && actual == s->rootTotal) {
                 // Shell has selected every item itself, without our building
-                // thousands of PIDLs or mapping the native row order.
+                // thousands of PIDLs or mapping the native row order. Shown
+                // inline children join it, as every row on screen is selected.
                 const auto before = CaptureVisibleSelection(*s);
                 s->selectedFlags.assign(s->entries.size(), 1);
                 s->selected = s->selected>=0 && s->selected<s->total ? s->selected : s->total ? 0 : -1;
@@ -36916,6 +40254,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             BeginTouchDrag(*s);
         return 0;
     case WM_TIMER:
+        if (wParam == kInlineTreeBusyTimerId) {
+            if (s) InlineTreeBusyTick(*s);
+            else KillTimer(hwnd, kInlineTreeBusyTimerId);
+            return 0;
+        }
         if (wParam == kClickRenameTimerId) {
             if (s) FireClickRename(*s);
             else KillTimer(hwnd, kClickRenameTimerId);
@@ -36997,6 +40340,11 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 if (!s->tabSwitchProbeUntil) UnregisterAnimationWindow(hwnd);
                 SetTimer(hwnd, kTimerId, kInactiveTabIdleTimerMs, nullptr);
                 return 0;
+            }
+            if (s->loaded && s->inScope && !s->directoryPending && !s->rename.editor) {
+                // Existing tab maintenance also catches midnight after an inactive tab wakes.
+                const auto stamp=DateGroupingStamp(*s);
+                if (stamp && stamp!=s->requestedCalendarStamp) QueueDirectoryRefresh(*s,false,true);
             }
             if (NativeColumnSnapshotReady(*s)) QueueFeatureInitialization(*s);
             if (s->loaded && !s->optimisticStartedAt && LayoutAnimationActive(*s, true)) {
@@ -37414,6 +40762,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ClampScroll(*s);
             RepositionRenameEdit(*s);
             Redraw(*s);
+            // The window already has its new bounds: publish the matching
+            // layout now. During splitter drags the queued WM_PAINT is starved
+            // by Explorer's posted layout traffic, and the frame wake yields to
+            // input that the splitter, not the overlay, receives. With a lane
+            // this only captures the model; drawing stays on the lane.
+            if (s->presenter && IsWindowVisible(hwnd)) {
+                UpdateWindow(hwnd);
+                if (State(hwnd) != s) return 0; // Painting may rebind the view.
+            }
             // Use the *same* navigation auto-refit pipeline after a settled,
             // meaningful viewport resize; no refit in WM_SIZE itself.
             if (wParam != SIZE_MINIMIZED)
@@ -37649,6 +41006,21 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 s->mousePressControl = control;
                 s->mousePressShift = shift;
+                if (index >= 0 && InlineTreeExpanderHit(*s, index, POINT{x, y})) {
+                    // The arrow only expands or collapses; selection stays.
+                    s->mousePressActive = false;
+                    s->mousePressRow = -1;
+                    ToggleInlineFolder(*s, index);
+                    return 0;
+                }
+                if (const int branch = InlineTreeBranchAt(*s, POINT{x, y}); branch >= 0) {
+                    // A branch line collapses the folder it belongs to.
+                    s->mousePressActive = false;
+                    s->mousePressRow = -1;
+                    ToggleInlineFolder(*s, branch);
+                    UpdateInlineTreeBranchHover(*s, POINT{x, y});
+                    return 0;
+                }
                 if (index >= 0) {
                     // A selected item drags from its whole row/cell. For an
                     // unselected item, blank padding remains a marquee origin.
@@ -37699,6 +41071,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         // The wiggle has already docked. Hold capture solely to swallow UP;
         // ignore all further drag movements until that button is released.
         if (s && s->columnWiggleAwaitRelease) return 0;
+        if (s) UpdateInlineTreeBranchHover(*s, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)},
+            !(wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)));
         // Hover re-arms on every move, so WM_MOUSEHOVER means the pointer
         // rested for the system hover time before showing an item tip.
         if (s && !PointerHoverSuppressed(*s)) {
@@ -37750,6 +41124,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->pointerInside = false;
             s->mouseTracking = false;
             ClearPointerHover(*s, true);
+            UpdateInlineTreeBranchHover(*s, POINT{}, false);
         }
         return 0;
     case WM_LBUTTONUP: {
@@ -38179,6 +41554,23 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             const int row = y >= s->headerPx && InsideListX(*s, x) &&
                 !OnScrollbar(*s, x, y) && !OnHorizontalBar(*s, x, y)
                 ? RowFromPoint(*s, y, x) : -1;
+            // A second press on the arrow is another toggle, never an Open.
+            if (row >= 0 && InlineTreeExpanderHit(*s, row, POINT{x, y})) {
+                ResetMouseClickSequence(*s);
+                ToggleInlineFolder(*s, row);
+                return 0;
+            }
+            if (const int branch = InlineTreeBranchAt(*s, POINT{x, y}); branch >= 0) {
+                ResetMouseClickSequence(*s);
+                ToggleInlineFolder(*s, branch);
+                UpdateInlineTreeBranchHover(*s, POINT{x, y});
+                return 0;
+            }
+            if (row >= 0 && TreeChildRow(*s, row)) {
+                ResetMouseClickSequence(*s);
+                OpenInlineTreeRow(*s, row);
+                return 0;
+            }
             // Touch pairs were already timed from packet timestamps.
             const bool up = g_doubleClickUp.load(std::memory_order_relaxed) &&
                 !(wParam & (MK_CONTROL | MK_SHIFT)) && EmptySpaceAt(*s,POINT{x,y}) &&
@@ -38375,11 +41767,34 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         break;
+    case kMsgPaletteReady:
+        if(s && wParam==WPARAM(s->lifetimeToken)) {
+            std::shared_ptr<const ContrastPalette> colors;
+            {
+                ExclusiveSrwLock lock(s->background->directoryLock);
+                colors=std::exchange(s->background->paletteResult,{});
+            }
+            if(colors && colors->revision==s->paletteRevision) {
+                s->contrastPalette=std::move(colors);
+                s->clipboardStaticBuffers=0; s->clipboardWiggleOnly=false;
+                if(s->dragPreview) PublishDragPreview(*s);
+                s->itemTip.paletteDirty=true;
+                if(IsWindowVisible(s->itemTip.hwnd)) ResolveItemTipPalette(*s);
+                Redraw(*s);
+            }
+        }
+        return 0;
     case kMsgThemeSettings:
         if (s) {
             const auto snapshot = Theme::Snapshot();
             if (snapshot != s->themeSnapshot) {
+                const float groupHeight = GroupHeadingHeight(*s);
                 s->themeSnapshot = snapshot;
+                QueueContrastPalette(*s);
+                UpdateColumnHeaderHeight(*s,CompactReveal(*s));
+                if (groupHeight != GroupHeadingHeight(*s)) LayoutGroupSections(*s);
+                ClampScroll(*s);
+                RepositionRenameEdit(*s);
                 s->clipboardStaticBuffers = 0; s->clipboardWiggleOnly = false;
                 s->itemTip.paletteDirty = true;
                 if (IsWindow(s->itemTip.hwnd) && IsWindowVisible(s->itemTip.hwnd)) ResolveItemTipPalette(*s);
@@ -38390,6 +41805,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     case kMsgSettings:
         if (s) {
+            // Turning the option off (or a layout that can't show it) returns
+            // the rows to the native folder's own listing.
+            if (!InlineTreeActive(*s)) ClearInlineTree(*s);
+            // With the option off, remembered expansion must not come back.
+            if (!g_expandableFolders.load(std::memory_order_relaxed)) {
+                for (auto& [folder, nodes] : s->inlineTreeMemory) ForgetInlineTreeMemory(*s, nodes);
+                s->inlineTreeMemory.clear();
+                s->inlineTreeReturnPath.clear();
+            }
             s->themeSnapshot = Theme::Snapshot();
             HideItemTip(*s); // Cancel old detail policy and text presentation immediately.
             RefreshViewToggleForFrame(s->frameHwnd);
@@ -38442,11 +41866,32 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s && wParam==WPARAM(s->lifetimeToken)) SetActive(hwnd, false);
         return 0;
     case kMsgViewToggle:
-        if (s && s->inScope && s->detailsViewActive && TabOwnsActiveView(*s))
+        if (s && s->inScope && s->detailsViewActive && TabOwnsActiveView(*s)) {
+            const bool toNative = s->visible;
+            // Read the selection before the switch publishes the native one.
+            const bool reveal = toNative && PrepareNativeInlineReveal(*s);
+            if (!reveal) { s->nativeRevealFolder.reset(); s->nativeRevealItems.clear(); }
             SetActive(hwnd, !s->visible);
+            if (reveal) BrowseNativeToInlineSelection(*s);
+        }
         return 0;
     case kMsgItemTipReady:
         if (s && wParam==WPARAM(s->lifetimeToken)) ConsumeItemTip(*s);
+        return 0;
+    case kMsgInlineTreeReady:
+        if(s && wParam==WPARAM(s->lifetimeToken)) ReceiveInlineTreeResults(*s);
+        return 0;
+    case kMsgInlineSelectionRename:
+        if (s && wParam == WPARAM(s->lifetimeToken) && InlineSelectionDetached(*s)) BeginInlineSelectionRename(*s);
+        return 0;
+    case kMsgInlineSelectionNotice:
+        if (s && wParam == WPARAM(s->lifetimeToken)) DeliverInlineSelectionNotice(*s);
+        return 0;
+    case kMsgInlineTreeReopen:
+        if(s && wParam==WPARAM(s->lifetimeToken)) {
+            s->inlineTreeReopenQueued = false;
+            if (!s->columnTransitionActive) ReopenInlineTree(*s, true);
+        }
         return 0;
     case kMsgTypeSearchReady:
         if(s && wParam==WPARAM(s->lifetimeToken) && s->typeSearchWaiting) {
@@ -39256,6 +42701,8 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.lastFolderToReveal = allowLastFolderRestore
         ? ImmediateChildOnReturn(navigationOrigin ? *navigationOrigin :
                                  state.folderPath, path) : L"";
+    state.inlineTreeReturnPath = state.lastFolderToReveal.empty() ? std::wstring() :
+        std::wstring(navigationOrigin ? *navigationOrigin : state.folderPath);
     CancelNativeSelectionRestore(state);
     state.lastFolderNativeAttempts = 0;
     state.lastFolderNativeNextAttempt = 0;
@@ -39323,6 +42770,8 @@ void ResetForNewDirectory(ViewState& state, const std::wstring& path,
     state.pendingWidthNativeHwnd = nullptr;
     state.widthCache.clear();
     state.total = 0;
+    state.rootTotal = 0;
+    ClearInlineTreeNodes(state); // Expansion belongs to the folder being left.
     state.sections.clear();
     state.rowGroup.clear();
     state.groupAnimating = false;
@@ -39543,6 +42992,11 @@ void ReportShellNavigationEvent(HWND overlay, ShellNavigationSignal signal,
         return;
     }
     ViewState* state = State(overlay);
+    // A native-view switch into a child folder selects its items there.
+    if (state && state->nativeRevealFolder && !state->visible &&
+        (signal == ShellNavigationSignal::Completed || signal == ShellNavigationSignal::ViewCreated ||
+         signal == ShellNavigationSignal::ContentShown))
+        ApplyNativeInlineReveal(*state);
     if (!state || !state->visible || !TabOwnsActiveView(*state)) return;
     if (nativeCandidate) {
         HWND assigned = OverlayForNative(nativeCandidate, state->frameHwnd);
@@ -40777,7 +44231,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
                 s->entries.clear();
                 s->entryPathIndex.clear();
                 RetireCachedEntries(*s, s->entryPathUpdates);
-                s->total = 0;
+                s->total = s->rootTotal = 0;
                 s->loaded = false;
                 s->selected = s->anchor = -1;
                 s->selectedFlags.clear();
@@ -40983,7 +44437,7 @@ void AttachView(HWND native, ComPtr<IFolderView2>& view,
     SetTimer(overlay, kTimerId, 250, nullptr);
 }
 
-void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
+void ScanShellWindow(HWND explorerFrame, HWND requestedTab, HWND expectedNative) {
     if (g_unloading.load() || !g_textRuntimeReady.load(std::memory_order_acquire) || !IsWindow(explorerFrame) ||
         GetPropW(explorerFrame, kShellScanProperty)) return;
     struct ScanGuard {
@@ -41169,7 +44623,7 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
         HWND native = nullptr;
         const HRESULT nativeResult = shellView->GetWindow(&native);
         stage.Mark(L"discovered IShellView GetWindow");
-        if (FAILED(nativeResult) || !native ||
+        if (FAILED(nativeResult) || !native || (expectedNative && native!=expectedNative) ||
             GetAncestor(native,GA_ROOT)!=explorerFrame || !NativeViewAvailable(native,preparing ? targetTab : nullptr) ||
             BrowserTabHost(shellBrowser.Get(), native, explorerFrame) !=
                 targetTab)
@@ -41179,6 +44633,7 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
         if (FAILED(viewResult) || !view) {
             if (viewResult!=E_NOINTERFACE) break; // Still unresolved, not proof of unsupported content.
             SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
+            SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1));
             if (HWND overlay = OverlayForTab(targetTab))
                 if (ViewState* state = State(overlay))
                     DeactivateOutsideScope(*state);
@@ -41195,9 +44650,12 @@ void ScanShellWindow(HWND explorerFrame, HWND requestedTab) {
         if (!pathResolved) {
             break;
         }
-        if (!IsSupportedLocation(path))
+        const bool supported=IsSupportedLocation(path);
+        if (!supported) {
             SetPropW(targetTab,kColdAttachResolvedProperty,reinterpret_cast<HANDLE>(1));
-        if (IsSupportedLocation(path)) {
+            SetPropW(native,kColdAttachPaintCheckedProperty,reinterpret_cast<HANDLE>(1));
+        }
+        if (supported) {
             AttachView(native,view,folder,shellBrowser,path,preparing);
             stage.Mark(L"AttachView discovered tab");
             if (HWND overlay = OverlayForTab(targetTab))
@@ -41353,6 +44811,7 @@ void NoteNativeNewFolderShortcut(const MSG& msg) {
 // run the Shell's New menu object. Its command records the creation intent
 // for the view it creates into: one path for every route, matched by the
 // Shell's creation notification and opened as the GPU rename field.
+bool ShellImplementation(void* address);
 using NewMenuInvoke_t = HRESULT (STDMETHODCALLTYPE*)(IContextMenu*, LPCMINVOKECOMMANDINFO);
 NewMenuInvoke_t g_newMenuInvokeOriginal = nullptr;
 
@@ -41409,15 +44868,428 @@ void* NewMenuInvokeCommandAddress() {
     CoUninitialize();
     // The implementation lives in the Shell's own module, never in COM's
     // proxy/stub libraries; anything else is not the object we meant.
+    return ShellImplementation(address) ? address : nullptr;
+}
+
+// A method address taken from a Shell object's vtable is hooked only when it is
+// the Shell's own implementation, never COM's shared proxy/stub code.
+bool ShellImplementation(void* address) {
     HMODULE owner = nullptr;
     wchar_t name[MAX_PATH]{};
     if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &owner) ||
-        !GetModuleFileNameW(owner, name, ARRAYSIZE(name))) return nullptr;
+        !GetModuleFileNameW(owner, name, ARRAYSIZE(name))) return false;
     const wchar_t* leaf = PathFindFileNameW(name);
     for (const wchar_t* proxy : {L"combase.dll", L"ole32.dll", L"oleaut32.dll", L"rpcrt4.dll"})
-        if (!_wcsicmp(leaf, proxy)) return nullptr;
-    return address;
+        if (!_wcsicmp(leaf, proxy)) return false;
+    return true;
+}
+// Two paths keep Explorer's commands on the whole selection when it includes
+// inline children:
+// - the selection bridge (InstallSelectionBridge) answers what Explorer asks
+//   the view for: the selection's items, count, menu and data, so the command
+//   bar, status bar and Shell code see and act on the whole selection;
+// - this reroute catches a verb run on a selection menu sited on the native
+//   view (one Explorer built internally from the native part, or the bridge's
+//   own menu once Explorer sites it) and sends it to the mod's handlers, which
+//   own rename (the GPU editor) and the multi-folder property sheet.
+// Both build their Shell objects through InlineSelectionMenu/-Pidls.
+using SelectionMenuInvoke_t = HRESULT (STDMETHODCALLTYPE*)(IContextMenu*, LPCMINVOKECOMMANDINFO);
+SelectionMenuInvoke_t g_selectionMenuInvokeOriginal = nullptr;
+bool RouteSelectionMenuCommand(IContextMenu* menu, LPCMINVOKECOMMANDINFO info, HRESULT& result) {
+    result = S_OK;
+    if (t_inlineMenuInvoking || g_unloading.load(std::memory_order_acquire) || !menu || !info ||
+        info->cbSize < sizeof(CMINVOKECOMMANDINFO)) return false;
+    // Only the native view's own selection menu: its site is that view.
+    ComPtr<IObjectWithSite> site; ComPtr<IServiceProvider> services; ComPtr<IShellView> view;
+    HWND native = nullptr;
+    if (FAILED(menu->QueryInterface(IID_PPV_ARGS(&site))) || FAILED(site->GetSite(IID_PPV_ARGS(&services))) ||
+        FAILED(services->QueryService(SID_SFolderView, IID_PPV_ARGS(&view))) || FAILED(view->GetWindow(&native)) ||
+        !native || GetWindowThreadProcessId(native, nullptr) != GetCurrentThreadId()) return false;
+    ViewState* state = State(reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty)));
+    if (!state || state->nativeHwnd != native || !state->visible || !state->inScope ||
+        state->rename.editor || !InlineSelectionDetached(*state)) return false;
+    // The verb, named or by menu offset.
+    std::wstring verb;
+    const auto* ex = info->cbSize >= sizeof(CMINVOKECOMMANDINFOEX) && (info->fMask & CMIC_MASK_UNICODE) ?
+        reinterpret_cast<LPCMINVOKECOMMANDINFOEX>(info) : nullptr;
+    if (ex && ex->lpVerbW && !IS_INTRESOURCE(ex->lpVerbW)) verb = ex->lpVerbW;
+    else if (!IS_INTRESOURCE(info->lpVerb)) { const char* a = info->lpVerb; verb.assign(a, a + strlen(a)); }
+    else {
+        wchar_t named[64]{};
+        if (SUCCEEDED(menu->GetCommandString(reinterpret_cast<UINT_PTR>(info->lpVerb), GCS_VERBW, nullptr,
+                reinterpret_cast<LPSTR>(named), ARRAYSIZE(named)))) verb = named;
+    }
+    if (verb.empty()) {
+        Wh_Log(L"[GPU tree] Explorer command without a verb on a selection with children; left to Explorer");
+        return false;
+    }
+    // Item commands only. The folder's background verbs (paste, new, view
+    // options) run through the same Shell menu and stay Explorer's.
+    static constexpr const wchar_t* kItemVerbs[]{L"delete", L"cut", L"copy", L"rename", L"properties",
+        L"open", L"opennewtab", L"opennewwindow", L"openas", L"runas", L"print", L"edit", L"copyaspath",
+        L"Windows.ModernShare", L"link"};
+    if (std::none_of(std::begin(kItemVerbs), std::end(kItemVerbs),
+            [&](const wchar_t* known) { return !_wcsicmp(known, verb.c_str()); })) {
+        Wh_Log(L"[GPU tree] Explorer command '%s' on a selection with children left to Explorer", verb.c_str());
+        return false;
+    }
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU tree] routed Explorer command '%s' to the whole selection", verb.c_str());
+    if (!_wcsicmp(verb.c_str(), L"rename")) {
+        result = BeginInlineSelectionRename(*state) ? S_OK : E_FAIL;
+        return true;
+    }
+    bool done;
+    if (!_wcsicmp(verb.c_str(), L"properties")) done = ShowInlineSelectionProperties(*state);
+    else {
+        const std::string ascii(verb.begin(), verb.end());
+        done = InvokeInlineSelectionCommand(*state, ascii.c_str(), info->fMask & (CMIC_MASK_SHIFT_DOWN | CMIC_MASK_CONTROL_DOWN));
+    }
+    result = done ? S_OK : E_FAIL;
+    return true;
+}
+HRESULT STDMETHODCALLTYPE SelectionMenuInvokeHook(IContextMenu* menu, LPCMINVOKECOMMANDINFO info) {
+    ApiCallbackGuard callback(ApiHook::SelectionMenuInvoke);
+    HRESULT result = S_OK;
+    if (RouteSelectionMenuCommand(menu, info, result)) return result;
+    return g_selectionMenuInvokeOriginal(menu, info);
+}
+// The Shell's default folder menu implementation, shared by its instances.
+void* SelectionMenuInvokeCommandAddress() {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(apartment)) return nullptr;
+    void* address = nullptr;
+    {
+        ComPtr<IShellFolder> desktop;
+        ComPtr<IContextMenu> menu;
+        if (SUCCEEDED(SHGetDesktopFolder(&desktop))) {
+            DEFCONTEXTMENU definition{};
+            definition.psf = desktop.Get();
+            if (SUCCEEDED(SHCreateDefaultContextMenu(&definition, IID_PPV_ARGS(&menu))) && menu)
+                address = (*reinterpret_cast<void***>(menu.Get()))[4]; // IContextMenu::InvokeCommand
+        }
+    }
+    CoUninitialize();
+    return ShellImplementation(address) ? address : nullptr;
+}
+
+// ---- Selection bridge: Explorer's own selection readers ----
+// Explorer's command bar, ribbon, status bar and Shell code read the list's
+// selection through the native view's own interfaces (measured in 1.1.21: the
+// command bar asks Items(SVGIO_SELECTION, IShellItemArray) and then the
+// selection's IContextMenu; the status bar asks ItemCount/Items). The native
+// view can't hold other folders' items, so while the selection includes inline
+// children these calls are answered with the whole selection. Hooked on the
+// Shell's view implementation, shared by every list; the mod's own calls, other
+// item sets and other interfaces keep Explorer's answer, so the mod's
+// selection mirroring and every comparison with the native view are unchanged.
+using ViewGetItemObject_t = HRESULT (STDMETHODCALLTYPE*)(IShellView*, UINT, REFIID, void**);
+using ViewItemCount_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView*, UINT, int*);
+using ViewItems_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView*, UINT, REFIID, void**);
+using ViewGetSelection_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView2*, BOOL, IShellItemArray**);
+using ViewSelectItem_t = HRESULT (STDMETHODCALLTYPE*)(IShellView*, PCUITEMID_CHILD, SVSIF);
+using FolderSelectItem_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView*, int, DWORD);
+ViewSelectItem_t g_viewSelectItemOriginal = nullptr;
+using ViewDoRename_t = HRESULT (STDMETHODCALLTYPE*)(IFolderView2*);
+ViewDoRename_t g_viewDoRenameOriginal = nullptr;
+FolderSelectItem_t g_folderSelectItemOriginal = nullptr;
+ViewGetItemObject_t g_viewGetItemObjectOriginal = nullptr;
+ViewItemCount_t g_viewItemCountOriginal = nullptr;
+ViewItems_t g_viewItemsOriginal = nullptr;
+ViewGetSelection_t g_viewGetSelectionOriginal = nullptr;
+bool CalledFromThisModule(void* address) {
+    HMODULE module = nullptr, self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        static_cast<LPCWSTR>(address), &module);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&CalledFromThisModule), &self);
+    return module && module == self;
+}
+// The tab whose native view this is, when its selection includes inline
+// children and the caller is Explorer (not this mod).
+ViewState* InlineSelectionViewOwner(IUnknown* view, void* caller) {
+    if (!view || g_unloading.load(std::memory_order_relaxed) || CalledFromThisModule(caller)) return nullptr;
+    ComPtr<IShellView> shell;
+    HWND native = nullptr;
+    if (FAILED(view->QueryInterface(IID_PPV_ARGS(&shell))) || FAILED(shell->GetWindow(&native)) || !native ||
+        GetWindowThreadProcessId(native, nullptr) != GetCurrentThreadId()) return nullptr;
+    ViewState* state = State(reinterpret_cast<HWND>(GetPropW(native, kOverlayProperty)));
+    return state && state->nativeHwnd == native && state->visible && state->inScope &&
+        InlineSelectionDetached(*state) ? state : nullptr;
+}
+ComPtr<IShellItemArray> InlineSelectionItemArray(ViewState& state) {
+    std::vector<OwnedPidl> items;
+    ComPtr<IShellItemArray> array;
+    if (!InlineSelectionPidls(state, items)) return array;
+    std::vector<PCIDLIST_ABSOLUTE> ids;
+    for (const auto& item : items) ids.push_back(item.get());
+    if (FAILED(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(ids.size()), ids.data(), &array))) array.Reset();
+    if (g_perf.load(std::memory_order_relaxed)) {
+        // What Explorer is handed, once per selection change, as the array
+        // itself reports it (a consumer dropping items shows up against it).
+        static const ViewState* lastState = nullptr;
+        static unsigned long long lastRevision = 0;
+        const auto revision = state.selectedFlags.Revision();
+        if (lastState != &state || lastRevision != revision) {
+            lastState = &state; lastRevision = revision;
+            DWORD count = 0;
+            if (array) array->GetCount(&count);
+            Wh_Log(L"[GPU selection] handed to Explorer: %lu items (selected rows %zu)", count, ids.size());
+            for (DWORD i = 0; i < count; ++i) {
+                ComPtr<IShellItem> item; PWSTR name = nullptr;
+                if (SUCCEEDED(array->GetItemAt(i, &item)) && SUCCEEDED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &name))) {
+                    Wh_Log(L"[GPU selection]   %lu: %s", i + 1, name);
+                    CoTaskMemFree(name);
+                }
+            }
+        }
+    }
+    return array;
+}
+// The selection's own menu, data or items for Explorer's commands and its item
+// menu (the selection bridge and CDefView::_GetItems): the same objects the GPU
+// keyboard and classic menu use. Other interfaces keep Explorer's answer
+// (E_NOINTERFACE here).
+HRESULT InlineSelectionViewObject(ViewState& state, REFIID riid, void** out) {
+    if (IsEqualIID(riid, IID_IShellItemArray)) {
+        auto array = InlineSelectionItemArray(state);
+        return array ? array->QueryInterface(riid, out) : E_FAIL;
+    }
+    if (IsEqualIID(riid, IID_IObjectCollection) || IsEqualIID(riid, IID_IObjectArray)) {
+        const auto array = InlineSelectionItemArray(state);
+        ComPtr<IObjectCollection> collection;
+        DWORD count = 0;
+        HRESULT hr = array ? CoCreateInstance(CLSID_EnumerableObjectCollection, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&collection)) : E_FAIL;
+        if (SUCCEEDED(hr)) hr = array->GetCount(&count);
+        for (DWORD i = 0; SUCCEEDED(hr) && i < count; ++i) {
+            ComPtr<IShellItem> item;
+            hr = array->GetItemAt(i, &item);
+            if (SUCCEEDED(hr)) hr = collection->AddObject(item.Get());
+        }
+        return SUCCEEDED(hr) ? collection->QueryInterface(riid, out) : hr;
+    }
+    if (IsEqualIID(riid, IID_IContextMenu) || IsEqualIID(riid, IID_IContextMenu2) || IsEqualIID(riid, IID_IContextMenu3)) {
+        ComPtr<IContextMenu> menu;
+        return InlineSelectionMenu(state, menu) ? menu->QueryInterface(riid, out) : E_FAIL;
+    }
+    if (IsEqualIID(riid, IID_IDataObject)) {
+        const auto objects = InlineSelectionDataObject(state, nullptr);
+        return objects ? objects->QueryInterface(riid, out) : E_FAIL;
+    }
+    return E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE ViewGetItemObjectHook(IShellView* view, UINT item, REFIID riid, void** out) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (out && (item & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0)))
+            if (SUCCEEDED(InlineSelectionViewObject(*state, riid, out))) return S_OK;
+    return g_viewGetItemObjectOriginal(view, item, riid, out);
+}
+HRESULT STDMETHODCALLTYPE ViewItemCountHook(IFolderView* view, UINT flags, int* count) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (count && (flags & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0))) {
+            // The same identities the item array is built from (cached), so the
+            // count and the items always agree, including Explorer's fallback.
+            std::vector<OwnedPidl> items;
+            if (InlineSelectionPidls(*state, items)) { *count = static_cast<int>(items.size()); return S_OK; }
+        }
+    return g_viewItemCountOriginal(view, flags, count);
+}
+HRESULT STDMETHODCALLTYPE ViewItemsHook(IFolderView* view, UINT flags, REFIID riid, void** out) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (out && (flags & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0)))
+            if (SUCCEEDED(InlineSelectionViewObject(*state, riid, out))) return S_OK;
+    return g_viewItemsOriginal(view, flags, riid, out);
+}
+HRESULT STDMETHODCALLTYPE ViewGetSelectionHook(IFolderView2* view, BOOL noneImpliesFolder, IShellItemArray** out) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (out)
+        if (auto* state = InlineSelectionViewOwner(view, __builtin_return_address(0)))
+            if (auto array = InlineSelectionItemArray(*state)) { *out = array.Detach(); return S_OK; }
+    return g_viewGetSelectionOriginal(view, noneImpliesFolder, out);
+}
+// The Shell's "rename" verb (command bar Rename, menus) asks the view to edit
+// an item (SVSI_EDIT). With inline children selected the view holds no such
+// row: the mod's own rename starts instead, posted so the Shell call unwinds.
+// `item`: the open folder's item the request names (none for DoRename). The
+// view also edits items it creates (New folder, Ctrl+Shift+N, a paste) with
+// SVSI_EDIT; such an item is not part of the GPU selection and keeps the
+// native route.
+bool BridgeInlineRename(IUnknown* view, UINT flags, void* caller, PCUITEMID_CHILD item = nullptr) {
+    if ((flags & SVSI_EDIT) != SVSI_EDIT) return false;
+    auto* state = InlineSelectionViewOwner(view, caller);
+    if (!state) return false;
+    if (item) {
+        // By the item's own leaf name: a selected child's ID is relative to its
+        // own folder, not the open one, so it is never resolved as a path here.
+        STRRET value{}; PWSTR leaf = nullptr;
+        const bool named = state->folder &&
+            SUCCEEDED(state->folder->GetDisplayNameOf(item, SHGDN_INFOLDER | SHGDN_FORPARSING, &value)) &&
+            SUCCEEDED(StrRetToStrW(&value, item, &leaf)) && leaf;
+        bool selected = false;
+        for (size_t i = 0; named && !selected && i < state->entries.size() && i < state->selectedFlags.size(); ++i)
+            selected = state->selectedFlags[i] && !_wcsicmp(PathFindFileNameW(state->entries[i].path.c_str()), leaf);
+        CoTaskMemFree(leaf);
+        if (!selected) return false;
+    }
+    if (g_perf.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU rename] Explorer asked the view to rename (flags=0x%X); the mod's rename starts instead", flags);
+    PostMessageW(state->hwnd, kMsgInlineSelectionRename, WPARAM(state->lifetimeToken), 0);
+    return true;
+}
+// Explorer's command bar Rename asks the view to rename its selection.
+HRESULT STDMETHODCALLTYPE ViewDoRenameHook(IFolderView2* view) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (BridgeInlineRename(view, SVSI_EDIT, __builtin_return_address(0))) return S_OK;
+    return g_viewDoRenameOriginal(view);
+}
+HRESULT STDMETHODCALLTYPE ViewSelectItemHook(IShellView* view, PCUITEMID_CHILD item, SVSIF flags) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    if (item && BridgeInlineRename(view, flags, __builtin_return_address(0), item)) return S_OK;
+    return g_viewSelectItemOriginal(view, item, flags);
+}
+HRESULT STDMETHODCALLTYPE FolderSelectItemHook(IFolderView* view, int index, DWORD flags) {
+    ApiCallbackGuard callback(ApiHook::SelectionBridge);
+    // The item at that index, from the view itself (Item is not bridged).
+    PITEMID_CHILD item = nullptr;
+    if ((flags & SVSI_EDIT) == SVSI_EDIT && view && FAILED(view->Item(index, &item))) item = nullptr;
+    const bool bridged = item && BridgeInlineRename(view, flags, __builtin_return_address(0), item);
+    if (item) CoTaskMemFree(item);
+    if (bridged) return S_OK;
+    return g_folderSelectItemOriginal(view, index, flags);
+}
+// The Shell's view implementation, from a windowless instance (no folder I/O).
+void InstallSelectionBridge() {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(apartment)) return;
+    void* slots[7]{};
+    {
+        ComPtr<IShellFolder> desktop;
+        ComPtr<IShellView> view;
+        SFV_CREATE create{sizeof(create)};
+        if (SUCCEEDED(SHGetDesktopFolder(&desktop))) {
+            create.pshf = desktop.Get();
+            if (SUCCEEDED(SHCreateShellFolderView(&create, &view)) && view) {
+                slots[0] = (*reinterpret_cast<void***>(view.Get()))[15]; // IShellView::GetItemObject
+                slots[4] = (*reinterpret_cast<void***>(view.Get()))[14]; // IShellView::SelectItem
+                ComPtr<IFolderView2> folder;
+                if (SUCCEEDED(view.As(&folder))) {
+                    void** table = *reinterpret_cast<void***>(folder.Get());
+                    slots[1] = table[7];  // IFolderView::ItemCount
+                    slots[2] = table[8];  // IFolderView::Items
+                    slots[3] = table[32]; // IFolderView2::GetSelection
+                    slots[5] = table[15]; // IFolderView::SelectItem
+                    slots[6] = table[41]; // IFolderView2::DoRename
+                }
+            }
+        }
+    }
+    CoUninitialize();
+    if (ShellImplementation(slots[0])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewGetItemObject_t>(slots[0]),
+        ViewGetItemObjectHook, &g_viewGetItemObjectOriginal);
+    if (ShellImplementation(slots[1])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewItemCount_t>(slots[1]),
+        ViewItemCountHook, &g_viewItemCountOriginal);
+    if (ShellImplementation(slots[2])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewItems_t>(slots[2]),
+        ViewItemsHook, &g_viewItemsOriginal);
+    if (ShellImplementation(slots[3])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewGetSelection_t>(slots[3]),
+        ViewGetSelectionHook, &g_viewGetSelectionOriginal);
+    if (ShellImplementation(slots[4])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewSelectItem_t>(slots[4]),
+        ViewSelectItemHook, &g_viewSelectItemOriginal);
+    if (ShellImplementation(slots[5])) WindhawkUtils::SetFunctionHook(reinterpret_cast<FolderSelectItem_t>(slots[5]),
+        FolderSelectItemHook, &g_folderSelectItemOriginal);
+    if (ShellImplementation(slots[6])) WindhawkUtils::SetFunctionHook(reinterpret_cast<ViewDoRename_t>(slots[6]),
+        ViewDoRenameHook, &g_viewDoRenameOriginal);
+}
+
+// ---- Explorer's own (modern) item menu for selections with inline children ----
+// Measured in 1.1.21 (docs/1.1.21-native-menu-decision.md): ExplorerFrame's
+// UIItemsView::ShowContextMenu asks its own list whether a row is selected
+// and calls CDefView::OnSelectionContextMenu or ::OnBackgroundContextMenu
+// (same signature). Every item-menu piece then reads the selection from
+// CDefView::_GetItems: the menu object (_GetItems(selection, 1, IContextMenu))
+// and the menu's commands (_GetItems(selection, 0, IShellItemArray)); the
+// presenter reads IFolderView::Items, which the selection bridge answers.
+// So the mod's request for inline children takes the item path, and that
+// view's _GetItems answers with the whole selection. The menu object is the
+// one the items' own folder builds (several folders: the desktop's default
+// menu, as for search results), never CDefView's, which would name the open
+// folder's files. Without these symbols the classic menu is used.
+using DefViewMenu_t = HRESULT (*)(void*, const POINT*);
+using DefViewGetItems_t = HRESULT (*)(void*, UINT, int, REFIID, void**);
+DefViewMenu_t g_defViewBackgroundMenuOriginal = nullptr;
+DefViewMenu_t g_defViewSelectionMenu = nullptr; // Called, not hooked.
+DefViewGetItems_t g_defViewGetItemsOriginal = nullptr;
+// The CDefView object behind a tab's native view, learned during the mod's
+// own menu request (its _GetItems is the first one called on that thread).
+struct InlineMenuView { void* defView; HWND owner; unsigned long long lifetime, token; };
+thread_local std::vector<InlineMenuView> t_inlineMenuViews;
+ViewState* InlineMenuOwner(void* defView) {
+    // The request's own view: the first _GetItems inside the request (the
+    // menu message is sent to that view and handled synchronously).
+    if (auto& request = t_inlineMenuRequest; request.owner && !request.learned)
+        if (auto* requesting = State(request.owner); requesting && requesting->lifetimeToken == request.lifetime) {
+            request.learned = true;
+            const InlineMenuView view{defView, requesting->hwnd, requesting->lifetimeToken, requesting->token};
+            const auto known = std::find_if(t_inlineMenuViews.begin(), t_inlineMenuViews.end(),
+                [&](const auto& entry) { return entry.owner == view.owner; });
+            if (known == t_inlineMenuViews.end()) t_inlineMenuViews.push_back(view);
+            else *known = view;
+        }
+    for (auto it = t_inlineMenuViews.begin(); it != t_inlineMenuViews.end();) {
+        auto* state = State(it->owner);
+        if (!state || state->lifetimeToken != it->lifetime || state->token != it->token) {
+            it = t_inlineMenuViews.erase(it); // The tab or its folder is gone.
+            continue;
+        }
+        if (it->defView == defView)
+            return !g_unloading.load(std::memory_order_relaxed) && InlineSelectionDetached(*state) ? state : nullptr;
+        ++it;
+    }
+    return nullptr;
+}
+HRESULT DefViewGetItemsHook(void* self, UINT svgio, int option, REFIID riid, void** out) {
+    ApiCallbackGuard callback(ApiHook::InlineMenu);
+    if (out && (svgio & SVGIO_TYPE_MASK) == SVGIO_SELECTION)
+        if (auto* state = InlineMenuOwner(self)) {
+            // The same objects the selection bridge hands Explorer's readers.
+            const HRESULT hr = InlineSelectionViewObject(*state, riid, out);
+            if (SUCCEEDED(hr)) return hr;
+            if (g_perf.load(std::memory_order_relaxed))
+                Wh_Log(L"[GPU menu] the selection's items were unavailable (hr=0x%08X); Explorer's own answer is used",
+                    static_cast<unsigned>(hr));
+        }
+    return g_defViewGetItemsOriginal(self, svgio, option, riid, out);
+}
+HRESULT DefViewBackgroundMenuHook(void* self, const POINT* point) {
+    ApiCallbackGuard callback(ApiHook::InlineMenu);
+    // Only the mod's own request for a selection of inline children, which
+    // Explorer's list holds none of: the item menu is the one requested.
+    if (t_inlineMenuRequest.owner && g_defViewSelectionMenu) return g_defViewSelectionMenu(self, point);
+    return g_defViewBackgroundMenuOriginal(self, point);
+}
+void InstallInlineNativeMenu() {
+    HMODULE shell32 = GetModuleHandleW(L"shell32.dll");
+    if (!shell32) return;
+    WindhawkUtils::SYMBOL_HOOK hooks[]{
+        {{L"public: virtual long __cdecl CDefView::OnBackgroundContextMenu(struct tagPOINT const *)"},
+            &g_defViewBackgroundMenuOriginal, DefViewBackgroundMenuHook, true},
+        {{L"public: virtual long __cdecl CDefView::OnSelectionContextMenu(struct tagPOINT const *)"},
+            &g_defViewSelectionMenu, nullptr, true},
+        {{L"private: long __cdecl CDefView::_GetItems(unsigned int,int,struct _GUID const &,void * *)"},
+            &g_defViewGetItemsOriginal, DefViewGetItemsHook, true},
+    };
+    const bool found = WindhawkUtils::HookSymbols(shell32, hooks, ARRAYSIZE(hooks));
+    // Only all three together give the item menu; otherwise the classic one.
+    g_inlineNativeMenu.store(found && g_defViewBackgroundMenuOriginal && g_defViewSelectionMenu && g_defViewGetItemsOriginal,
+        std::memory_order_release);
+    if (!g_inlineNativeMenu.load(std::memory_order_relaxed))
+        Wh_Log(L"[GPU menu] Explorer's item menu for expanded folders is unavailable on this Windows build "
+               L"(background=%d selection=%d items=%d); the classic menu is used",
+            g_defViewBackgroundMenuOriginal != nullptr, g_defViewSelectionMenu != nullptr, g_defViewGetItemsOriginal != nullptr);
 }
 
 // Native-owned shortcuts remain native. Frame/GPU shortcuts use the active
@@ -41480,6 +45352,19 @@ bool HandleNativeFileKey(const MSG& msg, ViewState* owner) {
         if (!state.visible || state.optimisticStartedAt || (!paste && !ShellRowsInteractive(state)) ||
             (direct && (!OverlayHasInputFocus(state) || !TabOwnsActiveView(state)))) return false;
         if (paste && !direct) return false; // Focused native lists keep their Paste accelerator.
+        // Inline children are outside the native selection: Delete, Copy and
+        // Cut act on the whole GPU selection through its Shell objects, even
+        // while the native list has focus (it would act on its part only).
+        // Paste keeps targeting the open folder, as in the native list.
+        if (!paste && InlineSelectionDetached(state)) {
+            if (msg.lParam & (1LL<<30)) return true;
+            NativeFileKeyClaim claim(state,msg,index);
+            const bool control=(GetKeyState(VK_CONTROL)&0x8000)!=0, shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+            const char* verb = msg.wParam==VK_DELETE ? "delete" : msg.wParam=='C' ? "copy" : "cut";
+            InvokeInlineSelectionCommand(state, verb,
+                (shift ? CMIC_MASK_SHIFT_DOWN : 0) | (control && msg.wParam==VK_DELETE ? CMIC_MASK_CONTROL_DOWN : 0));
+            return true;
+        }
         if (!paste && !direct && !state.pendingNativeSelection && !state.nativeSelectionUnsafe &&
             !state.nativeSelectionImportPending && !state.nativeSelectionAwaitingRefresh) return false;
         if (msg.lParam & (1LL<<30)) return true;
@@ -41600,6 +45485,16 @@ int TranslateAcceleratorInput(HWND hwnd, HACCEL accelerator, LPMSG msg) {
         DispatchMessageW(&renamedInput);
         return TRUE; // Consumed exactly once; Explorer's MSG stays untouched.
     }
+    // Alt+Enter on a selection that spans folders: Explorer's own handler
+    // would show the native (empty) selection's properties instead.
+    if (msg && msg->message == WM_SYSKEYDOWN && msg->wParam == VK_RETURN && !(msg->lParam & (1LL << 30)) &&
+        !g_unloading.load(std::memory_order_relaxed))
+        if (auto* state = State(OverlayUnder(GetAncestor(msg->hwnd, GA_ROOT)));
+            state && state->visible && state->inScope && !state->rename.editor && !state->optimisticStartedAt &&
+            OverlayHasInputFocus(*state) && TabOwnsActiveView(*state) && InlineSelectionDetached(*state)) {
+                ShowInlineSelectionProperties(*state);
+                return TRUE;
+            }
     if (msg && HandleNativeFileKey(*msg)) return TRUE;
     if (msg) NoteNativeNewFolderShortcut(*msg);
     if(msg && msg->message==WM_KEYDOWN) {
@@ -41945,6 +45840,7 @@ LRESULT WINAPI DispatchHook(const MSG* msg) {
         selectAllOverlay=state->hwnd; selectAllNative=state->nativeHwnd; selectAllToken=state->token;
         BeginNativeSelectAll(*state,true);
     }
+    if (msg && msg->message==WM_PAINT) AttachBeforeFirstNativePaint(msg->hwnd);
     if (msg && msg->message >= WM_USER) SuppressDispatchedNativeViewport(msg->hwnd);
     NativeStructureBatch structureBatch(msg ? msg->hwnd : nullptr);
     NativeViewInput viewInput(NativeViewInput::Owner(msg));
@@ -42839,6 +46735,19 @@ BOOL Wh_ModInit() {
     if (void* invoke = NewMenuInvokeCommandAddress())
         WindhawkUtils::SetFunctionHook(reinterpret_cast<NewMenuInvoke_t>(invoke),
             NewMenuInvokeHook, &g_newMenuInvokeOriginal);
+    // Explorer's selection commands (command bar, ribbon, native list) on a
+    // selection with inline children act on all of it. Optional: without the
+    // hook they act on the open folder's part only, as before.
+    if (void* invoke = SelectionMenuInvokeCommandAddress())
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<SelectionMenuInvoke_t>(invoke),
+            SelectionMenuInvokeHook, &g_selectionMenuInvokeOriginal);
+    // Explorer's selection readers (command bar, status bar, Shell code) see
+    // the whole selection when it includes inline children. Optional: without
+    // it they see the open folder's part only.
+    InstallSelectionBridge();
+    // Explorer's own item menu for selections with inline children. Optional:
+    // without its symbols those selections use the classic menu.
+    InstallInlineNativeMenu();
     // Retain this early suppression hook: applying hooks after startup is slow
     // in Windhawk, and the first owned native dispatch must already be batched.
     // Install last: failure before this point cannot release a module while

@@ -175,6 +175,7 @@ try {
     $previousProfile = $env:LLVM_PROFILE_FILE
     $testsPassed = $false
     $coverageStarted = $false
+    $hookCheck = $null
     try {
         $env:PATH = (Join-Path $compilerDirectory 'x86_64-w64-mingw32\bin') + ';' +
             (Join-Path $compilerDirectory 'bin') + ';' + $previousPath
@@ -184,6 +185,22 @@ try {
                 throw 'PENDING: MacType is injected into background-regression.exe. Add the filename background-regression.exe under [UnloadDll] in the active MacType profile before running regressions.'
             }
             if ($LASTEXITCODE -ne 0) { throw "MacType preflight could not run (exit $LASTEXITCODE)." }
+            # Windows' Undo can stop recording renames until the PC restarts
+            # (native Explorer shows no Undo Rename either); Undo tests would
+            # then fail for a machine state, not the mod.
+            & $executable --check-shell-undo
+            if ($LASTEXITCODE -eq 1) {
+                throw 'PENDING: Windows is not recording renames for Undo (no Undo Rename after a rename, in Explorer too). This is a stale Shell state: restart the PC before running regressions.'
+            }
+            if ($LASTEXITCODE -ne 0) { throw "Undo preflight could not run (exit $LASTEXITCODE)." }
+            # Advisory, beside the tests: do the names the mod hooks or looks
+            # up still exist across Windows builds? Never changes a result.
+            try {
+                $hookCheck = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-ProcessArgument (Join-Path $PSScriptRoot 'hook-symbol-check.ps1')),
+                    '-SourceFile', (ConvertTo-ProcessArgument $sourcePath), '-Compiler', (ConvertTo-ProcessArgument $compiler),
+                    '-OutputDirectory', (ConvertTo-ProcessArgument $outputDirectory))
+            } catch { Write-Warning "Hook check could not start: $_" }
         }
         if ($Coverage) {
             $env:LLVM_PROFILE_FILE = $coverageRun.Pattern
@@ -223,6 +240,21 @@ try {
         Write-Output ('PASS: complete {0} in {1:N2}s (compile and execution)' -f $runKind,$totalClock.Elapsed.TotalSeconds)
         if ($KeepArtifacts) { Write-Output "Artifacts retained at $outputDirectory" }
     } finally {
+        # The hook check's report, whatever the tests did (waits for it).
+        if ($hookCheck) {
+            try {
+                if (!$hookCheck.HasExited) {
+                    Write-Output 'Waiting for the hook check (downloads Windows binaries and symbols on its first run)...'
+                    if (!$hookCheck.WaitForExit(15 * 60 * 1000)) {
+                        $hookCheck.Kill(); Write-Output 'HOOK CHECK: stopped after 15 minutes without a result.'
+                    }
+                }
+                $hookSummary = Join-Path $outputDirectory 'hook-symbol-check.txt'
+                if (Test-Path -LiteralPath $hookSummary) {
+                    Get-Content -LiteralPath $hookSummary | ForEach-Object { Write-Output "HOOK CHECK: $_" }
+                } else { Write-Output 'HOOK CHECK: no report was written.' }
+            } catch { Write-Warning "Hook check report unavailable: $_" }
+        }
         $env:LLVM_PROFILE_FILE = $previousProfile
         try {
             if ($coverageStarted) {

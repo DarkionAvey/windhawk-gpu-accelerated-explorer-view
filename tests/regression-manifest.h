@@ -211,6 +211,18 @@ static const Regression::Test kRegressions[] = {
     REGRESSION("inline-dirs-live-parity-checkboxes", PARALLEL, TestInlineDirsLiveParityCheckboxes(fixture)),
     REGRESSION("inline-dirs-live-parity-item-tips", PARALLEL, TestInlineDirsLiveParityItemTips(fixture)),
     REGRESSION("inline-dirs-touch-type-search", PARALLEL, TestInlineDirsTouchAndTypeSearch(fixture)),
+    REGRESSION("inline-dirs-live-parity-open", PARALLEL, TestInlineDirsLiveParityOpen(fixture)),
+    REGRESSION("inline-dirs-live-parity-mouse", PARALLEL, TestInlineDirsLiveParityMouseSelection(fixture)),
+    REGRESSION("inline-dirs-live-parity-marquee", PARALLEL, TestInlineDirsLiveParityMarquee(fixture)),
+    REGRESSION("inline-dirs-live-parity-drag-out", PARALLEL, TestInlineDirsLiveParityDragOut(fixture)),
+    REGRESSION("inline-dirs-live-parity-file-keys", PARALLEL, TestInlineDirsLiveParityFileKeys(fixture)),
+    // Focused until Undo's invocation from the test host is understood (docs/1.1.21-inline-parity-gaps.md).
+    FOCUSED("inline-dirs-live-parity-undo", PARALLEL, TestInlineDirsLiveParityUndo(fixture)),
+    REGRESSION("inline-dirs-live-parity-properties", PARALLEL, TestInlineDirsLiveParityProperties(fixture)),
+    FOCUSED("inline-dirs-live-parity-properties-core", PARALLEL, TestInlineDirsLiveParityPropertiesCore(fixture)),
+    REGRESSION("inline-dirs-live-parity-middle-click", PARALLEL, TestInlineDirsLiveParityMiddleClick(fixture)),
+    REGRESSION("inline-dirs-live-parity-touch", PARALLEL, TestInlineDirsLiveParityTouch(fixture)),
+    REGRESSION("inline-dirs-live-parity-zoom", PARALLEL, TestInlineDirsLiveParityZoom(fixture)),
     // Styles, refresh, columns and native views.
     REGRESSION("resolved-styles", PARALLEL, TestResolvedStyles()),
     REGRESSION("style-events", PARALLEL, TestStyleEvents(fixture)),

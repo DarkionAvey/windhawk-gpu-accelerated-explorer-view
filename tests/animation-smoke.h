@@ -148,6 +148,18 @@ static void TestColumnViewTransition(HWND frame) {
                         <<","<<unsigned(pixels[p+2])<<","<<unsigned(pixels[p+3])<<" settled="<<unsigned(settledHeader[offset+p])<<","
                         <<unsigned(settledHeader[offset+p+1])<<","<<unsigned(settledHeader[offset+p+2])<<","<<unsigned(settledHeader[offset+p+3])
                         <<" visibility="<<alpha<<" shift="<<shift<<" error="<<error<<std::endl;
+                if(error>8) {
+                    // The alpha around it, settled (shifted) and animated.
+                    const int px=int(p/4%640), py=int(p/4/640);
+                    for(int y=std::max(0,py-3);y<=py+3 && size_t(y)<size_t(state.headerPx);++y) {
+                        std::cout<<"  row "<<y<<":";
+                        for(int x=std::max(0,px-4);x<=std::min(639,px+4);++x) {
+                            const size_t at=(size_t(y)*640+size_t(x))*4;
+                            std::cout<<" "<<unsigned(settledHeader[offset+at+3])<<"/"<<unsigned(pixels[at+3]);
+                        }
+                        std::cout<<std::endl;
+                    }
+                }
                 Check(error<=8,
                     "header container did not share the fixed-DIP vertical slide and fade");
             }
